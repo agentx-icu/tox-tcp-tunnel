@@ -1,0 +1,15 @@
+[Unit]
+Description=ToxTunnel - TCP Tunnel over Tox P2P Network
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=toxtunnel
+Group=toxtunnel
+ExecStart=/usr/bin/toxtunnel -c /etc/toxtunnel/config.yaml --service
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

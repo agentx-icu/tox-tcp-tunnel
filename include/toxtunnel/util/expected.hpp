@@ -31,16 +31,24 @@ unexpected(E) -> unexpected<E>;
 template <typename T, typename E>
 class Expected {
    public:
+    struct ValueHolder {
+        T value;
+    };
+
+    struct ErrorHolder {
+        E error;
+    };
+
     // Construct with value
-    Expected(const T& value) : storage_(value) {}
-    Expected(T&& value) : storage_(std::move(value)) {}
+    Expected(const T& value) : storage_(ValueHolder{value}) {}
+    Expected(T&& value) : storage_(ValueHolder{std::move(value)}) {}
 
     // Construct with error via unexpected wrapper — resolves ambiguity when T == E
-    Expected(const unexpected<E>& u) : storage_(u.value()) {}
-    Expected(unexpected<E>&& u) : storage_(std::move(u).value()) {}
+    Expected(const unexpected<E>& u) : storage_(ErrorHolder{u.value()}) {}
+    Expected(unexpected<E>&& u) : storage_(ErrorHolder{std::move(u).value()}) {}
 
     // Check if has value
-    [[nodiscard]] bool has_value() const { return std::holds_alternative<T>(storage_); }
+    [[nodiscard]] bool has_value() const { return std::holds_alternative<ValueHolder>(storage_); }
 
     [[nodiscard]] explicit operator bool() const { return has_value(); }
 
@@ -49,21 +57,21 @@ class Expected {
         if (!has_value()) {
             throw std::runtime_error("Expected contains error");
         }
-        return std::get<T>(storage_);
+        return std::get<ValueHolder>(storage_).value;
     }
 
     const T& value() const& {
         if (!has_value()) {
             throw std::runtime_error("Expected contains error");
         }
-        return std::get<T>(storage_);
+        return std::get<ValueHolder>(storage_).value;
     }
 
     T&& value() && {
         if (!has_value()) {
             throw std::runtime_error("Expected contains error");
         }
-        return std::get<T>(std::move(storage_));
+        return std::get<ValueHolder>(std::move(storage_)).value;
     }
 
     // Access error (throws if value)
@@ -71,21 +79,21 @@ class Expected {
         if (has_value()) {
             throw std::runtime_error("Expected contains value");
         }
-        return std::get<E>(storage_);
+        return std::get<ErrorHolder>(storage_).error;
     }
 
     const E& error() const& {
         if (has_value()) {
             throw std::runtime_error("Expected contains value");
         }
-        return std::get<E>(storage_);
+        return std::get<ErrorHolder>(storage_).error;
     }
 
     E&& error() && {
         if (has_value()) {
             throw std::runtime_error("Expected contains value");
         }
-        return std::get<E>(std::move(storage_));
+        return std::get<ErrorHolder>(std::move(storage_)).error;
     }
 
     // Value or default
@@ -94,11 +102,12 @@ class Expected {
     }
 
     T value_or(T&& default_value) && {
-        return has_value() ? std::get<T>(std::move(storage_)) : std::forward<T>(default_value);
+        return has_value() ? std::get<ValueHolder>(std::move(storage_)).value
+                           : std::forward<T>(default_value);
     }
 
    private:
-    std::variant<T, E> storage_;
+    std::variant<ValueHolder, ErrorHolder> storage_;
 };
 
 /// Partial specialization for Expected<void, E> (operations that can fail

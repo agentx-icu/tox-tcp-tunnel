@@ -107,9 +107,81 @@ Connect:  ssh -p 2222 localhost           → done
 
 ---
 
-## Quick Start
+## Installation
 
-### 1. Build
+### From GitHub Releases (Recommended)
+
+Download the latest installer from [GitHub Releases](https://github.com/anonymoussoft/tox-tcp-tunnel/releases).
+
+#### Linux (DEB - Ubuntu/Debian)
+
+```bash
+wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-linux-x86_64.deb
+sudo dpkg -i toxtunnel-1.0.0-linux-x86_64.deb
+```
+
+The DEB package automatically:
+- Installs `toxtunnel` to `/usr/bin/`
+- Creates a `toxtunnel` system user and group
+- Creates data directory `/var/lib/toxtunnel`
+- Installs config template to `/etc/toxtunnel/config.yaml`
+- Registers a systemd service (not started by default)
+
+Manage the service:
+
+```bash
+sudo systemctl start toxtunnel     # Start
+sudo systemctl enable toxtunnel    # Enable on boot
+sudo systemctl status toxtunnel    # Check status
+sudo systemctl stop toxtunnel      # Stop
+```
+
+#### Linux (RPM - Fedora/RHEL/CentOS)
+
+```bash
+wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-linux-x86_64.rpm
+sudo rpm -i toxtunnel-1.0.0-linux-x86_64.rpm
+```
+
+Service management is the same as the DEB package (systemd).
+
+#### macOS
+
+```bash
+# Download and install the .pkg
+wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-Darwin-arm64.pkg
+sudo installer -pkg toxtunnel-1.0.0-Darwin-arm64.pkg -target /
+```
+
+The package installs:
+- `toxtunnel` to `/usr/local/bin/`
+- launchd plist to `/Library/LaunchDaemons/com.toxtunnel.daemon.plist`
+- Config at `/usr/local/etc/toxtunnel/config.yaml`
+
+Manage the service:
+
+```bash
+sudo launchctl load /Library/LaunchDaemons/com.toxtunnel.daemon.plist     # Start
+sudo launchctl unload /Library/LaunchDaemons/com.toxtunnel.daemon.plist   # Stop
+```
+
+#### Windows
+
+1. Download `toxtunnel-installer.exe` from GitHub Releases
+2. Run the installer as Administrator
+3. The installer places files in `C:\Program Files\ToxTunnel\`
+4. A Windows service named `ToxTunnel` is registered automatically
+
+Manage the service:
+
+```powershell
+sc start ToxTunnel     # Start
+sc stop ToxTunnel      # Stop
+sc query ToxTunnel     # Check status
+sc delete ToxTunnel    # Remove service
+```
+
+### From Source
 
 ```bash
 # macOS
@@ -121,10 +193,27 @@ sudo apt install -y build-essential cmake git pkg-config libsodium-dev
 # Clone and build
 git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
-cmake -B build && cmake --build build
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```
 
-For Windows, Docker, etc., see [docs/BUILDING.md](docs/BUILDING.md).
+For Windows build instructions, see [docs/BUILDING.md](docs/BUILDING.md).
+
+---
+
+## Quick Start
+
+### Print Your Tox ID
+
+```bash
+# Text output
+toxtunnel print-id
+
+# QR code (for scanning with a phone to transfer the ID)
+toxtunnel print-id --qr
+
+# QR code with color
+toxtunnel print-id --qr --color
+```
 
 ## SSH Over ToxTunnel
 
@@ -280,7 +369,10 @@ ssh -p 2222 localhost
 
 ```
 toxtunnel [OPTIONS]
+toxtunnel print-id [OPTIONS]
 ```
+
+### Main Command
 
 | Flag                    | Description                                  |
 | ----------------------- | -------------------------------------------- |
@@ -291,7 +383,16 @@ toxtunnel [OPTIONS]
 | `-p, --port PORT`       | TCP relay port override (server mode)        |
 | `--server-id ID`        | Server's 76-char Tox address (client mode)   |
 | `--pipe HOST:PORT`      | Pipe mode: connect stdin/stdout to tunnel    |
+| `--service`             | Run as system service (systemd/SCM/launchd)  |
 | `-v, --version`         | Show version                                 |
+
+### print-id Subcommand
+
+| Flag                 | Description                                     |
+| -------------------- | ----------------------------------------------- |
+| `-d, --data-dir DIR` | Data directory for loading/creating Tox identity |
+| `--qr`               | Render Tox ID as terminal QR code               |
+| `--color`             | Use ANSI colors in QR output (requires `--qr`)  |
 
 ---
 
@@ -341,6 +442,24 @@ For detailed guides on various use cases, see:
 - [HTTP Tunneling](docs/HTTP_TUNNELING.md) - Web server access, HTTP proxy scenarios
 - [Database Tunneling](docs/DATABASE_TUNNELING.md) - Database access (PostgreSQL, MySQL, Redis, etc.)
 - [Advanced Scenarios](docs/ADVANCED_SCENARIOS.md) - RDP/VNC, Rsync, NAS, custom services
+
+## Packaging
+
+Pre-built installers are published to GitHub Releases on every version tag (`v*`).
+
+| Platform | Formats            | Service Type |
+|----------|--------------------|--------------|
+| Linux    | DEB, RPM, tar.gz   | systemd      |
+| macOS    | .pkg, tar.gz       | launchd      |
+| Windows  | NSIS .exe, .zip    | Windows SCM  |
+
+Build installers locally:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cd build && cpack    # produces platform-native packages
+```
 
 ---
 

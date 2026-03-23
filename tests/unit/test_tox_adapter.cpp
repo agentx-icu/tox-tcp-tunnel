@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <filesystem>
 #include <string>
 
 #include "toxtunnel/tox/tox_adapter.hpp"
@@ -68,6 +70,25 @@ TEST(ToxAdapterTest, ResolveBootstrapNodesForConfigKeepsConfiguredLanNodes) {
     ASSERT_EQ(result.value().size(), 1u);
     EXPECT_EQ(result.value()[0].ip, "192.168.1.20");
     EXPECT_FALSE(fetch_called);
+}
+
+TEST(ToxAdapterTest, GetToxIdOnlyReturnsStableIdForSameDirectory) {
+    const auto temp_root = std::filesystem::temp_directory_path();
+    const auto unique =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto test_dir = temp_root / ("toxtunnel_test_toxid_" + std::to_string(unique));
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    auto first = ToxAdapter::get_tox_id_only(test_dir);
+    ASSERT_TRUE(first.has_value()) << first.error();
+    EXPECT_EQ(first.value().size(), kToxIdHexLen);
+
+    auto second = ToxAdapter::get_tox_id_only(test_dir);
+    ASSERT_TRUE(second.has_value()) << second.error();
+    EXPECT_EQ(second.value(), first.value());
+
+    std::filesystem::remove_all(test_dir, ec);
 }
 
 }  // namespace

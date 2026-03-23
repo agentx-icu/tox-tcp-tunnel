@@ -83,9 +83,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(yaml-cpp)
 
+# QR Code generator (Nayuki)
+FetchContent_Declare(
+    qrcodegen
+    GIT_REPOSITORY https://github.com/nayuki/QR-Code-generator.git
+    GIT_TAG v1.8.0
+    SOURCE_SUBDIR cpp
+)
+FetchContent_MakeAvailable(qrcodegen)
+
 # Library target
 add_library(toxtunnel_lib STATIC)
 target_sources(toxtunnel_lib PRIVATE
+    ${qrcodegen_SOURCE_DIR}/cpp/qrcodegen.cpp
     src/placeholder.cpp
     src/core/io_context.cpp
     src/core/tcp_connection.cpp
@@ -106,10 +116,14 @@ target_sources(toxtunnel_lib PRIVATE
     src/util/config.cpp
     src/util/error.cpp
     src/util/logger.cpp
+    src/util/qr_code.cpp
+    src/util/systemd_notify.cpp
+    src/util/windows_service.cpp
 )
 target_include_directories(toxtunnel_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${asio_SOURCE_DIR}/asio/include
+    ${qrcodegen_SOURCE_DIR}/cpp
 )
 target_link_libraries(toxtunnel_lib PUBLIC
     toxcore_wrapper
@@ -179,3 +193,33 @@ install(FILES README.md LICENSE
     DESTINATION .
     COMPONENT toxtunnel-runtime
 )
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging")
+    install(FILES packaging/config.yaml.example
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel
+        COMPONENT toxtunnel-runtime
+        OPTIONAL
+    )
+    install(FILES packaging/linux/toxtunnel.service
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system
+        COMPONENT toxtunnel-runtime
+        OPTIONAL
+    )
+    install(PROGRAMS packaging/linux/postinst packaging/linux/prerm
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel/scripts
+        COMPONENT toxtunnel-runtime
+        OPTIONAL
+    )
+    install(FILES packaging/macos/com.toxtunnel.daemon.plist
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel
+        COMPONENT toxtunnel-runtime
+        OPTIONAL
+    )
+    install(FILES packaging/windows/installer.nsi
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel
+        COMPONENT toxtunnel-runtime
+        OPTIONAL
+    )
+endif()
+
+include(cmake/Packaging.cmake)

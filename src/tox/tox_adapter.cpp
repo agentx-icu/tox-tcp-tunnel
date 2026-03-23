@@ -75,6 +75,23 @@ ToxAdapter::~ToxAdapter() {
     stop();
 }
 
+util::Expected<std::string, std::string> ToxAdapter::get_tox_id_only(
+    const std::filesystem::path& data_dir) {
+    ToxAdapter adapter;
+    ToxAdapterConfig config;
+    config.data_dir = data_dir;
+    config.udp_enabled = false;
+    config.local_discovery_enabled = false;
+    config.bootstrap_mode = BootstrapMode::Lan;
+
+    auto init_result = adapter.initialize(config);
+    if (!init_result.has_value()) {
+        return util::unexpected(init_result.error());
+    }
+
+    return adapter.get_address().to_hex();
+}
+
 // ===========================================================================
 // Lifecycle
 // ===========================================================================

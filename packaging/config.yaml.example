@@ -1,0 +1,14 @@
+mode: server
+data_dir: /var/lib/toxtunnel
+
+logging:
+  level: info
+  file: /var/log/toxtunnel.log
+
+tox:
+  udp_enabled: true
+  tcp_port: 33445
+  bootstrap_mode: auto
+
+server:
+  rules_file: /etc/toxtunnel/rules.yaml

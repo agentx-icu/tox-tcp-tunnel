@@ -174,6 +174,9 @@ struct FriendInfo {
 /// @endcode
 class ToxAdapter {
    public:
+    [[nodiscard]] static util::Expected<std::string, std::string> get_tox_id_only(
+        const std::filesystem::path& data_dir);
+
     ToxAdapter();
     ~ToxAdapter();
 

@@ -18,6 +18,7 @@ add_executable(unit_tests
     unit/test_circular_buffer.cpp
     unit/test_config.cpp
     unit/test_pipe_mode.cpp
+    unit/test_qr_code.cpp
     unit/test_rules_engine.cpp
     unit/test_tox_adapter.cpp
     unit/test_tunnel.cpp

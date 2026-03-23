@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -eu
+
+if ! getent group toxtunnel >/dev/null 2>&1; then
+    groupadd --system toxtunnel >/dev/null 2>&1 || true
+fi
+
+if ! id -u toxtunnel >/dev/null 2>&1; then
+    useradd --system --gid toxtunnel --home /var/lib/toxtunnel --shell /usr/sbin/nologin \
+        toxtunnel >/dev/null 2>&1 || true
+fi
+
+mkdir -p /var/lib/toxtunnel
+mkdir -p /etc/toxtunnel
+chown -R toxtunnel:toxtunnel /var/lib/toxtunnel
+chmod 0750 /var/lib/toxtunnel
+
+if [ -f /usr/share/toxtunnel/config.yaml.example ] && [ ! -f /etc/toxtunnel/config.yaml ]; then
+    cp /usr/share/toxtunnel/config.yaml.example /etc/toxtunnel/config.yaml
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    systemctl enable toxtunnel.service || true
+fi
