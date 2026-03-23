@@ -32,22 +32,21 @@ jobs:
             deps
             revert
             bump
-          requireScope: |
-            subject: must start with one of the prefixes
-          subjectRegex: '^(feat|fix|docs|chore|refactor|test|ci|build|perf|style|deps|revert|bump)(\(.+\))?:\s.+'
-          headerPattern: '^(\w+)(\(.+\))?:\s.+'
-          lowercaseOnly: true
+          subjectPattern: ^[a-z0-9].*$
+          subjectPatternError: subject must start with a lowercase letter or digit
 
   # Run clang-tidy static analysis
   clang-tidy:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install clang-tidy
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-tidy
+          sudo apt-get install -y build-essential cmake pkg-config libsodium-dev clang-tidy
 
       - name: Configure CMake
         run: |
@@ -55,6 +54,5 @@ jobs:
 
       - name: Run clang-tidy
         run: |
-          cd build
-          clang-tidy -p ../src ../include -header-filter='.*' --warnings-as-errors
-        continue-on-error: true
+          find src tests -type f -name "*.cpp" -print0 | \
+            xargs -0 clang-tidy -p build -header-filter='.*' --warnings-as-errors='*'

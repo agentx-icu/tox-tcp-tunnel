@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     # c-toxcore unconditionally calls find_package(PkgConfig REQUIRED).
     # GitHub-hosted Windows runners do not guarantee a pkg-config executable,
     # so provide a tiny shim that lets pkg_search_module() fail cleanly and
@@ -78,7 +79,7 @@ FetchContent_MakeAvailable(cli11)
 FetchContent_Declare(
     yaml-cpp
     GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-    GIT_TAG yaml-cpp-0.7.0
+    GIT_TAG yaml-cpp-0.9.0
 )
 FetchContent_MakeAvailable(yaml-cpp)
 
