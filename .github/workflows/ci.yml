@@ -79,6 +79,7 @@ jobs:
           git clone https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
           & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
           & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install "libsodium:${{ matrix.target.vcpkg_triplet }}"
+          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install "pthreads:${{ matrix.target.vcpkg_triplet }}"
 
       - name: Configure CMake (Unix)
         if: matrix.target.platform != 'windows'
