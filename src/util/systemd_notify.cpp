@@ -36,11 +36,7 @@ void notify_state(const char* state) {
     }
 
     const std::string payload = std::string(state) + "\n";
-    (void)sendto(fd,
-                 payload.data(),
-                 payload.size(),
-                 0,
-                 reinterpret_cast<const sockaddr*>(&addr),
+    (void)sendto(fd, payload.data(), payload.size(), 0, reinterpret_cast<const sockaddr*>(&addr),
                  sizeof(addr));
     close(fd);
 }

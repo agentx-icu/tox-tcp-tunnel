@@ -14,7 +14,8 @@ namespace {
 // Global state for Windows service (guarded by being set before service start)
 std::atomic<bool> g_service_stopping{false};
 SERVICE_STATUS_HANDLE g_status_handle = nullptr;
-std::shared_ptr<std::function<int()>> g_run_fn;
+std::function<int()> g_run_fn;
+std::string g_service_name;
 std::wstring g_service_name_wide;
 int g_service_exit_code = 0;
 
@@ -62,9 +63,9 @@ VOID WINAPI service_main(DWORD argc, LPWSTR* argv) {
     set_service_status(SERVICE_START_PENDING);
 
     // Run the main function
-    if (g_run_fn && *g_run_fn) {
+    if (g_run_fn) {
         set_service_status(SERVICE_RUNNING);
-        g_service_exit_code = (*g_run_fn)();
+        g_service_exit_code = g_run_fn();
     }
 
     set_service_status(SERVICE_STOPPED,
@@ -77,8 +78,7 @@ std::wstring utf8_to_wide(const std::string& utf8) {
         return std::wstring();
     }
 
-    int size_needed =
-        MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
     if (size_needed <= 0) {
         return std::wstring();
     }
@@ -158,12 +158,12 @@ int run_windows_service_main(const std::string& service_name, const std::functio
     // Store the run function and service name for the service main callback
     g_run_fn = run_fn;
     g_service_name = service_name;
+    g_service_name_wide = utf8_to_wide(service_name);
     g_service_stopping.store(false);
 
     // Prepare the service table
-    std::wstring wide_name(service_name.begin(), service_name.end());
     SERVICE_TABLE_ENTRYW service_table[] = {
-        {const_cast<LPWSTR>(wide_name.c_str()),
+        {const_cast<LPWSTR>(g_service_name_wide.c_str()),
          reinterpret_cast<LPSERVICE_MAIN_FUNCTIONW>(service_main)},
         {nullptr, nullptr}};
 

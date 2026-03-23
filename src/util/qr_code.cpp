@@ -43,8 +43,8 @@ Expected<std::string, std::string> generate_qr_terminal(std::string_view text, b
     }
 
     try {
-        const qrcodegen::QrCode qr =
-            qrcodegen::QrCode::encodeText(std::string(text).c_str(), qrcodegen::QrCode::Ecc::MEDIUM);
+        const qrcodegen::QrCode qr = qrcodegen::QrCode::encodeText(std::string(text).c_str(),
+                                                                   qrcodegen::QrCode::Ecc::MEDIUM);
 
         constexpr int kBorder = 2;
         std::ostringstream out;

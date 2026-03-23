@@ -74,8 +74,7 @@ TEST(ToxAdapterTest, ResolveBootstrapNodesForConfigKeepsConfiguredLanNodes) {
 
 TEST(ToxAdapterTest, GetToxIdOnlyReturnsStableIdForSameDirectory) {
     const auto temp_root = std::filesystem::temp_directory_path();
-    const auto unique =
-        std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto test_dir = temp_root / ("toxtunnel_test_toxid_" + std::to_string(unique));
     std::error_code ec;
     std::filesystem::remove_all(test_dir, ec);
