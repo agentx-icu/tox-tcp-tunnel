@@ -1,9 +1,9 @@
 #include "toxtunnel/core/tcp_connection.hpp"
 
-#include "toxtunnel/util/logger.hpp"
-
 #include <cassert>
 #include <utility>
+
+#include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::core {
 
@@ -329,32 +329,31 @@ void TcpConnection::do_write() {
     auto& front = write_queue_.front();
 
     auto self = shared_from_this();
-    asio::async_write(
-        socket_, asio::buffer(front.data),
-        [this, self](const std::error_code& ec, std::size_t bytes_transferred) {
-            if (ec) {
-                util::Logger::debug("TcpConnection: write error: {}", ec.message());
-                write_in_progress_ = false;
-                notify_error(ec);
+    asio::async_write(socket_, asio::buffer(front.data),
+                      [this, self](const std::error_code& ec, std::size_t bytes_transferred) {
+                          if (ec) {
+                              util::Logger::debug("TcpConnection: write error: {}", ec.message());
+                              write_in_progress_ = false;
+                              notify_error(ec);
 
-                // On write error, transition to disconnecting and close.
-                if (state_ == ConnectionState::Connected) {
-                    set_state(ConnectionState::Disconnecting);
-                }
-                do_close(ec);
-                return;
-            }
+                              // On write error, transition to disconnecting and close.
+                              if (state_ == ConnectionState::Connected) {
+                                  set_state(ConnectionState::Disconnecting);
+                              }
+                              do_close(ec);
+                              return;
+                          }
 
-            // Remove the completed buffer from the queue.
-            assert(!write_queue_.empty());
-            write_buffer_bytes_ -= write_queue_.front().data.size();
-            write_queue_.pop_front();
+                          // Remove the completed buffer from the queue.
+                          assert(!write_queue_.empty());
+                          write_buffer_bytes_ -= write_queue_.front().data.size();
+                          write_queue_.pop_front();
 
-            (void)bytes_transferred;  // Already accounted for via buffer size.
+                          (void)bytes_transferred;  // Already accounted for via buffer size.
 
-            // Continue with the next queued buffer.
-            do_write();
-        });
+                          // Continue with the next queued buffer.
+                          do_write();
+                      });
 }
 
 void TcpConnection::do_close(const std::error_code& ec) {

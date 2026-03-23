@@ -1,7 +1,6 @@
 #pragma once
 
 #include <asio.hpp>
-
 #include <cstddef>
 #include <cstdint>
 #include <deque>

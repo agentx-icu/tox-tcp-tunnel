@@ -1,12 +1,12 @@
 #pragma once
 
+#include <yaml-cpp/yaml.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <yaml-cpp/yaml.h>
 
 #include "toxtunnel/tox/types.hpp"
 #include "toxtunnel/util/expected.hpp"
@@ -20,42 +20,38 @@ namespace toxtunnel {
 
 /// Represents a port forwarding rule for client mode.
 struct ForwardRule {
-    uint16_t local_port = 0;      ///< Local port to listen on
-    std::string remote_host;      ///< Remote host to connect to (via tunnel)
-    uint16_t remote_port = 0;     ///< Remote port to connect to
+    uint16_t local_port = 0;   ///< Local port to listen on
+    std::string remote_host;   ///< Remote host to connect to (via tunnel)
+    uint16_t remote_port = 0;  ///< Remote port to connect to
 
     bool operator==(const ForwardRule& other) const {
-        return local_port == other.local_port &&
-               remote_host == other.remote_host &&
+        return local_port == other.local_port && remote_host == other.remote_host &&
                remote_port == other.remote_port;
     }
 };
 
 /// Represents a pipe-mode target for client stdio forwarding.
 struct PipeTarget {
-    std::string remote_host;      ///< Remote host to connect to
-    uint16_t remote_port = 0;     ///< Remote port to connect to
+    std::string remote_host;   ///< Remote host to connect to
+    uint16_t remote_port = 0;  ///< Remote port to connect to
 
     bool operator==(const PipeTarget& other) const {
-        return remote_host == other.remote_host &&
-               remote_port == other.remote_port;
+        return remote_host == other.remote_host && remote_port == other.remote_port;
     }
 };
 
 /// Represents a DHT bootstrap node configuration (YAML-friendly).
 struct BootstrapNodeConfig {
-    std::string address;          ///< Hostname or IP address
-    uint16_t port = 33445;        ///< UDP port (default: 33445)
-    std::string public_key;       ///< Hex-encoded public key (64 chars)
+    std::string address;     ///< Hostname or IP address
+    uint16_t port = 33445;   ///< UDP port (default: 33445)
+    std::string public_key;  ///< Hex-encoded public key (64 chars)
 
     /// Convert to a BootstrapNode (parses public key).
     /// Returns error string if public key is invalid.
     [[nodiscard]] util::Expected<tox::BootstrapNode, std::string> to_bootstrap_node() const;
 
     bool operator==(const BootstrapNodeConfig& other) const {
-        return address == other.address &&
-               port == other.port &&
-               public_key == other.public_key;
+        return address == other.address && port == other.port && public_key == other.public_key;
     }
 };
 
@@ -63,23 +59,21 @@ using BootstrapMode = tox::BootstrapMode;
 
 /// Shared toxcore network configuration.
 struct ToxConfig {
-    bool udp_enabled = true;                           ///< Enable UDP for toxcore
-    uint16_t tcp_port = 33445;                        ///< TCP relay port (server use)
+    bool udp_enabled = true;                             ///< Enable UDP for toxcore
+    uint16_t tcp_port = 33445;                           ///< TCP relay port (server use)
     BootstrapMode bootstrap_mode = BootstrapMode::Auto;  ///< Bootstrap behavior
-    std::vector<BootstrapNodeConfig> bootstrap_nodes; ///< Explicit bootstrap nodes
+    std::vector<BootstrapNodeConfig> bootstrap_nodes;    ///< Explicit bootstrap nodes
 
     bool operator==(const ToxConfig& other) const {
-        return udp_enabled == other.udp_enabled &&
-               tcp_port == other.tcp_port &&
-               bootstrap_mode == other.bootstrap_mode &&
-               bootstrap_nodes == other.bootstrap_nodes;
+        return udp_enabled == other.udp_enabled && tcp_port == other.tcp_port &&
+               bootstrap_mode == other.bootstrap_mode && bootstrap_nodes == other.bootstrap_nodes;
     }
 };
 
 /// Logging configuration.
 struct LoggingConfig {
-    util::LogLevel level = util::LogLevel::Info;     ///< Minimum log level
-    std::optional<std::string> file;     ///< Optional log file path
+    util::LogLevel level = util::LogLevel::Info;  ///< Minimum log level
+    std::optional<std::string> file;              ///< Optional log file path
 
     bool operator==(const LoggingConfig& other) const {
         return level == other.level && file == other.file;
@@ -92,35 +86,31 @@ struct LoggingConfig {
 
 /// Server-specific configuration options.
 struct ServerConfig {
-    uint16_t tcp_port = 33445;                    ///< TCP relay port
-    bool udp_enabled = true;                      ///< Enable UDP for DHT
+    uint16_t tcp_port = 33445;                         ///< TCP relay port
+    bool udp_enabled = true;                           ///< Enable UDP for DHT
     std::vector<BootstrapNodeConfig> bootstrap_nodes;  ///< DHT bootstrap nodes
-    std::optional<std::string> rules_file;        ///< Optional access rules file
+    std::optional<std::string> rules_file;             ///< Optional access rules file
 
     bool operator==(const ServerConfig& other) const {
-        return tcp_port == other.tcp_port &&
-               udp_enabled == other.udp_enabled &&
-               bootstrap_nodes == other.bootstrap_nodes &&
-               rules_file == other.rules_file;
+        return tcp_port == other.tcp_port && udp_enabled == other.udp_enabled &&
+               bootstrap_nodes == other.bootstrap_nodes && rules_file == other.rules_file;
     }
 };
 
 /// Client-specific configuration options.
 struct ClientConfig {
-    std::string server_id;                    ///< Server's Tox ID (76 hex chars)
-    std::vector<ForwardRule> forwards;        ///< Port forwarding rules
-    std::optional<PipeTarget> pipe_target;    ///< Optional stdio pipe target
+    std::string server_id;                  ///< Server's Tox ID (76 hex chars)
+    std::vector<ForwardRule> forwards;      ///< Port forwarding rules
+    std::optional<PipeTarget> pipe_target;  ///< Optional stdio pipe target
 
     bool operator==(const ClientConfig& other) const {
-        return server_id == other.server_id &&
-               forwards == other.forwards &&
+        return server_id == other.server_id && forwards == other.forwards &&
                pipe_target == other.pipe_target;
     }
 };
 
 /// Parse a pipe target of the form "host:port".
-[[nodiscard]] util::Expected<PipeTarget, std::string> parse_pipe_target(
-    std::string_view spec);
+[[nodiscard]] util::Expected<PipeTarget, std::string> parse_pipe_target(std::string_view spec);
 
 // ---------------------------------------------------------------------------
 // Main configuration
@@ -136,7 +126,7 @@ enum class Mode {
 struct Config {
     // Common options
     Mode mode = Mode::Server;
-    std::filesystem::path data_dir;           ///< Directory for Tox save data
+    std::filesystem::path data_dir;  ///< Directory for Tox save data
     LoggingConfig logging;
     ToxConfig tox;
 
@@ -203,11 +193,8 @@ struct Config {
     [[nodiscard]] const ClientConfig& client_config() const;
 
     bool operator==(const Config& other) const {
-        return mode == other.mode &&
-               data_dir == other.data_dir &&
-               logging == other.logging &&
-               effective_tox_config() == other.effective_tox_config() &&
-               server == other.server &&
+        return mode == other.mode && data_dir == other.data_dir && logging == other.logging &&
+               effective_tox_config() == other.effective_tox_config() && server == other.server &&
                client == other.client;
     }
 };

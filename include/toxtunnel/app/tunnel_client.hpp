@@ -3,13 +3,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <mutex>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
-#include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/app/stdio_pipe_bridge.hpp"
+#include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/core/tcp_listener.hpp"
 #include "toxtunnel/tox/tox_adapter.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"

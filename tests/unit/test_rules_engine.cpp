@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <filesystem>
+#include <thread>
+
 #include "toxtunnel/app/rules_engine.hpp"
 
 using namespace toxtunnel;
@@ -343,12 +347,8 @@ TEST(RulesError, ErrorCodeCategory) {
 
 TEST(RulesError, AllCodesHaveMessages) {
     std::vector<RulesError> errors = {
-        RulesError::FileNotFound,
-        RulesError::ParseError,
-        RulesError::InvalidPublicKey,
-        RulesError::InvalidHostPattern,
-        RulesError::InvalidIpPattern,
-        RulesError::InvalidPort,
+        RulesError::FileNotFound,       RulesError::ParseError,       RulesError::InvalidPublicKey,
+        RulesError::InvalidHostPattern, RulesError::InvalidIpPattern, RulesError::InvalidPort,
     };
 
     for (const auto& err : errors) {
@@ -380,7 +380,11 @@ TEST(RulesEngineFile, SaveAndLoad) {
 
     RulesEngine engine(std::vector<FriendRule>{rule});
 
-    auto tmp = std::filesystem::temp_directory_path() / "test_rules_engine_save.yaml";
+    const auto unique_suffix =
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+        std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    auto tmp = std::filesystem::temp_directory_path() /
+               ("test_rules_engine_save_" + unique_suffix + ".yaml");
     auto save_result = engine.save(tmp);
     ASSERT_TRUE(save_result.has_value()) << save_result.error();
 

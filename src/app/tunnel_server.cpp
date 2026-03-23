@@ -47,8 +47,8 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     if (server_cfg.rules_file.has_value()) {
         auto rules_result = RulesEngine::from_file(server_cfg.rules_file.value());
         if (!rules_result) {
-            return util::unexpected(
-                std::string("Failed to load rules file: ") + rules_result.error());
+            return util::unexpected(std::string("Failed to load rules file: ") +
+                                    rules_result.error());
         }
         rules_engine_ = std::move(rules_result.value());
         util::Logger::info("Loaded access rules from {}", server_cfg.rules_file.value());
@@ -73,8 +73,8 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
         if (node_result) {
             tox_config.bootstrap_nodes.push_back(std::move(node_result.value()));
         } else {
-            util::Logger::warn("Skipping invalid bootstrap node {}: {}",
-                               node_cfg.address, node_result.error());
+            util::Logger::warn("Skipping invalid bootstrap node {}: {}", node_cfg.address,
+                               node_result.error());
         }
     }
 
@@ -82,8 +82,8 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     tox_adapter_ = std::make_unique<tox::ToxAdapter>();
     auto init_result = tox_adapter_->initialize(tox_config);
     if (!init_result) {
-        return util::unexpected(
-            std::string("Failed to initialize ToxAdapter: ") + init_result.error());
+        return util::unexpected(std::string("Failed to initialize ToxAdapter: ") +
+                                init_result.error());
     }
 
     // Wire up callbacks.
@@ -92,20 +92,16 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
             on_friend_request(pk, msg);
         });
 
-    tox_adapter_->set_on_friend_connection(
-        [this](uint32_t friend_number, bool connected) {
-            on_friend_connection(friend_number, connected);
-        });
+    tox_adapter_->set_on_friend_connection([this](uint32_t friend_number, bool connected) {
+        on_friend_connection(friend_number, connected);
+    });
 
     tox_adapter_->set_on_lossless_packet(
         [this](uint32_t friend_number, const uint8_t* data, std::size_t length) {
             on_lossless_packet(friend_number, data, length);
         });
 
-    tox_adapter_->set_on_self_connection(
-        [this](bool connected) {
-            on_self_connection(connected);
-        });
+    tox_adapter_->set_on_self_connection([this](bool connected) { on_self_connection(connected); });
 
     util::Logger::info("TunnelServer initialized successfully");
     return {};
@@ -186,11 +182,10 @@ void TunnelServer::on_friend_request(const tox::PublicKeyArray& public_key,
     // Auto-accept friend requests.
     auto result = tox_adapter_->add_friend_norequest(public_key);
     if (result) {
-        util::Logger::info("Accepted friend request from {}, friend_number={}",
-                           pk_hex, result.value());
+        util::Logger::info("Accepted friend request from {}, friend_number={}", pk_hex,
+                           result.value());
     } else {
-        util::Logger::error("Failed to accept friend request from {}: {}",
-                            pk_hex, result.error());
+        util::Logger::error("Failed to accept friend request from {}: {}", pk_hex, result.error());
     }
 }
 
@@ -206,8 +201,7 @@ void TunnelServer::on_friend_connection(uint32_t friend_number, bool connected) 
     }
 }
 
-void TunnelServer::on_lossless_packet(uint32_t friend_number,
-                                      const uint8_t* data,
+void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* data,
                                       std::size_t length) {
     // Lossless packets start with a byte in [160-191]. The actual frame
     // data starts at data[1].
@@ -218,12 +212,12 @@ void TunnelServer::on_lossless_packet(uint32_t friend_number,
     }
 
     // Deserialize the ProtocolFrame from data+1.
-    auto frame_result = tunnel::ProtocolFrame::deserialize(
-        std::span<const uint8_t>(data + 1, length - 1));
+    auto frame_result =
+        tunnel::ProtocolFrame::deserialize(std::span<const uint8_t>(data + 1, length - 1));
 
     if (!frame_result) {
-        util::Logger::warn("Failed to deserialize frame from friend {}: {}",
-                           friend_number, frame_result.error().message());
+        util::Logger::warn("Failed to deserialize frame from friend {}: {}", friend_number,
+                           frame_result.error().message());
         return;
     }
 
@@ -236,15 +230,22 @@ void TunnelServer::on_lossless_packet(uint32_t friend_number,
     }
 
     // Route all other frames to the friend's TunnelManager.
-    std::lock_guard lock(managers_mutex_);
-    auto it = managers_.find(friend_number);
-    if (it == managers_.end()) {
-        util::Logger::warn("Received frame from friend {} but no TunnelManager exists",
-                           friend_number);
-        return;
+    // IMPORTANT: We must NOT hold managers_mutex_ when calling route_frame(),
+    // because route_frame() can synchronously trigger callbacks (e.g., via
+    // tcp_conn->close() -> on_disconnect) that need to re-acquire managers_mutex_.
+    tunnel::TunnelManager* manager_ptr = nullptr;
+    {
+        std::lock_guard lock(managers_mutex_);
+        auto it = managers_.find(friend_number);
+        if (it == managers_.end()) {
+            util::Logger::warn("Received frame from friend {} but no TunnelManager exists",
+                               friend_number);
+            return;
+        }
+        manager_ptr = it->second.get();
     }
 
-    it->second->route_frame(frame);
+    manager_ptr->route_frame(frame);
 }
 
 void TunnelServer::on_self_connection(bool connected) {
@@ -260,8 +261,7 @@ void TunnelServer::on_self_connection(bool connected) {
 // ---------------------------------------------------------------------------
 
 void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
-    auto manager = std::make_unique<tunnel::TunnelManager>(
-        io_context_->get_io_context());
+    auto manager = std::make_unique<tunnel::TunnelManager>(io_context_->get_io_context());
 
     // Set up the send handler: serialize frame, prepend lossless packet byte,
     // send via ToxAdapter.
@@ -277,16 +277,14 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
         });
 
     // Set up tunnel created callback for logging.
-    manager->set_on_tunnel_created(
-        [friend_number](uint16_t tunnel_id) {
-            util::Logger::debug("Tunnel {} created for friend {}", tunnel_id, friend_number);
-        });
+    manager->set_on_tunnel_created([friend_number](uint16_t tunnel_id) {
+        util::Logger::debug("Tunnel {} created for friend {}", tunnel_id, friend_number);
+    });
 
     // Set up tunnel closed callback for logging.
-    manager->set_on_tunnel_closed(
-        [friend_number](uint16_t tunnel_id) {
-            util::Logger::debug("Tunnel {} closed for friend {}", tunnel_id, friend_number);
-        });
+    manager->set_on_tunnel_closed([friend_number](uint16_t tunnel_id) {
+        util::Logger::debug("Tunnel {} closed for friend {}", tunnel_id, friend_number);
+    });
 
     std::lock_guard lock(managers_mutex_);
     managers_[friend_number] = std::move(manager);
@@ -301,8 +299,7 @@ void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {
     }
 }
 
-void TunnelServer::handle_tunnel_open(uint32_t friend_number,
-                                      const tunnel::ProtocolFrame& frame) {
+void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::ProtocolFrame& frame) {
     auto open_payload = frame.as_tunnel_open();
     if (!open_payload) {
         util::Logger::warn("Malformed TUNNEL_OPEN from friend {}", friend_number);
@@ -313,8 +310,8 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number,
     auto target_port = open_payload->port;
     auto tunnel_id = frame.tunnel_id();
 
-    util::Logger::info("TUNNEL_OPEN from friend {}: tunnel_id={} target={}:{}",
-                       friend_number, tunnel_id, target_host, target_port);
+    util::Logger::info("TUNNEL_OPEN from friend {}: tunnel_id={} target={}:{}", friend_number,
+                       tunnel_id, target_host, target_port);
 
     // Check access rules.
     auto pk_hex = get_friend_pk_hex(friend_number);
@@ -325,15 +322,15 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number,
 
     auto access_result = rules_engine_.evaluate(access_req);
     if (access_result == AccessResult::Denied) {
-        util::Logger::warn("Access denied for friend {} to {}:{}", pk_hex,
-                           target_host, target_port);
+        util::Logger::warn("Access denied for friend {} to {}:{}", pk_hex, target_host,
+                           target_port);
 
         // Send error frame back.
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
         if (it != managers_.end()) {
-            auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
-                tunnel_id, 1, "Access denied");
+            auto error_frame =
+                tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 1, "Access denied");
             it->second->send_frame(error_frame);
         }
         return;
@@ -350,8 +347,7 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number,
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
         if (it == managers_.end()) {
-            util::Logger::warn("No TunnelManager for friend {} during TUNNEL_OPEN",
-                               friend_number);
+            util::Logger::warn("No TunnelManager for friend {} during TUNNEL_OPEN", friend_number);
             return;
         }
         manager_ptr = it->second.get();
@@ -364,16 +360,15 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number,
         return;
     }
 
-    auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(
-        io_context_->get_io_context(), tunnel_id, friend_number);
-    server_tunnel->set_on_send_to_tox(
-        [manager_ptr](std::span<const uint8_t> data) {
-            auto parsed = tunnel::ProtocolFrame::deserialize(data);
-            if (!parsed) {
-                return;
-            }
-            (void)manager_ptr->send_frame(parsed.value());
-        });
+    auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(io_context_->get_io_context(),
+                                                              tunnel_id, friend_number);
+    server_tunnel->set_on_send_to_tox([manager_ptr](std::span<const uint8_t> data) {
+        auto parsed = tunnel::ProtocolFrame::deserialize(data);
+        if (!parsed) {
+            return;
+        }
+        (void)manager_ptr->send_frame(parsed.value());
+    });
     manager_ptr->add_tunnel(tunnel_id, std::move(server_tunnel));
 
     // Create a TCP connection to the target host:port.
@@ -385,11 +380,10 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number,
     resolver->async_resolve(
         target_host, std::to_string(target_port),
         [this, resolver, tcp_conn, friend_number, tunnel_id, target_host, target_port](
-            const std::error_code& ec,
-            asio::ip::tcp::resolver::results_type results) {
+            const std::error_code& ec, asio::ip::tcp::resolver::results_type results) {
             if (ec) {
-                util::Logger::error("Failed to resolve {}:{} for tunnel {}: {}",
-                                    target_host, target_port, tunnel_id, ec.message());
+                util::Logger::error("Failed to resolve {}:{} for tunnel {}: {}", target_host,
+                                    target_port, tunnel_id, ec.message());
 
                 // Send error and close the tunnel.
                 std::lock_guard lock(managers_mutex_);
@@ -405,77 +399,87 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number,
 
             // Connect to the first resolved endpoint.
             auto endpoint = results.begin()->endpoint();
-            tcp_conn->async_connect(endpoint,
-                [this, tcp_conn, friend_number, tunnel_id, target_host, target_port](
-                    const std::error_code& connect_ec) {
-                    if (connect_ec) {
-                        util::Logger::error("Failed to connect to {}:{} for tunnel {}: {}",
-                                            target_host, target_port, tunnel_id,
-                                            connect_ec.message());
+            tcp_conn->async_connect(endpoint, [this, tcp_conn, friend_number, tunnel_id,
+                                               target_host,
+                                               target_port](const std::error_code& connect_ec) {
+                if (connect_ec) {
+                    util::Logger::error("Failed to connect to {}:{} for tunnel {}: {}", target_host,
+                                        target_port, tunnel_id, connect_ec.message());
 
-                        std::lock_guard lock(managers_mutex_);
-                        auto it = managers_.find(friend_number);
-                        if (it != managers_.end()) {
-                            auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
-                                tunnel_id, 3, "TCP connect failed: " + connect_ec.message());
-                            it->second->send_frame(error_frame);
-                            it->second->remove_tunnel(tunnel_id);
-                        }
-                        return;
+                    std::lock_guard lock(managers_mutex_);
+                    auto it = managers_.find(friend_number);
+                    if (it != managers_.end()) {
+                        auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
+                            tunnel_id, 3, "TCP connect failed: " + connect_ec.message());
+                        it->second->send_frame(error_frame);
+                        it->second->remove_tunnel(tunnel_id);
                     }
+                    return;
+                }
 
-                    util::Logger::info("TCP connected to {}:{} for tunnel {} (friend {})",
-                                       target_host, target_port, tunnel_id, friend_number);
+                util::Logger::info("TCP connected to {}:{} for tunnel {} (friend {})", target_host,
+                                   target_port, tunnel_id, friend_number);
 
-                    // Wire up the TCP connection to the tunnel.
-                    wire_tcp_to_tunnel(friend_number, tunnel_id, tcp_conn);
-                });
+                // Wire up the TCP connection to the tunnel.
+                wire_tcp_to_tunnel(friend_number, tunnel_id, tcp_conn);
+            });
         });
 }
 
-void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number,
-                                      uint16_t tunnel_id,
+void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id,
                                       std::shared_ptr<core::TcpConnection> tcp_conn) {
-    std::lock_guard lock(managers_mutex_);
-    auto it = managers_.find(friend_number);
-    if (it == managers_.end()) {
-        util::Logger::warn("Cannot wire tunnel {}: no TunnelManager for friend {}",
-                           tunnel_id, friend_number);
-        tcp_conn->close();
-        return;
+    tunnel::TunnelImpl* tunnel_impl = nullptr;
+    tunnel::TunnelManager* manager_ptr = nullptr;
+
+    // Look up manager and tunnel under the lock, then release immediately.
+    {
+        std::lock_guard lock(managers_mutex_);
+        auto it = managers_.find(friend_number);
+        if (it == managers_.end()) {
+            util::Logger::warn("Cannot wire tunnel {}: no TunnelManager for friend {}", tunnel_id,
+                               friend_number);
+            tcp_conn->close();
+            return;
+        }
+        manager_ptr = it->second.get();
+
+        auto* tunnel = manager_ptr->get_tunnel(tunnel_id);
+        if (tunnel == nullptr) {
+            util::Logger::warn("Cannot wire: tunnel {} not found for friend {}", tunnel_id,
+                               friend_number);
+            tcp_conn->close();
+            return;
+        }
+
+        // Downcast to TunnelImpl for the extended API.
+        tunnel_impl = dynamic_cast<tunnel::TunnelImpl*>(tunnel);
+        if (tunnel_impl == nullptr) {
+            util::Logger::error("Tunnel {} is not a TunnelImpl", tunnel_id);
+            tcp_conn->close();
+            return;
+        }
     }
 
-    auto* tunnel = it->second->get_tunnel(tunnel_id);
-    if (tunnel == nullptr) {
-        util::Logger::warn("Cannot wire: tunnel {} not found for friend {}",
-                           tunnel_id, friend_number);
-        tcp_conn->close();
-        return;
-    }
-
-    // Downcast to TunnelImpl for the extended API.
-    auto* tunnel_impl = dynamic_cast<tunnel::TunnelImpl*>(tunnel);
-    if (tunnel_impl == nullptr) {
-        util::Logger::error("Tunnel {} is not a TunnelImpl", tunnel_id);
-        tcp_conn->close();
-        return;
-    }
+    // All wiring below happens WITHOUT holding managers_mutex_.
+    // The manager/tunnel pointers remain valid because teardown only happens
+    // on the Tox thread (friend disconnect), not on I/O threads.
 
     // Associate the TCP connection with the tunnel.
     tunnel_impl->set_tcp_connection(tcp_conn);
 
     // TCP data -> Tox: when data arrives from TCP, forward it to the tunnel.
-    tcp_conn->set_on_data(
-        [tunnel_impl](const uint8_t* data, std::size_t length) {
-            tunnel_impl->on_tcp_data_received(data, length);
-        });
+    tcp_conn->set_on_data([tunnel_impl](const uint8_t* data, std::size_t length) {
+        tunnel_impl->on_tcp_data_received(data, length);
+    });
 
     // TCP disconnect: close the tunnel gracefully.
-    tcp_conn->set_on_disconnect(
-        [this, friend_number, tunnel_id](const std::error_code& ec) {
-            util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}",
-                                tunnel_id, friend_number, ec.message());
+    // Uses asio::post to defer cleanup, avoiding re-entrance into managers_mutex_
+    // if on_disconnect fires synchronously from tcp_conn->close().
+    tcp_conn->set_on_disconnect([this, friend_number, tunnel_id](const std::error_code& ec) {
+        util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}", tunnel_id,
+                            friend_number, ec.message());
 
+        asio::post(io_context_->get_io_context(), [this, friend_number, tunnel_id]() {
             std::lock_guard inner_lock(managers_mutex_);
             auto mgr_it = managers_.find(friend_number);
             if (mgr_it != managers_.end()) {
@@ -485,26 +489,22 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number,
                 mgr_it->second->remove_tunnel(tunnel_id);
             }
         });
+    });
 
     // Tox data -> TCP: set up the callback so tunnel data is written to TCP.
     tunnel_impl->set_on_data_for_tcp(
-        [tcp_conn](std::span<const uint8_t> data) {
-            tcp_conn->write(data.data(), data.size());
-        });
+        [tcp_conn](std::span<const uint8_t> data) { tcp_conn->write(data.data(), data.size()); });
 
     // Tunnel close callback: close the TCP connection when the tunnel is closed
     // from the Tox side.
-    tunnel_impl->set_on_close(
-        [tcp_conn]() {
-            tcp_conn->close();
-        });
+    tunnel_impl->set_on_close([tcp_conn]() { tcp_conn->close(); });
 
     // Transition the tunnel to Connected state and send ACK to the remote peer.
     tunnel_impl->set_state(tunnel::Tunnel::State::Connected);
 
     // Send TUNNEL_ACK to confirm the tunnel is open.
     auto ack_frame = tunnel::ProtocolFrame::make_tunnel_ack(tunnel_id, 0);
-    it->second->send_frame(ack_frame);
+    manager_ptr->send_frame(ack_frame);
 
     // Start reading from the TCP connection.
     tcp_conn->start_read();

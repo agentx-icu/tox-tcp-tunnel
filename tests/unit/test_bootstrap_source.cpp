@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
@@ -10,16 +12,18 @@ namespace toxtunnel::tox {
 namespace {
 
 class BootstrapSourceTest : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
-        temp_dir_ = std::filesystem::temp_directory_path() / "toxtunnel_bootstrap_source_test";
+        const auto unique_suffix =
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        temp_dir_ = std::filesystem::temp_directory_path() /
+                    ("toxtunnel_bootstrap_source_test_" + unique_suffix);
         std::filesystem::remove_all(temp_dir_);
         std::filesystem::create_directories(temp_dir_);
     }
 
-    void TearDown() override {
-        std::filesystem::remove_all(temp_dir_);
-    }
+    void TearDown() override { std::filesystem::remove_all(temp_dir_); }
 
     void write_cache(const std::string& json) {
         const auto cache_path = BootstrapSource::cache_file_path(temp_dir_);
@@ -68,13 +72,12 @@ TEST_F(BootstrapSourceTest, ParseNodesJsonPrefersOnlineUdpNodes) {
 }
 
 TEST_F(BootstrapSourceTest, ResolveBootstrapNodesUsesExplicitNodesWithoutFetching) {
-    const auto explicit_pk = parse_public_key(
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD");
+    const auto explicit_pk =
+        parse_public_key("DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD");
     ASSERT_TRUE(explicit_pk.has_value()) << explicit_pk.error();
 
     std::vector<BootstrapNode> configured = {
-        BootstrapNode{"198.51.100.42", 33445, explicit_pk.value()}
-    };
+        BootstrapNode{"198.51.100.42", 33445, explicit_pk.value()}};
 
     bool fetch_called = false;
     auto result = BootstrapSource::resolve_bootstrap_nodes(
@@ -137,13 +140,12 @@ TEST_F(BootstrapSourceTest, ResolveBootstrapNodesLanModeSkipsFetchAndCache) {
 }
 
 TEST_F(BootstrapSourceTest, ResolveBootstrapNodesLanModeReturnsExplicitNodes) {
-    const auto explicit_pk = parse_public_key(
-        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+    const auto explicit_pk =
+        parse_public_key("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
     ASSERT_TRUE(explicit_pk.has_value()) << explicit_pk.error();
 
     std::vector<BootstrapNode> configured = {
-        BootstrapNode{"192.168.1.20", 33445, explicit_pk.value()}
-    };
+        BootstrapNode{"192.168.1.20", 33445, explicit_pk.value()}};
 
     bool fetch_called = false;
     auto result = BootstrapSource::resolve_bootstrap_nodes(

@@ -1,13 +1,13 @@
 #include "toxtunnel/tox/tox_adapter.hpp"
 
-#include "toxtunnel/tox/bootstrap_source.hpp"
-#include "toxtunnel/util/logger.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <fstream>
 #include <thread>
+
+#include "toxtunnel/tox/bootstrap_source.hpp"
+#include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tox {
 
@@ -91,9 +91,8 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
         std::error_code ec;
         std::filesystem::create_directories(config_.data_dir, ec);
         if (ec) {
-            return util::unexpected(
-                std::string("failed to create data directory '") +
-                config_.data_dir.string() + "': " + ec.message());
+            return util::unexpected(std::string("failed to create data directory '") +
+                                    config_.data_dir.string() + "': " + ec.message());
         }
     }
 
@@ -181,10 +180,8 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
     // Set name and status message.
     if (!config_.name.empty()) {
         TOX_ERR_SET_INFO err;
-        tox_self_set_name(
-            tox_.get(),
-            reinterpret_cast<const uint8_t*>(config_.name.data()),
-            config_.name.size(), &err);
+        tox_self_set_name(tox_.get(), reinterpret_cast<const uint8_t*>(config_.name.data()),
+                          config_.name.size(), &err);
         if (err != TOX_ERR_SET_INFO_OK) {
             util::Logger::warn("Failed to set Tox name");
         }
@@ -192,10 +189,9 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
 
     if (!config_.status_message.empty()) {
         TOX_ERR_SET_INFO err;
-        tox_self_set_status_message(
-            tox_.get(),
-            reinterpret_cast<const uint8_t*>(config_.status_message.data()),
-            config_.status_message.size(), &err);
+        tox_self_set_status_message(tox_.get(),
+                                    reinterpret_cast<const uint8_t*>(config_.status_message.data()),
+                                    config_.status_message.size(), &err);
         if (err != TOX_ERR_SET_INFO_OK) {
             util::Logger::warn("Failed to set Tox status message");
         }
@@ -260,8 +256,8 @@ bool ToxAdapter::is_running() const noexcept {
 util::Expected<std::vector<BootstrapNode>, std::string>
 ToxAdapter::resolve_bootstrap_nodes_for_config(const ToxAdapterConfig& config,
                                                BootstrapSource::Fetcher fetcher) {
-    return BootstrapSource::resolve_bootstrap_nodes(
-        config.bootstrap_nodes, config.bootstrap_mode, config.data_dir, std::move(fetcher));
+    return BootstrapSource::resolve_bootstrap_nodes(config.bootstrap_nodes, config.bootstrap_mode,
+                                                    config.data_dir, std::move(fetcher));
 }
 
 std::size_t ToxAdapter::bootstrap() {
@@ -278,8 +274,7 @@ std::size_t ToxAdapter::bootstrap() {
             util::Logger::info("LAN bootstrap mode enabled; relying on local discovery");
         } else if (config_.bootstrap_mode == BootstrapMode::Auto &&
                    config_.bootstrap_nodes.empty()) {
-            util::Logger::info("Loaded {} bootstrap node(s) from {}",
-                               bootstrap_nodes.size(),
+            util::Logger::info("Loaded {} bootstrap node(s) from {}", bootstrap_nodes.size(),
                                std::string(BootstrapSource::kDefaultNodesUrl));
         }
     } else if (config_.bootstrap_mode == BootstrapMode::Lan) {
@@ -295,38 +290,30 @@ std::size_t ToxAdapter::bootstrap() {
 
     for (const auto& node : bootstrap_nodes) {
         TOX_ERR_BOOTSTRAP err;
-        bool ok = tox_bootstrap(
-            tox_.get(),
-            node.ip.c_str(),
-            node.port,
-            node.public_key.data(),
-            &err);
+        bool ok =
+            tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
 
         if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
             ++success_count;
             util::Logger::debug("Bootstrap success: {}:{}", node.ip, node.port);
         } else {
-            util::Logger::warn("Bootstrap failed for {}:{} (error {})",
-                               node.ip, node.port, static_cast<int>(err));
+            util::Logger::warn("Bootstrap failed for {}:{} (error {})", node.ip, node.port,
+                               static_cast<int>(err));
         }
 
         // Also add as TCP relay for TCP-only connections.
         TOX_ERR_BOOTSTRAP relay_err;
-        tox_add_tcp_relay(
-            tox_.get(),
-            node.ip.c_str(),
-            node.port,
-            node.public_key.data(),
-            &relay_err);
+        tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
+                          &relay_err);
 
         if (relay_err != TOX_ERR_BOOTSTRAP_OK) {
-            util::Logger::debug("TCP relay add failed for {}:{} (error {})",
-                                node.ip, node.port, static_cast<int>(relay_err));
+            util::Logger::debug("TCP relay add failed for {}:{} (error {})", node.ip, node.port,
+                                static_cast<int>(relay_err));
         }
     }
 
-    util::Logger::info("Bootstrap complete: {}/{} nodes contacted",
-                       success_count, bootstrap_nodes.size());
+    util::Logger::info("Bootstrap complete: {}/{} nodes contacted", success_count,
+                       bootstrap_nodes.size());
     return success_count;
 }
 
@@ -338,22 +325,13 @@ bool ToxAdapter::add_bootstrap_node(const BootstrapNode& node) {
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_BOOTSTRAP err;
-    bool ok = tox_bootstrap(
-        tox_.get(),
-        node.ip.c_str(),
-        node.port,
-        node.public_key.data(),
-        &err);
+    bool ok = tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
 
     if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
         // Also add as TCP relay.
         TOX_ERR_BOOTSTRAP relay_err;
-        tox_add_tcp_relay(
-            tox_.get(),
-            node.ip.c_str(),
-            node.port,
-            node.public_key.data(),
-            &relay_err);
+        tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
+                          &relay_err);
         return true;
     }
 
@@ -392,8 +370,8 @@ void ToxAdapter::set_nospam(uint32_t nospam) {
 // Friend management
 // ===========================================================================
 
-util::Expected<uint32_t, std::string>
-ToxAdapter::add_friend(const ToxId& tox_id, std::string_view message) {
+util::Expected<uint32_t, std::string> ToxAdapter::add_friend(const ToxId& tox_id,
+                                                             std::string_view message) {
     if (!initialized_.load()) {
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
@@ -401,28 +379,25 @@ ToxAdapter::add_friend(const ToxId& tox_id, std::string_view message) {
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_FRIEND_ADD err;
-    uint32_t friend_number = tox_friend_add(
-        tox_.get(),
-        tox_id.bytes().data(),
-        reinterpret_cast<const uint8_t*>(message.data()),
-        message.size(),
-        &err);
+    uint32_t friend_number =
+        tox_friend_add(tox_.get(), tox_id.bytes().data(),
+                       reinterpret_cast<const uint8_t*>(message.data()), message.size(), &err);
 
     if (err != TOX_ERR_FRIEND_ADD_OK) {
-        return util::unexpected(
-            std::string("failed to add friend: ") + friend_add_error_string(err));
+        return util::unexpected(std::string("failed to add friend: ") +
+                                friend_add_error_string(err));
     }
 
     // Persist the updated friend list.
     (void)write_save_data();
 
-    util::Logger::info("Friend added: number={}, id={}",
-                       friend_number, tox_id.public_key_hex().substr(0, 16) + "...");
+    util::Logger::info("Friend added: number={}, id={}", friend_number,
+                       tox_id.public_key_hex().substr(0, 16) + "...");
     return friend_number;
 }
 
-util::Expected<uint32_t, std::string>
-ToxAdapter::add_friend_norequest(const PublicKeyArray& public_key) {
+util::Expected<uint32_t, std::string> ToxAdapter::add_friend_norequest(
+    const PublicKeyArray& public_key) {
     if (!initialized_.load()) {
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
@@ -430,15 +405,11 @@ ToxAdapter::add_friend_norequest(const PublicKeyArray& public_key) {
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_FRIEND_ADD err;
-    uint32_t friend_number = tox_friend_add_norequest(
-        tox_.get(),
-        public_key.data(),
-        &err);
+    uint32_t friend_number = tox_friend_add_norequest(tox_.get(), public_key.data(), &err);
 
     if (err != TOX_ERR_FRIEND_ADD_OK) {
-        return util::unexpected(
-            std::string("failed to add friend (norequest): ") +
-            friend_add_error_string(err));
+        return util::unexpected(std::string("failed to add friend (norequest): ") +
+                                friend_add_error_string(err));
     }
 
     (void)write_save_data();
@@ -463,8 +434,8 @@ bool ToxAdapter::remove_friend(uint32_t friend_number) {
         return true;
     }
 
-    util::Logger::warn("Failed to remove friend {}: error {}",
-                       friend_number, static_cast<int>(err));
+    util::Logger::warn("Failed to remove friend {}: error {}", friend_number,
+                       static_cast<int>(err));
     return false;
 }
 
@@ -480,8 +451,7 @@ FriendState ToxAdapter::get_friend_connection_status(uint32_t friend_number) con
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_FRIEND_QUERY err;
-    TOX_CONNECTION conn = tox_friend_get_connection_status(
-        tox_.get(), friend_number, &err);
+    TOX_CONNECTION conn = tox_friend_get_connection_status(tox_.get(), friend_number, &err);
 
     if (err != TOX_ERR_FRIEND_QUERY_OK) {
         return FriendState::None;
@@ -490,8 +460,8 @@ FriendState ToxAdapter::get_friend_connection_status(uint32_t friend_number) con
     return connection_to_state(conn);
 }
 
-util::Expected<PublicKeyArray, std::string>
-ToxAdapter::get_friend_public_key(uint32_t friend_number) const {
+util::Expected<PublicKeyArray, std::string> ToxAdapter::get_friend_public_key(
+    uint32_t friend_number) const {
     if (!initialized_.load()) {
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
@@ -503,16 +473,15 @@ ToxAdapter::get_friend_public_key(uint32_t friend_number) const {
     bool ok = tox_friend_get_public_key(tox_.get(), friend_number, pk.data(), &err);
 
     if (!ok || err != TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
-        return util::unexpected(
-            std::string("failed to get public key for friend ") +
-            std::to_string(friend_number));
+        return util::unexpected(std::string("failed to get public key for friend ") +
+                                std::to_string(friend_number));
     }
 
     return pk;
 }
 
-util::Expected<uint32_t, std::string>
-ToxAdapter::friend_by_public_key(const PublicKeyArray& public_key) const {
+util::Expected<uint32_t, std::string> ToxAdapter::friend_by_public_key(
+    const PublicKeyArray& public_key) const {
     if (!initialized_.load()) {
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
@@ -520,8 +489,7 @@ ToxAdapter::friend_by_public_key(const PublicKeyArray& public_key) const {
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_FRIEND_BY_PUBLIC_KEY err;
-    uint32_t friend_number = tox_friend_by_public_key(
-        tox_.get(), public_key.data(), &err);
+    uint32_t friend_number = tox_friend_by_public_key(tox_.get(), public_key.data(), &err);
 
     if (err != TOX_ERR_FRIEND_BY_PUBLIC_KEY_OK) {
         return util::unexpected(std::string("friend not found for given public key"));
@@ -570,9 +538,8 @@ std::vector<FriendInfo> ToxAdapter::get_friend_info_list() const {
 
         TOX_ERR_FRIEND_QUERY q_err;
         TOX_CONNECTION conn = tox_friend_get_connection_status(tox_.get(), fn, &q_err);
-        info.state = (q_err == TOX_ERR_FRIEND_QUERY_OK)
-                         ? connection_to_state(conn)
-                         : FriendState::None;
+        info.state =
+            (q_err == TOX_ERR_FRIEND_QUERY_OK) ? connection_to_state(conn) : FriendState::None;
 
         infos.push_back(info);
     }
@@ -584,8 +551,7 @@ std::vector<FriendInfo> ToxAdapter::get_friend_info_list() const {
 // Data transfer
 // ===========================================================================
 
-bool ToxAdapter::send_lossless_packet(uint32_t friend_number,
-                                      const uint8_t* data,
+bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const uint8_t* data,
                                       std::size_t length) {
     if (!initialized_.load() || !data || length == 0) {
         return false;
@@ -594,25 +560,22 @@ bool ToxAdapter::send_lossless_packet(uint32_t friend_number,
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_FRIEND_CUSTOM_PACKET err;
-    bool ok = tox_friend_send_lossless_packet(
-        tox_.get(), friend_number, data, length, &err);
+    bool ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
 
     if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
-        util::Logger::debug("Send lossless packet failed for friend {}: error {}",
-                            friend_number, static_cast<int>(err));
+        util::Logger::debug("Send lossless packet failed for friend {}: error {}", friend_number,
+                            static_cast<int>(err));
         return false;
     }
 
     return true;
 }
 
-bool ToxAdapter::send_lossless_packet(uint32_t friend_number,
-                                      const std::vector<uint8_t>& data) {
+bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const std::vector<uint8_t>& data) {
     return send_lossless_packet(friend_number, data.data(), data.size());
 }
 
-bool ToxAdapter::send_lossy_packet(uint32_t friend_number,
-                                   const uint8_t* data,
+bool ToxAdapter::send_lossy_packet(uint32_t friend_number, const uint8_t* data,
                                    std::size_t length) {
     if (!initialized_.load() || !data || length == 0) {
         return false;
@@ -621,20 +584,19 @@ bool ToxAdapter::send_lossy_packet(uint32_t friend_number,
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_FRIEND_CUSTOM_PACKET err;
-    bool ok = tox_friend_send_lossy_packet(
-        tox_.get(), friend_number, data, length, &err);
+    bool ok = tox_friend_send_lossy_packet(tox_.get(), friend_number, data, length, &err);
 
     if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
-        util::Logger::debug("Send lossy packet failed for friend {}: error {}",
-                            friend_number, static_cast<int>(err));
+        util::Logger::debug("Send lossy packet failed for friend {}: error {}", friend_number,
+                            static_cast<int>(err));
         return false;
     }
 
     return true;
 }
 
-util::Expected<uint32_t, std::string>
-ToxAdapter::send_message(uint32_t friend_number, std::string_view message) {
+util::Expected<uint32_t, std::string> ToxAdapter::send_message(uint32_t friend_number,
+                                                               std::string_view message) {
     if (!initialized_.load()) {
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
@@ -642,13 +604,9 @@ ToxAdapter::send_message(uint32_t friend_number, std::string_view message) {
     std::lock_guard<std::mutex> lock(tox_mutex_);
 
     TOX_ERR_FRIEND_SEND_MESSAGE err;
-    uint32_t msg_id = tox_friend_send_message(
-        tox_.get(),
-        friend_number,
-        TOX_MESSAGE_TYPE_NORMAL,
-        reinterpret_cast<const uint8_t*>(message.data()),
-        message.size(),
-        &err);
+    uint32_t msg_id = tox_friend_send_message(tox_.get(), friend_number, TOX_MESSAGE_TYPE_NORMAL,
+                                              reinterpret_cast<const uint8_t*>(message.data()),
+                                              message.size(), &err);
 
     if (err != TOX_ERR_FRIEND_SEND_MESSAGE_OK) {
         std::string reason;
@@ -882,8 +840,7 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
 
     std::vector<uint8_t> data(static_cast<std::size_t>(size));
     file.seekg(0, std::ios::beg);
-    file.read(reinterpret_cast<char*>(data.data()),
-              static_cast<std::streamsize>(data.size()));
+    file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
 
     if (!file) {
         util::Logger::warn("Failed to read save file: {}", path.string());
@@ -909,8 +866,7 @@ bool ToxAdapter::write_save_data() const {
 
     std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
-        util::Logger::error("Could not open save file for writing: {}",
-                            tmp_path.string());
+        util::Logger::error("Could not open save file for writing: {}", tmp_path.string());
         return false;
     }
 
@@ -949,8 +905,7 @@ std::filesystem::path ToxAdapter::save_file_path() const {
 // ===========================================================================
 
 void ToxAdapter::on_friend_request_cb(Tox* /*tox*/, const uint8_t* public_key,
-                                      const uint8_t* message, size_t length,
-                                      void* user_data) {
+                                      const uint8_t* message, size_t length, void* user_data) {
     auto* self = static_cast<ToxAdapter*>(user_data);
 
     PublicKeyArray pk{};
@@ -964,43 +919,36 @@ void ToxAdapter::on_friend_request_cb(Tox* /*tox*/, const uint8_t* public_key,
 }
 
 void ToxAdapter::on_friend_connection_status_cb(Tox* /*tox*/, uint32_t friend_number,
-                                                TOX_CONNECTION connection_status,
-                                                void* user_data) {
+                                                TOX_CONNECTION connection_status, void* user_data) {
     auto* self = static_cast<ToxAdapter*>(user_data);
     bool connected = (connection_status != TOX_CONNECTION_NONE);
 
-    util::Logger::info("Friend {} connection status: {}",
-                       friend_number,
+    util::Logger::info("Friend {} connection status: {}", friend_number,
                        connected ? "connected" : "disconnected");
     self->enqueue_event(FriendConnectionEvent{friend_number, connected});
 }
 
 void ToxAdapter::on_friend_lossless_packet_cb(Tox* /*tox*/, uint32_t friend_number,
-                                              const uint8_t* data, size_t length,
-                                              void* user_data) {
+                                              const uint8_t* data, size_t length, void* user_data) {
     auto* self = static_cast<ToxAdapter*>(user_data);
 
-    util::Logger::trace("Lossless packet from friend {}: {} bytes",
-                        friend_number, length);
-    self->enqueue_event(FriendLosslessPacketEvent{
-        friend_number, std::vector<uint8_t>(data, data + length)});
+    util::Logger::trace("Lossless packet from friend {}: {} bytes", friend_number, length);
+    self->enqueue_event(
+        FriendLosslessPacketEvent{friend_number, std::vector<uint8_t>(data, data + length)});
 }
 
 void ToxAdapter::on_friend_lossy_packet_cb(Tox* /*tox*/, uint32_t friend_number,
-                                           const uint8_t* data, size_t length,
-                                           void* user_data) {
+                                           const uint8_t* data, size_t length, void* user_data) {
     auto* self = static_cast<ToxAdapter*>(user_data);
 
-    util::Logger::trace("Lossy packet from friend {}: {} bytes",
-                        friend_number, length);
-    self->enqueue_event(FriendLossyPacketEvent{
-        friend_number, std::vector<uint8_t>(data, data + length)});
+    util::Logger::trace("Lossy packet from friend {}: {} bytes", friend_number, length);
+    self->enqueue_event(
+        FriendLossyPacketEvent{friend_number, std::vector<uint8_t>(data, data + length)});
 }
 
 void ToxAdapter::on_friend_message_cb(Tox* /*tox*/, uint32_t friend_number,
-                                      TOX_MESSAGE_TYPE /*type*/,
-                                      const uint8_t* message, size_t length,
-                                      void* user_data) {
+                                      TOX_MESSAGE_TYPE /*type*/, const uint8_t* message,
+                                      size_t length, void* user_data) {
     auto* self = static_cast<ToxAdapter*>(user_data);
 
     std::string_view msg(reinterpret_cast<const char*>(message), length);
@@ -1009,8 +957,7 @@ void ToxAdapter::on_friend_message_cb(Tox* /*tox*/, uint32_t friend_number,
     self->enqueue_event(FriendMessageEvent{friend_number, std::string(msg)});
 }
 
-void ToxAdapter::on_self_connection_status_cb(Tox* /*tox*/,
-                                              TOX_CONNECTION connection_status,
+void ToxAdapter::on_self_connection_status_cb(Tox* /*tox*/, TOX_CONNECTION connection_status,
                                               void* user_data) {
     auto* self = static_cast<ToxAdapter*>(user_data);
     bool connected = (connection_status != TOX_CONNECTION_NONE);
@@ -1023,8 +970,7 @@ void ToxAdapter::on_self_connection_status_cb(Tox* /*tox*/,
         type_str = "UDP";
     }
 
-    util::Logger::info("Self connection status: {} ({})",
-                       connected ? "connected" : "disconnected",
+    util::Logger::info("Self connection status: {} ({})", connected ? "connected" : "disconnected",
                        type_str);
     self->enqueue_event(SelfConnectionEvent{connected});
 }

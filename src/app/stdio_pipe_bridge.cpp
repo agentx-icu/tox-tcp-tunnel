@@ -1,9 +1,9 @@
 #include "toxtunnel/app/stdio_pipe_bridge.hpp"
 
-#include "toxtunnel/util/logger.hpp"
-
 #include <array>
 #include <cerrno>
+
+#include "toxtunnel/util/logger.hpp"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -78,8 +78,7 @@ void StdioPipeBridge::stop() {
     running_.store(false);
     close_descriptors();
 
-    if (input_thread_.joinable() &&
-        input_thread_.get_id() != std::this_thread::get_id()) {
+    if (input_thread_.joinable() && input_thread_.get_id() != std::this_thread::get_id()) {
         input_thread_.join();
     }
 }
@@ -92,8 +91,7 @@ void StdioPipeBridge::read_loop() {
         const ssize_t rc = ::read(input_fd_, buffer.data(), buffer.size());
         if (rc > 0) {
             if (on_input_) {
-                on_input_(std::span<const uint8_t>(buffer.data(),
-                                                   static_cast<std::size_t>(rc)));
+                on_input_(std::span<const uint8_t>(buffer.data(), static_cast<std::size_t>(rc)));
             }
             continue;
         }

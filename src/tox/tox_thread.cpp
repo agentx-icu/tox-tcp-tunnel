@@ -1,10 +1,10 @@
 #include "toxtunnel/tox/tox_thread.hpp"
 
-#include "toxtunnel/util/logger.hpp"
-
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+
+#include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tox {
 
@@ -36,8 +36,7 @@ std::size_t EventQueue::size() const {
 // ToxThread -- construction / destruction
 // ===========================================================================
 
-ToxThread::ToxThread(const Config& config)
-    : config_(config) {}
+ToxThread::ToxThread(const Config& config) : config_(config) {}
 
 ToxThread::~ToxThread() {
     stop();
@@ -112,17 +111,14 @@ void ToxThread::init_tox() {
 void ToxThread::bootstrap() {
     for (const auto& node : config_.bootstrap_nodes) {
         TOX_ERR_BOOTSTRAP err;
-        bool ok = tox_bootstrap(tox_.get(),
-                                node.ip.c_str(),
-                                node.port,
-                                node.public_key.data(),
-                                &err);
+        bool ok =
+            tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
 
         if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
             util::Logger::debug("Bootstrapped to {}:{}", node.ip, node.port);
         } else {
-            util::Logger::warn("Failed to bootstrap to {}:{} (error {})",
-                               node.ip, node.port, static_cast<int>(err));
+            util::Logger::warn("Failed to bootstrap to {}:{} (error {})", node.ip, node.port,
+                               static_cast<int>(err));
         }
     }
 }
@@ -253,13 +249,12 @@ void ToxThread::process_commands() {
                 std::size_t payload_len = cmd.data.size() - sizeof(uint32_t);
 
                 TOX_ERR_FRIEND_CUSTOM_PACKET pkt_err;
-                bool ok = tox_friend_send_lossless_packet(
-                    tox_.get(), friend_number, payload, payload_len, &pkt_err);
+                bool ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, payload,
+                                                          payload_len, &pkt_err);
 
                 if (!ok) {
-                    util::Logger::warn(
-                        "Failed to send lossless packet to friend #{} (error {})",
-                        friend_number, static_cast<int>(pkt_err));
+                    util::Logger::warn("Failed to send lossless packet to friend #{} (error {})",
+                                       friend_number, static_cast<int>(pkt_err));
                 }
 
                 cmd.result.set_value({});
@@ -288,9 +283,8 @@ void ToxThread::process_events() {
         switch (event.type) {
             case EventQueue::Event::Type::FriendRequest:
                 if (friend_request_handler_) {
-                    std::string_view message(
-                        reinterpret_cast<const char*>(event.data.data()),
-                        event.data.size());
+                    std::string_view message(reinterpret_cast<const char*>(event.data.data()),
+                                             event.data.size());
                     friend_request_handler_(event.public_key, message);
                 }
                 break;
@@ -309,17 +303,15 @@ void ToxThread::process_events() {
 
             case EventQueue::Event::Type::FriendMessage:
                 if (friend_message_handler_) {
-                    std::string_view message(
-                        reinterpret_cast<const char*>(event.data.data()),
-                        event.data.size());
+                    std::string_view message(reinterpret_cast<const char*>(event.data.data()),
+                                             event.data.size());
                     friend_message_handler_(event.friend_number, message);
                 }
                 break;
 
             case EventQueue::Event::Type::DataReceived:
                 if (data_received_handler_) {
-                    data_received_handler_(event.friend_number,
-                                           event.data.data(),
+                    data_received_handler_(event.friend_number, event.data.data(),
                                            event.data.size());
                 }
                 break;
@@ -331,9 +323,8 @@ void ToxThread::process_events() {
 // Static toxcore callbacks
 // ===========================================================================
 
-void ToxThread::on_friend_request(Tox* /*tox*/, const uint8_t* public_key,
-                                   const uint8_t* message, size_t length,
-                                   void* user_data) {
+void ToxThread::on_friend_request(Tox* /*tox*/, const uint8_t* public_key, const uint8_t* message,
+                                  size_t length, void* user_data) {
     auto* self = static_cast<ToxThread*>(user_data);
 
     EventQueue::Event event;
@@ -345,23 +336,19 @@ void ToxThread::on_friend_request(Tox* /*tox*/, const uint8_t* public_key,
 }
 
 void ToxThread::on_friend_connection_status(Tox* /*tox*/, uint32_t friend_number,
-                                             TOX_CONNECTION status,
-                                             void* user_data) {
+                                            TOX_CONNECTION status, void* user_data) {
     auto* self = static_cast<ToxThread*>(user_data);
 
     EventQueue::Event event;
-    event.type = (status != TOX_CONNECTION_NONE)
-                     ? EventQueue::Event::Type::FriendConnected
-                     : EventQueue::Event::Type::FriendDisconnected;
+    event.type = (status != TOX_CONNECTION_NONE) ? EventQueue::Event::Type::FriendConnected
+                                                 : EventQueue::Event::Type::FriendDisconnected;
     event.friend_number = friend_number;
 
     self->event_queue_.push(std::move(event));
 }
 
-void ToxThread::on_friend_message(Tox* /*tox*/, uint32_t friend_number,
-                                   TOX_MESSAGE_TYPE /*type*/,
-                                   const uint8_t* message, size_t length,
-                                   void* user_data) {
+void ToxThread::on_friend_message(Tox* /*tox*/, uint32_t friend_number, TOX_MESSAGE_TYPE /*type*/,
+                                  const uint8_t* message, size_t length, void* user_data) {
     auto* self = static_cast<ToxThread*>(user_data);
 
     EventQueue::Event event;
@@ -372,9 +359,8 @@ void ToxThread::on_friend_message(Tox* /*tox*/, uint32_t friend_number,
     self->event_queue_.push(std::move(event));
 }
 
-void ToxThread::on_friend_lossless_packet(Tox* /*tox*/, uint32_t friend_number,
-                                           const uint8_t* data, size_t length,
-                                           void* user_data) {
+void ToxThread::on_friend_lossless_packet(Tox* /*tox*/, uint32_t friend_number, const uint8_t* data,
+                                          size_t length, void* user_data) {
     auto* self = static_cast<ToxThread*>(user_data);
 
     EventQueue::Event event;
@@ -458,8 +444,7 @@ std::future<void> ToxThread::add_friend(const ToxId& id, const std::string& mess
     });
 }
 
-std::future<void> ToxThread::send_data(uint32_t friend_number,
-                                        const std::vector<uint8_t>& data) {
+std::future<void> ToxThread::send_data(uint32_t friend_number, const std::vector<uint8_t>& data) {
     Command cmd;
     cmd.type = Command::Type::SendData;
 
@@ -477,9 +462,7 @@ std::future<void> ToxThread::send_data(uint32_t friend_number,
     }
     command_cv_.notify_one();
 
-    return std::async(std::launch::deferred, [f = std::move(future)]() mutable {
-        f.get();
-    });
+    return std::async(std::launch::deferred, [f = std::move(future)]() mutable { f.get(); });
 }
 
 }  // namespace toxtunnel::tox

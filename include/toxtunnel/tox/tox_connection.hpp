@@ -62,8 +62,7 @@ class ToxConnection {
     ///
     /// @param data    Pointer to the received bytes.
     /// @param length  Number of bytes received.
-    using DataReceivedCallback =
-        std::function<void(const uint8_t* data, std::size_t length)>;
+    using DataReceivedCallback = std::function<void(const uint8_t* data, std::size_t length)>;
 
     /// Called when the connection state changes.
     ///
@@ -79,8 +78,7 @@ class ToxConnection {
     /// @param friend_number    The toxcore friend number.
     /// @param send_window_size Maximum bytes that may be in-flight before
     ///                         backpressure signals (default 256 KiB).
-    explicit ToxConnection(uint32_t friend_number,
-                           std::size_t send_window_size = 256 * 1024);
+    explicit ToxConnection(uint32_t friend_number, std::size_t send_window_size = 256 * 1024);
 
     /// Non-copyable (mutex is non-copyable).
     ToxConnection(const ToxConnection&) = delete;

@@ -42,16 +42,14 @@ const char* to_string(Tunnel::State state) noexcept {
 // TunnelImpl - Construction / Destruction
 // ===========================================================================
 
-TunnelImpl::TunnelImpl(asio::io_context& io_ctx,
-                       uint16_t tunnel_id,
-                       uint32_t friend_number,
+TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t friend_number,
                        std::size_t send_window)
     : Tunnel(tunnel_id, io_ctx),
       friend_number_(friend_number),
       send_window_size_(send_window),
       last_activity_(std::chrono::steady_clock::now()) {
-    util::Logger::debug("Tunnel created: id={}, friend={}, window={}",
-                        tunnel_id_, friend_number_, send_window_size_);
+    util::Logger::debug("Tunnel created: id={}, friend={}, window={}", tunnel_id_, friend_number_,
+                        send_window_size_);
 }
 
 TunnelImpl::~TunnelImpl() {
@@ -100,8 +98,8 @@ void TunnelImpl::set_state(State new_state) {
 void TunnelImpl::transition_state(State new_state) {
     State old_state = state_.exchange(new_state, std::memory_order_acq_rel);
     if (old_state != new_state) {
-        util::Logger::debug("Tunnel {} state: {} -> {}",
-                            tunnel_id_, to_string(old_state), to_string(new_state));
+        util::Logger::debug("Tunnel {} state: {} -> {}", tunnel_id_, to_string(old_state),
+                            to_string(new_state));
 
         StateChangedCallback cb;
         {
@@ -122,8 +120,8 @@ void TunnelImpl::transition_state(State new_state) {
 bool TunnelImpl::open(const std::string& host, uint16_t port) {
     State current = state_.load(std::memory_order_acquire);
     if (current != State::None) {
-        util::Logger::warn("Tunnel {} open failed: invalid state {}",
-                           tunnel_id_, to_string(current));
+        util::Logger::warn("Tunnel {} open failed: invalid state {}", tunnel_id_,
+                           to_string(current));
         return false;
     }
 
@@ -149,8 +147,7 @@ void TunnelImpl::close() {
 
     // Only close from Connected state
     if (current != State::Connected) {
-        util::Logger::debug("Tunnel {} close ignored: state {}",
-                            tunnel_id_, to_string(current));
+        util::Logger::debug("Tunnel {} close ignored: state {}", tunnel_id_, to_string(current));
         return;
     }
 
@@ -191,8 +188,8 @@ void TunnelImpl::handle_frame(const ProtocolFrame& frame) {
     // Ignore frames with wrong tunnel_id (except PING/PONG which use tunnel_id 0)
     if (frame.type() != FrameType::PING && frame.type() != FrameType::PONG) {
         if (frame.tunnel_id() != tunnel_id_) {
-            util::Logger::debug("Tunnel {} ignored frame for tunnel {}",
-                                tunnel_id_, frame.tunnel_id());
+            util::Logger::debug("Tunnel {} ignored frame for tunnel {}", tunnel_id_,
+                                frame.tunnel_id());
             return;
         }
     }
@@ -222,8 +219,8 @@ void TunnelImpl::handle_frame(const ProtocolFrame& frame) {
             handle_pong_frame(frame);
             break;
         default:
-            util::Logger::warn("Tunnel {} received unknown frame type: {}",
-                               tunnel_id_, static_cast<int>(frame.type()));
+            util::Logger::warn("Tunnel {} received unknown frame type: {}", tunnel_id_,
+                               static_cast<int>(frame.type()));
             break;
     }
 }
@@ -242,8 +239,8 @@ void TunnelImpl::handle_tunnel_open_frame(const ProtocolFrame& frame) {
         target_port_ = payload->port;
     }
 
-    util::Logger::info("Tunnel {} received TUNNEL_OPEN for {}:{}",
-                        tunnel_id_, payload->host, payload->port);
+    util::Logger::info("Tunnel {} received TUNNEL_OPEN for {}:{}", tunnel_id_, payload->host,
+                       payload->port);
 }
 
 void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
@@ -322,13 +319,13 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
     while (current_window > 0) {
         std::size_t new_val = current_window > acked ? current_window - acked : 0;
         if (send_window_used_.compare_exchange_weak(current_window, new_val,
-                                                     std::memory_order_relaxed)) {
+                                                    std::memory_order_relaxed)) {
             break;
         }
     }
 
-    util::Logger::debug("Tunnel {} received ACK for {} bytes (window now {})",
-                        tunnel_id_, acked, send_window_used_.load());
+    util::Logger::debug("Tunnel {} received ACK for {} bytes (window now {})", tunnel_id_, acked,
+                        send_window_used_.load());
 }
 
 void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
@@ -338,8 +335,8 @@ void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
         return;
     }
 
-    util::Logger::error("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'",
-                        tunnel_id_, payload->error_code, payload->description);
+    util::Logger::error("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
+                        payload->error_code, payload->description);
 
     transition_state(State::Error);
 
@@ -392,8 +389,8 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
     std::size_t data_size = data.size();
     std::size_t current = send_window_used_.load(std::memory_order_relaxed);
     if (current + data_size > send_window_size_) {
-        util::Logger::debug("Tunnel {} send window full ({} + {} > {})",
-                            tunnel_id_, current, data_size, send_window_size_);
+        util::Logger::debug("Tunnel {} send window full ({} + {} > {})", tunnel_id_, current,
+                            data_size, send_window_size_);
         return false;
     }
 
@@ -404,10 +401,8 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
     total_bytes_sent_.fetch_add(data_size, std::memory_order_relaxed);
 
     for (std::size_t offset = 0; offset < data.size(); offset += kMaxTcpPayloadPerToxFrame) {
-        const auto chunk_size =
-            std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
-        auto frame = ProtocolFrame::make_tunnel_data(
-            tunnel_id_, data.subspan(offset, chunk_size));
+        const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
+        auto frame = ProtocolFrame::make_tunnel_data(tunnel_id_, data.subspan(offset, chunk_size));
         send_frame_to_tox(frame);
     }
 
@@ -427,8 +422,8 @@ void TunnelImpl::send_error(uint8_t error_code, const std::string& description) 
     send_frame_to_tox(frame);
     transition_state(State::Error);
 
-    util::Logger::error("Tunnel {} sent error: code={}, desc='{}'",
-                        tunnel_id_, error_code, description);
+    util::Logger::error("Tunnel {} sent error: code={}, desc='{}'", tunnel_id_, error_code,
+                        description);
 }
 
 // ===========================================================================

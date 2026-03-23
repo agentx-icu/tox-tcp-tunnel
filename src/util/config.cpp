@@ -14,7 +14,7 @@ namespace toxtunnel {
 namespace {
 
 class ConfigErrorCategory : public std::error_category {
-public:
+   public:
     const char* name() const noexcept override { return "config"; }
 
     std::string message(int ev) const override {
@@ -64,15 +64,15 @@ util::Expected<void, std::string> validate_bootstrap_nodes(
             return util::make_unexpected(std::string("Bootstrap node port cannot be 0"));
         }
         if (node.public_key.length() != toxtunnel::tox::kPublicKeyHexLen) {
-            return util::make_unexpected(
-                std::string("Bootstrap node public key must be ") +
-                std::to_string(toxtunnel::tox::kPublicKeyHexLen) +
-                std::string(" characters, got ") + std::to_string(node.public_key.length()));
+            return util::make_unexpected(std::string("Bootstrap node public key must be ") +
+                                         std::to_string(toxtunnel::tox::kPublicKeyHexLen) +
+                                         std::string(" characters, got ") +
+                                         std::to_string(node.public_key.length()));
         }
         auto pk_result = toxtunnel::tox::parse_public_key(node.public_key);
         if (!pk_result) {
-            return util::make_unexpected(
-                std::string("Invalid bootstrap node public key: ") + pk_result.error());
+            return util::make_unexpected(std::string("Invalid bootstrap node public key: ") +
+                                         pk_result.error());
         }
     }
 
@@ -179,16 +179,15 @@ util::Expected<PipeTarget, std::string> parse_pipe_target(std::string_view spec)
 
 util::Expected<Config, std::string> Config::from_file(const std::filesystem::path& filepath) {
     if (!std::filesystem::exists(filepath)) {
-        return util::make_unexpected(
-            std::string("Configuration file not found: ") + filepath.string());
+        return util::make_unexpected(std::string("Configuration file not found: ") +
+                                     filepath.string());
     }
 
     try {
         YAML::Node node = YAML::LoadFile(filepath.string());
         return node.as<Config>();
     } catch (const YAML::Exception& e) {
-        return util::make_unexpected(
-            std::string("Failed to parse configuration: ") + e.what());
+        return util::make_unexpected(std::string("Failed to parse configuration: ") + e.what());
     }
 }
 
@@ -197,8 +196,7 @@ util::Expected<Config, std::string> Config::from_string(std::string_view yaml_co
         YAML::Node node = YAML::Load(std::string(yaml_content));
         return node.as<Config>();
     } catch (const YAML::Exception& e) {
-        return util::make_unexpected(
-            std::string("Failed to parse configuration: ") + e.what());
+        return util::make_unexpected(std::string("Failed to parse configuration: ") + e.what());
     }
 }
 
@@ -214,7 +212,8 @@ Config Config::default_server() {
 Config Config::default_client() {
     Config config;
     config.mode = Mode::Client;
-    config.data_dir = std::filesystem::path(getenv("HOME") ? getenv("HOME") : ".") / ".config" / "toxtunnel";
+    config.data_dir =
+        std::filesystem::path(getenv("HOME") ? getenv("HOME") : ".") / ".config" / "toxtunnel";
     config.client = ClientConfig{};
     return config;
 }
@@ -264,7 +263,8 @@ util::Expected<void, std::string> Config::validate() const {
     // Validate mode-specific configuration
     if (mode == Mode::Server) {
         if (!server) {
-            return util::make_unexpected(std::string("Server configuration is required in server mode"));
+            return util::make_unexpected(
+                std::string("Server configuration is required in server mode"));
         }
 
         // Validate TCP port
@@ -273,7 +273,8 @@ util::Expected<void, std::string> Config::validate() const {
         }
     } else {  // Client mode
         if (!client) {
-            return util::make_unexpected(std::string("Client configuration is required in client mode"));
+            return util::make_unexpected(
+                std::string("Client configuration is required in client mode"));
         }
 
         // Validate server_id
@@ -287,7 +288,8 @@ util::Expected<void, std::string> Config::validate() const {
         }
         auto toxid_result = tox::ToxId::from_hex(client->server_id);
         if (!toxid_result) {
-            return util::make_unexpected(std::string("Invalid server Tox ID: ") + toxid_result.error());
+            return util::make_unexpected(std::string("Invalid server Tox ID: ") +
+                                         toxid_result.error());
         }
 
         // Validate forwarding rules
@@ -296,7 +298,8 @@ util::Expected<void, std::string> Config::validate() const {
                 return util::make_unexpected(std::string("Forward rule local_port cannot be 0"));
             }
             if (fwd.remote_host.empty()) {
-                return util::make_unexpected(std::string("Forward rule remote_host cannot be empty"));
+                return util::make_unexpected(
+                    std::string("Forward rule remote_host cannot be empty"));
             }
             if (fwd.remote_port == 0) {
                 return util::make_unexpected(std::string("Forward rule remote_port cannot be 0"));
@@ -305,7 +308,8 @@ util::Expected<void, std::string> Config::validate() const {
 
         if (client->pipe_target.has_value()) {
             if (client->pipe_target->remote_host.empty()) {
-                return util::make_unexpected(std::string("Pipe target remote_host cannot be empty"));
+                return util::make_unexpected(
+                    std::string("Pipe target remote_host cannot be empty"));
             }
             if (client->pipe_target->remote_port == 0) {
                 return util::make_unexpected(std::string("Pipe target remote_port cannot be 0"));
@@ -402,14 +406,22 @@ void Config::merge_cli_overrides(const Config& overrides) {
 // Helper function to encode LogLevel to string
 static const char* log_level_to_string(util::LogLevel level) {
     switch (level) {
-        case util::LogLevel::Trace: return "trace";
-        case util::LogLevel::Debug: return "debug";
-        case util::LogLevel::Info: return "info";
-        case util::LogLevel::Warn: return "warn";
-        case util::LogLevel::Error: return "error";
-        case util::LogLevel::Critical: return "critical";
-        case util::LogLevel::Off: return "off";
-        default: return "info";
+        case util::LogLevel::Trace:
+            return "trace";
+        case util::LogLevel::Debug:
+            return "debug";
+        case util::LogLevel::Info:
+            return "info";
+        case util::LogLevel::Warn:
+            return "warn";
+        case util::LogLevel::Error:
+            return "error";
+        case util::LogLevel::Critical:
+            return "critical";
+        case util::LogLevel::Off:
+            return "off";
+        default:
+            return "info";
     }
 }
 
@@ -497,8 +509,8 @@ util::Expected<void, std::string> Config::save(const std::filesystem::path& file
     try {
         std::ofstream ofs(filepath);
         if (!ofs) {
-            return util::make_unexpected(
-                std::string("Failed to open file for writing: ") + filepath.string());
+            return util::make_unexpected(std::string("Failed to open file for writing: ") +
+                                         filepath.string());
         }
         ofs << to_yaml();
         return {};
@@ -533,15 +545,15 @@ const ClientConfig& Config::client_config() const {
 
 namespace YAML {
 
-using toxtunnel::ForwardRule;
-using toxtunnel::PipeTarget;
 using toxtunnel::BootstrapNodeConfig;
-using toxtunnel::ToxConfig;
-using toxtunnel::LoggingConfig;
-using toxtunnel::ServerConfig;
 using toxtunnel::ClientConfig;
-using toxtunnel::Mode;
 using toxtunnel::Config;
+using toxtunnel::ForwardRule;
+using toxtunnel::LoggingConfig;
+using toxtunnel::Mode;
+using toxtunnel::PipeTarget;
+using toxtunnel::ServerConfig;
+using toxtunnel::ToxConfig;
 using toxtunnel::tox::BootstrapMode;
 using toxtunnel::tox::kPublicKeyHexLen;
 
@@ -660,9 +672,8 @@ bool convert<BootstrapMode>::decode(const Node& node, BootstrapMode& rhs) {
     }
 
     auto str = node.as<std::string>();
-    std::transform(str.begin(), str.end(), str.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
+    std::transform(str.begin(), str.end(), str.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
     if (str == "auto") {
         rhs = BootstrapMode::Auto;
@@ -845,14 +856,22 @@ bool convert<Mode>::decode(const Node& node, Mode& rhs) {
 
 Node convert<toxtunnel::util::LogLevel>::encode(const toxtunnel::util::LogLevel& rhs) {
     switch (rhs) {
-        case toxtunnel::util::LogLevel::Trace: return Node("trace");
-        case toxtunnel::util::LogLevel::Debug: return Node("debug");
-        case toxtunnel::util::LogLevel::Info: return Node("info");
-        case toxtunnel::util::LogLevel::Warn: return Node("warn");
-        case toxtunnel::util::LogLevel::Error: return Node("error");
-        case toxtunnel::util::LogLevel::Critical: return Node("critical");
-        case toxtunnel::util::LogLevel::Off: return Node("off");
-        default: return Node("info");
+        case toxtunnel::util::LogLevel::Trace:
+            return Node("trace");
+        case toxtunnel::util::LogLevel::Debug:
+            return Node("debug");
+        case toxtunnel::util::LogLevel::Info:
+            return Node("info");
+        case toxtunnel::util::LogLevel::Warn:
+            return Node("warn");
+        case toxtunnel::util::LogLevel::Error:
+            return Node("error");
+        case toxtunnel::util::LogLevel::Critical:
+            return Node("critical");
+        case toxtunnel::util::LogLevel::Off:
+            return Node("off");
+        default:
+            return Node("info");
     }
 }
 

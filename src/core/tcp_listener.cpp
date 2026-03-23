@@ -1,8 +1,8 @@
 #include "toxtunnel/core/tcp_listener.hpp"
 
-#include "toxtunnel/util/logger.hpp"
-
 #include <utility>
+
+#include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::core {
 
@@ -10,8 +10,7 @@ namespace toxtunnel::core {
 // Construction
 // ===========================================================================
 
-TcpListener::TcpListener(asio::io_context& io, std::uint16_t port)
-    : acceptor_(io), port_(port) {
+TcpListener::TcpListener(asio::io_context& io, std::uint16_t port) : acceptor_(io), port_(port) {
     asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), port);
     setup_acceptor(endpoint);
 }
@@ -129,36 +128,34 @@ void TcpListener::do_accept() {
         return;
     }
 
-    acceptor_.async_accept(
-        [this](const asio::error_code& ec, asio::ip::tcp::socket peer_socket) {
-            if (ec) {
-                if (ec == asio::error::operation_aborted) {
-                    // Acceptor was closed (stop() was called); do not continue.
-                    return;
-                }
-                util::Logger::error("TcpListener: accept failed on port {}: {}", port_,
-                                    ec.message());
-                // Transient error -- keep trying.
-                do_accept();
+    acceptor_.async_accept([this](const asio::error_code& ec, asio::ip::tcp::socket peer_socket) {
+        if (ec) {
+            if (ec == asio::error::operation_aborted) {
+                // Acceptor was closed (stop() was called); do not continue.
                 return;
             }
-
-            ++connection_count_;
-
-            // Wrap the accepted socket in a TcpConnection.
-            auto conn = std::make_shared<TcpConnection>(std::move(peer_socket));
-
-            util::Logger::debug("TcpListener: accepted connection from {} (active: {}/{})",
-                                conn->remote_endpoint().address().to_string(), connection_count_,
-                                max_connections_);
-
-            if (accept_handler_) {
-                accept_handler_(std::move(conn));
-            }
-
-            // Continue the accept loop.
+            util::Logger::error("TcpListener: accept failed on port {}: {}", port_, ec.message());
+            // Transient error -- keep trying.
             do_accept();
-        });
+            return;
+        }
+
+        ++connection_count_;
+
+        // Wrap the accepted socket in a TcpConnection.
+        auto conn = std::make_shared<TcpConnection>(std::move(peer_socket));
+
+        util::Logger::debug("TcpListener: accepted connection from {} (active: {}/{})",
+                            conn->remote_endpoint().address().to_string(), connection_count_,
+                            max_connections_);
+
+        if (accept_handler_) {
+            accept_handler_(std::move(conn));
+        }
+
+        // Continue the accept loop.
+        do_accept();
+    });
 }
 
 }  // namespace toxtunnel::core

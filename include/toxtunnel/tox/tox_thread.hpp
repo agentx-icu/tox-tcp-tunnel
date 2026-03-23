@@ -1,8 +1,5 @@
 #pragma once
 
-#include "toxtunnel/tox/tox_save.hpp"
-#include "toxtunnel/tox/types.hpp"
-
 #include <toxcore/tox.h>
 
 #include <atomic>
@@ -19,6 +16,9 @@
 #include <thread>
 #include <vector>
 
+#include "toxtunnel/tox/tox_save.hpp"
+#include "toxtunnel/tox/types.hpp"
+
 namespace toxtunnel::tox {
 
 // ---------------------------------------------------------------------------
@@ -32,10 +32,10 @@ namespace toxtunnel::tox {
 /// has been processed.
 struct Command {
     enum class Type {
-        GetToxId,    ///< Retrieve the local Tox address.
-        AddFriend,   ///< Send a friend request.
-        SendData,    ///< Send a lossless custom packet.
-        Shutdown,    ///< Gracefully terminate the event loop.
+        GetToxId,   ///< Retrieve the local Tox address.
+        AddFriend,  ///< Send a friend request.
+        SendData,   ///< Send a lossless custom packet.
+        Shutdown,   ///< Gracefully terminate the event loop.
     };
 
     Type type;
@@ -72,7 +72,7 @@ class EventQueue {
         Type type;
         uint32_t friend_number{0};
         std::vector<uint8_t> data;    ///< Message text or packet payload.
-        PublicKeyArray public_key{};   ///< Set for FriendRequest events.
+        PublicKeyArray public_key{};  ///< Set for FriendRequest events.
     };
 
     /// Push an event (called from Tox callbacks, which run on the Tox thread).
@@ -176,8 +176,7 @@ class ToxThread {
     std::future<void> add_friend(const ToxId& id, const std::string& message);
 
     /// Send raw data to a friend via lossless custom packets.
-    std::future<void> send_data(uint32_t friend_number,
-                                const std::vector<uint8_t>& data);
+    std::future<void> send_data(uint32_t friend_number, const std::vector<uint8_t>& data);
 
     // -----------------------------------------------------------------
     // Event handler registration (set before calling start())
@@ -188,8 +187,7 @@ class ToxThread {
         std::function<void(const PublicKeyArray& public_key, std::string_view message)>;
 
     /// Called when a friend's connection status changes.
-    using FriendConnectionHandler =
-        std::function<void(uint32_t friend_number, bool connected)>;
+    using FriendConnectionHandler = std::function<void(uint32_t friend_number, bool connected)>;
 
     /// Called when a text message is received from a friend.
     using FriendMessageHandler =
@@ -234,22 +232,17 @@ class ToxThread {
     // Static toxcore callbacks
     // -----------------------------------------------------------------
 
-    static void on_friend_request(Tox* tox, const uint8_t* public_key,
-                                  const uint8_t* message, size_t length,
-                                  void* user_data);
+    static void on_friend_request(Tox* tox, const uint8_t* public_key, const uint8_t* message,
+                                  size_t length, void* user_data);
 
-    static void on_friend_connection_status(Tox* tox, uint32_t friend_number,
-                                            TOX_CONNECTION status,
+    static void on_friend_connection_status(Tox* tox, uint32_t friend_number, TOX_CONNECTION status,
                                             void* user_data);
 
-    static void on_friend_message(Tox* tox, uint32_t friend_number,
-                                  TOX_MESSAGE_TYPE type,
-                                  const uint8_t* message, size_t length,
-                                  void* user_data);
+    static void on_friend_message(Tox* tox, uint32_t friend_number, TOX_MESSAGE_TYPE type,
+                                  const uint8_t* message, size_t length, void* user_data);
 
-    static void on_friend_lossless_packet(Tox* tox, uint32_t friend_number,
-                                          const uint8_t* data, size_t length,
-                                          void* user_data);
+    static void on_friend_lossless_packet(Tox* tox, uint32_t friend_number, const uint8_t* data,
+                                          size_t length, void* user_data);
 
     // -----------------------------------------------------------------
     // Data members

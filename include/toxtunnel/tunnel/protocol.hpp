@@ -58,8 +58,8 @@ struct TunnelAckPayload {
 
 /// Parsed payload for a TUNNEL_ERROR frame.
 struct TunnelErrorPayload {
-    uint8_t error_code{0};       ///< Application-defined error code.
-    std::string description;     ///< Human-readable error description.
+    uint8_t error_code{0};    ///< Application-defined error code.
+    std::string description;  ///< Human-readable error description.
 };
 
 // ---------------------------------------------------------------------------
@@ -131,8 +131,7 @@ class ProtocolFrame {
     /// @param tunnel_id  Logical tunnel identifier.
     /// @param host       Target hostname or IP (truncated to 255 bytes).
     /// @param port       Target TCP port.
-    [[nodiscard]] static ProtocolFrame make_tunnel_open(uint16_t tunnel_id,
-                                                        const std::string& host,
+    [[nodiscard]] static ProtocolFrame make_tunnel_open(uint16_t tunnel_id, const std::string& host,
                                                         uint16_t port);
 
     /// Create a TUNNEL_DATA frame carrying raw bytes.
@@ -149,16 +148,14 @@ class ProtocolFrame {
     ///
     /// @param tunnel_id    Logical tunnel identifier.
     /// @param bytes_acked  Number of bytes being acknowledged.
-    [[nodiscard]] static ProtocolFrame make_tunnel_ack(uint16_t tunnel_id,
-                                                       uint32_t bytes_acked);
+    [[nodiscard]] static ProtocolFrame make_tunnel_ack(uint16_t tunnel_id, uint32_t bytes_acked);
 
     /// Create a TUNNEL_ERROR frame.
     ///
     /// @param tunnel_id    Logical tunnel identifier.
     /// @param error_code   Application-defined error code.
     /// @param description  Human-readable error message.
-    [[nodiscard]] static ProtocolFrame make_tunnel_error(uint16_t tunnel_id,
-                                                         uint8_t error_code,
+    [[nodiscard]] static ProtocolFrame make_tunnel_error(uint16_t tunnel_id, uint8_t error_code,
                                                          const std::string& description);
 
     /// Create a PING frame (tunnel_id is 0).

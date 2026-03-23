@@ -1,5 +1,5 @@
-#include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <gtest/gtest.h>
 
 #include <array>
 #include <atomic>
@@ -10,9 +10,9 @@
 #include <thread>
 #include <vector>
 
-#include "toxtunnel/tunnel/tunnel_manager.hpp"
-#include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
+#include "toxtunnel/tunnel/tunnel.hpp"
+#include "toxtunnel/tunnel/tunnel_manager.hpp"
 
 using namespace toxtunnel::tunnel;
 
@@ -33,26 +33,17 @@ std::span<const uint8_t> make_span(const std::array<uint8_t, N>& arr) {
 /// Provides controllable behavior and records interactions.
 class TestTunnel : public Tunnel {
    public:
-    TestTunnel(uint16_t tunnel_id, asio::io_context& io_ctx)
-        : Tunnel(tunnel_id, io_ctx) {}
+    TestTunnel(uint16_t tunnel_id, asio::io_context& io_ctx) : Tunnel(tunnel_id, io_ctx) {}
 
     // -- Tunnel interface implementation --
 
-    [[nodiscard]] State state() const noexcept override {
-        return state_;
-    }
+    [[nodiscard]] State state() const noexcept override { return state_; }
 
-    [[nodiscard]] bool is_active() const override {
-        return state_ == State::Connected;
-    }
+    [[nodiscard]] bool is_active() const override { return state_ == State::Connected; }
 
-    [[nodiscard]] std::size_t buffer_level() const override {
-        return buffer_level_;
-    }
+    [[nodiscard]] std::size_t buffer_level() const override { return buffer_level_; }
 
-    void handle_frame(const ProtocolFrame& /*frame*/) override {
-        ++frames_handled_;
-    }
+    void handle_frame(const ProtocolFrame& /*frame*/) override { ++frames_handled_; }
 
     void close() override {
         ++close_count_;
@@ -83,13 +74,9 @@ class TunnelManagerTest : public ::testing::Test {
     asio::io_context io_ctx;
     std::unique_ptr<TunnelManager> manager;
 
-    void SetUp() override {
-        manager = std::make_unique<TunnelManager>(io_ctx);
-    }
+    void SetUp() override { manager = std::make_unique<TunnelManager>(io_ctx); }
 
-    void TearDown() override {
-        manager.reset();
-    }
+    void TearDown() override { manager.reset(); }
 
     // Helper to create a TestTunnel
     std::unique_ptr<TestTunnel> create_test_tunnel(uint16_t tunnel_id) {

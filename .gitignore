@@ -32,3 +32,9 @@ docker_build/
 
 # Local superpowers docs (keep local, do not track)
 docs/superpowers/
+.gstack/
+
+# Build/packaging artifacts
+.cache/
+build-debug-gha/
+stage/

@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include "toxtunnel/util/expected.hpp"
 
 using toxtunnel::util::Expected;
@@ -16,7 +17,8 @@ TEST(ExpectedTest, ConstructWithError) {
 }
 
 TEST(ExpectedTest, ErrorAccessOnError) {
-    Expected<int, std::string> result(toxtunnel::util::make_unexpected(std::string("something went wrong")));
+    Expected<int, std::string> result(
+        toxtunnel::util::make_unexpected(std::string("something went wrong")));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), "something went wrong");
 }
