@@ -6,11 +6,12 @@
 // correctly under non-trivial rule configurations.
 
 #include <gtest/gtest.h>
-#include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,18 +49,21 @@ class RulesIntegrationTest : public ::testing::Test {
     /// Helper that creates a temporary file path, writes content, and returns
     /// the path.  The caller is responsible for cleanup (see cleanup_file).
     static std::filesystem::path write_temp_file(std::string_view content) {
-        std::string tmpl = "/tmp/toxtunnel_test_rules_XXXXXX";
-        int fd = mkstemp(tmpl.data());
-        EXPECT_NE(fd, -1) << "mkstemp failed";
-        // Write content through an ofstream (close the fd first).
-        close(fd);
-
-        std::ofstream ofs(tmpl);
+        auto path = make_temp_path();
+        std::ofstream ofs(path);
         EXPECT_TRUE(ofs.good());
         ofs << content;
         ofs.close();
+        return path;
+    }
 
-        return std::filesystem::path(tmpl);
+    /// Generate a unique temporary file path.
+    static std::filesystem::path make_temp_path() {
+        static std::mt19937 rng(
+            static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::uniform_int_distribution<unsigned> dist(0, 999999);
+        auto temp_dir = std::filesystem::temp_directory_path();
+        return temp_dir / ("toxtunnel_test_rules_" + std::to_string(dist(rng)));
     }
 
     /// Remove a temporary file if it exists.
