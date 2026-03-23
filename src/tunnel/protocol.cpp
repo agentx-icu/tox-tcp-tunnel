@@ -113,8 +113,7 @@ ProtocolFrame ProtocolFrame::make_tunnel_open(uint16_t tunnel_id, const std::str
     return frame;
 }
 
-ProtocolFrame ProtocolFrame::make_tunnel_data(uint16_t tunnel_id,
-                                              std::span<const uint8_t> data) {
+ProtocolFrame ProtocolFrame::make_tunnel_data(uint16_t tunnel_id, std::span<const uint8_t> data) {
     ProtocolFrame frame(FrameType::TUNNEL_DATA, tunnel_id);
     frame.payload_.assign(data.begin(), data.end());
     return frame;
@@ -172,7 +171,8 @@ std::vector<uint8_t> ProtocolFrame::serialize() const {
     result.push_back(tid_buf[1]);
 
     // [length:2] -- big-endian
-    auto payload_len = static_cast<uint16_t>(std::min<std::size_t>(payload_.size(), kMaxPayloadSize));
+    auto payload_len =
+        static_cast<uint16_t>(std::min<std::size_t>(payload_.size(), kMaxPayloadSize));
     uint8_t len_buf[2];
     write_u16_be(len_buf, payload_len);
     result.push_back(len_buf[0]);

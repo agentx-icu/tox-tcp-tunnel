@@ -61,7 +61,7 @@ struct ToxOptionsGuard {
 // ===========================================================================
 
 util::Expected<Success, std::string> save_tox_data(const Tox* tox,
-                                                    const std::filesystem::path& filepath) {
+                                                   const std::filesystem::path& filepath) {
     if (!tox) {
         return util::unexpected(std::string("cannot save: Tox instance is null"));
     }
@@ -106,8 +106,8 @@ util::Expected<Success, std::string> save_tox_data(const Tox* tox,
     if (fs_ec) {
         // Best-effort cleanup of the temp file.
         std::filesystem::remove(tmp_path);
-        return util::unexpected(std::string("failed to rename temp file to '") +
-                                filepath.string() + "': " + fs_ec.message());
+        return util::unexpected(std::string("failed to rename temp file to '") + filepath.string() +
+                                "': " + fs_ec.message());
     }
 
     util::Logger::debug("saved Tox state ({} bytes) to '{}'", size, filepath.string());
@@ -152,8 +152,8 @@ util::Expected<std::vector<uint8_t>, std::string> load_tox_data(
     std::vector<uint8_t> data(static_cast<std::size_t>(file_size));
     ifs.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(file_size));
     if (!ifs) {
-        return util::unexpected(std::string("failed to read save data from '") +
-                                filepath.string() + "'");
+        return util::unexpected(std::string("failed to read save data from '") + filepath.string() +
+                                "'");
     }
 
     util::Logger::debug("loaded Tox state ({} bytes) from '{}'", data.size(), filepath.string());
@@ -165,7 +165,7 @@ util::Expected<std::vector<uint8_t>, std::string> load_tox_data(
 // ===========================================================================
 
 util::Expected<ToxPtr, std::string> create_tox_from_savedata(const std::vector<uint8_t>& savedata,
-                                                              Tox_Options* options) {
+                                                             Tox_Options* options) {
     if (savedata.empty()) {
         return util::unexpected(std::string("save data is empty"));
     }
@@ -238,7 +238,7 @@ util::Expected<ToxPtr, std::string> create_new_tox(Tox_Options* options) {
 // ===========================================================================
 
 util::Expected<ToxPtr, std::string> create_or_load_tox(const std::filesystem::path& filepath,
-                                                        Tox_Options* options) {
+                                                       Tox_Options* options) {
     std::error_code fs_ec;
     bool file_exists = std::filesystem::exists(filepath, fs_ec);
 

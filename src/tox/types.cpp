@@ -16,9 +16,12 @@ namespace {
 
 /// Map a single hex character to its 4-bit value, or -1 on error.
 int hex_char_value(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F')
+        return 10 + (c - 'A');
     return -1;
 }
 
@@ -72,10 +75,9 @@ bool hex_to_bytes(std::string_view hex, uint8_t* out, std::size_t out_len) {
 
 util::Expected<PublicKeyArray, std::string> parse_public_key(std::string_view hex) {
     if (hex.size() != kPublicKeyHexLen) {
-        return util::unexpected(
-            std::string("public key hex must be exactly ") +
-            std::to_string(kPublicKeyHexLen) + " characters, got " +
-            std::to_string(hex.size()));
+        return util::unexpected(std::string("public key hex must be exactly ") +
+                                std::to_string(kPublicKeyHexLen) + " characters, got " +
+                                std::to_string(hex.size()));
     }
 
     PublicKeyArray pk{};
@@ -91,10 +93,9 @@ util::Expected<PublicKeyArray, std::string> parse_public_key(std::string_view he
 
 util::Expected<ToxId, std::string> ToxId::from_hex(std::string_view hex) {
     if (hex.size() != kToxIdHexLen) {
-        return util::unexpected(
-            std::string("Tox ID hex must be exactly ") +
-            std::to_string(kToxIdHexLen) + " characters, got " +
-            std::to_string(hex.size()));
+        return util::unexpected(std::string("Tox ID hex must be exactly ") +
+                                std::to_string(kToxIdHexLen) + " characters, got " +
+                                std::to_string(hex.size()));
     }
 
     ToxIdArray bytes{};
@@ -188,16 +189,14 @@ util::Expected<BootstrapNode, std::string> BootstrapNode::parse(std::string_view
 
         // Expect ':' after ']'
         if (remaining.empty() || remaining.front() != ':') {
-            return util::unexpected(
-                std::string("expected ':' after IPv6 address bracket"));
+            return util::unexpected(std::string("expected ':' after IPv6 address bracket"));
         }
         remaining = remaining.substr(1);
     } else {
         // IPv4 or hostname: find the first ':'
         auto colon = remaining.find(':');
         if (colon == std::string_view::npos) {
-            return util::unexpected(
-                std::string("expected format 'ip:port:public_key'"));
+            return util::unexpected(std::string("expected format 'ip:port:public_key'"));
         }
         ip_part = std::string(remaining.substr(0, colon));
         remaining = remaining.substr(colon + 1);
@@ -206,8 +205,7 @@ util::Expected<BootstrapNode, std::string> BootstrapNode::parse(std::string_view
     // Split remaining into port and public key
     auto colon = remaining.find(':');
     if (colon == std::string_view::npos) {
-        return util::unexpected(
-            std::string("expected format 'ip:port:public_key'"));
+        return util::unexpected(std::string("expected format 'ip:port:public_key'"));
     }
     port_part = remaining.substr(0, colon);
     key_part = remaining.substr(colon + 1);
@@ -221,8 +219,7 @@ util::Expected<BootstrapNode, std::string> BootstrapNode::parse(std::string_view
     uint16_t port = 0;
     auto [ptr, ec] = std::from_chars(port_part.data(), port_part.data() + port_part.size(), port);
     if (ec != std::errc{} || ptr != port_part.data() + port_part.size()) {
-        return util::unexpected(
-            std::string("invalid port number: ") + std::string(port_part));
+        return util::unexpected(std::string("invalid port number: ") + std::string(port_part));
     }
     if (port == 0) {
         return util::unexpected(std::string("port must be non-zero"));
@@ -231,8 +228,7 @@ util::Expected<BootstrapNode, std::string> BootstrapNode::parse(std::string_view
     // Parse public key
     auto pk_result = parse_public_key(key_part);
     if (!pk_result) {
-        return util::unexpected(
-            std::string("invalid bootstrap public key: ") + pk_result.error());
+        return util::unexpected(std::string("invalid bootstrap public key: ") + pk_result.error());
     }
 
     BootstrapNode node;

@@ -13,7 +13,7 @@ namespace toxtunnel {
 namespace {
 
 class RulesErrorCategory : public std::error_category {
-public:
+   public:
     const char* name() const noexcept override { return "rules"; }
 
     std::string message(int ev) const override {
@@ -55,21 +55,18 @@ std::error_code make_error_code(RulesError e) noexcept {
 util::Expected<RulesEngine, std::string> RulesEngine::from_file(
     const std::filesystem::path& filepath) {
     if (!std::filesystem::exists(filepath)) {
-        return util::make_unexpected(
-            std::string("Rules file not found: ") + filepath.string());
+        return util::make_unexpected(std::string("Rules file not found: ") + filepath.string());
     }
 
     try {
         YAML::Node node = YAML::LoadFile(filepath.string());
         return from_string(YAML::Dump(node));
     } catch (const YAML::Exception& e) {
-        return util::make_unexpected(
-            std::string("Failed to parse rules file: ") + e.what());
+        return util::make_unexpected(std::string("Failed to parse rules file: ") + e.what());
     }
 }
 
-util::Expected<RulesEngine, std::string> RulesEngine::from_string(
-    std::string_view yaml_content) {
+util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_view yaml_content) {
     try {
         YAML::Node node = YAML::Load(std::string(yaml_content));
 
@@ -104,8 +101,8 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(
                 // Validate public key is valid hex
                 auto pk_result = tox::parse_public_key(rule.friend_pk);
                 if (!pk_result) {
-                    return util::make_unexpected(
-                        std::string("Invalid public key: ") + pk_result.error());
+                    return util::make_unexpected(std::string("Invalid public key: ") +
+                                                 pk_result.error());
                 }
 
                 // Validate port ranges
@@ -128,20 +125,17 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(
 
                 engine.rules_.push_back(std::move(rule));
             } catch (const YAML::Exception& e) {
-                return util::make_unexpected(
-                    std::string("Failed to parse rule: ") + e.what());
+                return util::make_unexpected(std::string("Failed to parse rule: ") + e.what());
             }
         }
 
         return engine;
     } catch (const YAML::Exception& e) {
-        return util::make_unexpected(
-            std::string("Failed to parse rules: ") + e.what());
+        return util::make_unexpected(std::string("Failed to parse rules: ") + e.what());
     }
 }
 
-RulesEngine::RulesEngine(std::vector<FriendRule> rules)
-    : rules_(std::move(rules)) {}
+RulesEngine::RulesEngine(std::vector<FriendRule> rules) : rules_(std::move(rules)) {}
 
 // ---------------------------------------------------------------------------
 // RulesEngine evaluation
@@ -177,10 +171,9 @@ bool RulesEngine::has_rules_for_friend(const std::string& friend_pk) const {
 }
 
 const FriendRule* RulesEngine::find_friend_rule(const std::string& friend_pk) const {
-    auto it = std::find_if(rules_.begin(), rules_.end(),
-        [&friend_pk](const FriendRule& rule) {
-            return rule.friend_pk == friend_pk;
-        });
+    auto it = std::find_if(rules_.begin(), rules_.end(), [&friend_pk](const FriendRule& rule) {
+        return rule.friend_pk == friend_pk;
+    });
     return it != rules_.end() ? &(*it) : nullptr;
 }
 
@@ -401,13 +394,12 @@ std::string RulesEngine::to_yaml() const {
     return out.c_str();
 }
 
-util::Expected<void, std::string> RulesEngine::save(
-    const std::filesystem::path& filepath) const {
+util::Expected<void, std::string> RulesEngine::save(const std::filesystem::path& filepath) const {
     try {
         std::ofstream ofs(filepath);
         if (!ofs) {
-            return util::make_unexpected(
-                std::string("Failed to open file for writing: ") + filepath.string());
+            return util::make_unexpected(std::string("Failed to open file for writing: ") +
+                                         filepath.string());
         }
         ofs << to_yaml();
         return {};
@@ -428,9 +420,9 @@ void RulesEngine::add_rule(FriendRule rule) {
 
 namespace YAML {
 
-using toxtunnel::TargetSpec;
-using toxtunnel::SourceSpec;
 using toxtunnel::FriendRule;
+using toxtunnel::SourceSpec;
+using toxtunnel::TargetSpec;
 
 // ---------------------------------------------------------------------------
 // TargetSpec

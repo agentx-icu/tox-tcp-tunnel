@@ -1,7 +1,6 @@
 #pragma once
 
 #include <asio.hpp>
-
 #include <atomic>
 #include <cstdint>
 #include <functional>

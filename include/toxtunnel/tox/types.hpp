@@ -118,8 +118,8 @@ class ToxId {
 
 /// Bootstrap resolution policy for discovering DHT entry points.
 enum class BootstrapMode : uint8_t {
-    Auto,   ///< Use configured nodes or fall back to public discovery/cache.
-    Lan,    ///< Use local discovery and optional manually configured nodes only.
+    Auto,  ///< Use configured nodes or fall back to public discovery/cache.
+    Lan,   ///< Use local discovery and optional manually configured nodes only.
 };
 
 /// Represents a Tox DHT bootstrap node.

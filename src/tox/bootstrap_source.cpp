@@ -28,8 +28,7 @@ std::string trim_trailing_whitespace(std::string value) {
 }
 
 util::Expected<std::vector<BootstrapNode>, std::string> load_cached_nodes(
-    const std::filesystem::path& cache_path,
-    std::size_t max_nodes) {
+    const std::filesystem::path& cache_path, std::size_t max_nodes) {
     if (!std::filesystem::exists(cache_path)) {
         return util::unexpected(std::string("bootstrap cache file not found"));
     }
@@ -60,8 +59,8 @@ void write_cache(const std::filesystem::path& cache_path, std::string_view json)
 
 }  // namespace
 
-util::Expected<std::vector<BootstrapNode>, std::string>
-BootstrapSource::parse_nodes_json(std::string_view json, std::size_t max_nodes) {
+util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::parse_nodes_json(
+    std::string_view json, std::size_t max_nodes) {
     YAML::Node root;
     try {
         root = YAML::Load(std::string(json));
@@ -127,12 +126,9 @@ BootstrapSource::parse_nodes_json(std::string_view json, std::size_t max_nodes) 
     return nodes;
 }
 
-util::Expected<std::vector<BootstrapNode>, std::string>
-BootstrapSource::resolve_bootstrap_nodes(const std::vector<BootstrapNode>& configured_nodes,
-                                         BootstrapMode bootstrap_mode,
-                                         const std::filesystem::path& data_dir,
-                                         Fetcher fetcher,
-                                         std::size_t max_nodes) {
+util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve_bootstrap_nodes(
+    const std::vector<BootstrapNode>& configured_nodes, BootstrapMode bootstrap_mode,
+    const std::filesystem::path& data_dir, Fetcher fetcher, std::size_t max_nodes) {
     if (!configured_nodes.empty()) {
         return configured_nodes;
     }
@@ -169,8 +165,8 @@ util::Expected<std::string, BootstrapFetchError> BootstrapSource::fetch_default_
 #endif
 
     if (!pipe) {
-        return util::unexpected(BootstrapFetchError{
-            std::string("failed to execute curl for bootstrap nodes")});
+        return util::unexpected(
+            BootstrapFetchError{std::string("failed to execute curl for bootstrap nodes")});
     }
 
     std::array<char, 4096> buffer{};
@@ -185,14 +181,14 @@ util::Expected<std::string, BootstrapFetchError> BootstrapSource::fetch_default_
     const int exit_code = pclose(pipe);
 #endif
     if (exit_code != 0) {
-        return util::unexpected(BootstrapFetchError{
-            std::string("curl exited with status ") + std::to_string(exit_code)});
+        return util::unexpected(BootstrapFetchError{std::string("curl exited with status ") +
+                                                    std::to_string(exit_code)});
     }
 
     output = trim_trailing_whitespace(std::move(output));
     if (output.empty()) {
-        return util::unexpected(BootstrapFetchError{
-            std::string("bootstrap node fetch returned empty output")});
+        return util::unexpected(
+            BootstrapFetchError{std::string("bootstrap node fetch returned empty output")});
     }
 
     return output;

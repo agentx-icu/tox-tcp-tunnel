@@ -1,15 +1,14 @@
 #include "toxtunnel/core/io_context.hpp"
 
-#include "toxtunnel/util/logger.hpp"
-
 #include <algorithm>
+
+#include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::core {
 
 IoContext::IoContext(std::size_t num_threads)
-    : num_threads_(num_threads == 0
-                       ? std::max<std::size_t>(std::thread::hardware_concurrency(), 2)
-                       : num_threads) {}
+    : num_threads_(num_threads == 0 ? std::max<std::size_t>(std::thread::hardware_concurrency(), 2)
+                                    : num_threads) {}
 
 IoContext::~IoContext() {
     stop();
@@ -29,8 +28,7 @@ void IoContext::run() {
 
     // Install a work guard so that io_context::run() does not return
     // while we want the thread pool to stay alive.
-    work_guard_ =
-        std::make_unique<work_guard_type>(io_context_.get_executor());
+    work_guard_ = std::make_unique<work_guard_type>(io_context_.get_executor());
 
     threads_.reserve(num_threads_);
     for (std::size_t i = 0; i < num_threads_; ++i) {

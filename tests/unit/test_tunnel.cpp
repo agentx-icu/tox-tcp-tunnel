@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include <asio.hpp>
 
 #include "toxtunnel/tunnel/tunnel.hpp"
@@ -202,9 +203,7 @@ TEST_F(TunnelTest, HandleFrame_TunnelError) {
     tunnel.set_state(Tunnel::State::Connecting);
 
     std::optional<TunnelErrorPayload> error_received;
-    tunnel.set_on_error([&error_received](const TunnelErrorPayload& err) {
-        error_received = err;
-    });
+    tunnel.set_on_error([&error_received](const TunnelErrorPayload& err) { error_received = err; });
 
     auto frame = ProtocolFrame::make_tunnel_error(test_tunnel_id, 42, "Connection refused");
     tunnel.handle_frame(frame);
@@ -469,9 +468,8 @@ TEST_F(TunnelTest, ErrorHandling_InvalidTunnelIdIgnored) {
 
     // Frame with wrong tunnel ID should be ignored
     bool data_callback_called = false;
-    tunnel.set_on_data_for_tcp([&data_callback_called](std::span<const uint8_t>) {
-        data_callback_called = true;
-    });
+    tunnel.set_on_data_for_tcp(
+        [&data_callback_called](std::span<const uint8_t>) { data_callback_called = true; });
 
     std::vector<uint8_t> data = {0x01, 0x02, 0x03};
     auto frame = ProtocolFrame::make_tunnel_data(test_tunnel_id + 1, data);
@@ -488,9 +486,7 @@ TEST_F(TunnelTest, Callbacks_OnStateChange) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
 
     std::vector<Tunnel::State> state_changes;
-    tunnel.set_on_state_change([&state_changes](Tunnel::State s) {
-        state_changes.push_back(s);
-    });
+    tunnel.set_on_state_change([&state_changes](Tunnel::State s) { state_changes.push_back(s); });
 
     (void)tunnel.open("localhost", 8080);
 
@@ -503,9 +499,7 @@ TEST_F(TunnelTest, Callbacks_OnClose) {
     tunnel.set_state(Tunnel::State::Connected);
 
     bool close_callback_called = false;
-    tunnel.set_on_close([&close_callback_called]() {
-        close_callback_called = true;
-    });
+    tunnel.set_on_close([&close_callback_called]() { close_callback_called = true; });
 
     tunnel.handle_frame(ProtocolFrame::make_tunnel_close(test_tunnel_id));
 

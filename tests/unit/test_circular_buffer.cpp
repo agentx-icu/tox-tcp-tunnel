@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
+
+#include <atomic>
 #include <thread>
 #include <vector>
-#include <atomic>
+
 #include "toxtunnel/util/circular_buffer.hpp"
 
 using toxtunnel::util::CircularBuffer;
@@ -195,8 +197,8 @@ TEST_F(CircularBufferTest, PeekDoesNotConsume_WithIndex) {
 TEST_F(CircularBufferTest, PeekDoesNotConsume_OutOfBoundsReturnsNullopt) {
     buffer.write(1);
 
-    EXPECT_EQ(buffer.peek(0), 1);    // Valid
-    EXPECT_EQ(buffer.peek(1), std::nullopt);  // Out of bounds
+    EXPECT_EQ(buffer.peek(0), 1);               // Valid
+    EXPECT_EQ(buffer.peek(1), std::nullopt);    // Out of bounds
     EXPECT_EQ(buffer.peek(100), std::nullopt);  // Way out of bounds
 }
 

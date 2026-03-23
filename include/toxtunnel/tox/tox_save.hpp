@@ -1,12 +1,12 @@
 #pragma once
 
+#include <toxcore/tox.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include <toxcore/tox.h>
 
 #include "toxtunnel/util/expected.hpp"
 

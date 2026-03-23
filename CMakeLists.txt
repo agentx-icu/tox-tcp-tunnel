@@ -70,7 +70,7 @@ FetchContent_MakeAvailable(spdlog)
 FetchContent_Declare(
     cli11
     GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-    GIT_TAG v2.3.2
+    GIT_TAG v2.6.2
 )
 FetchContent_MakeAvailable(cli11)
 
@@ -133,7 +133,11 @@ else()
     # GCC 13+ has false positives for array-bounds in spdlog's fmt bundle
     # See: https://github.com/fmtlib/fmt/issues/3413
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(toxtunnel_lib PRIVATE -Wno-array-bounds -Wno-stringop-overread)
+        target_compile_options(toxtunnel_lib PRIVATE
+            -Wno-array-bounds
+            -Wno-stringop-overread
+            -Wno-stringop-overflow
+        )
     endif()
 endif()
 
@@ -151,7 +155,11 @@ else()
         target_compile_options(toxtunnel PRIVATE -Werror)
     endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(toxtunnel PRIVATE -Wno-array-bounds -Wno-stringop-overread)
+        target_compile_options(toxtunnel PRIVATE
+            -Wno-array-bounds
+            -Wno-stringop-overread
+            -Wno-stringop-overflow
+        )
     endif()
 endif()
 

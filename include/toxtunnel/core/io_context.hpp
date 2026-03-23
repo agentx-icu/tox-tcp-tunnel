@@ -1,7 +1,6 @@
 #pragma once
 
 #include <asio.hpp>
-
 #include <chrono>
 #include <cstddef>
 #include <functional>
@@ -146,8 +145,7 @@ class IoContext {
 
     /// @overload Create a timer that expires after @p delay.
     template <typename Rep, typename Period>
-    [[nodiscard]] asio::steady_timer make_steady_timer(
-        std::chrono::duration<Rep, Period> delay) {
+    [[nodiscard]] asio::steady_timer make_steady_timer(std::chrono::duration<Rep, Period> delay) {
         return asio::steady_timer(io_context_, delay);
     }
 
@@ -179,8 +177,7 @@ class IoContext {
     /// Work guard that prevents io_context::run() from returning when
     /// there are no pending handlers.  Uses the modern executor_work_guard
     /// API (the old io_context::work is removed under ASIO_NO_DEPRECATED).
-    using work_guard_type =
-        asio::executor_work_guard<asio::io_context::executor_type>;
+    using work_guard_type = asio::executor_work_guard<asio::io_context::executor_type>;
     std::unique_ptr<work_guard_type> work_guard_;
 
     std::vector<std::thread> threads_;

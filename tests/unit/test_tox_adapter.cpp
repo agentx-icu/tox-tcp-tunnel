@@ -37,8 +37,7 @@ TEST(ToxAdapterTest, ResolveBootstrapNodesForConfigSkipsFetchInLanModeWithoutNod
 
     bool fetch_called = false;
     auto result = ToxAdapter::resolve_bootstrap_nodes_for_config(
-        config,
-        [&fetch_called]() -> util::Expected<std::string, BootstrapFetchError> {
+        config, [&fetch_called]() -> util::Expected<std::string, BootstrapFetchError> {
             fetch_called = true;
             return util::unexpected(BootstrapFetchError{std::string("should not fetch")});
         });
@@ -53,16 +52,14 @@ TEST(ToxAdapterTest, ResolveBootstrapNodesForConfigKeepsConfiguredLanNodes) {
     config.bootstrap_mode = BootstrapMode::Lan;
     config.local_discovery_enabled = true;
 
-    auto public_key = parse_public_key(
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    auto public_key =
+        parse_public_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     ASSERT_TRUE(public_key.has_value()) << public_key.error();
-    config.bootstrap_nodes.push_back(
-        BootstrapNode{"192.168.1.20", 33445, public_key.value()});
+    config.bootstrap_nodes.push_back(BootstrapNode{"192.168.1.20", 33445, public_key.value()});
 
     bool fetch_called = false;
     auto result = ToxAdapter::resolve_bootstrap_nodes_for_config(
-        config,
-        [&fetch_called]() -> util::Expected<std::string, BootstrapFetchError> {
+        config, [&fetch_called]() -> util::Expected<std::string, BootstrapFetchError> {
             fetch_called = true;
             return util::unexpected(BootstrapFetchError{std::string("should not fetch")});
         });

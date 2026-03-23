@@ -39,10 +39,15 @@ else()
         target_compile_options(unit_tests PRIVATE -Werror)
     endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(unit_tests PRIVATE -Wno-array-bounds -Wno-stringop-overread)
+        target_compile_options(unit_tests PRIVATE
+            -Wno-array-bounds
+            -Wno-stringop-overread
+            -Wno-stringop-overflow
+        )
     endif()
 endif()
 gtest_discover_tests(unit_tests
+    DISCOVERY_TIMEOUT 60
     PROPERTIES LABELS "unit"
 )
 
@@ -71,9 +76,14 @@ else()
         target_compile_options(integration_tests PRIVATE -Werror)
     endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(integration_tests PRIVATE -Wno-array-bounds -Wno-stringop-overread)
+        target_compile_options(integration_tests PRIVATE
+            -Wno-array-bounds
+            -Wno-stringop-overread
+            -Wno-stringop-overflow
+        )
     endif()
 endif()
 gtest_discover_tests(integration_tests
+    DISCOVERY_TIMEOUT 60
     PROPERTIES LABELS "integration"
 )

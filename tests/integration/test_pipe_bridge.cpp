@@ -18,7 +18,7 @@ namespace {
 using namespace std::chrono_literals;
 
 class PipeBridgeTest : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
         ASSERT_EQ(::pipe(input_pipe_), 0);
         ASSERT_EQ(::pipe(output_pipe_), 0);
@@ -54,9 +54,7 @@ TEST_F(PipeBridgeTest, MovesInputToTunnelAndTunnelToOutput) {
         [&tunnel_data_promise](std::span<const uint8_t> data) {
             tunnel_data_promise.set_value(std::string(data.begin(), data.end()));
         },
-        [&input_closed_promise]() {
-            input_closed_promise.set_value();
-        });
+        [&input_closed_promise]() { input_closed_promise.set_value(); });
     ASSERT_TRUE(start.has_value()) << start.error();
 
     const std::string inbound = "ssh-handshake";
@@ -66,8 +64,8 @@ TEST_F(PipeBridgeTest, MovesInputToTunnelAndTunnelToOutput) {
     EXPECT_EQ(tunnel_data.get(), inbound);
 
     const std::string outbound = "server-reply";
-    bridge.write_output(std::span<const uint8_t>(
-        reinterpret_cast<const uint8_t*>(outbound.data()), outbound.size()));
+    bridge.write_output(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(outbound.data()),
+                                                 outbound.size()));
 
     std::array<char, 64> buffer{};
     const ssize_t read_bytes = ::read(output_pipe_[0], buffer.data(), buffer.size());

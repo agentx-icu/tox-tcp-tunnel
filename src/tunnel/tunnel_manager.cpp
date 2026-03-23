@@ -1,8 +1,9 @@
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
-#include "toxtunnel/tunnel/protocol.hpp"
-#include "toxtunnel/util/logger.hpp"
 
 #include <algorithm>
+
+#include "toxtunnel/tunnel/protocol.hpp"
+#include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tunnel {
 
@@ -10,8 +11,7 @@ namespace toxtunnel::tunnel {
 // Construction
 // ===========================================================================
 
-TunnelManager::TunnelManager(asio::io_context& io_ctx)
-    : io_ctx_(io_ctx), used_ids_(65536, false) {
+TunnelManager::TunnelManager(asio::io_context& io_ctx) : io_ctx_(io_ctx), used_ids_(65536, false) {
     // ID 0 is reserved for control frames (PING/PONG)
     used_ids_[0] = true;
 }
@@ -66,10 +66,12 @@ uint16_t TunnelManager::find_available_id() {
             uint16_t result = next_tunnel_id_;
             used_ids_[result] = true;
             // Advance to next ID, wrapping at 65535, skipping 0
-            next_tunnel_id_ = (next_tunnel_id_ == 65535) ? 1 : static_cast<uint16_t>(next_tunnel_id_ + 1);
+            next_tunnel_id_ =
+                (next_tunnel_id_ == 65535) ? 1 : static_cast<uint16_t>(next_tunnel_id_ + 1);
             return result;
         }
-        next_tunnel_id_ = (next_tunnel_id_ == 65535) ? 1 : static_cast<uint16_t>(next_tunnel_id_ + 1);
+        next_tunnel_id_ =
+            (next_tunnel_id_ == 65535) ? 1 : static_cast<uint16_t>(next_tunnel_id_ + 1);
     } while (next_tunnel_id_ != start);
 
     // No available IDs - this should be very rare
@@ -304,8 +306,8 @@ void TunnelManager::route_frame(const ProtocolFrame& frame) {
 
         // Send TUNNEL_ERROR back if this was a data frame
         if (frame.type() == FrameType::TUNNEL_DATA) {
-            ProtocolFrame error_frame = ProtocolFrame::make_tunnel_error(
-                tid, static_cast<uint8_t>(1), "Tunnel not found");
+            ProtocolFrame error_frame =
+                ProtocolFrame::make_tunnel_error(tid, static_cast<uint8_t>(1), "Tunnel not found");
             send_frame(error_frame);
         }
     }
@@ -350,8 +352,8 @@ bool TunnelManager::handle_incoming_open(const ProtocolFrame& frame) {
         used_ids_[tunnel_id] = true;
     }
 
-    util::Logger::info("TunnelManager: accepted incoming tunnel {} -> {}:{}",
-                       tunnel_id, open_payload->host, open_payload->port);
+    util::Logger::info("TunnelManager: accepted incoming tunnel {} -> {}:{}", tunnel_id,
+                       open_payload->host, open_payload->port);
 
     TunnelCreatedCallback created_cb;
     {
@@ -385,7 +387,8 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
         record_frame_sent();
         record_bytes_sent(frame.serialized_size());
     } else {
-        util::Logger::debug("TunnelManager::send_frame: send handler returned false (backpressure)");
+        util::Logger::debug(
+            "TunnelManager::send_frame: send handler returned false (backpressure)");
     }
 
     return success;

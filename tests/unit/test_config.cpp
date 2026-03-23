@@ -1,6 +1,9 @@
 #include <gtest/gtest.h>
+
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 
 #include "toxtunnel/util/config.hpp"
 
@@ -11,10 +14,13 @@ using namespace toxtunnel;
 // ---------------------------------------------------------------------------
 
 class ConfigTest : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
-        // Create a temp directory for test files
-        test_dir_ = std::filesystem::temp_directory_path() / "toxtunnel_config_test";
+        const auto unique_suffix =
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        test_dir_ =
+            std::filesystem::temp_directory_path() / ("toxtunnel_config_test_" + unique_suffix);
         std::filesystem::create_directories(test_dir_);
     }
 
@@ -692,20 +698,15 @@ TEST_F(ConfigTest, ConfigErrorCodeCategory) {
 
 TEST_F(ConfigTest, AllConfigErrorCodesHaveMessages) {
     std::vector<ConfigError> errors = {
-        ConfigError::FileNotFound,
-        ConfigError::ParseError,
-        ConfigError::ValidationError,
-        ConfigError::InvalidMode,
-        ConfigError::InvalidPort,
-        ConfigError::InvalidToxId,
-        ConfigError::InvalidPublicKey,
-        ConfigError::MissingRequired,
+        ConfigError::FileNotFound,     ConfigError::ParseError,      ConfigError::ValidationError,
+        ConfigError::InvalidMode,      ConfigError::InvalidPort,     ConfigError::InvalidToxId,
+        ConfigError::InvalidPublicKey, ConfigError::MissingRequired,
     };
 
     for (const auto& err : errors) {
         auto ec = make_error_code(err);
-        EXPECT_FALSE(ec.message().empty()) << "Error code " << static_cast<int>(err)
-                                           << " has no message";
+        EXPECT_FALSE(ec.message().empty())
+            << "Error code " << static_cast<int>(err) << " has no message";
     }
 }
 
@@ -715,11 +716,8 @@ TEST_F(ConfigTest, AllConfigErrorCodesHaveMessages) {
 
 TEST_F(ConfigTest, BootstrapNodeConfigToBootstrapNode) {
     // Use a valid 64-char hex key
-    BootstrapNodeConfig config{
-        "bootstrap.tox.me",
-        33445,
-        "0000000000000000000000000000000000000000000000000000000000000000"
-    };
+    BootstrapNodeConfig config{"bootstrap.tox.me", 33445,
+                               "0000000000000000000000000000000000000000000000000000000000000000"};
 
     auto result = config.to_bootstrap_node();
     ASSERT_TRUE(result.has_value()) << result.error();
@@ -730,11 +728,7 @@ TEST_F(ConfigTest, BootstrapNodeConfigToBootstrapNode) {
 }
 
 TEST_F(ConfigTest, BootstrapNodeConfigInvalidPublicKey) {
-    BootstrapNodeConfig config{
-        "bootstrap.tox.me",
-        33445,
-        "invalid_key"
-    };
+    BootstrapNodeConfig config{"bootstrap.tox.me", 33445, "invalid_key"};
 
     auto result = config.to_bootstrap_node();
     EXPECT_FALSE(result.has_value());

@@ -2,10 +2,6 @@
 
 #include <toxcore/tox.h>
 
-#include "toxtunnel/tox/bootstrap_source.hpp"
-#include "toxtunnel/tox/types.hpp"
-#include "toxtunnel/util/expected.hpp"
-
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +13,10 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+
+#include "toxtunnel/tox/bootstrap_source.hpp"
+#include "toxtunnel/tox/types.hpp"
+#include "toxtunnel/util/expected.hpp"
 
 namespace toxtunnel::tox {
 
@@ -47,8 +47,7 @@ using FriendRequestCallback =
 ///
 /// @param friend_number  The friend number.
 /// @param connected      True if the friend came online, false if they went offline.
-using FriendConnectionCallback =
-    std::function<void(uint32_t friend_number, bool connected)>;
+using FriendConnectionCallback = std::function<void(uint32_t friend_number, bool connected)>;
 
 /// Called when a lossless packet is received from a friend.
 ///
@@ -70,8 +69,7 @@ using FriendLossyPacketCallback =
 ///
 /// @param friend_number  The friend number who sent the message.
 /// @param message        The text message.
-using FriendMessageCallback =
-    std::function<void(uint32_t friend_number, std::string_view message)>;
+using FriendMessageCallback = std::function<void(uint32_t friend_number, std::string_view message)>;
 
 /// Called when this node's own connection status to the DHT changes.
 ///
@@ -130,9 +128,9 @@ struct ToxAdapterConfig {
 
 /// Represents the connection state of a friend.
 enum class FriendState : uint8_t {
-    None,          ///< No established connection.
-    TCP,           ///< Connected via TCP relay.
-    UDP,           ///< Connected directly via UDP.
+    None,  ///< No established connection.
+    TCP,   ///< Connected via TCP relay.
+    UDP,   ///< Connected directly via UDP.
 };
 
 /// Information about a known friend.
@@ -224,9 +222,8 @@ class ToxAdapter {
 
     /// Resolve bootstrap nodes for a config without touching a live Tox instance.
     [[nodiscard]] static util::Expected<std::vector<BootstrapNode>, std::string>
-    resolve_bootstrap_nodes_for_config(
-        const ToxAdapterConfig& config,
-        BootstrapSource::Fetcher fetcher = {});
+    resolve_bootstrap_nodes_for_config(const ToxAdapterConfig& config,
+                                       BootstrapSource::Fetcher fetcher = {});
 
     /// Add a single bootstrap node at runtime and attempt to connect.
     ///
@@ -260,16 +257,16 @@ class ToxAdapter {
     /// Add a friend by their full Tox ID and attach a message.
     ///
     /// @return The friend number on success, or an error string.
-    [[nodiscard]] util::Expected<uint32_t, std::string>
-    add_friend(const ToxId& tox_id, std::string_view message = "toxtunnel");
+    [[nodiscard]] util::Expected<uint32_t, std::string> add_friend(
+        const ToxId& tox_id, std::string_view message = "toxtunnel");
 
     /// Add a friend by their full Tox ID without sending a friend request.
     ///
     /// Use this when you have already exchanged friend requests out-of-band.
     ///
     /// @return The friend number on success, or an error string.
-    [[nodiscard]] util::Expected<uint32_t, std::string>
-    add_friend_norequest(const PublicKeyArray& public_key);
+    [[nodiscard]] util::Expected<uint32_t, std::string> add_friend_norequest(
+        const PublicKeyArray& public_key);
 
     /// Remove a friend.
     ///
@@ -283,12 +280,12 @@ class ToxAdapter {
     [[nodiscard]] FriendState get_friend_connection_status(uint32_t friend_number) const;
 
     /// Get the public key for a given friend number.
-    [[nodiscard]] util::Expected<PublicKeyArray, std::string>
-    get_friend_public_key(uint32_t friend_number) const;
+    [[nodiscard]] util::Expected<PublicKeyArray, std::string> get_friend_public_key(
+        uint32_t friend_number) const;
 
     /// Get the friend number for a given public key.
-    [[nodiscard]] util::Expected<uint32_t, std::string>
-    friend_by_public_key(const PublicKeyArray& public_key) const;
+    [[nodiscard]] util::Expected<uint32_t, std::string> friend_by_public_key(
+        const PublicKeyArray& public_key) const;
 
     /// Return the list of all known friend numbers.
     [[nodiscard]] std::vector<uint32_t> get_friend_list() const;
@@ -305,8 +302,7 @@ class ToxAdapter {
     /// The first byte of `data` must be in the range [160, 191].
     ///
     /// @return true on success, false on failure.
-    [[nodiscard]] bool send_lossless_packet(uint32_t friend_number,
-                                            const uint8_t* data,
+    [[nodiscard]] bool send_lossless_packet(uint32_t friend_number, const uint8_t* data,
                                             std::size_t length);
 
     /// Convenience overload accepting a vector.
@@ -318,15 +314,14 @@ class ToxAdapter {
     /// The first byte of `data` must be in the range [200, 254].
     ///
     /// @return true on success, false on failure.
-    [[nodiscard]] bool send_lossy_packet(uint32_t friend_number,
-                                         const uint8_t* data,
+    [[nodiscard]] bool send_lossy_packet(uint32_t friend_number, const uint8_t* data,
                                          std::size_t length);
 
     /// Send a text message to a friend.
     ///
     /// @return The message ID on success, or an error string.
-    [[nodiscard]] util::Expected<uint32_t, std::string>
-    send_message(uint32_t friend_number, std::string_view message);
+    [[nodiscard]] util::Expected<uint32_t, std::string> send_message(uint32_t friend_number,
+                                                                     std::string_view message);
 
     // -----------------------------------------------------------------
     // Callbacks
@@ -411,29 +406,22 @@ class ToxAdapter {
     // Static toxcore callback trampolines
     // -----------------------------------------------------------------
 
-    static void on_friend_request_cb(Tox* tox, const uint8_t* public_key,
-                                     const uint8_t* message, size_t length,
-                                     void* user_data);
+    static void on_friend_request_cb(Tox* tox, const uint8_t* public_key, const uint8_t* message,
+                                     size_t length, void* user_data);
 
     static void on_friend_connection_status_cb(Tox* tox, uint32_t friend_number,
-                                               TOX_CONNECTION connection_status,
-                                               void* user_data);
+                                               TOX_CONNECTION connection_status, void* user_data);
 
-    static void on_friend_lossless_packet_cb(Tox* tox, uint32_t friend_number,
-                                             const uint8_t* data, size_t length,
-                                             void* user_data);
+    static void on_friend_lossless_packet_cb(Tox* tox, uint32_t friend_number, const uint8_t* data,
+                                             size_t length, void* user_data);
 
-    static void on_friend_lossy_packet_cb(Tox* tox, uint32_t friend_number,
-                                          const uint8_t* data, size_t length,
-                                          void* user_data);
+    static void on_friend_lossy_packet_cb(Tox* tox, uint32_t friend_number, const uint8_t* data,
+                                          size_t length, void* user_data);
 
-    static void on_friend_message_cb(Tox* tox, uint32_t friend_number,
-                                     TOX_MESSAGE_TYPE type,
-                                     const uint8_t* message, size_t length,
-                                     void* user_data);
+    static void on_friend_message_cb(Tox* tox, uint32_t friend_number, TOX_MESSAGE_TYPE type,
+                                     const uint8_t* message, size_t length, void* user_data);
 
-    static void on_self_connection_status_cb(Tox* tox,
-                                             TOX_CONNECTION connection_status,
+    static void on_self_connection_status_cb(Tox* tox, TOX_CONNECTION connection_status,
                                              void* user_data);
 
     // -----------------------------------------------------------------
@@ -490,12 +478,9 @@ class ToxAdapter {
         bool connected = false;
     };
 
-    using CallbackEvent = std::variant<FriendRequestEvent,
-                                       FriendConnectionEvent,
-                                       FriendLosslessPacketEvent,
-                                       FriendLossyPacketEvent,
-                                       FriendMessageEvent,
-                                       SelfConnectionEvent>;
+    using CallbackEvent =
+        std::variant<FriendRequestEvent, FriendConnectionEvent, FriendLosslessPacketEvent,
+                     FriendLossyPacketEvent, FriendMessageEvent, SelfConnectionEvent>;
 
     mutable std::mutex event_mutex_;
     std::vector<CallbackEvent> pending_events_;

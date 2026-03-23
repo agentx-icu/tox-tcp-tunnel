@@ -1,7 +1,6 @@
 #pragma once
 
 #include <asio.hpp>
-
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -43,12 +42,12 @@ class Tunnel {
 
     /// Lifecycle states for a tunnel.
     enum class State : uint8_t {
-        None,          ///< Initial state; no connection attempted.
-        Connecting,    ///< TUNNEL_OPEN sent, awaiting response.
-        Connected,     ///< Tunnel is active and data can flow.
-        Disconnecting, ///< TUNNEL_CLOSE sent, awaiting drain.
-        Closed,        ///< Tunnel is fully closed.
-        Error,         ///< Tunnel encountered an error.
+        None,           ///< Initial state; no connection attempted.
+        Connecting,     ///< TUNNEL_OPEN sent, awaiting response.
+        Connected,      ///< Tunnel is active and data can flow.
+        Disconnecting,  ///< TUNNEL_CLOSE sent, awaiting drain.
+        Closed,         ///< Tunnel is fully closed.
+        Error,          ///< Tunnel encountered an error.
     };
 
     // -----------------------------------------------------------------
@@ -171,9 +170,7 @@ class TunnelImpl : public Tunnel {
     /// @param tunnel_id      Unique tunnel identifier within the friend context.
     /// @param friend_number  The toxcore friend number.
     /// @param send_window    Maximum bytes in-flight before backpressure.
-    TunnelImpl(asio::io_context& io_ctx,
-               uint16_t tunnel_id,
-               uint32_t friend_number,
+    TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t friend_number,
                std::size_t send_window = kDefaultSendWindowSize);
 
     ~TunnelImpl() override;
@@ -288,9 +285,7 @@ class TunnelImpl : public Tunnel {
     }
 
     /// Return the send window size.
-    [[nodiscard]] std::size_t send_window_size() const noexcept {
-        return send_window_size_;
-    }
+    [[nodiscard]] std::size_t send_window_size() const noexcept { return send_window_size_; }
 
     /// Return the number of bytes received (for ACK generation).
     [[nodiscard]] std::size_t bytes_received() const noexcept {

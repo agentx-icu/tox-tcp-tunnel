@@ -39,9 +39,7 @@ class TcpLoopbackTest : public ::testing::Test {
         io_ctx_->run();
     }
 
-    void TearDown() override {
-        io_ctx_->stop();
-    }
+    void TearDown() override { io_ctx_->stop(); }
 
     /// Return the underlying asio::io_context for constructing TCP objects.
     asio::io_context& io() { return io_ctx_->get_io_context(); }
@@ -148,16 +146,16 @@ TEST_F(TcpLoopbackTest, BidirectionalDataTransfer) {
     {
         auto received = std::make_shared<std::vector<uint8_t>>();
         auto target_size = c2s_payload.size();
-        auto promise_ptr = std::make_shared<std::promise<std::vector<uint8_t>>>(
-            std::move(server_data_promise));
+        auto promise_ptr =
+            std::make_shared<std::promise<std::vector<uint8_t>>>(std::move(server_data_promise));
 
-        server->set_on_data([received, target_size, promise_ptr](const uint8_t* data,
-                                                                  std::size_t len) {
-            received->insert(received->end(), data, data + len);
-            if (received->size() >= target_size) {
-                promise_ptr->set_value(*received);
-            }
-        });
+        server->set_on_data(
+            [received, target_size, promise_ptr](const uint8_t* data, std::size_t len) {
+                received->insert(received->end(), data, data + len);
+                if (received->size() >= target_size) {
+                    promise_ptr->set_value(*received);
+                }
+            });
     }
 
     // Server -> Client
@@ -168,16 +166,16 @@ TEST_F(TcpLoopbackTest, BidirectionalDataTransfer) {
     {
         auto received = std::make_shared<std::vector<uint8_t>>();
         auto target_size = s2c_payload.size();
-        auto promise_ptr = std::make_shared<std::promise<std::vector<uint8_t>>>(
-            std::move(client_data_promise));
+        auto promise_ptr =
+            std::make_shared<std::promise<std::vector<uint8_t>>>(std::move(client_data_promise));
 
-        client->set_on_data([received, target_size, promise_ptr](const uint8_t* data,
-                                                                  std::size_t len) {
-            received->insert(received->end(), data, data + len);
-            if (received->size() >= target_size) {
-                promise_ptr->set_value(*received);
-            }
-        });
+        client->set_on_data(
+            [received, target_size, promise_ptr](const uint8_t* data, std::size_t len) {
+                received->insert(received->end(), data, data + len);
+                if (received->size() >= target_size) {
+                    promise_ptr->set_value(*received);
+                }
+            });
     }
 
     // Start reading on both sides.
@@ -220,16 +218,15 @@ TEST_F(TcpLoopbackTest, MultipleConnections) {
     auto all_accepted_future = all_accepted_promise.get_future();
     bool all_accepted_notified = false;
 
-    listener->start_accept(
-        [&server_mu, &server_conns, &all_accepted_promise, &all_accepted_notified](
-            std::shared_ptr<core::TcpConnection> conn) {
-            std::lock_guard lock(server_mu);
-            server_conns.push_back(std::move(conn));
-            if (server_conns.size() == kNumClients && !all_accepted_notified) {
-                all_accepted_notified = true;
-                all_accepted_promise.set_value();
-            }
-        });
+    listener->start_accept([&server_mu, &server_conns, &all_accepted_promise,
+                            &all_accepted_notified](std::shared_ptr<core::TcpConnection> conn) {
+        std::lock_guard lock(server_mu);
+        server_conns.push_back(std::move(conn));
+        if (server_conns.size() == kNumClients && !all_accepted_notified) {
+            all_accepted_notified = true;
+            all_accepted_promise.set_value();
+        }
+    });
 
     // Connect N clients.
     std::vector<std::shared_ptr<core::TcpConnection>> clients;
@@ -240,9 +237,8 @@ TEST_F(TcpLoopbackTest, MultipleConnections) {
         auto promise = std::make_shared<std::promise<std::error_code>>();
         connect_futures.push_back(promise->get_future());
 
-        client->async_connect(loopback(port), [promise](const std::error_code& ec) {
-            promise->set_value(ec);
-        });
+        client->async_connect(loopback(port),
+                              [promise](const std::error_code& ec) { promise->set_value(ec); });
 
         clients.push_back(std::move(client));
     }
@@ -360,10 +356,9 @@ TEST_F(TcpLoopbackTest, GracefulClose) {
     std::promise<std::error_code> server_disconnect_promise;
     auto server_disconnect_future = server_disconnect_promise.get_future();
 
-    server->set_on_disconnect(
-        [&server_disconnect_promise](const std::error_code& ec) {
-            server_disconnect_promise.set_value(ec);
-        });
+    server->set_on_disconnect([&server_disconnect_promise](const std::error_code& ec) {
+        server_disconnect_promise.set_value(ec);
+    });
 
     server->start_read();
 

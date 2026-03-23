@@ -82,8 +82,7 @@ class TunnelServer {
     // -----------------------------------------------------------------
 
     /// Handle incoming friend requests by auto-accepting them.
-    void on_friend_request(const tox::PublicKeyArray& public_key,
-                           std::string_view message);
+    void on_friend_request(const tox::PublicKeyArray& public_key, std::string_view message);
 
     /// Handle friend connection status changes.
     /// Creates a TunnelManager when a friend comes online,
@@ -93,9 +92,7 @@ class TunnelServer {
     /// Handle incoming lossless packets.
     /// Deserializes the ProtocolFrame and routes it to the
     /// friend's TunnelManager.
-    void on_lossless_packet(uint32_t friend_number,
-                            const uint8_t* data,
-                            std::size_t length);
+    void on_lossless_packet(uint32_t friend_number, const uint8_t* data, std::size_t length);
 
     /// Handle self connection status changes (DHT connectivity).
     void on_self_connection(bool connected);
@@ -112,12 +109,10 @@ class TunnelServer {
 
     /// Handle a TUNNEL_OPEN request: check access rules,
     /// create TcpConnection, and wire data flow.
-    void handle_tunnel_open(uint32_t friend_number,
-                            const tunnel::ProtocolFrame& frame);
+    void handle_tunnel_open(uint32_t friend_number, const tunnel::ProtocolFrame& frame);
 
     /// Wire a TCP connection to a tunnel for bidirectional data flow.
-    void wire_tcp_to_tunnel(uint32_t friend_number,
-                            uint16_t tunnel_id,
+    void wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id,
                             std::shared_ptr<core::TcpConnection> tcp_conn);
 
     /// Get the hex public key string for a friend number.
@@ -142,8 +137,9 @@ class TunnelServer {
     /// Map of friend_number -> TunnelManager.
     std::unordered_map<uint32_t, std::unique_ptr<tunnel::TunnelManager>> managers_;
 
-    /// Protects managers_ map.
-    mutable std::mutex managers_mutex_;
+    /// Protects managers_ map. Recursive to avoid self-deadlock when
+    /// callbacks (e.g., on_disconnect) re-enter while the lock is held.
+    mutable std::recursive_mutex managers_mutex_;
 
     /// Whether the server is running.
     std::atomic<bool> running_{false};

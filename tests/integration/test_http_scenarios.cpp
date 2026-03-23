@@ -32,9 +32,8 @@ class HttpTunnelTest : public ::testing::Test {
     void SetUp() override {
         // Create io_context and run it on a background thread.
         io_ctx_ = std::make_unique<asio::io_context>();
-        work_guard_ =
-            std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
-                io_ctx_->get_executor());
+        work_guard_ = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
+            io_ctx_->get_executor());
         io_thread_ = std::thread([this] { io_ctx_->run(); });
 
         // Create client and server TunnelManagers.
@@ -42,23 +41,21 @@ class HttpTunnelTest : public ::testing::Test {
         server_mgr_ = std::make_unique<tunnel::TunnelManager>(*io_ctx_);
 
         // Wire send handlers: client -> server, server -> client.
-        client_mgr_->set_send_handler(
-            [this](const std::vector<uint8_t>& data) -> bool {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    server_mgr_->route_frame(frame.value());
-                }
-                return frame.has_value();
-            });
+        client_mgr_->set_send_handler([this](const std::vector<uint8_t>& data) -> bool {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                server_mgr_->route_frame(frame.value());
+            }
+            return frame.has_value();
+        });
 
-        server_mgr_->set_send_handler(
-            [this](const std::vector<uint8_t>& data) -> bool {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    client_mgr_->route_frame(frame.value());
-                }
-                return frame.has_value();
-            });
+        server_mgr_->set_send_handler([this](const std::vector<uint8_t>& data) -> bool {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                client_mgr_->route_frame(frame.value());
+            }
+            return frame.has_value();
+        });
 
         // Mock HTTP server behavior on the server side.
         http_request_received_ = false;
@@ -83,8 +80,10 @@ class HttpTunnelTest : public ::testing::Test {
                 }
             });
         };
-        if (client_mgr_) clear_callbacks(*client_mgr_);
-        if (server_mgr_) clear_callbacks(*server_mgr_);
+        if (client_mgr_)
+            clear_callbacks(*client_mgr_);
+        if (server_mgr_)
+            clear_callbacks(*server_mgr_);
 
         // Stop the io_context
         work_guard_.reset();
@@ -95,9 +94,7 @@ class HttpTunnelTest : public ::testing::Test {
     }
 
     /// Allow pending io_context handlers to execute.
-    static void poll() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    static void poll() { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
 
     // Simulate HTTP request parsing
     void parse_http_request(const std::vector<uint8_t>& data) {
@@ -121,7 +118,8 @@ class HttpTunnelTest : public ::testing::Test {
             size_t pos = 0;
             while (pos < headers_str.length()) {
                 size_t end = headers_str.find("\r\n", pos);
-                if (end == std::string::npos) break;
+                if (end == std::string::npos)
+                    break;
 
                 std::string header = headers_str.substr(pos, end - pos);
                 if (!header.empty()) {
@@ -152,8 +150,8 @@ class HttpTunnelTest : public ::testing::Test {
     }
 
     // Helper: create a connected tunnel pair and return pointers to both tunnels
-    std::pair<tunnel::TunnelImpl*, tunnel::TunnelImpl*>
-    create_connected_tunnel_pair(uint16_t& tid_out) {
+    std::pair<tunnel::TunnelImpl*, tunnel::TunnelImpl*> create_connected_tunnel_pair(
+        uint16_t& tid_out) {
         const uint16_t tid = client_mgr_->allocate_tunnel_id();
         constexpr uint32_t kFriendNumber = 1;
 
@@ -161,13 +159,12 @@ class HttpTunnelTest : public ::testing::Test {
         auto client_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
         auto* client_raw = client_tunnel.get();
 
-        client_tunnel->set_on_send_to_tox(
-            [this](std::span<const uint8_t> data) {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    (void)client_mgr_->send_frame(frame.value());
-                }
-            });
+        client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                (void)client_mgr_->send_frame(frame.value());
+            }
+        });
 
         client_mgr_->add_tunnel(tid, std::move(client_tunnel));
         (void)client_raw->open("127.0.0.1", 9090);
@@ -176,13 +173,12 @@ class HttpTunnelTest : public ::testing::Test {
         auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
         auto* server_raw = server_tunnel.get();
 
-        server_tunnel->set_on_send_to_tox(
-            [this](std::span<const uint8_t> data) {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    (void)server_mgr_->send_frame(frame.value());
-                }
-            });
+        server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                (void)server_mgr_->send_frame(frame.value());
+            }
+        });
 
         server_tunnel->set_state(tunnel::Tunnel::State::Connected);
         server_mgr_->add_tunnel(tid, std::move(server_tunnel));
@@ -198,8 +194,7 @@ class HttpTunnelTest : public ::testing::Test {
     }
 
     std::unique_ptr<asio::io_context> io_ctx_;
-    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>>
-        work_guard_;
+    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work_guard_;
     std::thread io_thread_;
     std::unique_ptr<tunnel::TunnelManager> client_mgr_;
     std::unique_ptr<tunnel::TunnelManager> server_mgr_;
@@ -225,16 +220,16 @@ TEST_F(HttpTunnelTest, BasicHttpRequestResponse) {
     ASSERT_TRUE(server_tunnel);
 
     std::vector<uint8_t> received_request;
-    server_tunnel->set_on_data_for_tcp(
-        [&received_request](std::span<const uint8_t> data) {
-            received_request.insert(received_request.end(), data.begin(), data.end());
-        });
+    server_tunnel->set_on_data_for_tcp([&received_request](std::span<const uint8_t> data) {
+        received_request.insert(received_request.end(), data.begin(), data.end());
+    });
 
-    const std::string http_request = "GET /api/test HTTP/1.1\r\n"
-                                     "Host: localhost\r\n"
-                                     "User-Agent: TestClient\r\n"
-                                     "Content-Length: 0\r\n"
-                                     "\r\n";
+    const std::string http_request =
+        "GET /api/test HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "User-Agent: TestClient\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
     EXPECT_TRUE(client_tunnel->send_data_to_tox(
         std::vector<uint8_t>(http_request.begin(), http_request.end())));
 
@@ -267,12 +262,13 @@ TEST_F(HttpTunnelTest, HttpRequestPost) {
     ASSERT_TRUE(server_tunnel);
 
     // Client sends POST request
-    const std::string post_request = "POST /api/data HTTP/1.1\r\n"
-                                    "Host: localhost\r\n"
-                                    "Content-Type: application/json\r\n"
-                                    "Content-Length: 26\r\n"
-                                    "\r\n"
-                                    "{\"name\":\"test\",\"value\":123}";
+    const std::string post_request =
+        "POST /api/data HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 26\r\n"
+        "\r\n"
+        "{\"name\":\"test\",\"value\":123}";
     EXPECT_TRUE(client_tunnel->send_data_to_tox(
         std::vector<uint8_t>(post_request.begin(), post_request.end())));
 
@@ -318,17 +314,17 @@ TEST_F(HttpTunnelTest, HttpStreaming) {
 
     // Server side: receive client request
     std::vector<uint8_t> server_received;
-    server_tunnel->set_on_data_for_tcp(
-        [&server_received](std::span<const uint8_t> data) {
-            server_received.insert(server_received.end(), data.begin(), data.end());
-        });
+    server_tunnel->set_on_data_for_tcp([&server_received](std::span<const uint8_t> data) {
+        server_received.insert(server_received.end(), data.begin(), data.end());
+    });
 
     // Client requests large response
-    const std::string request = "GET /large-file HTTP/1.1\r\n"
-                               "Host: localhost\r\n"
-                               "\r\n";
-    EXPECT_TRUE(client_tunnel->send_data_to_tox(
-        std::vector<uint8_t>(request.begin(), request.end())));
+    const std::string request =
+        "GET /large-file HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    EXPECT_TRUE(
+        client_tunnel->send_data_to_tox(std::vector<uint8_t>(request.begin(), request.end())));
 
     poll();
 
@@ -337,12 +333,13 @@ TEST_F(HttpTunnelTest, HttpStreaming) {
     EXPECT_TRUE(server_req_str.find("GET /large-file") != std::string::npos);
 
     // Server sends response in chunks
-    const std::string chunk1 = "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: application/octet-stream\r\n"
-                             "Transfer-Encoding: chunked\r\n"
-                             "\r\n";
-    EXPECT_TRUE(server_tunnel->send_data_to_tox(
-        std::vector<uint8_t>(chunk1.begin(), chunk1.end())));
+    const std::string chunk1 =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n";
+    EXPECT_TRUE(
+        server_tunnel->send_data_to_tox(std::vector<uint8_t>(chunk1.begin(), chunk1.end())));
 
     // Send actual data in chunks
     for (int i = 0; i < 5; ++i) {
@@ -378,13 +375,11 @@ TEST_F(HttpTunnelTest, HttpKeepAlive) {
     const std::vector<std::string> requests = {
         "GET /first HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
         "GET /second HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
-        "GET /third HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    };
+        "GET /third HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"};
 
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& req = requests[i];
-        EXPECT_TRUE(client_tunnel->send_data_to_tox(
-            std::vector<uint8_t>(req.begin(), req.end())));
+        EXPECT_TRUE(client_tunnel->send_data_to_tox(std::vector<uint8_t>(req.begin(), req.end())));
         poll();
 
         // Server responds
@@ -409,11 +404,12 @@ TEST_F(HttpTunnelTest, HttpErrorResponses) {
     ASSERT_TRUE(server_tunnel);
 
     // Client requests non-existent resource
-    const std::string request = "GET /not-found HTTP/1.1\r\n"
-                               "Host: localhost\r\n"
-                               "\r\n";
-    EXPECT_TRUE(client_tunnel->send_data_to_tox(
-        std::vector<uint8_t>(request.begin(), request.end())));
+    const std::string request =
+        "GET /not-found HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    EXPECT_TRUE(
+        client_tunnel->send_data_to_tox(std::vector<uint8_t>(request.begin(), request.end())));
 
     poll();
 
@@ -439,26 +435,29 @@ TEST_F(HttpTunnelTest, HttpProxyBehavior) {
     ASSERT_TRUE(server_tunnel);
 
     // Client sends CONNECT request (proxy method)
-    const std::string connect_request = "CONNECT example.com:443 HTTP/1.1\r\n"
-                                      "Host: example.com\r\n"
-                                      "\r\n";
+    const std::string connect_request =
+        "CONNECT example.com:443 HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "\r\n";
     EXPECT_TRUE(client_tunnel->send_data_to_tox(
         std::vector<uint8_t>(connect_request.begin(), connect_request.end())));
 
     poll();
 
     // Server responds with 200 Connection Established
-    const std::string proxy_response = "HTTP/1.1 200 Connection Established\r\n"
-                                       "\r\n";
+    const std::string proxy_response =
+        "HTTP/1.1 200 Connection Established\r\n"
+        "\r\n";
     EXPECT_TRUE(server_tunnel->send_data_to_tox(
         std::vector<uint8_t>(proxy_response.begin(), proxy_response.end())));
 
     poll();
 
     // Now send HTTPS request (should be forwarded as-is, encrypted)
-    const std::string https_request = "GET / HTTP/1.1\r\n"
-                                     "Host: example.com\r\n"
-                                     "\r\n";
+    const std::string https_request =
+        "GET / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "\r\n";
     EXPECT_TRUE(client_tunnel->send_data_to_tox(
         std::vector<uint8_t>(https_request.begin(), https_request.end())));
 
@@ -493,15 +492,12 @@ TEST_F(HttpTunnelTest, MultipleHttpStreams) {
         });
 
     // Client sends multiple requests quickly
-    const std::vector<std::string> requests = {
-        "GET /api/1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        "GET /api/2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        "GET /api/3 HTTP/1.1\r\nHost: localhost\r\n\r\n"
-    };
+    const std::vector<std::string> requests = {"GET /api/1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                                               "GET /api/2 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                                               "GET /api/3 HTTP/1.1\r\nHost: localhost\r\n\r\n"};
 
     for (const auto& req : requests) {
-        EXPECT_TRUE(client_tunnel->send_data_to_tox(
-            std::vector<uint8_t>(req.begin(), req.end())));
+        EXPECT_TRUE(client_tunnel->send_data_to_tox(std::vector<uint8_t>(req.begin(), req.end())));
     }
 
     poll();
@@ -511,7 +507,8 @@ TEST_F(HttpTunnelTest, MultipleHttpStreams) {
         std::lock_guard lock(requests_mutex);
         EXPECT_EQ(received_requests.size(), 3u);
         for (size_t i = 0; i < 3; ++i) {
-            EXPECT_TRUE(received_requests[i].find("/api/" + std::to_string(i + 1)) != std::string::npos);
+            EXPECT_TRUE(received_requests[i].find("/api/" + std::to_string(i + 1)) !=
+                        std::string::npos);
         }
     }
 
@@ -535,11 +532,12 @@ TEST_F(HttpTunnelTest, HttpRequestTimeout) {
     ASSERT_TRUE(server_tunnel);
 
     // Client sends request but doesn't receive response
-    const std::string request = "GET /timeout-test HTTP/1.1\r\n"
-                               "Host: localhost\r\n"
-                               "\r\n";
-    EXPECT_TRUE(client_tunnel->send_data_to_tox(
-        std::vector<uint8_t>(request.begin(), request.end())));
+    const std::string request =
+        "GET /timeout-test HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "\r\n";
+    EXPECT_TRUE(
+        client_tunnel->send_data_to_tox(std::vector<uint8_t>(request.begin(), request.end())));
 
     poll();
 
@@ -563,26 +561,31 @@ TEST_F(HttpTunnelTest, HttpRequestCompression) {
     ASSERT_TRUE(server_tunnel);
 
     // Client requests compressed response
-    const std::string request = "GET /compressed HTTP/1.1\r\n"
-                               "Host: localhost\r\n"
-                               "Accept-Encoding: gzip\r\n"
-                               "\r\n";
-    EXPECT_TRUE(client_tunnel->send_data_to_tox(
-        std::vector<uint8_t>(request.begin(), request.end())));
+    const std::string request =
+        "GET /compressed HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Accept-Encoding: gzip\r\n"
+        "\r\n";
+    EXPECT_TRUE(
+        client_tunnel->send_data_to_tox(std::vector<uint8_t>(request.begin(), request.end())));
 
     poll();
 
     // Server sends compressed response
-    std::string original = "This is a compressed response that should be decompressed by the client";
-    std::string response = "HTTP/1.1 200 OK\r\n"
-                          "Content-Encoding: gzip\r\n"
-                          "Content-Type: text/plain\r\n"
-                          "Content-Length: " + std::to_string(original.length()) + "\r\n"
-                          "\r\n" +
-                          original;
+    std::string original =
+        "This is a compressed response that should be decompressed by the client";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Encoding: gzip\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: " +
+        std::to_string(original.length()) +
+        "\r\n"
+        "\r\n" +
+        original;
 
-    EXPECT_TRUE(server_tunnel->send_data_to_tox(
-        std::vector<uint8_t>(response.begin(), response.end())));
+    EXPECT_TRUE(
+        server_tunnel->send_data_to_tox(std::vector<uint8_t>(response.begin(), response.end())));
 
     poll();
 
@@ -604,15 +607,18 @@ TEST_F(HttpTunnelTest, LargeHttpRequest) {
     // Create moderate-sized request body (1KB to avoid timeout)
     std::string body(1024, 'A');
 
-    std::string request = "POST /upload HTTP/1.1\r\n"
-                         "Host: localhost\r\n"
-                         "Content-Type: application/octet-stream\r\n"
-                         "Content-Length: " + std::to_string(body.length()) + "\r\n"
-                         "\r\n" +
-                         body;
+    std::string request =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: " +
+        std::to_string(body.length()) +
+        "\r\n"
+        "\r\n" +
+        body;
 
-    EXPECT_TRUE(client_tunnel->send_data_to_tox(
-        std::vector<uint8_t>(request.begin(), request.end())));
+    EXPECT_TRUE(
+        client_tunnel->send_data_to_tox(std::vector<uint8_t>(request.begin(), request.end())));
 
     poll();
 

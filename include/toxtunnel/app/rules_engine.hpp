@@ -1,11 +1,11 @@
 #pragma once
 
+#include <yaml-cpp/yaml.h>
+
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <yaml-cpp/yaml.h>
 
 #include "toxtunnel/tox/types.hpp"
 #include "toxtunnel/util/expected.hpp"
@@ -20,8 +20,8 @@ namespace toxtunnel {
 /// Represents a target specification in an access rule.
 /// Can match hosts (with optional wildcard patterns) and ports.
 struct TargetSpec {
-    std::string host;                    ///< Host pattern (supports '*' wildcards)
-    std::vector<uint16_t> ports;         ///< List of allowed/denied ports (empty = all ports)
+    std::string host;             ///< Host pattern (supports '*' wildcards)
+    std::vector<uint16_t> ports;  ///< List of allowed/denied ports (empty = all ports)
 
     bool operator==(const TargetSpec& other) const {
         return host == other.host && ports == other.ports;
@@ -31,51 +31,45 @@ struct TargetSpec {
 /// Represents a source specification in an access rule.
 /// Can match IP addresses (with optional wildcard patterns) and ports.
 struct SourceSpec {
-    std::optional<std::string> ip;       ///< IP pattern (supports '*' wildcards, nullopt = any)
-    std::optional<uint16_t> port;        ///< Port (nullopt = any port)
+    std::optional<std::string> ip;  ///< IP pattern (supports '*' wildcards, nullopt = any)
+    std::optional<uint16_t> port;   ///< Port (nullopt = any port)
 
-    bool operator==(const SourceSpec& other) const {
-        return ip == other.ip && port == other.port;
-    }
+    bool operator==(const SourceSpec& other) const { return ip == other.ip && port == other.port; }
 };
 
 /// Represents an access rule for a specific friend.
 /// A friend can have multiple allow and deny target specifications.
 struct FriendRule {
-    std::string friend_pk;                        ///< Friend's hex-encoded public key (64 chars)
-    std::vector<TargetSpec> allow;                ///< Targets this friend is allowed to access
-    std::vector<TargetSpec> deny;                 ///< Targets this friend is denied from accessing
+    std::string friend_pk;          ///< Friend's hex-encoded public key (64 chars)
+    std::vector<TargetSpec> allow;  ///< Targets this friend is allowed to access
+    std::vector<TargetSpec> deny;   ///< Targets this friend is denied from accessing
 
     bool operator==(const FriendRule& other) const {
-        return friend_pk == other.friend_pk &&
-               allow == other.allow &&
-               deny == other.deny;
+        return friend_pk == other.friend_pk && allow == other.allow && deny == other.deny;
     }
 };
 
 /// Request context for access evaluation.
 /// Contains information about the incoming tunnel request.
 struct AccessRequest {
-    std::string friend_pk;    ///< Friend's hex-encoded public key (64 chars)
-    std::string target_host;  ///< Target host being requested
-    uint16_t target_port;     ///< Target port being requested
-    std::optional<std::string> source_ip;   ///< Optional source IP of the request
-    std::optional<uint16_t> source_port;    ///< Optional source port
+    std::string friend_pk;                 ///< Friend's hex-encoded public key (64 chars)
+    std::string target_host;               ///< Target host being requested
+    uint16_t target_port;                  ///< Target port being requested
+    std::optional<std::string> source_ip;  ///< Optional source IP of the request
+    std::optional<uint16_t> source_port;   ///< Optional source port
 
     bool operator==(const AccessRequest& other) const {
-        return friend_pk == other.friend_pk &&
-               target_host == other.target_host &&
-               target_port == other.target_port &&
-               source_ip == other.source_ip &&
+        return friend_pk == other.friend_pk && target_host == other.target_host &&
+               target_port == other.target_port && source_ip == other.source_ip &&
                source_port == other.source_port;
     }
 };
 
 /// Result of an access evaluation.
 enum class AccessResult {
-    Allowed,   ///< Access is explicitly allowed
-    Denied,    ///< Access is explicitly denied
-    Default,   ///< No matching rule, use default policy
+    Allowed,  ///< Access is explicitly allowed
+    Denied,   ///< Access is explicitly denied
+    Default,  ///< No matching rule, use default policy
 };
 
 // ---------------------------------------------------------------------------
@@ -105,7 +99,7 @@ enum class AccessResult {
 ///   }
 /// @endcode
 class RulesEngine {
-public:
+   public:
     /// Default constructor creates an empty ruleset (default deny all).
     RulesEngine() = default;
 
@@ -156,21 +150,20 @@ public:
 
     /// Check if a port is in the allowed list.
     /// Empty list means all ports are allowed.
-    [[nodiscard]] static bool port_allowed(uint16_t port, const std::vector<uint16_t>& allowed_ports);
+    [[nodiscard]] static bool port_allowed(uint16_t port,
+                                           const std::vector<uint16_t>& allowed_ports);
 
-private:
+   private:
     std::vector<FriendRule> rules_;
 
     /// Find rules for a specific friend.
     [[nodiscard]] const FriendRule* find_friend_rule(const std::string& friend_pk) const;
 
     /// Check if a target matches a target specification.
-    [[nodiscard]] static bool target_matches(
-        const AccessRequest& request, const TargetSpec& spec);
+    [[nodiscard]] static bool target_matches(const AccessRequest& request, const TargetSpec& spec);
 
     /// Check if a source matches a source specification.
-    [[nodiscard]] static bool source_matches(
-        const AccessRequest& request, const SourceSpec& spec);
+    [[nodiscard]] static bool source_matches(const AccessRequest& request, const SourceSpec& spec);
 };
 
 // ---------------------------------------------------------------------------

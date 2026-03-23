@@ -35,9 +35,8 @@ class TunnelDataFlowTest : public ::testing::Test {
     void SetUp() override {
         // Create io_context and run it on a background thread.
         io_ctx_ = std::make_unique<asio::io_context>();
-        work_guard_ =
-            std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
-                io_ctx_->get_executor());
+        work_guard_ = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
+            io_ctx_->get_executor());
         io_thread_ = std::thread([this] { io_ctx_->run(); });
 
         // Create client and server TunnelManagers.
@@ -46,23 +45,21 @@ class TunnelDataFlowTest : public ::testing::Test {
 
         // Wire send handlers: client -> server, server -> client.
         // The send handler receives serialized frame data.
-        client_mgr_->set_send_handler(
-            [this](const std::vector<uint8_t>& data) -> bool {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    server_mgr_->route_frame(frame.value());
-                }
-                return frame.has_value();
-            });
+        client_mgr_->set_send_handler([this](const std::vector<uint8_t>& data) -> bool {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                server_mgr_->route_frame(frame.value());
+            }
+            return frame.has_value();
+        });
 
-        server_mgr_->set_send_handler(
-            [this](const std::vector<uint8_t>& data) -> bool {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    client_mgr_->route_frame(frame.value());
-                }
-                return frame.has_value();
-            });
+        server_mgr_->set_send_handler([this](const std::vector<uint8_t>& data) -> bool {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                client_mgr_->route_frame(frame.value());
+            }
+            return frame.has_value();
+        });
     }
 
     void TearDown() override {
@@ -80,8 +77,10 @@ class TunnelDataFlowTest : public ::testing::Test {
                 }
             });
         };
-        if (client_mgr_) clear_callbacks(*client_mgr_);
-        if (server_mgr_) clear_callbacks(*server_mgr_);
+        if (client_mgr_)
+            clear_callbacks(*client_mgr_);
+        if (server_mgr_)
+            clear_callbacks(*server_mgr_);
 
         // Stop the io_context and join the thread.
         work_guard_.reset();
@@ -96,9 +95,7 @@ class TunnelDataFlowTest : public ::testing::Test {
     }
 
     /// Allow pending io_context handlers to execute.
-    void poll() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    void poll() { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
 
     // -----------------------------------------------------------------------
     // Helper: create a connected tunnel pair
@@ -120,19 +117,17 @@ class TunnelDataFlowTest : public ::testing::Test {
         constexpr uint32_t kFriendNumber = 1;
 
         // --- Client side ---
-        auto client_tunnel =
-            std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
+        auto client_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
 
         // Wire the tunnel's on_send_to_tox so frames are forwarded through
         // the client TunnelManager's send_handler (which routes to server).
         auto* client_raw = client_tunnel.get();
-        client_tunnel->set_on_send_to_tox(
-            [this](std::span<const uint8_t> data) {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    (void)client_mgr_->send_frame(frame.value());
-                }
-            });
+        client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                (void)client_mgr_->send_frame(frame.value());
+            }
+        });
 
         client_mgr_->add_tunnel(tid, std::move(client_tunnel));
 
@@ -145,17 +140,15 @@ class TunnelDataFlowTest : public ::testing::Test {
         // TUNNEL_OPEN via route_frame.  However, handle_incoming_open only
         // reserves the ID; it does not create a TunnelImpl.  We therefore
         // create one manually (simulating the server application layer).
-        auto server_tunnel =
-            std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
+        auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
 
         auto* server_raw = server_tunnel.get();
-        server_tunnel->set_on_send_to_tox(
-            [this](std::span<const uint8_t> data) {
-                auto frame = tunnel::ProtocolFrame::deserialize(data);
-                if (frame) {
-                    (void)server_mgr_->send_frame(frame.value());
-                }
-            });
+        server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+            auto frame = tunnel::ProtocolFrame::deserialize(data);
+            if (frame) {
+                (void)server_mgr_->send_frame(frame.value());
+            }
+        });
 
         // Mark server tunnel as Connected (server accepted the open).
         server_tunnel->set_state(tunnel::Tunnel::State::Connected);
@@ -177,8 +170,7 @@ class TunnelDataFlowTest : public ::testing::Test {
     }
 
     std::unique_ptr<asio::io_context> io_ctx_;
-    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>>
-        work_guard_;
+    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work_guard_;
     std::thread io_thread_;
     std::unique_ptr<tunnel::TunnelManager> client_mgr_;
     std::unique_ptr<tunnel::TunnelManager> server_mgr_;
@@ -198,8 +190,7 @@ TEST_F(TunnelDataFlowTest, TunnelPairOpenAckLifecycle) {
     std::mutex client_states_mu;
 
     // --- Client creates tunnel and calls open() ---
-    auto client_tunnel =
-        std::make_unique<tunnel::TunnelImpl>(*io_ctx_, kTunnelId, kFriendNumber);
+    auto client_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, kTunnelId, kFriendNumber);
     auto* client_raw = client_tunnel.get();
 
     client_tunnel->set_on_state_change(
@@ -209,13 +200,12 @@ TEST_F(TunnelDataFlowTest, TunnelPairOpenAckLifecycle) {
         });
 
     // Wire on_send_to_tox -> client manager send_frame -> server route_frame.
-    client_tunnel->set_on_send_to_tox(
-        [this](std::span<const uint8_t> data) {
-            auto frame = tunnel::ProtocolFrame::deserialize(data);
-            if (frame) {
-                (void)client_mgr_->send_frame(frame.value());
-            }
-        });
+    client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+        auto frame = tunnel::ProtocolFrame::deserialize(data);
+        if (frame) {
+            (void)client_mgr_->send_frame(frame.value());
+        }
+    });
 
     client_mgr_->add_tunnel(kTunnelId, std::move(client_tunnel));
 
@@ -231,17 +221,15 @@ TEST_F(TunnelDataFlowTest, TunnelPairOpenAckLifecycle) {
     // creates its own internal tunnel that would conflict with ours).
 
     // Create server-side tunnel.
-    auto server_tunnel =
-        std::make_unique<tunnel::TunnelImpl>(*io_ctx_, kTunnelId, kFriendNumber);
+    auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, kTunnelId, kFriendNumber);
     auto* server_raw = server_tunnel.get();
 
-    server_tunnel->set_on_send_to_tox(
-        [this](std::span<const uint8_t> data) {
-            auto frame = tunnel::ProtocolFrame::deserialize(data);
-            if (frame) {
-                (void)server_mgr_->send_frame(frame.value());
-            }
-        });
+    server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+        auto frame = tunnel::ProtocolFrame::deserialize(data);
+        if (frame) {
+            (void)server_mgr_->send_frame(frame.value());
+        }
+    });
 
     server_tunnel->set_state(tunnel::Tunnel::State::Connected);
     server_mgr_->add_tunnel(kTunnelId, std::move(server_tunnel));
@@ -348,13 +336,11 @@ TEST_F(TunnelDataFlowTest, TunnelPairGracefulClose) {
     });
 
     std::atomic<bool> server_state_changed_to_closed{false};
-    server_raw->set_on_state_change(
-        [&server_state_changed_to_closed](tunnel::Tunnel::State s) {
-            if (s == tunnel::Tunnel::State::Closed) {
-                server_state_changed_to_closed.store(true,
-                                                     std::memory_order_release);
-            }
-        });
+    server_raw->set_on_state_change([&server_state_changed_to_closed](tunnel::Tunnel::State s) {
+        if (s == tunnel::Tunnel::State::Closed) {
+            server_state_changed_to_closed.store(true, std::memory_order_release);
+        }
+    });
 
     // Client closes the tunnel.  This sends TUNNEL_CLOSE via the wired
     // transport, which routes to the server tunnel's handle_frame.
@@ -384,19 +370,17 @@ TEST_F(TunnelDataFlowTest, TunnelPairErrorHandling) {
     // Install error callback on the client to observe the error.
     std::optional<tunnel::TunnelErrorPayload> received_error;
     std::mutex error_mu;
-    client_raw->set_on_error(
-        [&received_error, &error_mu](const tunnel::TunnelErrorPayload& err) {
-            std::lock_guard lock(error_mu);
-            received_error = err;
-        });
+    client_raw->set_on_error([&received_error, &error_mu](const tunnel::TunnelErrorPayload& err) {
+        std::lock_guard lock(error_mu);
+        received_error = err;
+    });
 
     std::atomic<bool> client_error_state{false};
-    client_raw->set_on_state_change(
-        [&client_error_state](tunnel::Tunnel::State s) {
-            if (s == tunnel::Tunnel::State::Error) {
-                client_error_state.store(true, std::memory_order_release);
-            }
-        });
+    client_raw->set_on_state_change([&client_error_state](tunnel::Tunnel::State s) {
+        if (s == tunnel::Tunnel::State::Error) {
+            client_error_state.store(true, std::memory_order_release);
+        }
+    });
 
     // Server sends an error frame to the client.
     server_raw->send_error(42, "Connection refused by target");
@@ -442,8 +426,7 @@ TEST_F(TunnelDataFlowTest, MultipleTunnelsOnSameManager) {
     // Create all pairs.
     for (std::size_t i = 0; i < kNumTunnels; ++i) {
         auto pair = std::make_unique<TunnelPair>();
-        pair->tunnel_id =
-            create_connected_pair(pair->client, pair->server);
+        pair->tunnel_id = create_connected_pair(pair->client, pair->server);
         pairs.push_back(std::move(pair));
     }
 
@@ -453,19 +436,15 @@ TEST_F(TunnelDataFlowTest, MultipleTunnelsOnSameManager) {
 
     // Wire data-for-tcp callbacks.
     for (auto& pair : pairs) {
-        pair->server->set_on_data_for_tcp(
-            [p = pair.get()](std::span<const uint8_t> data) {
-                std::lock_guard lock(p->server_mu);
-                p->server_received.insert(p->server_received.end(),
-                                          data.begin(), data.end());
-            });
+        pair->server->set_on_data_for_tcp([p = pair.get()](std::span<const uint8_t> data) {
+            std::lock_guard lock(p->server_mu);
+            p->server_received.insert(p->server_received.end(), data.begin(), data.end());
+        });
 
-        pair->client->set_on_data_for_tcp(
-            [p = pair.get()](std::span<const uint8_t> data) {
-                std::lock_guard lock(p->client_mu);
-                p->client_received.insert(p->client_received.end(),
-                                          data.begin(), data.end());
-            });
+        pair->client->set_on_data_for_tcp([p = pair.get()](std::span<const uint8_t> data) {
+            std::lock_guard lock(p->client_mu);
+            p->client_received.insert(p->client_received.end(), data.begin(), data.end());
+        });
     }
 
     // Send unique data through each tunnel.
@@ -489,15 +468,13 @@ TEST_F(TunnelDataFlowTest, MultipleTunnelsOnSameManager) {
         {
             std::lock_guard lock(pairs[i]->server_mu);
             EXPECT_EQ(pairs[i]->server_received, expected_c2s)
-                << "Tunnel " << pairs[i]->tunnel_id
-                << " server data mismatch";
+                << "Tunnel " << pairs[i]->tunnel_id << " server data mismatch";
         }
 
         {
             std::lock_guard lock(pairs[i]->client_mu);
             EXPECT_EQ(pairs[i]->client_received, expected_s2c)
-                << "Tunnel " << pairs[i]->tunnel_id
-                << " client data mismatch";
+                << "Tunnel " << pairs[i]->tunnel_id << " client data mismatch";
         }
     }
 }

@@ -76,8 +76,7 @@ std::vector<uint8_t> ToxConnection::get_pending_data(std::size_t max_bytes) {
     }
 
     std::vector<uint8_t> result(send_buffer_.begin(),
-                                send_buffer_.begin() +
-                                    static_cast<std::ptrdiff_t>(available));
+                                send_buffer_.begin() + static_cast<std::ptrdiff_t>(available));
     send_buffer_.erase(send_buffer_.begin(),
                        send_buffer_.begin() + static_cast<std::ptrdiff_t>(available));
     return result;
@@ -119,11 +118,9 @@ std::vector<uint8_t> ToxConnection::read_received_data(std::size_t max_bytes) {
     }
 
     std::vector<uint8_t> result(receive_buffer_.begin(),
-                                receive_buffer_.begin() +
-                                    static_cast<std::ptrdiff_t>(available));
+                                receive_buffer_.begin() + static_cast<std::ptrdiff_t>(available));
     receive_buffer_.erase(receive_buffer_.begin(),
-                          receive_buffer_.begin() +
-                              static_cast<std::ptrdiff_t>(available));
+                          receive_buffer_.begin() + static_cast<std::ptrdiff_t>(available));
     return result;
 }
 
@@ -144,8 +141,7 @@ void ToxConnection::on_ack(uint32_t bytes_acked) {
     // CAS loop to safely clamp the subtraction.
     while (true) {
         std::size_t desired = (current > acked) ? (current - acked) : 0;
-        if (send_window_used_.compare_exchange_weak(current, desired,
-                                                    std::memory_order_acq_rel,
+        if (send_window_used_.compare_exchange_weak(current, desired, std::memory_order_acq_rel,
                                                     std::memory_order_acquire)) {
             break;
         }

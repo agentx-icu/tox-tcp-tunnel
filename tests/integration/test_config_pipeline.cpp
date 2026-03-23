@@ -4,9 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "toxtunnel/util/config.hpp"
@@ -27,12 +29,14 @@ constexpr const char* kValidPublicKey =
 // ---------------------------------------------------------------------------
 
 class ConfigPipelineTest : public ::testing::Test {
-protected:
+   protected:
     /// Create a temporary file path for testing.
     std::filesystem::path make_temp_path() {
-        auto tmp = std::filesystem::temp_directory_path() /
-                   "toxtunnel_test_config_XXXXXX.yaml";
-        return tmp;
+        const auto unique_suffix =
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        return std::filesystem::temp_directory_path() /
+               ("toxtunnel_test_config_" + unique_suffix + ".yaml");
     }
 
     /// Register a path for automatic cleanup.
@@ -99,17 +103,17 @@ logging:
 
 TEST_F(ConfigPipelineTest, ClientConfigYamlRoundTrip) {
     const std::string yaml = std::string("mode: client\n") +
-        "data_dir: /home/user/.config/toxtunnel\n" +
-        "server_id: " + kValidToxId + "\n" +
-        "forwards:\n"
-        "  - local_port: 2222\n"
-        "    remote_host: localhost\n"
-        "    remote_port: 22\n"
-        "  - local_port: 8080\n"
-        "    remote_host: 192.168.1.100\n"
-        "    remote_port: 80\n"
-        "logging:\n"
-        "  level: warn\n";
+                             "data_dir: /home/user/.config/toxtunnel\n" +
+                             "server_id: " + kValidToxId + "\n" +
+                             "forwards:\n"
+                             "  - local_port: 2222\n"
+                             "    remote_host: localhost\n"
+                             "    remote_port: 22\n"
+                             "  - local_port: 8080\n"
+                             "    remote_host: 192.168.1.100\n"
+                             "    remote_port: 80\n"
+                             "logging:\n"
+                             "  level: warn\n";
 
     // First load
     auto result1 = Config::from_string(yaml);
@@ -335,10 +339,12 @@ udp_enabled: false
 bootstrap_nodes:
   - address: node1.tox.chat
     port: 33445
-    public_key: )") + kValidPublicKey + R"(
+    public_key: )") + kValidPublicKey +
+                             R"(
   - address: node2.tox.chat
     port: 33446
-    public_key: )" + kValidPublicKey + R"(
+    public_key: )" + kValidPublicKey +
+                             R"(
 rules_file: /etc/toxtunnel/rules.yaml
 logging:
   level: trace
@@ -395,21 +401,21 @@ logging:
 
 TEST_F(ConfigPipelineTest, CompleteClientConfig) {
     const std::string yaml = std::string("mode: client\n") +
-        "data_dir: /home/user/.config/toxtunnel\n" +
-        "server_id: " + kValidToxId + "\n" +
-        "forwards:\n"
-        "  - local_port: 2222\n"
-        "    remote_host: localhost\n"
-        "    remote_port: 22\n"
-        "  - local_port: 8080\n"
-        "    remote_host: 192.168.1.100\n"
-        "    remote_port: 80\n"
-        "  - local_port: 3306\n"
-        "    remote_host: db.internal\n"
-        "    remote_port: 3306\n"
-        "logging:\n"
-        "  level: warn\n"
-        "  file: /home/user/.local/log/toxtunnel_client.log\n";
+                             "data_dir: /home/user/.config/toxtunnel\n" +
+                             "server_id: " + kValidToxId + "\n" +
+                             "forwards:\n"
+                             "  - local_port: 2222\n"
+                             "    remote_host: localhost\n"
+                             "    remote_port: 22\n"
+                             "  - local_port: 8080\n"
+                             "    remote_host: 192.168.1.100\n"
+                             "    remote_port: 80\n"
+                             "  - local_port: 3306\n"
+                             "    remote_host: db.internal\n"
+                             "    remote_port: 3306\n"
+                             "logging:\n"
+                             "  level: warn\n"
+                             "  file: /home/user/.local/log/toxtunnel_client.log\n";
 
     auto result = Config::from_string(yaml);
     ASSERT_TRUE(result.has_value()) << result.error();
@@ -467,7 +473,8 @@ tox:
   bootstrap_nodes:
     - address: 192.168.1.50
       port: 33445
-      public_key: )") + kValidPublicKey + R"(
+      public_key: )") + kValidPublicKey +
+                             R"(
 server:
   rules_file: /etc/toxtunnel/rules.yaml
 )";
@@ -506,7 +513,8 @@ server:
   bootstrap_nodes:
     - address: node1.tox.chat
       port: 33445
-      public_key: )") + kValidPublicKey + R"(
+      public_key: )") + kValidPublicKey +
+                             R"(
   rules_file: /etc/toxtunnel/rules.yaml
 )";
 

@@ -6,13 +6,13 @@
 // correctly under non-trivial rule configurations.
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
-#include <unistd.h>
 #include <vector>
 
 #include "toxtunnel/app/rules_engine.hpp"
@@ -25,22 +25,18 @@ namespace {
 // Constants
 // ---------------------------------------------------------------------------
 
-constexpr const char* kFriendA =
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-constexpr const char* kFriendB =
-    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-constexpr const char* kFriendC =
-    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+constexpr const char* kFriendA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr const char* kFriendB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+constexpr const char* kFriendC = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 // ---------------------------------------------------------------------------
 // Test Fixture
 // ---------------------------------------------------------------------------
 
 class RulesIntegrationTest : public ::testing::Test {
-protected:
+   protected:
     /// Helper to build an AccessRequest concisely.
-    static AccessRequest make_request(const std::string& friend_pk,
-                                      const std::string& host,
+    static AccessRequest make_request(const std::string& friend_pk, const std::string& host,
                                       uint16_t port) {
         AccessRequest req;
         req.friend_pk = friend_pk;
@@ -103,34 +99,26 @@ rules:
     const RulesEngine& engine = result.value();
 
     // Friend A: allowed to localhost:22
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 22)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 22)), AccessResult::Allowed);
     // Friend A: allowed to localhost:80
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 80)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 80)), AccessResult::Allowed);
     // Friend A: localhost:443 not in allow list -> Default
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 443)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 443)), AccessResult::Default);
     // Friend A: denied *.evil.com
     EXPECT_EQ(engine.evaluate(make_request(kFriendA, "malware.evil.com", 80)),
               AccessResult::Denied);
 
     // Friend B: denied *:22 (deny takes precedence)
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "somehost", 22)),
-              AccessResult::Denied);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "somehost", 22)), AccessResult::Denied);
     // Friend B: allowed *:80
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "somehost", 80)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "somehost", 80)), AccessResult::Allowed);
     // Friend B: allowed *:443
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "anyhost", 443)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "anyhost", 443)), AccessResult::Allowed);
     // Friend B: port 8080 not in allow ports -> Default
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "anyhost", 8080)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "anyhost", 8080)), AccessResult::Default);
 
     // Friend C: no rules at all -> Default
-    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "localhost", 22)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "localhost", 22)), AccessResult::Default);
 }
 
 // ============================================================================
@@ -142,8 +130,7 @@ TEST_F(RulesIntegrationTest, RoundTripYamlSerialization) {
     RulesEngine original;
     original.add_rule(FriendRule{
         .friend_pk = std::string(kFriendA),
-        .allow = {{.host = "localhost", .ports = {22, 80}},
-                  {.host = "10.0.0.1", .ports = {}}},
+        .allow = {{.host = "localhost", .ports = {22, 80}}, {.host = "10.0.0.1", .ports = {}}},
         .deny = {{.host = "*.internal.corp", .ports = {}}},
     });
     original.add_rule(FriendRule{
@@ -176,8 +163,7 @@ TEST_F(RulesIntegrationTest, RoundTripYamlSerialization) {
 
     for (const auto& probe : probes) {
         EXPECT_EQ(original.evaluate(probe), reloaded.value().evaluate(probe))
-            << "Mismatch for friend=" << probe.friend_pk
-            << " host=" << probe.target_host
+            << "Mismatch for friend=" << probe.friend_pk << " host=" << probe.target_host
             << " port=" << probe.target_port;
     }
 }
@@ -256,14 +242,11 @@ TEST_F(RulesIntegrationTest, ComplexAccessControl) {
     // -- Friend A tests --
 
     // Allowed: localhost:22
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 22)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 22)), AccessResult::Allowed);
     // Allowed: localhost:80
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 80)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 80)), AccessResult::Allowed);
     // Not explicitly allowed: localhost:443 -> Default
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 443)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "localhost", 443)), AccessResult::Default);
     // Denied: db.internal.corp:3306
     EXPECT_EQ(engine.evaluate(make_request(kFriendA, "db.internal.corp", 3306)),
               AccessResult::Denied);
@@ -271,38 +254,28 @@ TEST_F(RulesIntegrationTest, ComplexAccessControl) {
     EXPECT_EQ(engine.evaluate(make_request(kFriendA, "web.internal.corp", 80)),
               AccessResult::Denied);
     // Not matching any rule: google.com:443 -> Default
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "google.com", 443)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "google.com", 443)), AccessResult::Default);
 
     // -- Friend B tests --
 
     // Denied: 10.0.0.1:22 (deny *:22 takes precedence over allow 10.0.0.*:*)
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.1", 22)),
-              AccessResult::Denied);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.1", 22)), AccessResult::Denied);
     // Allowed: 10.0.0.1:80
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.1", 80)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.1", 80)), AccessResult::Allowed);
     // Allowed: 10.0.0.255:443
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.255", 443)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.255", 443)), AccessResult::Allowed);
     // Denied: 10.0.0.50:22
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.50", 22)),
-              AccessResult::Denied);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "10.0.0.50", 22)), AccessResult::Denied);
     // Denied: example.com:22
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "example.com", 22)),
-              AccessResult::Denied);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "example.com", 22)), AccessResult::Denied);
     // Not in 10.0.0.*: 192.168.1.1:80 -> Default (no allow match)
-    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "192.168.1.1", 80)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendB, "192.168.1.1", 80)), AccessResult::Default);
 
     // -- Friend C tests (no rules) --
 
-    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "localhost", 22)),
-              AccessResult::Default);
-    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "10.0.0.1", 80)),
-              AccessResult::Default);
-    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "anything", 9999)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "localhost", 22)), AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "10.0.0.1", 80)), AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendC, "anything", 9999)), AccessResult::Default);
 
     // -- Verify has_rules_for_friend --
 
@@ -354,8 +327,7 @@ bootstrap_nodes:
     ASSERT_TRUE(reloaded.has_value()) << reloaded.error();
     ASSERT_TRUE(reloaded.value().server.has_value());
     ASSERT_TRUE(reloaded.value().server->rules_file.has_value());
-    EXPECT_EQ(reloaded.value().server->rules_file.value(),
-              "/etc/toxtunnel/rules.yaml");
+    EXPECT_EQ(reloaded.value().server->rules_file.value(), "/etc/toxtunnel/rules.yaml");
 }
 
 // ============================================================================
@@ -415,10 +387,11 @@ TEST_F(RulesIntegrationTest, WildcardPatternIntegration) {
     RulesEngine engine;
     engine.add_rule(FriendRule{
         .friend_pk = std::string(kFriendA),
-        .allow = {
-            {.host = "*.example.com", .ports = {80, 443}},
-            {.host = "192.168.*", .ports = {}},  // all ports
-        },
+        .allow =
+            {
+                {.host = "*.example.com", .ports = {80, 443}},
+                {.host = "192.168.*", .ports = {}},  // all ports
+            },
         .deny = {},
     });
 
@@ -433,17 +406,14 @@ TEST_F(RulesIntegrationTest, WildcardPatternIntegration) {
               AccessResult::Default);
     // Not allowed: bare example.com:80 (wildcard prefix requires characters
     // before ".example.com")
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "example.com", 80)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "example.com", 80)), AccessResult::Default);
 
     // 192.168.* with empty ports -> all ports allowed
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "192.168.1.1", 22)),
-              AccessResult::Allowed);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "192.168.1.1", 22)), AccessResult::Allowed);
     EXPECT_EQ(engine.evaluate(make_request(kFriendA, "192.168.255.255", 9999)),
               AccessResult::Allowed);
     // Not matching the IP pattern.
-    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "10.0.0.1", 80)),
-              AccessResult::Default);
+    EXPECT_EQ(engine.evaluate(make_request(kFriendA, "10.0.0.1", 80)), AccessResult::Default);
 }
 
 }  // namespace
