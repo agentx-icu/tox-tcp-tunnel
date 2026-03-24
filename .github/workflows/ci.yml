@@ -203,6 +203,12 @@ jobs:
           & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
           & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install libsodium:x64-windows pthreads:x64-windows
 
+      - name: Install NSIS (Windows)
+        if: startsWith(matrix.target.id, 'windows-')
+        shell: pwsh
+        run: |
+          choco install nsis -y
+
       - name: Configure (Unix)
         if: ${{ !startsWith(matrix.target.id, 'windows-') }}
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
