@@ -26,7 +26,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 endif()
 
 if(WIN32)
-    set(CPACK_GENERATOR "NSIS;ZIP")
+    set(CPACK_GENERATOR "ZIP")
     set(CPACK_NSIS_DISPLAY_NAME "ToxTunnel")
     set(CPACK_NSIS_PACKAGE_NAME "ToxTunnel")
     set(CPACK_PACKAGE_INSTALL_DIRECTORY "ToxTunnel")
