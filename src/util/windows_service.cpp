@@ -5,7 +5,6 @@
 
 #include <atomic>
 #include <functional>
-#include <memory>
 #include <string>
 
 namespace toxtunnel::util {
@@ -83,8 +82,10 @@ std::wstring utf8_to_wide(const std::string& utf8) {
         return std::wstring();
     }
 
-    std::wstring wide(size_needed - 1, 0);
+    // size_needed includes the null terminator; allocate full buffer then resize
+    std::wstring wide(static_cast<size_t>(size_needed), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &wide[0], size_needed);
+    wide.resize(static_cast<size_t>(size_needed - 1));  // trim null terminator
     return wide;
 }
 

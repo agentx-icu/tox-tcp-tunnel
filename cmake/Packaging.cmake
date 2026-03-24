@@ -11,6 +11,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CPACK_GENERATOR "DEB;RPM;TGZ")
     set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium23")
     set(CPACK_RPM_PACKAGE_REQUIRES "libsodium")
+
+    # Wire postinst/prerm scripts as DEB/RPM lifecycle hooks
+    set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/postinst;${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/prerm")
+    set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/postinst")
+    set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/prerm")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")

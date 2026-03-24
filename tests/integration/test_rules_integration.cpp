@@ -191,11 +191,7 @@ TEST_F(RulesIntegrationTest, FileRoundTrip) {
     });
 
     // Save to a temporary file.
-    std::string tmpl = "/tmp/toxtunnel_test_rules_XXXXXX";
-    int fd = mkstemp(tmpl.data());
-    ASSERT_NE(fd, -1) << "mkstemp failed";
-    close(fd);
-    std::filesystem::path filepath(tmpl);
+    std::filesystem::path filepath = make_temp_path();
 
     auto save_result = original.save(filepath);
     ASSERT_TRUE(save_result.has_value()) << save_result.error();

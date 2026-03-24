@@ -28,16 +28,24 @@ void notify_state(const char* state) {
 
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
+    socklen_t addr_len = 0;
     if (socket_path[0] == '@') {
+        // Abstract socket: sun_path[0] is '\0', name follows without trailing '\0'
         addr.sun_path[0] = '\0';
-        std::strncpy(addr.sun_path + 1, socket_path + 1, sizeof(addr.sun_path) - 2);
+        size_t name_len = std::strlen(socket_path + 1);
+        if (name_len > sizeof(addr.sun_path) - 2) {
+            name_len = sizeof(addr.sun_path) - 2;
+        }
+        std::memcpy(addr.sun_path + 1, socket_path + 1, name_len);
+        addr_len = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + 1 + name_len);
     } else {
         std::strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+        addr_len = sizeof(addr);
     }
 
     const std::string payload = std::string(state) + "\n";
     (void)sendto(fd, payload.data(), payload.size(), 0, reinterpret_cast<const sockaddr*>(&addr),
-                 sizeof(addr));
+                 addr_len);
     close(fd);
 }
 

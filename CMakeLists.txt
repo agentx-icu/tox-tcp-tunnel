@@ -83,14 +83,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(yaml-cpp)
 
-# QR Code generator (Nayuki)
+# QR Code generator (Nayuki) — source-only library, no CMakeLists.txt
 FetchContent_Declare(
     qrcodegen
     GIT_REPOSITORY https://github.com/nayuki/QR-Code-generator.git
     GIT_TAG v1.8.0
-    SOURCE_SUBDIR cpp
 )
-FetchContent_MakeAvailable(qrcodegen)
+FetchContent_Populate(qrcodegen)
 
 # Library target
 add_library(toxtunnel_lib STATIC)
