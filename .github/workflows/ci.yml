@@ -173,11 +173,20 @@ jobs:
           - id: linux-x86_64
             runner: ubuntu-24.04
             generator: "DEB;RPM;TGZ"
-          - id: macos-universal
+          - id: linux-aarch64
+            runner: ubuntu-24.04-arm
+            generator: "DEB;RPM;TGZ"
+          - id: macos-x86_64
+            runner: macos-15-intel
+            generator: "productbuild;TGZ"
+          - id: macos-aarch64
             runner: macos-15
             generator: "productbuild;TGZ"
           - id: windows-x86_64
             runner: windows-2025
+            generator: "ZIP"
+          - id: windows-aarch64
+            runner: windows-11-arm
             generator: "ZIP"
     steps:
       - uses: actions/checkout@v4
