@@ -178,7 +178,7 @@ jobs:
             generator: "productbuild;TGZ"
           - id: windows-x86_64
             runner: windows-2025
-            generator: "NSIS;ZIP"
+            generator: "ZIP"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -202,12 +202,6 @@ jobs:
           git clone https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
           & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
           & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install libsodium:x64-windows pthreads:x64-windows
-
-      - name: Install NSIS (Windows)
-        if: startsWith(matrix.target.id, 'windows-')
-        shell: pwsh
-        run: |
-          choco install nsis -y
 
       - name: Configure (Unix)
         if: ${{ !startsWith(matrix.target.id, 'windows-') }}
