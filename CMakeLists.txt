@@ -41,7 +41,7 @@ set(DHT_BOOTSTRAP OFF CACHE BOOL "" FORCE)
 set(BOOTSTRAP_DAEMON OFF CACHE BOOL "" FORCE)
 set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
 set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
-add_subdirectory(third_party/c-toxcore)
+add_subdirectory(third_party/c-toxcore EXCLUDE_FROM_ALL)
 
 add_library(toxcore_wrapper INTERFACE)
 target_link_libraries(toxcore_wrapper INTERFACE toxcore_static)

@@ -172,26 +172,26 @@ jobs:
         target:
           - id: linux-x86_64
             runner: ubuntu-24.04
-            generator: "DEB;RPM;TGZ"
+            generator: "DEB;RPM"
           - id: linux-aarch64
             runner: ubuntu-24.04-arm
-            generator: "DEB;RPM;TGZ"
+            generator: "DEB;RPM"
           - id: macos-x86_64
             runner: macos-15-intel
-            generator: "productbuild;TGZ"
+            generator: "productbuild"
           - id: macos-aarch64
             runner: macos-15
-            generator: "productbuild;TGZ"
-          - id: windows-x86_64
-            runner: windows-2025
-            generator: "ZIP"
-          - id: windows-aarch64
-            runner: windows-11-arm
-            generator: "ZIP"
+            generator: "productbuild"
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Derive version from tag
+        id: version
+        run: echo "version=${RELEASE_VERSION#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux dependencies
         if: startsWith(matrix.target.id, 'linux-')
@@ -204,48 +204,19 @@ jobs:
         run: |
           brew install cmake pkg-config libsodium
 
-      - name: Bootstrap vcpkg (Windows)
-        if: startsWith(matrix.target.id, 'windows-')
-        shell: pwsh
+      - name: Configure
         run: |
-          git clone https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
-          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
-          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install libsodium:x64-windows pthreads:x64-windows
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTOXTUNNEL_BUILD_TESTS=OFF \
+            -DRELEASE_VERSION="${{ steps.version.outputs.version }}"
 
-      - name: Configure (Unix)
-        if: ${{ !startsWith(matrix.target.id, 'windows-') }}
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-      - name: Configure (Windows)
-        if: startsWith(matrix.target.id, 'windows-')
-        shell: pwsh
-        run: |
-          cmake -B build `
-            -G "Visual Studio 17 2022" `
-            -A x64 `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET="x64-windows"
-
-      - name: Build (Unix)
-        if: ${{ !startsWith(matrix.target.id, 'windows-') }}
+      - name: Build
         run: cmake --build build --parallel
 
-      - name: Build (Windows)
-        if: startsWith(matrix.target.id, 'windows-')
-        shell: pwsh
-        run: cmake --build build --config Release --parallel
-
-      - name: Package installers (Unix)
-        if: ${{ !startsWith(matrix.target.id, 'windows-') }}
+      - name: Package installers
         working-directory: build
         run: cpack -G "${{ matrix.target.generator }}"
-
-      - name: Package installers (Windows)
-        if: startsWith(matrix.target.id, 'windows-')
-        working-directory: build
-        shell: pwsh
-        run: cpack -C Release -G "${{ matrix.target.generator }}"
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
@@ -254,10 +225,7 @@ jobs:
           path: |
             build/*.deb
             build/*.rpm
-            build/*.tar.gz
             build/*.pkg
-            build/*.exe
-            build/*.zip
           if-no-files-found: error
 
   code-style-check:
