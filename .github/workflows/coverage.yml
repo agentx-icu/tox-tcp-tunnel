@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
           fetch-depth: 0
@@ -56,7 +56,7 @@ jobs:
           lcov --summary coverage.info >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: build/coverage-report/
