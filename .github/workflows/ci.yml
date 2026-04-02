@@ -232,7 +232,13 @@ jobs:
         if: matrix.target.platform == 'windows'
         working-directory: build
         shell: pwsh
-        run: cpack -C Release -G "${{ matrix.target.generator }}"
+        run: |
+          cpack -C Release -G "${{ matrix.target.generator }}" --verbose
+          if ($LASTEXITCODE -ne 0) {
+            $wixLog = Get-ChildItem -Recurse -Filter "wix.log" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($wixLog) { Get-Content $wixLog.FullName }
+            exit 1
+          }
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v7
