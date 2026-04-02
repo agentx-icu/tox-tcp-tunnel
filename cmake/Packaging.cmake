@@ -7,7 +7,7 @@ else()
     set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 endif()
 set(CPACK_PACKAGE_CONTACT "maintainers@toxtunnel.local")
-set(CPACK_COMPONENTS_ALL toxtunnel-runtime)
+set(CPACK_COMPONENTS_ALL toxtunnel_runtime)
 
 set(CPACK_PACKAGE_FILE_NAME
     "toxtunnel-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")

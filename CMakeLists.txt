@@ -186,29 +186,29 @@ endif()
 # Install
 install(TARGETS toxtunnel
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    COMPONENT toxtunnel-runtime
+    COMPONENT toxtunnel_runtime
 )
 install(FILES README.md LICENSE
     DESTINATION .
-    COMPONENT toxtunnel-runtime
+    COMPONENT toxtunnel_runtime
 )
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging")
     install(FILES packaging/config.yaml.example
         DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel
-        COMPONENT toxtunnel-runtime
+        COMPONENT toxtunnel_runtime
         OPTIONAL
     )
     # Linux-specific files
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         install(FILES packaging/linux/toxtunnel.service
             DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system
-            COMPONENT toxtunnel-runtime
+            COMPONENT toxtunnel_runtime
             OPTIONAL
         )
         install(PROGRAMS packaging/linux/postinst packaging/linux/prerm
             DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel/scripts
-            COMPONENT toxtunnel-runtime
+            COMPONENT toxtunnel_runtime
             OPTIONAL
         )
     endif()
@@ -216,7 +216,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging")
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         install(FILES packaging/macos/com.toxtunnel.daemon.plist
             DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel
-            COMPONENT toxtunnel-runtime
+            COMPONENT toxtunnel_runtime
             OPTIONAL
         )
     endif()
