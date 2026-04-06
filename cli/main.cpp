@@ -18,7 +18,11 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.0";
+#ifndef TOXTUNNEL_VERSION
+#define TOXTUNNEL_VERSION "0.0.0-dev"
+#endif
+
+constexpr const char* kVersion = TOXTUNNEL_VERSION;
 
 /// Map from CLI string to LogLevel.
 const std::map<std::string, toxtunnel::util::LogLevel> kLogLevelMap = {

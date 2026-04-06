@@ -1,0 +1,47 @@
+include(BundleUtilities)
+
+set(toxtunnel_binary "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@/toxtunnel@CMAKE_EXECUTABLE_SUFFIX@")
+set(toxtunnel_search_dirs "@toxtunnel_fixup_dirs@")
+
+function(gp_item_default_embedded_path_override item default_embedded_path_var)
+    if(APPLE)
+        set(${default_embedded_path_var} "@executable_path" PARENT_SCOPE)
+    endif()
+endfunction()
+
+if(NOT EXISTS "${toxtunnel_binary}")
+    message(FATAL_ERROR "Expected installed executable at ${toxtunnel_binary}")
+endif()
+
+fixup_bundle("${toxtunnel_binary}" "" "${toxtunnel_search_dirs}")
+
+if(APPLE)
+    file(GLOB bundled_dylibs
+        "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@/*.dylib"
+    )
+    foreach(bundled_dylib IN LISTS bundled_dylibs)
+        execute_process(
+            COMMAND codesign --force --sign - "${bundled_dylib}"
+            RESULT_VARIABLE codesign_result
+            OUTPUT_VARIABLE codesign_stdout
+            ERROR_VARIABLE codesign_stderr
+        )
+        if(NOT codesign_result EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to ad-hoc sign ${bundled_dylib}: ${codesign_stdout}${codesign_stderr}"
+            )
+        endif()
+    endforeach()
+
+    execute_process(
+        COMMAND codesign --force --sign - "${toxtunnel_binary}"
+        RESULT_VARIABLE codesign_result
+        OUTPUT_VARIABLE codesign_stdout
+        ERROR_VARIABLE codesign_stderr
+    )
+    if(NOT codesign_result EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to ad-hoc sign ${toxtunnel_binary}: ${codesign_stdout}${codesign_stderr}"
+        )
+    endif()
+endif()

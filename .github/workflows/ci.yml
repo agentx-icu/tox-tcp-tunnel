@@ -250,6 +250,21 @@ jobs:
             exit 1
           }
 
+      - name: Verify macOS package
+        if: matrix.target.platform == 'macos'
+        run: |
+          bash tests/packaging/verify_macos_pkg.sh build/*.pkg "${{ steps.version.outputs.version }}"
+
+      - name: Verify Windows install tree
+        if: matrix.target.platform == 'windows'
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "toxtunnel-stage"
+          cmake --install build --config Release --prefix $stage
+          & "${{ github.workspace }}\tests\packaging\verify_windows_install.ps1" `
+            -InstallRoot $stage `
+            -ExpectedVersion "${{ steps.version.outputs.version }}"
+
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v7
         with:

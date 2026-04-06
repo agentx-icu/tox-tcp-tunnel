@@ -1,11 +1,6 @@
 set(CPACK_PACKAGE_NAME "ToxTunnel")
 set(CPACK_PACKAGE_VENDOR "ToxTunnel")
-# Allow CI to override the package version (e.g. from git tag)
-if(DEFINED RELEASE_VERSION)
-    set(CPACK_PACKAGE_VERSION "${RELEASE_VERSION}")
-else()
-    set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
-endif()
+set(CPACK_PACKAGE_VERSION "${TOXTUNNEL_VERSION}")
 set(CPACK_PACKAGE_CONTACT "maintainers@toxtunnel.local")
 set(CPACK_COMPONENTS_ALL toxtunnel_runtime)
 
@@ -28,6 +23,7 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CPACK_GENERATOR "productbuild;TGZ")
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/usr/local")
 endif()
 
 if(WIN32)

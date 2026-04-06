@@ -1,7 +1,13 @@
 cmake_minimum_required(VERSION 3.16)
-project(toxtunnel VERSION 1.0.0 LANGUAGES C CXX)
+project(toxtunnel VERSION 0.1.9 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
+
+if(DEFINED RELEASE_VERSION)
+    set(TOXTUNNEL_VERSION "${RELEASE_VERSION}")
+else()
+    set(TOXTUNNEL_VERSION "${PROJECT_VERSION}")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -158,6 +164,7 @@ endif()
 # Executable target
 add_executable(toxtunnel cli/main.cpp)
 target_link_libraries(toxtunnel PRIVATE toxtunnel_lib CLI11::CLI11)
+target_compile_definitions(toxtunnel PRIVATE TOXTUNNEL_VERSION="${TOXTUNNEL_VERSION}")
 if(MSVC)
     target_compile_options(toxtunnel PRIVATE /W4)
     if(TOXTUNNEL_WARNINGS_AS_ERRORS)
@@ -175,6 +182,29 @@ else()
             -Wno-stringop-overflow
         )
     endif()
+endif()
+
+set(toxtunnel_fixup_dirs "")
+if(DEFINED LIBSODIUM_LIBRARY_DIRS)
+    list(APPEND toxtunnel_fixup_dirs ${LIBSODIUM_LIBRARY_DIRS})
+endif()
+if(DEFINED LIBSODIUM_LIBDIR)
+    list(APPEND toxtunnel_fixup_dirs ${LIBSODIUM_LIBDIR})
+endif()
+if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+    list(APPEND toxtunnel_fixup_dirs
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/bin"
+    )
+endif()
+list(REMOVE_DUPLICATES toxtunnel_fixup_dirs)
+
+if(APPLE OR WIN32)
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/FixupInstall.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/FixupInstall.cmake"
+        @ONLY
+    )
 endif()
 
 # Tests
@@ -220,6 +250,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging")
             OPTIONAL
         )
     endif()
+endif()
+
+if(APPLE OR WIN32)
+    install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/FixupInstall.cmake"
+        COMPONENT toxtunnel_runtime
+    )
 endif()
 
 include(cmake/Packaging.cmake)
