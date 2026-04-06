@@ -185,13 +185,23 @@ jobs:
         if: matrix.target.platform == 'windows'
         shell: pwsh
         run: |
-          $wixDir = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
-          if (Test-Path $wixDir) {
-            echo "$wixDir" >> $env:GITHUB_PATH
-          } else {
-            Write-Error "WiX Toolset not found at $wixDir"
+          $wixCandidates = @(
+            "C:\Program Files (x86)\WiX Toolset v3.14\bin",
+            "C:\Program Files\WiX Toolset v3.14\bin"
+          )
+
+          $wixDir = $wixCandidates | Where-Object { Test-Path (Join-Path $_ "candle.exe") } | Select-Object -First 1
+          if (-not $wixDir) {
+            choco install wixtoolset --yes --no-progress
+            $wixDir = $wixCandidates | Where-Object { Test-Path (Join-Path $_ "candle.exe") } | Select-Object -First 1
+          }
+
+          if (-not $wixDir) {
+            Write-Error "WiX Toolset v3 was not found after installation."
             exit 1
           }
+
+          echo "$wixDir" >> $env:GITHUB_PATH
 
       - name: Configure (Unix)
         if: matrix.target.platform != 'windows'
