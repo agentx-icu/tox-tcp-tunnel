@@ -8,9 +8,53 @@ endif()
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM "windows+pe")
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL "dumpbin")
 
-find_program(toxtunnel_dumpbin dumpbin)
+set(toxtunnel_dumpbin_hints "")
+
+if("@CMAKE_CXX_COMPILER@" MATCHES "cl(\\.exe)?$")
+    get_filename_component(toxtunnel_msvc_bin_dir "@CMAKE_CXX_COMPILER@" DIRECTORY)
+    list(APPEND toxtunnel_dumpbin_hints "${toxtunnel_msvc_bin_dir}")
+endif()
+
+if("@CMAKE_LINKER@" MATCHES "link(\\.exe)?$")
+    get_filename_component(toxtunnel_linker_dir "@CMAKE_LINKER@" DIRECTORY)
+    list(APPEND toxtunnel_dumpbin_hints "${toxtunnel_linker_dir}")
+endif()
+
+if(DEFINED ENV{VCToolsInstallDir})
+    file(GLOB toxtunnel_vctools_dumpbin_dirs
+        "$ENV{VCToolsInstallDir}/bin/Host*/x64"
+        "$ENV{VCToolsInstallDir}/bin/Host*/arm64"
+    )
+    list(APPEND toxtunnel_dumpbin_hints ${toxtunnel_vctools_dumpbin_dirs})
+endif()
+
+list(APPEND toxtunnel_dumpbin_hints
+    "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSVC"
+    "C:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Tools/MSVC"
+    "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC"
+    "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
+)
+
+set(toxtunnel_dumpbin_search_paths "")
+foreach(toxtunnel_hint IN LISTS toxtunnel_dumpbin_hints)
+    if(IS_DIRECTORY "${toxtunnel_hint}")
+        file(GLOB toxtunnel_hint_subdirs
+            "${toxtunnel_hint}"
+            "${toxtunnel_hint}/*"
+            "${toxtunnel_hint}/*/*"
+        )
+        list(APPEND toxtunnel_dumpbin_search_paths ${toxtunnel_hint_subdirs})
+    endif()
+endforeach()
+list(REMOVE_DUPLICATES toxtunnel_dumpbin_search_paths)
+
+find_program(toxtunnel_dumpbin dumpbin HINTS ${toxtunnel_dumpbin_search_paths})
 if(NOT toxtunnel_dumpbin)
-    message(FATAL_ERROR "dumpbin was not found in PATH for runtime dependency analysis")
+    list(JOIN toxtunnel_dumpbin_search_paths ", " toxtunnel_dumpbin_search_paths_joined)
+    message(FATAL_ERROR
+        "dumpbin was not found for runtime dependency analysis. searched: "
+        "${toxtunnel_dumpbin_search_paths_joined}"
+    )
 endif()
 set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "${toxtunnel_dumpbin}")
 
