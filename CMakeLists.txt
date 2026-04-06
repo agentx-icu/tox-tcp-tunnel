@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(toxtunnel VERSION 0.1.9 LANGUAGES C CXX)
+project(toxtunnel VERSION 0.1.10 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -252,8 +252,20 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging")
     endif()
 endif()
 
-if(APPLE OR WIN32)
+if(APPLE)
     install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/FixupInstall.cmake"
+        COMPONENT toxtunnel_runtime
+    )
+endif()
+
+if(WIN32)
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/InstallRuntimeDepsWindows.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/InstallRuntimeDepsWindows.cmake"
+        @ONLY
+    )
+
+    install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/InstallRuntimeDepsWindows.cmake"
         COMPONENT toxtunnel_runtime
     )
 endif()

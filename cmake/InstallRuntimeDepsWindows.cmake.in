@@ -1,0 +1,42 @@
+set(toxtunnel_binary "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@/toxtunnel@CMAKE_EXECUTABLE_SUFFIX@")
+set(toxtunnel_search_dirs "@toxtunnel_fixup_dirs@")
+
+if(NOT EXISTS "${toxtunnel_binary}")
+    message(FATAL_ERROR "Expected installed executable at ${toxtunnel_binary}")
+endif()
+
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM "windows+pe")
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL "dumpbin")
+
+find_program(toxtunnel_dumpbin dumpbin)
+if(NOT toxtunnel_dumpbin)
+    message(FATAL_ERROR "dumpbin was not found in PATH for runtime dependency analysis")
+endif()
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND "${toxtunnel_dumpbin}")
+
+file(GET_RUNTIME_DEPENDENCIES
+    RESOLVED_DEPENDENCIES_VAR toxtunnel_runtime_deps
+    UNRESOLVED_DEPENDENCIES_VAR toxtunnel_unresolved_deps
+    EXECUTABLES "${toxtunnel_binary}"
+    DIRECTORIES ${toxtunnel_search_dirs}
+    PRE_EXCLUDE_REGEXES
+        "api-ms-"
+        "ext-ms-"
+    POST_EXCLUDE_REGEXES
+        ".*/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/[Ss]ystem32/.*"
+        ".*/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/.*"
+)
+
+if(toxtunnel_unresolved_deps)
+    list(JOIN toxtunnel_unresolved_deps ", " unresolved_joined)
+    message(FATAL_ERROR "Unresolved runtime dependencies: ${unresolved_joined}")
+endif()
+
+foreach(runtime_dep IN LISTS toxtunnel_runtime_deps)
+    file(INSTALL
+        DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@"
+        TYPE FILE
+        FILES "${runtime_dep}"
+        FOLLOW_SYMLINK_CHAIN
+    )
+endforeach()
