@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(toxtunnel VERSION 0.1.10 LANGUAGES C CXX)
+project(toxtunnel VERSION 0.1.11 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
