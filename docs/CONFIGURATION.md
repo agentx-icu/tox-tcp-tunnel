@@ -1,6 +1,8 @@
 # Configuration
 
 ToxTunnel uses YAML configuration files. CLI flags can override most settings.
+Default data directories are `/var/lib/toxtunnel` in server mode and
+`$HOME/.config/toxtunnel` in client mode.
 
 ## Server Configuration
 
@@ -29,7 +31,7 @@ server:
 
 ```yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 logging:
   level: info

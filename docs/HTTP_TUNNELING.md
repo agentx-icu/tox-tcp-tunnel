@@ -47,12 +47,19 @@ Copy the server's Tox address from the output (76 hex characters).
 # Terminal 3: Start client (replace with server's Tox address)
 SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"
 
-./build/toxtunnel -m client \
-    --server-id "$SERVER_ID" \
-    --local-port 8080 \
-    --remote-host 127.0.0.1 \
-    --remote-port 8888 \
-    -d /tmp/toxtunnel-client
+cat > /tmp/toxtunnel-http-client.yaml <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-client
+
+client:
+  server_id: "${SERVER_ID}"
+  forwards:
+    - local_port: 8080
+      remote_host: 127.0.0.1
+      remote_port: 8888
+EOF
+
+./build/toxtunnel -c /tmp/toxtunnel-http-client.yaml
 ```
 
 ### Test HTTP Access
@@ -116,7 +123,7 @@ The machine from which you want to access the remote service.
 
 ```yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 logging:
   level: info

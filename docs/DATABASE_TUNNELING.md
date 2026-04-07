@@ -66,12 +66,19 @@ Copy the server's Tox address from the output.
 # Terminal 2: Start client
 SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"
 
-./build/toxtunnel -m client \
-    --server-id "$SERVER_ID" \
-    --local-port 5432 \
-    --remote-host 127.0.0.1 \
-    --remote-port 5432 \
-    -d /tmp/toxtunnel-client
+cat > /tmp/toxtunnel-db-client.yaml <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-client
+
+client:
+  server_id: "${SERVER_ID}"
+  forwards:
+    - local_port: 5432
+      remote_host: 127.0.0.1
+      remote_port: 5432
+EOF
+
+./build/toxtunnel -c /tmp/toxtunnel-db-client.yaml
 ```
 
 ### Connect to Tunnel
@@ -174,7 +181,7 @@ The machine from which you want to access the database.
 
 ```yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 logging:
   level: info
@@ -325,22 +332,16 @@ db.test.insert_one({'message': 'hello from ToxTunnel'})
 
 ### SQLite
 
-SQLite is file-based, so you can tunnel the file access:
+SQLite is file-based and does not speak TCP on its own, so it is not a direct fit for ToxTunnel.
+Use ToxTunnel to reach an SSH service, a custom application protocol, or a database proxy on the
+remote machine instead.
 
 ```bash
-# Start the tunnel to a machine with SQLite
-# Local: 9000 -> Remote: /path/to/sqlite.db
-./build/toxtunnel -m client \
-    --server-id "SERVER_ID" \
-    --local-port 9000 \
-    --remote-host 127.0.0.1 \
-    --remote-port 9000
+# Recommended approach: tunnel SSH, then copy or mount the SQLite file securely
+ssh -o ProxyCommand="toxtunnel -m client --server-id SERVER_ID --pipe 127.0.0.1:22" user@dummy
 
-# On remote server: run SQLite on localhost:9000
-sqlite3 --listen 127.0.0.1:9000
-
-# On local: connect to localhost:9000
-sqlite3 "127.0.0.1:9000"
+# Once connected, work with the database file on the remote host
+sqlite3 /path/to/database.db
 ```
 
 ---
@@ -619,7 +620,7 @@ sudo ./build/toxtunnel -m server
 
 ```bash
 # 1. Start client
-./build/toxtunnel -c client.yaml -d ~/.toxtunnel
+./build/toxtunnel -c client.yaml -d ~/.config/toxtunnel
 
 # 2. Connect to database
 psql -h localhost -p 5432 -U app_user -d app_db

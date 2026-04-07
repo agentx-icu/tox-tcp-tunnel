@@ -21,33 +21,50 @@ Synchronize files between machines using ToxTunnel for secure tunneling.
 ### Single-Machine Testing
 
 ```bash
-# Terminal 1: Start ToxTunnel server
+# Terminal 1: Start an rsync daemon for testing
+mkdir -p /tmp/rsync-root /tmp/dest
+echo "Hello World" > /tmp/rsync-root/test.txt
+echo "Data file" > /tmp/rsync-root/data.txt
+
+cat > /tmp/rsyncd.conf <<'EOF'
+[files]
+path = /tmp/rsync-root
+read only = false
+use chroot = false
+EOF
+
+rsync --daemon --no-detach --config=/tmp/rsyncd.conf
+```
+
+```bash
+# Terminal 2: Start ToxTunnel server
 ./build/toxtunnel -m server -d /tmp/toxtunnel-server
 ```
 
 Copy the server's Tox address.
 
 ```bash
-# Terminal 2: Start ToxTunnel client
+# Terminal 3: Start ToxTunnel client
 SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"
-./build/toxtunnel -m client \
-    --server-id "$SERVER_ID" \
-    --local-port 873 \
-    --remote-host 127.0.0.1 \
-    --remote-port 873 \
-    -d /tmp/toxtunnel-client
+
+cat > /tmp/toxtunnel-rsync-client.yaml <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-client
+
+client:
+  server_id: "${SERVER_ID}"
+  forwards:
+    - local_port: 8873
+      remote_host: 127.0.0.1
+      remote_port: 873
+EOF
+
+./build/toxtunnel -c /tmp/toxtunnel-rsync-client.yaml
 ```
 
 ```bash
-# Terminal 3: Test rsync
-# Create test files
-mkdir -p /tmp/source /tmp/dest
-echo "Hello World" > /tmp/source/test.txt
-echo "Data file" > /tmp/source/data.txt
-
-# Sync files
-rsync -avz -e "ssh -o ProxyCommand=\"./build/toxtunnel -m client --server-id $SERVER_ID --pipe 127.0.0.1:873\"" \
-    /tmp/source/ dummy@localhost:/tmp/dest/
+# Terminal 4: Test rsync through the forwarded port
+rsync -avz rsync://localhost:8873/files/ /tmp/dest/
 
 # Check destination
 cat /tmp/dest/test.txt
@@ -89,7 +106,7 @@ rsync --daemon --config=/tmp/rsyncd.conf
 ```yaml
 # rsync_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 logging:
   level: info
@@ -98,7 +115,7 @@ client:
   server_id: "PASTE_SERVER_TOX_ADDRESS_HERE"
 
   forwards:
-    - local_port: 873
+    - local_port: 8873
       remote_host: 127.0.0.1
       remote_port: 873      # rsync port
 ```
@@ -108,11 +125,12 @@ client:
 ./build/toxtunnel -c rsync_client.yaml
 
 # Sync files from remote
-rsync -avz rsync://localhost:873/files/ /local/backup/
+rsync -avz rsync://localhost:8873/files/ /local/backup/
 
-# With SSH-style syntax (single file)
-rsync -avz -e "./build/toxtunnel -m client --server-id $SERVER_ID --pipe remote-host:source/path" \
-    user@remote:/remote/path/ /local/destination/
+# With SSH-style syntax instead of an rsync daemon
+SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"
+rsync -avz -e "ssh -o ProxyCommand=\"./build/toxtunnel -m client --server-id ${SERVER_ID} --pipe 127.0.0.1:22\"" \
+    user@dummy:/remote/path/ /local/destination/
 ```
 
 ### Automated Backups
@@ -128,7 +146,7 @@ After=network.target
 [Service]
 Type=oneshot
 User=backup
-ExecStart=/usr/bin/rsync -avz rsync://localhost:873/files/ /mnt/backups/
+ExecStart=/usr/bin/rsync -avz rsync://localhost:8873/files/ /mnt/backups/
 ```
 
 ```bash
@@ -167,12 +185,20 @@ Copy the server's Tox address.
 ```bash
 # Terminal 3: Start ToxTunnel client
 SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"
-./build/toxtunnel -m client \
-    --server-id "$SERVER_ID" \
-    --local-port 5901 \
-    --remote-host 127.0.0.1 \
-    --remote-port 5901 \
-    -d /tmp/toxtunnel-client
+
+cat > /tmp/toxtunnel-vnc-client.yaml <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-client
+
+client:
+  server_id: "${SERVER_ID}"
+  forwards:
+    - local_port: 5901
+      remote_host: 127.0.0.1
+      remote_port: 5901
+EOF
+
+./build/toxtunnel -c /tmp/toxtunnel-vnc-client.yaml
 
 # Terminal 4: Connect to VNC through tunnel
 vncviewer localhost:1
@@ -194,7 +220,7 @@ vncviewer localhost:5901
 ```yaml
 # rdp_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   server_id: "PASTE_WINDOWS_MACHINE_TOX_ADDRESS"
@@ -238,7 +264,7 @@ vncserver :1 -geometry 1920x1080 -depth 24
 ```yaml
 # vnc_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   server_id: "PASTE_LINUX_MACHINE_TOX_ADDRESS"
@@ -255,11 +281,7 @@ client:
 
 # Connect with VNC viewer
 # RealVNC, TightVNC, TigerVNC, etc.
-# Or with command line tools
 vncviewer localhost:1
-
-# With x11vnc for any desktop
-x11vnc -localhost -rfbport localhost:5901
 ```
 
 ### NoMachine (Alternative Desktop)
@@ -303,12 +325,20 @@ Copy the server's Tox address.
 ```bash
 # Terminal 3: Start ToxTunnel client
 SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"
-./build/toxtunnel -m client \
-    --server-id "$SERVER_ID" \
-    --local-port 8888 \
-    --remote-host 127.0.0.1 \
-    --remote-port 8080 \
-    -d /tmp/toxtunnel-client
+
+cat > /tmp/toxtunnel-nas-http-client.yaml <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-client
+
+client:
+  server_id: "${SERVER_ID}"
+  forwards:
+    - local_port: 8888
+      remote_host: 127.0.0.1
+      remote_port: 8080
+EOF
+
+./build/toxtunnel -c /tmp/toxtunnel-nas-http-client.yaml
 
 # Terminal 4: Access the NAS through tunnel
 curl http://localhost:8888/
@@ -328,12 +358,20 @@ For SSHFS-based testing:
 ./build/toxtunnel -m server -d /tmp/toxtunnel-server
 
 # Terminal 2: Start client (after getting server Tox ID)
-./build/toxtunnel -m client \
-    --server-id "$SERVER_ID" \
-    --local-port 2222 \
-    --remote-host 127.0.0.1 \
-    --remote-port 22 \
-    -d /tmp/toxtunnel-client
+SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"
+cat > /tmp/toxtunnel-nas-ssh-client.yaml <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-client
+
+client:
+  server_id: "${SERVER_ID}"
+  forwards:
+    - local_port: 2222
+      remote_host: 127.0.0.1
+      remote_port: 22
+EOF
+
+./build/toxtunnel -c /tmp/toxtunnel-nas-ssh-client.yaml
 
 # Terminal 3: Mount via SSHFS
 mkdir -p /tmp/nas-mount
@@ -352,7 +390,7 @@ Most NAS systems provide web interfaces:
 ```yaml
 # nas_web_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   server_id: "PASTE_NAS_TOX_ADDRESS"
@@ -364,7 +402,7 @@ client:
       remote_port: 5000
 
     # SMB/CIFS file shares
-    - local_port: 445
+    - local_port: 1445
       remote_host: 127.0.0.1
       remote_port: 445
 ```
@@ -379,9 +417,9 @@ sudo mkdir -p /mnt/nas-share
 
 # Mount through tunnel
 sudo mount -t cifs \
-    //localhost:445/share \
+    //localhost/share \
     /mnt/nas-share \
-    -o username=youruser,password=yourpass,domain=WORKGROUP,vers=3.0
+    -o username=youruser,password=yourpass,domain=WORKGROUP,vers=3.0,port=1445
 ```
 
 #### SSHFS Mount (SSH enabled NAS)
@@ -392,7 +430,7 @@ client:
   server_id: "PASTE_NAS_TOX_ADDRESS"
 
   forwards:
-    - local_port: 22
+    - local_port: 2222
       remote_host: 127.0.0.1
       remote_port: 22      # SSH port
 ```
@@ -414,7 +452,7 @@ sshfs -o port=2222 \
 ```yaml
 # synology_client.yaml
 client:
-  server_id: "PASTE_SYNLOGY_TOX_ADDRESS"
+  server_id: "PASTE_SYNOLOGY_TOX_ADDRESS"
 
   forwards:
     - local_port: 5000
@@ -422,13 +460,22 @@ client:
       remote_port: 5000      # DSM web interface
     - local_port: 5001
       remote_host: 127.0.0.1
-      remote_port: 5001      # Synology SSH
+      remote_port: 5001      # DSM HTTPS
+    - local_port: 1445
+      remote_host: 127.0.0.1
+      remote_port: 445       # SMB
+    - local_port: 2222
+      remote_host: 127.0.0.1
+      remote_port: 22        # SSH
 ```
 
 ```bash
-# Mount Synology share
-sudo mount -t cifs //localhost:5000/share /mnt/nas \
-    -o username=admin,password=mypass
+# Open DSM in your browser
+# http://localhost:5000
+
+# Or mount the SMB share through the forwarded SMB port
+sudo mount -t cifs //localhost/share /mnt/nas \
+    -o username=admin,password=mypass,port=1445
 ```
 
 ### Cloud Storage Tunneling
@@ -466,7 +513,7 @@ ls /mnt/cloud
 ```yaml
 # minecraft_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   server_id: "PASTE_MINECRAFT_HOST_TOX_ADDRESS"
@@ -482,9 +529,6 @@ client:
 
 ```bash
 # Connect to Minecraft server
-# Direct: localhost:25565
-# With tunnel: ./build/toxtunnel -m client --server-id ID -p 25565 remote-host:25565
-
 # Start client
 ./build/toxtunnel -c minecraft_client.yaml
 
@@ -496,7 +540,7 @@ client:
 ```yaml
 # game_servers.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   server_id: "PASTE_GAME_HOST_TOX_ADDRESS"
@@ -523,7 +567,7 @@ client:
 ```yaml
 # docker_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   server_id: "PASTE_DOCKER_HOST_TOX_ADDRESS"
@@ -547,7 +591,7 @@ docker -H tcp://localhost:2375 ps
 ```yaml
 # k8s_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   server_id: "PASTE_K8S_MASTER_TOX_ADDRESS"
@@ -590,9 +634,7 @@ public IP     private IP      private IP
 mode: server
 data_dir: /var/lib/toxtunnel-gateway
 
-server:
-  # Listen on public Tox network
-  # ...
+server: {}
 ```
 
 ```yaml
@@ -616,7 +658,7 @@ client:
 ```yaml
 # my_pc_client.yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 client:
   # Connect to gateway
@@ -646,11 +688,20 @@ SERVER_PORT="$2"
 LOCAL_PORT="$3"
 
 # Start ToxTunnel connecting through gateway
-./build/toxtunnel -m client \
-    --server-id "$GATEWAY_ID" \
-    --local-port "$LOCAL_PORT" \
-    --remote-host 127.0.0.1 \
-    --remote-port "$SERVER_PORT" &
+TMP_CONFIG="/tmp/toxtunnel-multihop-${LOCAL_PORT}.yaml"
+cat > "$TMP_CONFIG" <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-multihop
+
+client:
+  server_id: "${GATEWAY_ID}"
+  forwards:
+    - local_port: ${LOCAL_PORT}
+      remote_host: 127.0.0.1
+      remote_port: ${SERVER_PORT}
+EOF
+
+./build/toxtunnel -c "$TMP_CONFIG" &
 
 # Wait for connection
 sleep 5
@@ -670,19 +721,19 @@ echo "Access at: http://localhost:$LOCAL_PORT"
 mode: server
 data_dir: /var/lib/toxtunnel-lb
 
-server:
-  # Listen on multiple ports
-  tcp_port: 33445
+tox:
   udp_enabled: true
+  tcp_port: 33445
+  bootstrap_mode: auto
+  bootstrap_nodes:
+    - address: tox1.example.com
+      port: 33445
+      public_key: "KEY1"
+    - address: tox2.example.com
+      port: 33445
+      public_key: "KEY2"
 
-# Load balance across multiple Tox servers
-bootstrap_nodes:
-  - address: tox1.example.com
-    port: 33445
-    public_key: "KEY1"
-  - address: tox2.example.com
-    port: 33445
-    public_key: "KEY2"
+server: {}
 ```
 
 ### Failover Configuration
@@ -694,22 +745,34 @@ bootstrap_nodes:
 PRIMARY="PRIMARY_TOX_ID"
 BACKUP="BACKUP_TOX_ID"
 
+start_tunnel() {
+    local server_id="$1"
+    local local_port="$2"
+    local config_path="$3"
+
+    cat > "$config_path" <<EOF
+mode: client
+data_dir: /tmp/toxtunnel-ha
+
+client:
+  server_id: "${server_id}"
+  forwards:
+    - local_port: ${local_port}
+      remote_host: 127.0.0.1
+      remote_port: 80
+EOF
+
+    ./build/toxtunnel -c "$config_path" &
+}
+
 # Start primary tunnel
 start_primary() {
-    ./build/toxtunnel -m client \
-        --server-id "$PRIMARY" \
-        --local-port 8080 \
-        --remote-host 127.0.0.1 \
-        --remote-port 80
+    start_tunnel "$PRIMARY" 8080 /tmp/toxtunnel-primary.yaml
 }
 
 # Start backup tunnel
 start_backup() {
-    ./build/toxtunnel -m client \
-        --server-id "$BACKUP" \
-        --local-port 8081 \
-        --remote-host 127.0.0.1 \
-        --remote-port 80
+    start_tunnel "$BACKUP" 8081 /tmp/toxtunnel-backup.yaml
 }
 
 # Health check
@@ -728,8 +791,7 @@ start_backup
 while true; do
     if ! check_health; then
         echo "Primary failed, switching to backup..."
-        # Restart primary with backup ID
-        pkill -f "localhost:8080"
+        pkill -f "/tmp/toxtunnel-primary.yaml"
         start_primary
     fi
     sleep 10
@@ -901,9 +963,19 @@ spec:
         command: ["/bin/sh", "-c"]
         args:
         - |
+          cat > /tmp/toxtunnel-client.yaml <<EOF
+          mode: client
+          data_dir: /tmp/toxtunnel
+
+          client:
+            server_id: "$(cat /etc/tox/id)"
+            forwards:
+              - local_port: 8080
+                remote_host: 127.0.0.1
+                remote_port: 80
+          EOF
           while true; do
-            ./toxtunnel -m client --server-id "$(cat /etc/tox/id)" \
-              --local-port 8080 --remote-host 127.0.0.1 --remote-port 80
+            ./toxtunnel -c /tmp/toxtunnel-client.yaml
             sleep 10
           done
         volumeMounts:

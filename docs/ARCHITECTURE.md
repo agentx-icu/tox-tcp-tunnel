@@ -129,8 +129,8 @@ Offset  Size  Field
 | [c-toxcore](https://github.com/TokTok/c-toxcore) | v0.2.22 | Tox protocol (git submodule, built from source) |
 | [asio](https://github.com/chriskohlhoff/asio)    | 1.28.0  | Async I/O (FetchContent, header-only)           |
 | [spdlog](https://github.com/gabime/spdlog)       | 1.12.0  | Logging (FetchContent)                          |
-| [CLI11](https://github.com/CLIUtils/CLI11)       | 2.3.2   | CLI argument parsing (FetchContent)             |
-| [yaml-cpp](https://github.com/jbeder/yaml-cpp)   | 0.7.0   | YAML parsing (FetchContent)                     |
+| [CLI11](https://github.com/CLIUtils/CLI11)       | 2.6.2   | CLI argument parsing (FetchContent)             |
+| [yaml-cpp](https://github.com/jbeder/yaml-cpp)   | 0.9.0   | YAML parsing (FetchContent)                     |
 | libsodium                                        | system  | Cryptography (required by toxcore)              |
 | [Google Test](https://github.com/google/googletest) | latest | Testing (FetchContent, test builds only)     |
 
@@ -169,8 +169,8 @@ tox-tcp-tunnel/
       circular_buffer.hpp
   src/                          # Implementations (mirrors include/)
   tests/
-    unit/                       # Unit tests (219 tests)
-    integration/                # Integration tests (29 tests)
+    unit/                       # Unit tests (232 tests)
+    integration/                # Integration tests (41 tests)
   third_party/
     c-toxcore/                  # toxcore git submodule
   docs/                         # Documentation

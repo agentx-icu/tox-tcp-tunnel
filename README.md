@@ -65,7 +65,7 @@ Forward any TCP port through Tox with end-to-end encryption, no central server, 
 
 ```
 Server:   ./toxtunnel -m server           → prints Tox ID
-Client:   ./toxtunnel -m client --server-id <TOX_ID>
+Client:   ./toxtunnel -c client.yaml      → opens local port(s)
 Connect:  ssh -p 2222 localhost           → done
 ```
 
@@ -112,12 +112,15 @@ Connect:  ssh -p 2222 localhost           → done
 ### From GitHub Releases (Recommended)
 
 Download the latest installer from [GitHub Releases](https://github.com/anonymoussoft/tox-tcp-tunnel/releases).
+Release assets use the pattern `toxtunnel-<version>-<System>-<arch>.<ext>`.
 
 #### Linux (DEB - Ubuntu/Debian)
 
 ```bash
-wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-linux-x86_64.deb
-sudo dpkg -i toxtunnel-1.0.0-linux-x86_64.deb
+VERSION=0.1.11   # replace with the release you want
+ARCH=x86_64
+wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/download/v${VERSION}/toxtunnel-${VERSION}-Linux-${ARCH}.deb"
+sudo dpkg -i "toxtunnel-${VERSION}-Linux-${ARCH}.deb"
 ```
 
 The DEB package automatically:
@@ -139,8 +142,10 @@ sudo systemctl stop toxtunnel      # Stop
 #### Linux (RPM - Fedora/RHEL/CentOS)
 
 ```bash
-wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-linux-x86_64.rpm
-sudo rpm -i toxtunnel-1.0.0-linux-x86_64.rpm
+VERSION=0.1.11   # replace with the release you want
+ARCH=x86_64
+wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/download/v${VERSION}/toxtunnel-${VERSION}-Linux-${ARCH}.rpm"
+sudo rpm -i "toxtunnel-${VERSION}-Linux-${ARCH}.rpm"
 ```
 
 Service management is the same as the DEB package (systemd).
@@ -148,9 +153,10 @@ Service management is the same as the DEB package (systemd).
 #### macOS
 
 ```bash
-# Download and install the .pkg
-wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-Darwin-arm64.pkg
-sudo installer -pkg toxtunnel-1.0.0-Darwin-arm64.pkg -target /
+VERSION=0.1.11   # replace with the release you want
+ARCH=arm64          # or x86_64
+wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/download/v${VERSION}/toxtunnel-${VERSION}-Darwin-${ARCH}.pkg"
+sudo installer -pkg "toxtunnel-${VERSION}-Darwin-${ARCH}.pkg" -target /
 ```
 
 The package installs:
@@ -161,13 +167,13 @@ The package installs:
 Manage the service:
 
 ```bash
-sudo launchctl load /Library/LaunchDaemons/com.toxtunnel.daemon.plist     # Start
-sudo launchctl unload /Library/LaunchDaemons/com.toxtunnel.daemon.plist   # Stop
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+sudo launchctl bootout system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
 ```
 
 #### Windows
 
-1. Download `toxtunnel-installer.exe` from GitHub Releases
+1. Download the `.msi` installer from GitHub Releases
 2. Run the installer as Administrator
 3. The installer places files in `C:\Program Files\ToxTunnel\`
 4. A Windows service named `ToxTunnel` is registered automatically
@@ -251,7 +257,7 @@ Create a config file `client.yaml`:
 
 ```yaml
 mode: client
-data_dir: ~/.toxtunnel
+data_dir: ~/.config/toxtunnel
 
 tox:
   udp_enabled: true
@@ -355,8 +361,8 @@ To test locally before deploying:
 # Terminal 1: Start server
 ./build/toxtunnel -m server
 
-# Terminal 2: Start client (use the server's Tox address from Terminal 1)
-./build/toxtunnel -m client --server-id <SERVER_TOX_ADDRESS> -d /tmp/tox-client
+# Terminal 2: Start client with the config from Step 2
+./build/toxtunnel -c client.yaml -d /tmp/tox-client
 
 # Wait for connection, then:
 # Terminal 3: Test SSH
@@ -378,7 +384,7 @@ toxtunnel print-id [OPTIONS]
 | ----------------------- | -------------------------------------------- |
 | `-c, --config FILE`     | YAML config file                             |
 | `-m, --mode MODE`       | `server` or `client`                         |
-| `-d, --data-dir DIR`    | Directory for Tox identity (default: `.`)    |
+| `-d, --data-dir DIR`    | Override data directory (`/var/lib/toxtunnel` for server, `$HOME/.config/toxtunnel` for client) |
 | `-l, --log-level LEVEL` | `trace`, `debug`, `info`, `warn`, `error`    |
 | `-p, --port PORT`       | TCP relay port override (server mode)        |
 | `--server-id ID`        | Server's 76-char Tox address (client mode)   |
@@ -390,7 +396,7 @@ toxtunnel print-id [OPTIONS]
 
 | Flag                 | Description                                     |
 | -------------------- | ----------------------------------------------- |
-| `-d, --data-dir DIR` | Data directory for loading/creating Tox identity |
+| `-d, --data-dir DIR` | Data directory for loading/creating local Tox identity (default: `$HOME/.config/toxtunnel`) |
 | `--qr`               | Render Tox ID as terminal QR code               |
 | `--color`             | Use ANSI colors in QR output (requires `--qr`)  |
 
@@ -451,7 +457,7 @@ Pre-built installers are published to GitHub Releases on every version tag (`v*`
 |----------|--------------------|--------------|
 | Linux    | DEB, RPM, tar.gz   | systemd      |
 | macOS    | .pkg, tar.gz       | launchd      |
-| Windows  | NSIS .exe, .zip    | Windows SCM  |
+| Windows  | MSI                | Windows SCM  |
 
 Build installers locally:
 
