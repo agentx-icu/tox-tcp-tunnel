@@ -1,16 +1,6 @@
 ---
 name: tox-tunnel-ops
-description: >-
-  Secure TCP port forwarding and encrypted tunnel management through the Tox P2P network.
-  A zero-config alternative to VPN, ngrok, and SSH tunneling for NAT traversal and
-  firewall bypass — no central server, no registration, no port forwarding needed.
-  Design, deploy, and diagnose tunnels for SSH remote access, RDP remote desktop,
-  database connections (PostgreSQL, MySQL, Redis, MongoDB), web service exposure,
-  NAS/homelab access, and arbitrary TCP forwarding. Supports intranet penetration (内网穿透),
-  reverse proxy, dev server sharing, contractor temporary access with access control,
-  and LAN-first bootstrap for air-gapped networks.
-user-invocable: true
-maintained: true
+description: "Design, deploy, and troubleshoot secure TCP tunnels over the Tox P2P network for SSH, RDP/VNC, database access, web service exposure, NAS/homelab access, and arbitrary TCP forwarding. Use when: remote SSH without port forwarding, NAT traversal, intranet penetration, exposing internal services, generating ToxTunnel config files, setting up temporary contractor access, diagnosing toxtunnel connection failures, or tightening rules.yaml access control."
 metadata:
   openclaw:
     requires:
@@ -22,19 +12,21 @@ metadata:
 ---
 
 # tox-tunnel-ops
-
 You are a ToxTunnel operations specialist. You help users design, deploy, and diagnose TCP tunnels over the Tox P2P network using **tox-tcp-tunnel**.
 
-## What This Skill Does
+Project links:
+- GitHub repository: `https://github.com/anonymoussoft/tox-tcp-tunnel`
+- Releases: `https://github.com/anonymoussoft/tox-tcp-tunnel/releases`
 
+## What This Skill Does
 This skill helps you create **secure, encrypted TCP tunnels** that work behind NATs and firewalls without any central server. Common use cases:
 
-- **Remote SSH access** — connect to a home or office machine from anywhere, no port forwarding needed (替代 SSH 端口转发)
+- **Remote SSH access** — connect to a home or office machine from anywhere, no port forwarding needed
 - **Remote desktop (RDP/VNC)** — access Windows/Linux desktops through encrypted P2P tunnel
-- **Database tunnel** — securely connect to PostgreSQL, MySQL, Redis, MongoDB through a private tunnel (数据库远程访问)
-- **Web service exposure** — share a local dev server or internal web app with teammates (类似 ngrok 的内网穿透)
-- **NAS / homelab remote access** — access Synology, TrueNAS, or any home server from outside the LAN (NAS 远程访问)
-- **Intranet penetration (内网穿透)** — bypass corporate or carrier-grade NAT without VPN infrastructure
+- **Database tunnel** — securely connect to PostgreSQL, MySQL, Redis, MongoDB through a private tunnel
+- **Web service exposure** — share a local dev server or internal web app with teammates
+- **NAS / homelab remote access** — access Synology, TrueNAS, or any home server from outside the LAN
+- **Intranet penetration** — bypass corporate or carrier-grade NAT without VPN infrastructure
 - **Temporary contractor access** — grant time-scoped, auditable access to specific services
 - **Air-gapped / LAN-only networking** — works entirely on local network without internet
 
@@ -45,7 +37,6 @@ This skill helps you create **secure, encrypted TCP tunnels** that work behind N
 - vs **Tailscale / ZeroTier**: No account, no registration, no third-party dependency
 
 ---
-
 ## Background Knowledge
 
 ### What is tox-tcp-tunnel?
@@ -214,9 +205,9 @@ Analyze the user's message and route to the appropriate mode:
 
 | Signal | Mode | Examples |
 |--------|------|----------|
-| Describes a need/scenario, asks "how to" | **Design** | "帮我把 NAS 暴露出来", "我要远程连 SSH", "给外包商开数据库访问" |
-| Asks to generate config, start service, write files | **Execute** | "帮我生成配置", "启动 server", "写入 client.yaml" |
-| Describes a failure, asks "why not working" | **Diagnose** | "连不上", "端口不通", "规则拦截了", "friend 连上了但转发失败" |
+| Describes a need/scenario, asks "how to" | **Design** | "Expose my NAS remotely", "I need remote SSH access", "Give a contractor temporary database access" |
+| Asks to generate config, start service, write files | **Execute** | "Generate the config", "Start the server", "Write client.yaml" |
+| Describes a failure, asks "why not working" | **Diagnose** | "It won't connect", "The port is unreachable", "The rules blocked it", "Friend is connected but forwarding still fails" |
 
 **Modes flow naturally:** Design → Execute → Diagnose. After design, if user says "execute it", switch to Execute. After execute, if something fails, switch to Diagnose. No explicit mode switching needed.
 
@@ -402,275 +393,39 @@ Numbered step-by-step:
 - Note: Windows UNC paths don't support non-standard SMB ports, suggest `netsh` redirect
 
 ---
+## Bundled Resources
 
+- `templates/server.yaml.tpl`, `templates/client.yaml.tpl`, `templates/rules.yaml.tpl`
+  — base templates for generated configs
+- `examples/*.md` — scenario-specific walk-throughs for SSH, RDP, DB, web, NAS, and
+  temporary access
+- `references/execute.md` — detailed install, startup, persistence, lifecycle, and
+  verification commands by platform
+- `references/diagnose.md` — deep troubleshooting flow, common errors, and diagnosis
+  output format
+- `scripts/verify.sh`, `scripts/diagnose.sh` — local helper scripts; inspect before
+  running
+
+---
 ## Mode 2: Execute
 
-When the user wants to deploy the tunnel — generate files, start services.
+When the user wants to deploy the tunnel, generate files and commands first, then
+run only the minimum necessary operations on the current machine.
 
-### Step 0: Environment Detection
+Execution checklist:
+1. Detect OS, package/manual install status, `toxtunnel` availability, and free ports.
+2. Generate `server.yaml`, `client.yaml`, and `rules.yaml` from `templates/`.
+3. Prefer GitHub Releases packages over source builds unless no package fits.
+4. Start direct processes only when the user explicitly wants them run here.
+5. Set up system persistence only on explicit request; treat service definitions as
+   manual-review templates.
+6. Verify with `scripts/verify.sh` or scenario-specific client commands.
 
-Before anything else, run these checks:
-
-**1. Is `toxtunnel` installed?**
-```bash
-which toxtunnel 2>/dev/null || where toxtunnel 2>nul
-```
-- If not found, provide install instructions. **Prefer package install over building from source:**
-
-  Each release publishes both versioned assets
-  (`toxtunnel-<VERSION>-<System>-<arch>.<ext>`) and a stable **`-latest`** alias
-  (`toxtunnel-<System>-<arch>-latest.<ext>`). Use the alias URLs below — they
-  always serve the newest release. For a specific version, swap to the versioned
-  filename and the `download/v<VERSION>/` path.
-
-  **Linux (DEB - Ubuntu/Debian):**
-  ```bash
-  ARCH=x86_64      # or aarch64
-  wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
-  sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
-  ```
-
-  **Linux (RPM - Fedora/RHEL/CentOS):**
-  ```bash
-  ARCH=x86_64      # or aarch64
-  wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
-  sudo rpm -i "toxtunnel-Linux-${ARCH}-latest.rpm"
-  ```
-
-  **macOS:**
-  ```bash
-  ARCH=arm64       # or x86_64
-  wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
-  sudo installer -pkg "toxtunnel-Darwin-${ARCH}-latest.pkg" -target /
-  ```
-
-  **Windows:**
-  Download the MSI from
-  `https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
-  (use `toxtunnel-Windows-ARM64-latest.msi` for ARM) and run it as Administrator.
-
-  **Build from source (if no package available for your platform):**
-  - macOS: `brew install libsodium && cd <project> && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(sysctl -n hw.ncpu) && sudo cp build/toxtunnel /usr/local/bin/`
-  - Linux (Debian/Ubuntu): `sudo apt install libsodium-dev build-essential cmake && cd <project> && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && sudo cp build/toxtunnel /usr/local/bin/`
-  - Linux (Fedora/RHEL): `sudo dnf install libsodium-devel cmake gcc-c++ && ...`
-  - Windows: build with MSVC + vcpkg or MSYS2 (see BUILDING.md)
-
-**2. Is libsodium available?**
-```bash
-pkg-config --exists libsodium && echo "OK" || echo "MISSING"
-# or: ldconfig -p | grep libsodium   (Linux)
-# or: brew list libsodium             (macOS)
-```
-
-**3. Are target ports available?**
-```bash
-lsof -i :PORT -sTCP:LISTEN   # macOS/Linux
-netstat -an | findstr :PORT   # Windows
-```
-
-**4. Detect OS for path and service defaults:**
-- macOS (from .pkg): `binary: /usr/local/bin/toxtunnel`, example config at `/usr/local/share/toxtunnel/config.yaml.example` (you must copy/edit it yourself, e.g. to `/usr/local/etc/toxtunnel/config.yaml`), launchd plist at `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist` (must be moved to `/Library/LaunchDaemons/` manually)
-- macOS (manual / source build): `data_dir: ~/Library/Application Support/toxtunnel/` (or `~/.config/toxtunnel/`), service: launchd user agent
-- Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml` (seeded from example by postinst), `data_dir: /var/lib/toxtunnel`, service: systemd (`toxtunnel.service`, enabled but not started)
-- Linux (manual): `data_dir: ~/.config/toxtunnel/`, service: systemd unit you write yourself
-- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. The MSI does NOT seed a config file or register a service — pick a config path (e.g. `C:\ProgramData\ToxTunnel\config.yaml`) and create the service yourself with `sc.exe` or NSSM.
-- Windows (manual): `data_dir: %APPDATA%\toxtunnel\`, service: NSSM or Task Scheduler
-
-### Step 1: Write Config Files
-
-Generate and write to the working directory (or user-specified path):
-- `server.yaml` — filled from template with extracted values
-- `client.yaml` — filled from template with extracted values
-- `rules.yaml` — if access control was specified (enforce security constraints)
-
-Use the Bash tool or Write tool to create the files. Confirm the write path with the user if ambiguous.
-
-### Step 2: Startup Commands
-
-Provide the exact commands:
-```bash
-# Server side (on the machine with the target service)
-toxtunnel -m server -c /path/to/server.yaml
-
-# Client side (after obtaining server's Tox ID from server output)
-toxtunnel -m client -c /path/to/client.yaml
-```
-
-If running on the current machine, offer to start the process directly.
-
-### Step 3: Service Persistence (only if user requests)
-
-Behavior depends on the installer:
-
-- **Linux DEB/RPM** — the postinst script registers and enables the
-  `toxtunnel.service` systemd unit, copies `config.yaml.example` to
-  `/etc/toxtunnel/config.yaml` (only if missing), and creates the `toxtunnel`
-  system user. The service is *enabled but not started* by default.
-- **macOS .pkg** — installs the binary to `/usr/local/bin/`, the example config to
-  `/usr/local/share/toxtunnel/config.yaml.example`, and the launchd plist to
-  `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist`. **It does NOT load
-  the launchd job automatically;** you must copy the plist into
-  `/Library/LaunchDaemons/` and bootstrap it manually.
-- **Windows MSI** — installs files into `C:\Program Files\ToxTunnel\`. **It
-  does NOT register a Windows service automatically;** create the service via
-  `sc.exe` or NSSM after install.
-
-**Linux (installed from DEB/RPM):**
-```bash
-# Edit config (postinst already created it from the example, if missing)
-sudo vim /etc/toxtunnel/config.yaml
-
-# Start service (postinst enables it; you still need an explicit start)
-sudo systemctl start toxtunnel
-sudo systemctl enable toxtunnel      # auto-start on boot (already enabled by postinst)
-sudo systemctl status toxtunnel      # check status
-```
-
-**macOS (installed from .pkg):**
-```bash
-# Copy the example config to a location of your choice, then edit it
-sudo mkdir -p /usr/local/etc/toxtunnel
-sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
-sudo vim /usr/local/etc/toxtunnel/config.yaml
-
-# Install and load the launchd job (the .pkg leaves the plist in share/, not LaunchDaemons/)
-sudo cp /usr/local/share/toxtunnel/com.toxtunnel.daemon.plist /Library/LaunchDaemons/
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
-
-# Stop / unload
-sudo launchctl bootout system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
-```
-
-**Windows (installed from MSI):**
-```powershell
-# Place a config file (the MSI does not seed one; copy from the source tree
-# or write your own). Common location: C:\ProgramData\ToxTunnel\config.yaml.
-
-# Register the service manually — the MSI does NOT do this for you.
-sc create ToxTunnel binPath= "\"C:\Program Files\ToxTunnel\bin\toxtunnel.exe\" -c \"C:\ProgramData\ToxTunnel\config.yaml\" --service" start= auto
-sc start ToxTunnel
-sc query ToxTunnel
-sc stop ToxTunnel
-```
-
-If toxtunnel was built from source, set up the service manually:
-
-**Linux (systemd — manual setup):**
-```ini
-[Unit]
-Description=ToxTunnel %i
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=notify
-ExecStart=/usr/local/bin/toxtunnel -m %i -c /etc/toxtunnel/%i.yaml --service
-Restart=on-failure
-RestartSec=5
-User=toxtunnel
-WorkingDirectory=/etc/toxtunnel
-
-[Install]
-WantedBy=multi-user.target
-```
-Install: `sudo cp toxtunnel@.service /etc/systemd/system/ && sudo systemctl enable --now toxtunnel@server`
-
-**macOS (launchd — manual setup):**
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.toxtunnel.MODE</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/toxtunnel</string>
-        <string>-m</string>
-        <string>MODE</string>
-        <string>-c</string>
-        <string>/usr/local/etc/toxtunnel/MODE.yaml</string>
-        <string>--service</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/usr/local/var/log/toxtunnel-MODE.log</string>
-    <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/toxtunnel-MODE.log</string>
-</dict>
-</plist>
-```
-Install: `cp com.toxtunnel.MODE.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.toxtunnel.MODE.plist`
-
-**Windows (manual setup with sc.exe):**
-```cmd
-sc create ToxTunnel binPath= "\"C:\path\to\toxtunnel.exe\" -c \"C:\path\to\config.yaml\" --service" start= auto
-sc start ToxTunnel
-```
-
-**Windows (alternative: NSSM for more control):**
-```cmd
-nssm install ToxTunnel-MODE "C:\path\to\toxtunnel.exe" -m MODE -c "C:\path\to\MODE.yaml"
-nssm set ToxTunnel-MODE AppStdout "C:\path\to\logs\MODE.log"
-nssm set ToxTunnel-MODE AppStderr "C:\path\to\logs\MODE.log"
-nssm start ToxTunnel-MODE
-```
-
-### Step 4: Lifecycle Operations
-
-**Start / Stop / Restart:**
-```bash
-# Direct process
-toxtunnel -m server -c server.yaml &          # background
-kill $(pgrep -f "toxtunnel.*server")           # stop
-
-# systemd (Linux, from package or manual setup)
-sudo systemctl start toxtunnel                 # package-installed service
-sudo systemctl stop toxtunnel
-sudo systemctl restart toxtunnel
-sudo systemctl start toxtunnel@server          # manual template-based service
-sudo systemctl stop toxtunnel@server
-
-# launchd (macOS — after manually moving the plist into /Library/LaunchDaemons/)
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
-sudo launchctl bootout    system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
-launchctl start com.toxtunnel.server           # manual user agent
-launchctl stop  com.toxtunnel.server
-
-# Windows SCM (after manually creating the service via `sc create ToxTunnel ...`)
-sc start ToxTunnel
-sc stop  ToxTunnel
-
-# Windows NSSM (manual setup)
-nssm start ToxTunnel-server
-nssm stop ToxTunnel-server
-```
-
-**View logs:**
-```bash
-# If log file configured
-tail -f /var/log/toxtunnel/server.log
-
-# systemd journal
-journalctl -u toxtunnel@server -f
-
-# macOS
-tail -f /usr/local/var/log/toxtunnel-server.log
-
-# Increase verbosity for debugging
-toxtunnel -m server -c server.yaml -l debug
-```
-
-### Step 5: Post-Deploy Verification
-
-Run the verification script or manual checks:
-```bash
-bash scripts/verify.sh <local_port> <service_type>
-```
+Read on demand:
+- `references/execute.md` for platform-specific install, startup, persistence,
+  lifecycle, and verification commands
+- `examples/*.md` for ready-made tunnel scenarios
+- `scripts/verify.sh` for local smoke tests; inspect before running
 
 ### Output Format
 
@@ -700,114 +455,24 @@ bash scripts/verify.sh <local_port> <service_type>
 ```
 
 ---
-
 ## Mode 3: Diagnose
 
-When the user reports a problem with an existing tunnel.
+When the user reports a failure, diagnose from the bottom up and stop at the first
+confirmed fault domain.
 
-### Diagnostic Layers
+Diagnostic checklist:
+1. Check `toxtunnel` binary, process state, mode, and version.
+2. Validate config syntax plus `server_id`, `forwards`, `data_dir`, and `rules_file`.
+3. Review `rules.yaml` for over-broad access, bad friend keys, and deny/allow mistakes.
+4. Confirm bootstrap conditions, DHT connectivity, friend status, and UDP/TCP path.
+5. Test local listener, remote target reachability, and service-specific smoke checks.
+6. Report a concrete fix with a verification command.
 
-Run through these layers in order. Stop at the first failure and propose a fix.
-
-#### Layer 1: Process & Binary
-- Is `toxtunnel` installed? (`which toxtunnel`)
-- Is it running? (`ps aux | grep toxtunnel` / `Get-Process toxtunnel`)
-- Which config file is it using? What mode?
-- What version?
-
-#### Layer 2: Configuration Static Check
-- Is the YAML syntactically valid?
-- Is `mode` set correctly?
-- Does `data_dir` exist and is it writable?
-- Does `tox_save.dat` exist? (first run creates it)
-- **Client-specific:**
-  - Is `server_id` set and exactly 76 characters?
-  - Is `server_id` NOT the placeholder `<PASTE_SERVER_TOX_ID_HERE>`?
-  - Are `forwards` entries present with valid port numbers?
-- **Server-specific:**
-  - If `rules_file` is set, does the file exist?
-  - Is the rules YAML valid?
-
-#### Layer 3: Rules Risk Analysis
-- Parse the rules.yaml and check for:
-  - **Overly broad allow rules**: host `*` with empty ports (allows everything)
-  - **Missing deny coverage**: friend rules with only allow, no deny
-  - **Stale friend keys**: friend_pk entries that don't match any known friends
-  - **Port 0 in rules**: invalid, will cause parse error
-  - **Friend key format**: must be exactly 64 hex characters
-- Report risk level: LOW / MEDIUM / HIGH
-- Suggest improvements for any MEDIUM or HIGH risks
-
-#### Layer 4: Network & Tox Connection
-- Does the machine have internet access? (`ping -c 1 -W 2 1.1.1.1`)
-  - If `bootstrap_mode: lan`, internet is NOT required — but both machines must be on the same subnet
-  - If `bootstrap_mode: auto`, internet IS required for DHT bootstrap
-- Is UDP blocked? (Tox uses UDP for direct connections; falls back to TCP relay)
-- Is `tox.tcp_port` (default 33445) available?
-- Check log for key events:
-  - `Connected to DHT` — Tox network joined
-  - `Self connection status: Online` — DHT fully connected
-  - `Friend connection status: Connected` — friend link established
-
-#### Layer 5: Port & Tunnel Connectivity
-- Is the local listening port open? (`lsof -i :PORT -sTCP:LISTEN`)
-- Can TCP connect to it? (`nc -z -w 5 127.0.0.1 PORT`)
-- Is the target service running on the server side? (`nc -zv target_host target_port`)
-- Check for `TUNNEL_OPEN` / `TUNNEL_ERROR` / `TUNNEL_CLOSE` in logs
-
-#### Layer 6: Application Layer Smoke Test
-- Scenario-specific connectivity test:
-  - SSH: check for SSH banner via `nc`
-  - HTTP: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:PORT/`
-  - DB: use DB CLI client ping (e.g., `redis-cli ping`, `psql -c "SELECT 1"`)
-
-### Common Errors Explained
-
-| Error / Symptom | Meaning | Fix |
-|-----------------|---------|-----|
-| `Connection refused` on local port | Client not running, or wrong local_port, or port conflict | Check client process; verify config; check `lsof -i :PORT` |
-| Friend stays `Offline` | Wrong server_id, DHT not connected, or UDP blocked | Verify 76-char Tox ID; wait 30-60s; check internet; try `bootstrap_mode: lan` if on same LAN |
-| `Friend online` but tunnel fails | Rules blocking the target, or target service not running | Check `rules.yaml` allows the requested `host:port`; test target with `nc -zv host port` on server |
-| `Invalid public key length` in logs | rules.yaml has wrong friend key format | Friend public key must be exactly 64 hex chars (NOT the full 76-char Tox ID) |
-| `Rules file not found` | Path in `server.rules_file` is wrong | Check path; use absolute path; verify file permissions |
-| Slow transfer speed | Using Tox TCP relay instead of direct UDP | Check if direct UDP connection is established (log: `Direct UDP connection`); ensure UDP is not blocked |
-| Periodic disconnects | Tox friend connection instability | Increase log to debug; check for network interruptions; ensure both sides have stable connectivity |
-| `Failed to bind port` | Port already in use | Find the conflicting process: `lsof -i :PORT`; choose a different `local_port` |
-| `Permission denied` on data_dir | Wrong file ownership/permissions | `chmod 700 data_dir`; check ownership matches the running user |
-| Config parse error | YAML syntax issue | Check indentation (spaces, not tabs); validate with `python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" config.yaml` |
-
-### Output Format
-
-```
-## Diagnosis Result
-
-### Layer [N]: [Layer Name]
-
-### Problem Identified
-[Clear description of what's wrong]
-
-### Evidence
-[Log lines, command output, or config snippets that confirm the issue]
-
-### Risk Assessment (for rules issues)
-[LOW / MEDIUM / HIGH with explanation]
-
-### Fix
-[Exact steps to resolve, including commands to run]
-
-### Verification
-[Command to confirm the fix worked]
-```
-
-### Using the Diagnostic Scripts
-
-```bash
-# Full diagnostic
-bash scripts/diagnose.sh /path/to/config.yaml
-
-# Verify a specific port
-bash scripts/verify.sh <local_port> [ssh|http|postgres|mysql|redis|mongo|tcp]
-```
+Read on demand:
+- `references/diagnose.md` for the full layered checklist, common errors, and response
+  template
+- `scripts/diagnose.sh` for a local end-to-end diagnostic pass; inspect before running
+- `scripts/verify.sh` for service-specific tunnel verification; inspect before running
 
 ---
 

@@ -17,7 +17,13 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y --no-install-recommends "${package_path}"
+# apt requires local deb paths to be absolute or prefixed with ./.
+if [[ "${package_path}" = /* ]]; then
+    install_target="${package_path}"
+else
+    install_target="./${package_path}"
+fi
+apt-get install -y --no-install-recommends "${install_target}"
 
 binary_path="/usr/bin/toxtunnel"
 if [[ ! -x "${binary_path}" ]]; then
