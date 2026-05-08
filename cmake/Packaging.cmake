@@ -9,6 +9,13 @@ set(CPACK_PACKAGE_FILE_NAME
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CPACK_GENERATOR "DEB;RPM;TGZ")
+    # Debian packages must use Debian architecture names, not CMake's
+    # CMAKE_SYSTEM_PROCESSOR values (e.g. x86_64/aarch64).
+    if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+        set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
+    elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
+    endif()
     # Portable Linux builds still rely on the system's libsodium package.
     # Keep explicit package-manager metadata so target-distro install tests can
     # resolve the dependency instead of producing a package that installs but
