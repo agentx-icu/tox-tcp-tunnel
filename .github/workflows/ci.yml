@@ -240,13 +240,20 @@ jobs:
                 yum install -y cmake3
                 ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
               fi
-              yum install -y rpm-build pkgconfig libsodium-devel
+              yum install -y rpm-build pkgconfig
+              if ! yum install -y libsodium-devel; then
+                yum install -y epel-release
+                yum install -y libsodium-devel
+              fi
               cmake -B build \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DTOXTUNNEL_BUILD_TESTS=OFF \
                 -DTOXTUNNEL_PORTABLE_RELEASE=ON \
                 -DRELEASE_VERSION="${TARGET_VERSION}"
               cmake --build build --parallel
+              cd build
+              cpack -G DEB
+              cpack -G RPM
             '
           sudo chown -R "$(id -u):$(id -g)" build
 
@@ -280,8 +287,7 @@ jobs:
 
       - name: Package (Linux)
         if: matrix.target.platform == 'linux'
-        working-directory: build
-        run: cpack -G "${{ matrix.target.generator }}"
+        run: echo "Linux packages are generated inside the portable container step."
 
       - name: Package (Windows)
         if: matrix.target.platform == 'windows'
