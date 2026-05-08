@@ -52,13 +52,21 @@ CPack configuration lives in `cmake/Packaging.cmake`. Packaging assets are under
 
 ## Installation (from packages)
 
+Each release publishes both versioned and stable `-latest` aliases. Pull the
+latest assets from
+`https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-<System>-<arch>-latest.<ext>`
+where `<System>` is `Linux` / `Darwin` / `Windows` and `<ext>` is `deb` / `rpm` / `pkg` / `msi`.
+
 ### Linux (DEB/RPM)
 
 ```bash
 sudo dpkg -i toxtunnel-*.deb         # or: sudo rpm -i toxtunnel-*.rpm
-sudo systemctl start toxtunnel       # Start service
-sudo systemctl enable toxtunnel      # Enable on boot
+sudo systemctl start toxtunnel       # Start service (postinst already enables it)
+sudo systemctl enable toxtunnel      # Enable on boot (no-op if postinst already did this)
 ```
+
+Postinst seeds `/etc/toxtunnel/config.yaml` from `config.yaml.example` if absent,
+creates the `toxtunnel` system user, and enables the unit.
 
 Config: `/etc/toxtunnel/config.yaml`, data: `/var/lib/toxtunnel`, binary: `/usr/bin/toxtunnel`.
 
@@ -66,16 +74,27 @@ Config: `/etc/toxtunnel/config.yaml`, data: `/var/lib/toxtunnel`, binary: `/usr/
 
 ```bash
 sudo installer -pkg toxtunnel-*.pkg -target /
+
+# The .pkg does NOT seed a config or load the launchd job — do that manually:
+sudo mkdir -p /usr/local/etc/toxtunnel
+sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
+sudo cp /usr/local/share/toxtunnel/com.toxtunnel.daemon.plist /Library/LaunchDaemons/
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
 ```
 
-Config: `/usr/local/etc/toxtunnel/config.yaml`, binary: `/usr/local/bin/toxtunnel`.
+Binary: `/usr/local/bin/toxtunnel`. Example config: `/usr/local/share/toxtunnel/config.yaml.example`.
 
 ### Windows
 
-Run the MSI installer as Administrator. It installs to `C:\Program Files\ToxTunnel\` and registers a `ToxTunnel` Windows service.
+Run the MSI installer as Administrator. It installs files into `C:\Program Files\ToxTunnel\`.
+The MSI does NOT register a Windows service or seed a config — register the service manually
+after writing a config file:
 
 ```powershell
+mkdir 'C:\ProgramData\ToxTunnel'
+notepad 'C:\ProgramData\ToxTunnel\config.yaml'
+
+sc create ToxTunnel binPath= "\"C:\Program Files\ToxTunnel\bin\toxtunnel.exe\" -c \"C:\ProgramData\ToxTunnel\config.yaml\" --service" start= auto
 sc start ToxTunnel
 ```
 

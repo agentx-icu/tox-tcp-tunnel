@@ -130,12 +130,16 @@ jobs:
             generator: "DEB;RPM"
             container_image: quay.io/pypa/manylinux2014_x86_64
             cmake_arch: x86_64
+            verify_deb_image: ubuntu:20.04
+            verify_rpm_image: centos:7
           - id: linux-aarch64
             runner: ubuntu-24.04-arm
             platform: linux
             generator: "DEB;RPM"
             container_image: quay.io/pypa/manylinux2014_aarch64
             cmake_arch: aarch64
+            verify_deb_image: arm64v8/ubuntu:20.04
+            verify_rpm_image: arm64v8/centos:7
           - id: macos-x86_64
             runner: macos-15-intel
             platform: macos
@@ -176,6 +180,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpm
           docker pull "${{ matrix.target.container_image }}"
+          docker pull "${{ matrix.target.verify_deb_image }}"
+          docker pull "${{ matrix.target.verify_rpm_image }}"
 
       - name: Install macOS dependencies
         if: matrix.target.platform == 'macos'
@@ -311,6 +317,30 @@ jobs:
         run: |
           bash tests/packaging/verify_linux_abi.sh build/toxtunnel 2.17
 
+      - name: Verify Ubuntu 20.04 DEB install
+        if: matrix.target.platform == 'linux'
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          deb_package="$(echo build/*.deb)"
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "${{ matrix.target.verify_deb_image }}" \
+            /bin/bash -lc "bash tests/packaging/verify_linux_deb_install.sh \"${deb_package}\" \"${EXPECTED_VERSION}\""
+
+      - name: Verify CentOS 7 RPM install
+        if: matrix.target.platform == 'linux'
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          rpm_package="$(echo build/*.rpm)"
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            "${{ matrix.target.verify_rpm_image }}" \
+            /bin/bash -lc "bash tests/packaging/verify_linux_rpm_install.sh \"${rpm_package}\" \"${EXPECTED_VERSION}\""
+
       - name: Verify Windows install tree
         if: matrix.target.platform == 'windows'
         shell: pwsh
@@ -407,6 +437,40 @@ jobs:
           pattern: installer-*
           path: release-artifacts
           merge-multiple: true
+
+      - name: Generate -latest alias artifacts
+        # For every versioned package CPack produced, also publish a copy
+        # whose filename omits the version and ends with `-latest`. This
+        # gives docs a stable URL via /releases/latest/download/<file>.
+        shell: bash
+        working-directory: release-artifacts
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          if [ -z "${version}" ]; then
+            echo "Could not derive version from ref ${VERSION}" >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          for f in *.deb *.rpm *.pkg *.msi; do
+            [ -f "$f" ] || continue
+            # Strip the `-${version}` segment from the filename, then append
+            # `-latest` before the extension. Example:
+            #   toxtunnel-0.1.11-Linux-x86_64.deb -> toxtunnel-Linux-x86_64-latest.deb
+            stripped="${f//-${version}-/-}"
+            if [ "$stripped" = "$f" ]; then
+              echo "Skipping ${f}: version segment '${version}' not found in filename" >&2
+              continue
+            fi
+            ext="${stripped##*.}"
+            stem="${stripped%.*}"
+            alias="${stem}-latest.${ext}"
+            cp -- "$f" "$alias"
+            echo "Aliased ${f} -> ${alias}"
+          done
+          ls -la
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3

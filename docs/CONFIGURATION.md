@@ -98,11 +98,15 @@ tox:
   bootstrap_nodes:
     - address: 144.217.167.73
       port: 33445
-      public_key: "7E5B5593A644DADA5272775FE2674241FFC0A2AB922990A9"
+      # public_key must be exactly 64 hex characters (the bootstrap node's DHT key)
+      public_key: "7E5B5593A644DADA5272775FE2674241FFC0A2AB922990A91219C5092750F69D"
     - address: tox.kurnevsky.net
       port: 33445
-      public_key: "82EF82BA33445A1F53A3BF27B7C4BBFCC9C78BC8BE2F5D17"
+      public_key: "82EF82BA33445A1F53A3BF27B7C4BBFCC9C78BC8BE2F5D17A0DA2B6F3E32D1B25"
 ```
+
+> Note: the `public_key` values above are illustrative — fetch real, current
+> values from `https://nodes.tox.chat/json` before relying on them.
 
 Get current bootstrap nodes from:
 - https://nodes.tox.chat/json (official Tox node list)
@@ -121,12 +125,13 @@ Create `rules.yaml`:
 
 ```yaml
 rules:
-  - friend_public_key: "AABBCCDD..."     # 64 hex characters (public key only)
+  - friend: "AABBCCDD..."               # 64 hex characters (public key only)
+                                        # `friend_pk` is also accepted as an alias
     allow:
       - host: "127.0.0.1"
         ports: [22, 80, 443]
       - host: "*.internal.example.com"
-        ports: []                         # empty = all ports
+        ports: []                       # empty = all ports
     deny:
       - host: "10.*"
         ports: []
@@ -141,11 +146,25 @@ server:
 
 ### Pattern Matching
 
-- `*` matches any sequence (`*.example.com`, `192.168.*`)
-- `?` matches a single character
-- Host matching is case-insensitive
-- IP octet wildcards: `192.168.*.*`
-- **Deny rules take precedence over allow rules**
+Target host patterns (`allow[].host` / `deny[].host`):
+
+- A single `*` wildcard is supported per pattern, with one prefix and one
+  suffix (e.g. `*.example.com`, `localhost*`, `192.168.*`).
+- A bare `*` matches any host.
+- Host matching is case-insensitive.
+- Multi-segment patterns like `192.168.*.*` will NOT match — the rules engine
+  honors only the first `*` for host targets. Use `192.168.*` instead.
+
+Source IP patterns (rule sources, when present) use a separate per-octet
+matcher that does support multi-octet wildcards such as `192.168.*.*`.
+
+Other rules:
+
+- Empty `ports: []` means "all ports".
+- **Deny rules take precedence over allow rules.**
+- The friend identity field accepts `friend` (canonical) or `friend_pk` (alias);
+  it must be exactly 64 hex characters (the friend's public key, not the full
+  76-char Tox ID).
 
 ### Default Behavior
 

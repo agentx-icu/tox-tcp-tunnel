@@ -149,10 +149,13 @@ rules:
 4. If no rule matches → **default deny**
 
 **Pattern matching:**
-- Host: `*` wildcard supported (e.g., `*.example.com`, `192.168.*.*`)
+- Host: a single `*` wildcard is supported (e.g., `*.example.com`, `localhost*`, `192.168.*`).
+  The implementation checks one prefix and one suffix only, so multi-segment patterns like
+  `192.168.*.*` will NOT match — use `192.168.*` instead.
 - Host matching is case-insensitive
 - Ports: list specific ports, or use empty list `[]` to mean "all ports"
-- `friend` key accepts both `friend` and `friend_pk` as aliases
+- The friend identity key accepts both `friend` (canonical) and `friend_pk` (alias).
+  `friend_public_key` is NOT recognized.
 
 If no `rules_file` is configured, the server allows ALL connections from any friend.
 
@@ -414,26 +417,37 @@ which toxtunnel 2>/dev/null || where toxtunnel 2>nul
 ```
 - If not found, provide install instructions. **Prefer package install over building from source:**
 
+  Each release publishes both versioned assets
+  (`toxtunnel-<VERSION>-<System>-<arch>.<ext>`) and a stable **`-latest`** alias
+  (`toxtunnel-<System>-<arch>-latest.<ext>`). Use the alias URLs below — they
+  always serve the newest release. For a specific version, swap to the versioned
+  filename and the `download/v<VERSION>/` path.
+
   **Linux (DEB - Ubuntu/Debian):**
   ```bash
-  wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-linux-x86_64.deb
-  sudo dpkg -i toxtunnel-1.0.0-linux-x86_64.deb
+  ARCH=x86_64      # or aarch64
+  wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
+  sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
   ```
 
   **Linux (RPM - Fedora/RHEL/CentOS):**
   ```bash
-  wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-linux-x86_64.rpm
-  sudo rpm -i toxtunnel-1.0.0-linux-x86_64.rpm
+  ARCH=x86_64      # or aarch64
+  wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
+  sudo rpm -i "toxtunnel-Linux-${ARCH}-latest.rpm"
   ```
 
   **macOS:**
   ```bash
-  wget https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-1.0.0-Darwin-arm64.pkg
-  sudo installer -pkg toxtunnel-1.0.0-Darwin-arm64.pkg -target /
+  ARCH=arm64       # or x86_64
+  wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
+  sudo installer -pkg "toxtunnel-Darwin-${ARCH}-latest.pkg" -target /
   ```
 
   **Windows:**
-  Download `toxtunnel-installer.exe` from [GitHub Releases](https://github.com/anonymoussoft/tox-tcp-tunnel/releases) and run as Administrator.
+  Download the MSI from
+  `https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
+  (use `toxtunnel-Windows-ARM64-latest.msi` for ARM) and run it as Administrator.
 
   **Build from source (if no package available for your platform):**
   - macOS: `brew install libsodium && cd <project> && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(sysctl -n hw.ncpu) && sudo cp build/toxtunnel /usr/local/bin/`
@@ -455,11 +469,11 @@ netstat -an | findstr :PORT   # Windows
 ```
 
 **4. Detect OS for path and service defaults:**
-- macOS (from .pkg): `binary: /usr/local/bin/toxtunnel`, `config: /usr/local/etc/toxtunnel/config.yaml`, service: launchd
-- macOS (manual): `data_dir: ~/Library/Application Support/toxtunnel/`, service: launchd
-- Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data_dir: /var/lib/toxtunnel`, service: systemd
-- Linux (manual): `data_dir: ~/.config/toxtunnel/`, service: systemd
-- Windows (from installer): `binary: C:\Program Files\ToxTunnel\toxtunnel.exe`, `config: %APPDATA%\toxtunnel\config.yaml`, service: Windows SCM
+- macOS (from .pkg): `binary: /usr/local/bin/toxtunnel`, example config at `/usr/local/share/toxtunnel/config.yaml.example` (you must copy/edit it yourself, e.g. to `/usr/local/etc/toxtunnel/config.yaml`), launchd plist at `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist` (must be moved to `/Library/LaunchDaemons/` manually)
+- macOS (manual / source build): `data_dir: ~/Library/Application Support/toxtunnel/` (or `~/.config/toxtunnel/`), service: launchd user agent
+- Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml` (seeded from example by postinst), `data_dir: /var/lib/toxtunnel`, service: systemd (`toxtunnel.service`, enabled but not started)
+- Linux (manual): `data_dir: ~/.config/toxtunnel/`, service: systemd unit you write yourself
+- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. The MSI does NOT seed a config file or register a service — pick a config path (e.g. `C:\ProgramData\ToxTunnel\config.yaml`) and create the service yourself with `sc.exe` or NSSM.
 - Windows (manual): `data_dir: %APPDATA%\toxtunnel\`, service: NSSM or Task Scheduler
 
 ### Step 1: Write Config Files
@@ -486,39 +500,57 @@ If running on the current machine, offer to start the process directly.
 
 ### Step 3: Service Persistence (only if user requests)
 
-If toxtunnel was installed from a package (DEB/RPM/.pkg/NSIS), the system service is already registered. Just enable and start it:
+Behavior depends on the installer:
+
+- **Linux DEB/RPM** — the postinst script registers and enables the
+  `toxtunnel.service` systemd unit, copies `config.yaml.example` to
+  `/etc/toxtunnel/config.yaml` (only if missing), and creates the `toxtunnel`
+  system user. The service is *enabled but not started* by default.
+- **macOS .pkg** — installs the binary to `/usr/local/bin/`, the example config to
+  `/usr/local/share/toxtunnel/config.yaml.example`, and the launchd plist to
+  `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist`. **It does NOT load
+  the launchd job automatically;** you must copy the plist into
+  `/Library/LaunchDaemons/` and bootstrap it manually.
+- **Windows MSI** — installs files into `C:\Program Files\ToxTunnel\`. **It
+  does NOT register a Windows service automatically;** create the service via
+  `sc.exe` or NSSM after install.
 
 **Linux (installed from DEB/RPM):**
 ```bash
-# Edit config
+# Edit config (postinst already created it from the example, if missing)
 sudo vim /etc/toxtunnel/config.yaml
 
-# Start service
+# Start service (postinst enables it; you still need an explicit start)
 sudo systemctl start toxtunnel
-sudo systemctl enable toxtunnel      # auto-start on boot
+sudo systemctl enable toxtunnel      # auto-start on boot (already enabled by postinst)
 sudo systemctl status toxtunnel      # check status
 ```
 
 **macOS (installed from .pkg):**
 ```bash
-# Edit config
+# Copy the example config to a location of your choice, then edit it
+sudo mkdir -p /usr/local/etc/toxtunnel
+sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
 sudo vim /usr/local/etc/toxtunnel/config.yaml
 
-# Start service
-sudo launchctl load /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+# Install and load the launchd job (the .pkg leaves the plist in share/, not LaunchDaemons/)
+sudo cp /usr/local/share/toxtunnel/com.toxtunnel.daemon.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
 
-# Stop service
-sudo launchctl unload /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+# Stop / unload
+sudo launchctl bootout system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
 ```
 
-**Windows (installed from NSIS installer):**
+**Windows (installed from MSI):**
 ```powershell
-# Edit config at %APPDATA%\toxtunnel\config.yaml
+# Place a config file (the MSI does not seed one; copy from the source tree
+# or write your own). Common location: C:\ProgramData\ToxTunnel\config.yaml.
 
-# Service is registered automatically by the installer
+# Register the service manually — the MSI does NOT do this for you.
+sc create ToxTunnel binPath= "\"C:\Program Files\ToxTunnel\bin\toxtunnel.exe\" -c \"C:\ProgramData\ToxTunnel\config.yaml\" --service" start= auto
 sc start ToxTunnel
-sc stop ToxTunnel
 sc query ToxTunnel
+sc stop ToxTunnel
 ```
 
 If toxtunnel was built from source, set up the service manually:
@@ -603,15 +635,15 @@ sudo systemctl restart toxtunnel
 sudo systemctl start toxtunnel@server          # manual template-based service
 sudo systemctl stop toxtunnel@server
 
-# launchd (macOS)
-sudo launchctl load /Library/LaunchDaemons/com.toxtunnel.daemon.plist    # package
-sudo launchctl unload /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+# launchd (macOS — after manually moving the plist into /Library/LaunchDaemons/)
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+sudo launchctl bootout    system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
 launchctl start com.toxtunnel.server           # manual user agent
-launchctl stop com.toxtunnel.server
+launchctl stop  com.toxtunnel.server
 
-# Windows SCM
-sc start ToxTunnel                             # package-installed service
-sc stop ToxTunnel
+# Windows SCM (after manually creating the service via `sc create ToxTunnel ...`)
+sc start ToxTunnel
+sc stop  ToxTunnel
 
 # Windows NSSM (manual setup)
 nssm start ToxTunnel-server
@@ -786,11 +818,11 @@ bash scripts/verify.sh <local_port> [ssh|http|postgres|mysql|redis|mongo|tcp]
 3. **Minimum privilege by default.** When generating rules.yaml, only allow the exact host:port combinations needed. Each friend gets their own rule entry with explicit 64-char hex public key.
 4. **No friend wildcards.** The `friend` field in rules.yaml must be an exact 64-character hex public key. Never use `*` for friend identity.
 5. **OS-aware.** Detect or ask the user's OS and tailor paths, commands, and service management:
-   - macOS (package): `binary: /usr/local/bin/toxtunnel`, `config: /usr/local/etc/toxtunnel/config.yaml`, service: launchd
-   - Linux (package): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data: /var/lib/toxtunnel`, service: systemd
-   - Windows (package): `binary: C:\Program Files\ToxTunnel\toxtunnel.exe`, service: Windows SCM
+   - macOS (package): `binary: /usr/local/bin/toxtunnel`; example config at `/usr/local/share/toxtunnel/config.yaml.example`; user copies to `/usr/local/etc/toxtunnel/config.yaml` and moves the plist to `/Library/LaunchDaemons/` to enable launchd.
+   - Linux (package): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data: /var/lib/toxtunnel`, service: systemd (`toxtunnel.service`, enabled by postinst but not started).
+   - Windows (package): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`, service: Windows SCM — but the MSI does NOT register the service or seed a config; both must be done manually with `sc.exe` (or NSSM).
    - For manual installs, use home-directory paths as before.
-6. **Prefer package installation.** When guiding users to install toxtunnel, recommend DEB/RPM/.pkg/NSIS packages from GitHub Releases first. Only suggest building from source when no pre-built package exists for the target platform.
+6. **Prefer package installation.** When guiding users to install toxtunnel, recommend DEB/RPM/.pkg/MSI packages from GitHub Releases first. Only suggest building from source when no pre-built package exists for the target platform.
 7. **Safe defaults.** `bootstrap_mode: auto` unless confirmed LAN. `log_level: info` unless diagnosing. `tox.tcp_port: 33445` unless blocked.
 8. **Pipe mode for SSH.** Always mention SSH ProxyCommand as an alternative for SSH scenarios. Note: pipe mode is POSIX only and **not supported on Windows** — on Windows, always use the `forwards` port-mapping approach instead.
 9. **Security reminders.** Remind users: Tox ID = identity. Keep `tox_save.dat` backed up. Never share private keys.

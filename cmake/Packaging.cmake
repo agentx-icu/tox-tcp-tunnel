@@ -9,14 +9,12 @@ set(CPACK_PACKAGE_FILE_NAME
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CPACK_GENERATOR "DEB;RPM;TGZ")
-    if(TOXTUNNEL_PORTABLE_RELEASE)
-        # Portable builds should avoid hard pinning distro package names.
-        set(CPACK_DEBIAN_PACKAGE_DEPENDS "")
-        set(CPACK_RPM_PACKAGE_REQUIRES "")
-    else()
-        set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium23")
-        set(CPACK_RPM_PACKAGE_REQUIRES "libsodium")
-    endif()
+    # Portable Linux builds still rely on the system's libsodium package.
+    # Keep explicit package-manager metadata so target-distro install tests can
+    # resolve the dependency instead of producing a package that installs but
+    # fails to start at runtime.
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium23")
+    set(CPACK_RPM_PACKAGE_REQUIRES "libsodium")
 
     # Wire postinst/prerm scripts as DEB/RPM lifecycle hooks
     set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA

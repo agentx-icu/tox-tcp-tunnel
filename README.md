@@ -111,16 +111,19 @@ Connect:  ssh -p 2222 localhost           → done
 
 ### From GitHub Releases (Recommended)
 
-Download the latest installer from [GitHub Releases](https://github.com/anonymoussoft/tox-tcp-tunnel/releases).
-Release assets use the pattern `toxtunnel-<version>-<System>-<arch>.<ext>`.
+Every release publishes both **versioned** assets
+(`toxtunnel-<version>-<System>-<arch>.<ext>`) and a stable **`-latest`** alias
+(`toxtunnel-<System>-<arch>-latest.<ext>`). The commands below use the alias
+via `releases/latest/download/...`, which always serves the newest release.
+For a specific version, browse [GitHub Releases](https://github.com/anonymoussoft/tox-tcp-tunnel/releases)
+and use the versioned filename instead.
 
 #### Linux (DEB - Ubuntu/Debian)
 
 ```bash
-VERSION=0.1.11   # replace with the release you want
-ARCH=x86_64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/download/v${VERSION}/toxtunnel-${VERSION}-Linux-${ARCH}.deb"
-sudo dpkg -i "toxtunnel-${VERSION}-Linux-${ARCH}.deb"
+ARCH=x86_64   # or aarch64
+wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
+sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
 ```
 
 The DEB package automatically:
@@ -142,10 +145,9 @@ sudo systemctl stop toxtunnel      # Stop
 #### Linux (RPM - Fedora/RHEL/CentOS)
 
 ```bash
-VERSION=0.1.11   # replace with the release you want
-ARCH=x86_64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/download/v${VERSION}/toxtunnel-${VERSION}-Linux-${ARCH}.rpm"
-sudo rpm -i "toxtunnel-${VERSION}-Linux-${ARCH}.rpm"
+ARCH=x86_64   # or aarch64
+wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
+sudo rpm -i "toxtunnel-Linux-${ARCH}-latest.rpm"
 ```
 
 Service management is the same as the DEB package (systemd).
@@ -153,34 +155,54 @@ Service management is the same as the DEB package (systemd).
 #### macOS
 
 ```bash
-VERSION=0.1.11   # replace with the release you want
-ARCH=arm64          # or x86_64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/download/v${VERSION}/toxtunnel-${VERSION}-Darwin-${ARCH}.pkg"
-sudo installer -pkg "toxtunnel-${VERSION}-Darwin-${ARCH}.pkg" -target /
+ARCH=arm64    # or x86_64
+wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
+sudo installer -pkg "toxtunnel-Darwin-${ARCH}-latest.pkg" -target /
 ```
 
 The package installs:
 - `toxtunnel` to `/usr/local/bin/`
-- launchd plist to `/Library/LaunchDaemons/com.toxtunnel.daemon.plist`
-- Config at `/usr/local/etc/toxtunnel/config.yaml`
+- Example config to `/usr/local/share/toxtunnel/config.yaml.example`
+- Sample launchd plist to `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist`
 
-Manage the service:
+> The .pkg does NOT seed `/usr/local/etc/toxtunnel/config.yaml` and does NOT
+> load the launchd job — copy the files into place yourself before starting
+> the service.
+
+Set up the service:
 
 ```bash
+# Seed the config (one-time)
+sudo mkdir -p /usr/local/etc/toxtunnel
+sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
+
+# Install and load the launchd job
+sudo cp /usr/local/share/toxtunnel/com.toxtunnel.daemon.plist /Library/LaunchDaemons/
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
-sudo launchctl bootout system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+sudo launchctl bootout    system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
 ```
 
 #### Windows
 
-1. Download the `.msi` installer from GitHub Releases
+1. Download the latest MSI from
+   `https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
+   (use `toxtunnel-Windows-ARM64-latest.msi` for ARM)
 2. Run the installer as Administrator
 3. The installer places files in `C:\Program Files\ToxTunnel\`
-4. A Windows service named `ToxTunnel` is registered automatically
 
-Manage the service:
+> The MSI does NOT seed a config file or register a Windows service — both
+> have to be done manually after install.
+
+Register and manage the service (one-time setup):
 
 ```powershell
+# Place a config file. C:\ProgramData\ToxTunnel\ is a typical location.
+mkdir 'C:\ProgramData\ToxTunnel'
+notepad 'C:\ProgramData\ToxTunnel\config.yaml'
+
+# Register the service
+sc create ToxTunnel binPath= "\"C:\Program Files\ToxTunnel\bin\toxtunnel.exe\" -c \"C:\ProgramData\ToxTunnel\config.yaml\" --service" start= auto
+
 sc start ToxTunnel     # Start
 sc stop ToxTunnel      # Stop
 sc query ToxTunnel     # Check status
