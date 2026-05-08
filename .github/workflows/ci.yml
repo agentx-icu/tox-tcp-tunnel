@@ -145,12 +145,12 @@ jobs:
             platform: macos
             generator: "productbuild"
           - id: windows-x86_64
-            runner: windows-2019
+            runner: windows-2022
             platform: windows
             generator: "WIX"
             vcpkg_triplet: x64-windows-static
             cmake_arch: x64
-            vs_generator: "Visual Studio 16 2019"
+            vs_generator: "Visual Studio 17 2022"
           - id: windows-aarch64
             runner: windows-11-arm
             platform: windows
