@@ -326,6 +326,19 @@ jobs:
         shell: pwsh
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "toxtunnel-stage"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($vsInstallPath) {
+              $dumpbinDir = Get-ChildItem -Path (Join-Path $vsInstallPath "VC\Tools\MSVC") -Directory |
+                Sort-Object Name -Descending |
+                Select-Object -First 1 |
+                ForEach-Object { Join-Path $_.FullName "bin\Hostx64\x64" }
+              if ($dumpbinDir -and (Test-Path (Join-Path $dumpbinDir "dumpbin.exe"))) {
+                $env:PATH = "$dumpbinDir;$env:PATH"
+              }
+            }
+          }
           & "${{ github.workspace }}\tests\packaging\verify_windows_deps.ps1" `
             -BinaryPath (Join-Path $stage "bin\toxtunnel.exe")
 
