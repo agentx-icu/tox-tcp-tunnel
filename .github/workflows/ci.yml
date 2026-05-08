@@ -232,7 +232,10 @@ jobs:
             "${{ matrix.target.container_image }}" \
             /bin/bash -lc '
               set -euo pipefail
-              export PATH="/opt/rh/devtoolset-10/root/usr/bin:$PATH"
+              toolset_bin="$(ls -d /opt/rh/*toolset*/root/usr/bin 2>/dev/null | sort -V | tail -n1 || true)"
+              if [ -n "${toolset_bin}" ]; then
+                export PATH="${toolset_bin}:$PATH"
+              fi
               if ! command -v cmake >/dev/null 2>&1; then
                 yum install -y cmake3
                 ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
@@ -245,6 +248,7 @@ jobs:
                 -DRELEASE_VERSION="${TARGET_VERSION}"
               cmake --build build --parallel
             '
+          sudo chown -R "$(id -u):$(id -g)" build
 
       - name: Configure (Windows)
         if: matrix.target.platform == 'windows'
@@ -310,6 +314,12 @@ jobs:
           & "${{ github.workspace }}\tests\packaging\verify_windows_install.ps1" `
             -InstallRoot $stage `
             -ExpectedVersion "${{ steps.version.outputs.version }}"
+
+      - name: Verify Windows binary dependencies (x86_64)
+        if: matrix.target.platform == 'windows' && matrix.target.id == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "toxtunnel-stage"
           & "${{ github.workspace }}\tests\packaging\verify_windows_deps.ps1" `
             -BinaryPath (Join-Path $stage "bin\toxtunnel.exe")
 
