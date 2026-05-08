@@ -31,11 +31,23 @@ endif()
 option(TOXTUNNEL_BUILD_TESTS "Build tests" ON)
 option(TOXTUNNEL_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(TOXTUNNEL_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
+option(TOXTUNNEL_PORTABLE_RELEASE "Enable portability-oriented release flags" OFF)
 
 # Sanitizer flags (applied globally since they affect linking too)
 if(NOT MSVC AND TOXTUNNEL_ENABLE_ASAN)
     add_compile_options(-fsanitize=address,undefined -g)
     add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(TOXTUNNEL_PORTABLE_RELEASE)
+    if(MSVC)
+        # Static MSVC runtime simplifies deployment and avoids redist mismatch.
+        set(CMAKE_MSVC_RUNTIME_LIBRARY
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+            CACHE STRING "MSVC runtime library" FORCE)
+    else()
+        add_link_options(-static-libgcc -static-libstdc++)
+    endif()
 endif()
 
 # Dependencies
@@ -139,6 +151,14 @@ target_compile_definitions(toxtunnel_lib PUBLIC
     ASIO_STANDALONE
     ASIO_NO_DEPRECATED
 )
+if(WIN32 AND TOXTUNNEL_PORTABLE_RELEASE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+    # Windows 7 API floor for x64 release artifacts.
+    target_compile_definitions(toxtunnel_lib PUBLIC
+        WINVER=0x0601
+        _WIN32_WINNT=0x0601
+        NTDDI_VERSION=0x06010000
+    )
+endif()
 # Apply strict warnings only to our own library target
 if(MSVC)
     target_compile_options(toxtunnel_lib PRIVATE /W4)

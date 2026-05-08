@@ -9,8 +9,14 @@ set(CPACK_PACKAGE_FILE_NAME
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CPACK_GENERATOR "DEB;RPM;TGZ")
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium23")
-    set(CPACK_RPM_PACKAGE_REQUIRES "libsodium")
+    if(TOXTUNNEL_PORTABLE_RELEASE)
+        # Portable builds should avoid hard pinning distro package names.
+        set(CPACK_DEBIAN_PACKAGE_DEPENDS "")
+        set(CPACK_RPM_PACKAGE_REQUIRES "")
+    else()
+        set(CPACK_DEBIAN_PACKAGE_DEPENDS "libsodium23")
+        set(CPACK_RPM_PACKAGE_REQUIRES "libsodium")
+    endif()
 
     # Wire postinst/prerm scripts as DEB/RPM lifecycle hooks
     set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA

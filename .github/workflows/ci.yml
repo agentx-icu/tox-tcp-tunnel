@@ -126,10 +126,14 @@ jobs:
             runner: ubuntu-24.04
             platform: linux
             generator: "DEB;RPM"
+            container_image: quay.io/pypa/manylinux2014_x86_64
+            cmake_arch: x86_64
           - id: linux-aarch64
             runner: ubuntu-24.04-arm
             platform: linux
             generator: "DEB;RPM"
+            container_image: quay.io/pypa/manylinux2014_aarch64
+            cmake_arch: aarch64
           - id: macos-x86_64
             runner: macos-15-intel
             platform: macos
@@ -139,16 +143,16 @@ jobs:
             platform: macos
             generator: "productbuild"
           - id: windows-x86_64
-            runner: windows-2025
+            runner: windows-2019
             platform: windows
             generator: "WIX"
-            vcpkg_triplet: x64-windows
+            vcpkg_triplet: x64-windows-static
             cmake_arch: x64
           - id: windows-aarch64
             runner: windows-11-arm
             platform: windows
             generator: "WIX"
-            vcpkg_triplet: arm64-windows
+            vcpkg_triplet: arm64-windows-static
             cmake_arch: ARM64
     env:
       RELEASE_VERSION: ${{ github.ref_name }}
@@ -166,7 +170,8 @@ jobs:
         if: matrix.target.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config libsodium-dev rpm
+          sudo apt-get install -y rpm
+          docker pull "${{ matrix.target.container_image }}"
 
       - name: Install macOS dependencies
         if: matrix.target.platform == 'macos'
@@ -204,12 +209,38 @@ jobs:
           echo "$wixDir" >> $env:GITHUB_PATH
 
       - name: Configure (Unix)
-        if: matrix.target.platform != 'windows'
+        if: matrix.target.platform == 'macos'
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DTOXTUNNEL_BUILD_TESTS=OFF \
             -DRELEASE_VERSION="${{ steps.version.outputs.version }}"
+
+      - name: Configure/Build/Package (Linux portable container)
+        if: matrix.target.platform == 'linux'
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e TARGET_VERSION="${TARGET_VERSION}" \
+            "${{ matrix.target.container_image }}" \
+            /bin/bash -lc '
+              set -euo pipefail
+              export PATH="/opt/rh/devtoolset-10/root/usr/bin:$PATH"
+              if ! command -v cmake >/dev/null 2>&1; then
+                yum install -y cmake3
+                ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
+              fi
+              yum install -y rpm-build pkgconfig libsodium-devel
+              cmake -B build \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DTOXTUNNEL_BUILD_TESTS=OFF \
+                -DTOXTUNNEL_PORTABLE_RELEASE=ON \
+                -DRELEASE_VERSION="${TARGET_VERSION}"
+              cmake --build build --parallel
+            '
 
       - name: Configure (Windows)
         if: matrix.target.platform == 'windows'
@@ -220,12 +251,13 @@ jobs:
             -A "${{ matrix.target.cmake_arch }}" `
             -DCMAKE_BUILD_TYPE=Release `
             -DTOXTUNNEL_BUILD_TESTS=OFF `
+            -DTOXTUNNEL_PORTABLE_RELEASE=ON `
             -DRELEASE_VERSION="${{ steps.version.outputs.version }}" `
             -DCMAKE_TOOLCHAIN_FILE="$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET="${{ matrix.target.vcpkg_triplet }}"
 
       - name: Build (Unix)
-        if: matrix.target.platform != 'windows'
+        if: matrix.target.platform == 'macos'
         run: cmake --build build --parallel
 
       - name: Build (Windows)
@@ -234,7 +266,12 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: Package (Unix)
-        if: matrix.target.platform != 'windows'
+        if: matrix.target.platform == 'macos'
+        working-directory: build
+        run: cpack -G "${{ matrix.target.generator }}"
+
+      - name: Package (Linux)
+        if: matrix.target.platform == 'linux'
         working-directory: build
         run: cpack -G "${{ matrix.target.generator }}"
 
@@ -255,6 +292,11 @@ jobs:
         run: |
           bash tests/packaging/verify_macos_pkg.sh build/*.pkg "${{ steps.version.outputs.version }}"
 
+      - name: Verify Linux ABI and runtime deps
+        if: matrix.target.platform == 'linux'
+        run: |
+          bash tests/packaging/verify_linux_abi.sh build/toxtunnel 2.17
+
       - name: Verify Windows install tree
         if: matrix.target.platform == 'windows'
         shell: pwsh
@@ -264,6 +306,8 @@ jobs:
           & "${{ github.workspace }}\tests\packaging\verify_windows_install.ps1" `
             -InstallRoot $stage `
             -ExpectedVersion "${{ steps.version.outputs.version }}"
+          & "${{ github.workspace }}\tests\packaging\verify_windows_deps.ps1" `
+            -BinaryPath (Join-Path $stage "bin\toxtunnel.exe")
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v7

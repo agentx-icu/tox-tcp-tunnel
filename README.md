@@ -453,6 +453,12 @@ For detailed guides on various use cases, see:
 
 Pre-built installers are published to GitHub Releases on every version tag (`v*`).
 
+Runtime compatibility targets for release artifacts:
+
+- Linux x86_64/aarch64 packages are built against a CentOS 7-era ABI floor (glibc 2.17) and are intended to run on Ubuntu 20.04+, CentOS 7+, and newer derivatives.
+- Windows x86_64 release builds target the Windows 7 API baseline while remaining compatible with modern Windows.
+- Windows ARM64 artifacts target modern Windows only (Windows 7 has no ARM64 edition).
+
 | Platform | Formats            | Service Type |
 |----------|--------------------|--------------|
 | Linux    | DEB, RPM, tar.gz   | systemd      |
