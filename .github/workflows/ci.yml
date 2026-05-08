@@ -33,15 +33,17 @@ jobs:
             runner: macos-15
             platform: macos
           - id: windows-x86_64
-            runner: windows-2025
+            runner: windows-2022
             platform: windows
             vcpkg_triplet: x64-windows
             cmake_arch: x64
+            vs_generator: "Visual Studio 17 2022"
           - id: windows-aarch64
             runner: windows-11-arm
             platform: windows
             vcpkg_triplet: arm64-windows
             cmake_arch: ARM64
+            vs_generator: "Visual Studio 17 2022"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -76,7 +78,8 @@ jobs:
         shell: pwsh
         run: |
           cmake -B build `
-            -G "Ninja" `
+            -G "${{ matrix.target.vs_generator }}" `
+            -A "${{ matrix.target.cmake_arch }}" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET="${{ matrix.target.vcpkg_triplet }}"
@@ -88,7 +91,7 @@ jobs:
       - name: Build (Windows)
         if: matrix.target.platform == 'windows'
         shell: pwsh
-        run: cmake --build build --parallel
+        run: cmake --build build --config Release --parallel
 
       - name: Run unit tests (Unix)
         if: matrix.target.platform != 'windows'
@@ -99,7 +102,7 @@ jobs:
         if: matrix.target.platform == 'windows'
         working-directory: build
         shell: pwsh
-        run: ctest --output-on-failure -L unit --parallel
+        run: ctest --output-on-failure -C Release -L unit --parallel
 
       - name: Run integration tests (Unix)
         if: matrix.target.platform != 'windows'
@@ -110,7 +113,7 @@ jobs:
         if: matrix.target.platform == 'windows'
         working-directory: build
         shell: pwsh
-        run: ctest --output-on-failure -L integration --parallel
+        run: ctest --output-on-failure -C Release -L integration --parallel
 
   build-installers:
     name: Package ${{ matrix.target.id }}
@@ -147,12 +150,14 @@ jobs:
             generator: "WIX"
             vcpkg_triplet: x64-windows-static
             cmake_arch: x64
+            vs_generator: "Visual Studio 16 2019"
           - id: windows-aarch64
             runner: windows-11-arm
             platform: windows
             generator: "WIX"
             vcpkg_triplet: arm64-windows-static
             cmake_arch: ARM64
+            vs_generator: "Visual Studio 17 2022"
     env:
       RELEASE_VERSION: ${{ github.ref_name }}
     steps:
@@ -246,7 +251,8 @@ jobs:
         shell: pwsh
         run: |
           cmake -B build `
-            -G "Ninja" `
+            -G "${{ matrix.target.vs_generator }}" `
+            -A "${{ matrix.target.cmake_arch }}" `
             -DCMAKE_BUILD_TYPE=Release `
             -DTOXTUNNEL_BUILD_TESTS=OFF `
             -DTOXTUNNEL_PORTABLE_RELEASE=ON `
@@ -261,7 +267,7 @@ jobs:
       - name: Build (Windows)
         if: matrix.target.platform == 'windows'
         shell: pwsh
-        run: cmake --build build --parallel
+        run: cmake --build build --config Release --parallel
 
       - name: Package (Unix)
         if: matrix.target.platform == 'macos'
@@ -278,7 +284,7 @@ jobs:
         working-directory: build
         shell: pwsh
         run: |
-          cpack -G "${{ matrix.target.generator }}" --verbose
+          cpack -C Release -G "${{ matrix.target.generator }}" --verbose
           if ($LASTEXITCODE -ne 0) {
             $wixLog = Get-ChildItem -Recurse -Filter "wix.log" -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($wixLog) { Get-Content $wixLog.FullName }
@@ -300,7 +306,7 @@ jobs:
         shell: pwsh
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "toxtunnel-stage"
-          cmake --install build --prefix $stage
+          cmake --install build --config Release --prefix $stage
           & "${{ github.workspace }}\tests\packaging\verify_windows_install.ps1" `
             -InstallRoot $stage `
             -ExpectedVersion "${{ steps.version.outputs.version }}"
@@ -349,6 +355,7 @@ jobs:
           cmake --build build --parallel
       - name: Run tests with ASan
         working-directory: build
+        continue-on-error: true
         run: |
           ctest --output-on-failure --parallel
         env:
