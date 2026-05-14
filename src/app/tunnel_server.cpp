@@ -7,15 +7,11 @@
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/system_info.hpp"
 
 namespace toxtunnel::app {
 
-namespace {
-
-/// Lossless packet prefix byte. Must be in the range [160, 191].
-constexpr uint8_t kLosslessPacketByte = 0xA0;
-
-}  // namespace
+using tunnel::kLosslessPacketByte;
 
 // ---------------------------------------------------------------------------
 // Construction / Destruction
@@ -222,6 +218,31 @@ void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* dat
     }
 
     auto& frame = frame_result.value();
+
+    // Handle INFO_REQUEST as a per-friend control frame outside the TunnelManager
+    // (it is not bound to a tunnel_id). Reply with an INFO_REPLY whose payload
+    // is filtered by `server.disclose.*`. Always reply — even with an empty
+    // payload — so the client can distinguish "modern server, nothing to share"
+    // from "old server, ignored the request".
+    if (frame.type() == tunnel::FrameType::INFO_REQUEST) {
+        const auto& disclose =
+            config_.server.has_value() ? config_.server->disclose : ServerInfoDisclose{};
+        const auto snapshot = util::gather_system_info(disclose);
+        const auto yaml = util::snapshot_to_yaml(snapshot);
+
+        std::vector<uint8_t> packet;
+        auto reply = tunnel::ProtocolFrame::make_info_reply(yaml);
+        auto wire = reply.serialize();
+        packet.reserve(1 + wire.size());
+        packet.push_back(kLosslessPacketByte);
+        packet.insert(packet.end(), wire.begin(), wire.end());
+        const bool sent =
+            tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size());
+        util::Logger::debug(
+            "INFO_REQUEST from friend {}: replied with {} bytes ({} fields disclosed, send={})",
+            friend_number, yaml.size(), disclose.any() ? "some" : "no", sent);
+        return;
+    }
 
     // Handle TUNNEL_OPEN specially: need to check access rules and create TCP connection.
     if (frame.type() == tunnel::FrameType::TUNNEL_OPEN) {

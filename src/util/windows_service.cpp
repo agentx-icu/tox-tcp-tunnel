@@ -96,17 +96,23 @@ std::wstring utf8_to_wide(const std::string& utf8) {
 namespace toxtunnel::util {
 
 bool install_windows_service(const std::string& service_name, const std::string& display_name,
-                             const std::string& binary_path) {
+                             const std::string& binary_path, const std::string& extra_arguments) {
 #if defined(_WIN32)
     SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
         return false;
     }
 
+    std::string bin_line = std::string("\"") + binary_path + "\"";
+    if (!extra_arguments.empty()) {
+        bin_line += " ";
+        bin_line += extra_arguments;
+    }
+
     SC_HANDLE service =
         CreateServiceA(scm, service_name.c_str(), display_name.c_str(), SERVICE_ALL_ACCESS,
                        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-                       binary_path.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
+                       bin_line.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!service) {
         CloseServiceHandle(scm);
         return false;
@@ -119,6 +125,7 @@ bool install_windows_service(const std::string& service_name, const std::string&
     (void)service_name;
     (void)display_name;
     (void)binary_path;
+    (void)extra_arguments;
     return false;
 #endif
 }
@@ -142,6 +149,28 @@ bool uninstall_windows_service(const std::string& service_name) {
     return ok;
 #else
     (void)service_name;
+    return false;
+#endif
+}
+
+bool register_packaged_toxtunnel_service(const std::string& config_yaml_path) {
+#if defined(_WIN32)
+    char exe[MAX_PATH]{};
+    if (GetModuleFileNameA(nullptr, exe, MAX_PATH) == 0) {
+        return false;
+    }
+    std::string args = std::string("-c \"") + config_yaml_path + "\" --service";
+    return install_windows_service("ToxTunnel", "ToxTunnel", exe, args);
+#else
+    (void)config_yaml_path;
+    return false;
+#endif
+}
+
+bool unregister_packaged_toxtunnel_service() {
+#if defined(_WIN32)
+    return uninstall_windows_service("ToxTunnel");
+#else
     return false;
 #endif
 }

@@ -48,6 +48,8 @@ void write_u32_be(uint8_t* out, uint32_t value) noexcept {
         case FrameType::TUNNEL_CLOSE:
         case FrameType::TUNNEL_ACK:
         case FrameType::TUNNEL_ERROR:
+        case FrameType::INFO_REQUEST:
+        case FrameType::INFO_REPLY:
         case FrameType::PING:
         case FrameType::PONG:
             return true;
@@ -74,6 +76,10 @@ std::string_view to_string(FrameType type) noexcept {
             return "TUNNEL_ACK";
         case FrameType::TUNNEL_ERROR:
             return "TUNNEL_ERROR";
+        case FrameType::INFO_REQUEST:
+            return "INFO_REQUEST";
+        case FrameType::INFO_REPLY:
+            return "INFO_REPLY";
         case FrameType::PING:
             return "PING";
         case FrameType::PONG:
@@ -151,6 +157,22 @@ ProtocolFrame ProtocolFrame::make_ping() {
 
 ProtocolFrame ProtocolFrame::make_pong() {
     return ProtocolFrame(FrameType::PONG, 0);
+}
+
+ProtocolFrame ProtocolFrame::make_info_request() {
+    return ProtocolFrame(FrameType::INFO_REQUEST, 0);
+}
+
+ProtocolFrame ProtocolFrame::make_info_reply(std::string_view yaml_payload) {
+    ProtocolFrame frame(FrameType::INFO_REPLY, 0);
+    frame.payload_.assign(yaml_payload.begin(), yaml_payload.end());
+    return frame;
+}
+
+std::string_view ProtocolFrame::as_info_reply_yaml() const {
+    if (type_ != FrameType::INFO_REPLY)
+        return {};
+    return std::string_view(reinterpret_cast<const char*>(payload_.data()), payload_.size());
 }
 
 // ===========================================================================

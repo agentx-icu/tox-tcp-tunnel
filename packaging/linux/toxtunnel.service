@@ -7,7 +7,14 @@ Wants=network-online.target
 Type=notify
 User=toxtunnel
 Group=toxtunnel
+StateDirectory=toxtunnel
+StateDirectoryMode=0750
 ExecStart=/usr/bin/toxtunnel -c /etc/toxtunnel/config.yaml --service
+# When the daemon exits 0 because the service policy gates it off (client +
+# allow_client_daemon=false, server + auto_start=false, or config missing under
+# --service soft-fail), keep the unit shown as `active (exited)` instead of
+# `inactive (dead)` — the latter looks like a startup failure to operators.
+RemainAfterExit=yes
 Restart=on-failure
 RestartSec=5
 

@@ -6,15 +6,24 @@
 namespace toxtunnel::util {
 
 /// Install a Windows service via the Service Control Manager.
+/// @param extra_arguments Optional arguments appended after the quoted executable path
+///                        (e.g. `-c "C:\\ProgramData\\ToxTunnel\\config.yaml" --service`).
 /// Returns true on success, false on failure.
 /// On non-Windows platforms, always returns false.
 bool install_windows_service(const std::string& service_name, const std::string& display_name,
-                             const std::string& binary_path);
+                             const std::string& binary_path,
+                             const std::string& extra_arguments = {});
 
 /// Uninstall a Windows service.
 /// Returns true on success, false on failure.
 /// On non-Windows platforms, always returns false.
 bool uninstall_windows_service(const std::string& service_name);
+
+/// Install ToxTunnel using this executable with `-c <config> --service`.
+[[nodiscard]] bool register_packaged_toxtunnel_service(const std::string& config_yaml_path);
+
+/// Remove the ToxTunnel Windows service installed via register_packaged_toxtunnel_service.
+[[nodiscard]] bool unregister_packaged_toxtunnel_service();
 
 /// Check if the Windows service is being stopped.
 /// Used by the application to check if it should exit.

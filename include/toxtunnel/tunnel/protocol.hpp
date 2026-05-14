@@ -22,6 +22,11 @@ inline constexpr std::size_t kFrameHeaderSize = 5;
 /// Maximum payload length that can be expressed in the 2-byte length field.
 inline constexpr std::size_t kMaxPayloadSize = 65535;
 
+/// First byte prepended to every ProtocolFrame when sent as a toxcore lossless
+/// custom packet. Toxcore reserves the 0xA0..0xFF range for application-defined
+/// lossless packets; we use 0xA0 across client and server.
+inline constexpr uint8_t kLosslessPacketByte = 0xA0;
+
 // ---------------------------------------------------------------------------
 // FrameType
 // ---------------------------------------------------------------------------
@@ -33,8 +38,16 @@ enum class FrameType : uint8_t {
     TUNNEL_CLOSE = 0x03,  ///< Gracefully close a tunnel.
     TUNNEL_ACK = 0x04,    ///< Acknowledge receipt of bytes (flow control).
     TUNNEL_ERROR = 0x05,  ///< Report an error associated with a tunnel.
-    PING = 0x10,          ///< Keep-alive request.
-    PONG = 0x11,          ///< Keep-alive response.
+    /// Client → Server: ask the peer for system info (tunnel_id == 0,
+    /// empty payload). Server replies with INFO_REPLY filtered by its
+    /// `server.disclose.*` opt-in flags.
+    INFO_REQUEST = 0x06,
+    /// Server → Client response to INFO_REQUEST. tunnel_id == 0;
+    /// payload is a small UTF-8 YAML map. An empty payload (`length == 0`)
+    /// is valid and means "policy is to disclose nothing".
+    INFO_REPLY = 0x07,
+    PING = 0x10,  ///< Keep-alive request.
+    PONG = 0x11,  ///< Keep-alive response.
 };
 
 /// Return a human-readable label for a frame type, or "UNKNOWN" if the
@@ -163,6 +176,17 @@ class ProtocolFrame {
 
     /// Create a PONG frame (tunnel_id is 0).
     [[nodiscard]] static ProtocolFrame make_pong();
+
+    /// Create an INFO_REQUEST frame (tunnel_id is 0, empty payload).
+    [[nodiscard]] static ProtocolFrame make_info_request();
+
+    /// Create an INFO_REPLY frame carrying a UTF-8 YAML payload (tunnel_id is 0).
+    /// `yaml_payload` may be empty, signalling "no fields disclosed".
+    [[nodiscard]] static ProtocolFrame make_info_reply(std::string_view yaml_payload);
+
+    /// Convenience: when this is an INFO_REPLY, return the payload as a UTF-8
+    /// string view over the underlying bytes. Empty if not INFO_REPLY.
+    [[nodiscard]] std::string_view as_info_reply_yaml() const;
 
     // -----------------------------------------------------------------
     // Serialization

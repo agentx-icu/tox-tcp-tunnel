@@ -35,12 +35,17 @@ endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CPACK_GENERATOR "productbuild;TGZ")
     set(CPACK_PACKAGING_INSTALL_PREFIX "/usr/local")
+    # pkgbuild postinstall: install launchd plist and bootstrap (see packaging/macos/postinstall.sh).
+    set(CPACK_POSTFLIGHT_TOXTUNNEL_RUNTIME_SCRIPT
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/postinstall.sh")
 endif()
 
 if(WIN32)
     set(CPACK_GENERATOR "WIX")
     set(CPACK_WIX_UPGRADE_GUID "F8A3B2C1-7D6E-4A5F-9B0C-1E2D3F4A5B6C")
     set(CPACK_PACKAGE_INSTALL_DIRECTORY "ToxTunnel")
+    list(APPEND CPACK_WIX_PATCH_FILE
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows/wix-service-patch.xml")
 endif()
 
 include(CPack)

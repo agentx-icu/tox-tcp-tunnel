@@ -15,7 +15,34 @@ which toxtunnel 2>/dev/null || where toxtunnel 2>nul
 
 If not found, prefer package installation over source builds.
 
-Each release publishes both versioned assets
+#### One-line install (recommended)
+
+The repo ships installer scripts that auto-detect arch, download the matching
+native package from GitHub Releases, install it, and seed `config.yaml`
+based on `--mode`. Client mode writes a config scaffold and leaves the system
+service idled (exit 0) until the user fills in `client.server_id` and sets
+`service.allow_client_daemon: true`.
+
+```bash
+# macOS / Linux (DEB / RPM / .pkg auto-detected)
+curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh                       # server
+curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client   # client scaffold
+```
+
+```powershell
+# Windows (Administrator PowerShell)
+irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex                                       # server
+$env:TOXTUNNEL_MODE='client'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex         # client scaffold
+```
+
+Env vars / flags: `TOXTUNNEL_MODE`, `TOXTUNNEL_VERSION`, `TOXTUNNEL_REPO`. The
+installer is idempotent on the same mode and refuses to overwrite a
+user-customized config (only rewrites the freshly seeded server template
+when switching to client).
+
+#### Manual install per platform
+
+Each release also publishes both versioned assets
 (`toxtunnel-<VERSION>-<System>-<arch>.<ext>`) and a stable `-latest` alias
 (`toxtunnel-<System>-<arch>-latest.<ext>`). Use the alias URLs below for the
 newest release.
@@ -74,11 +101,11 @@ netstat -an | findstr :PORT   # Windows
 
 ### 4. Detect OS for path and service defaults
 
-- macOS (from `.pkg`): `binary: /usr/local/bin/toxtunnel`, example config at `/usr/local/share/toxtunnel/config.yaml.example`, launchd plist at `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist`
+- macOS (from `.pkg`): `binary: /usr/local/bin/toxtunnel`, example config at `/usr/local/share/toxtunnel/config.yaml.example`. The pkg postinstall automatically seeds `/usr/local/etc/toxtunnel/config.yaml` (from the example), installs `com.toxtunnel.daemon.plist` into `/Library/LaunchDaemons/`, and runs `launchctl bootstrap`.
 - macOS (manual/source build): `data_dir: ~/Library/Application Support/toxtunnel/` or `~/.config/toxtunnel/`, service: launchd user agent
-- Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data_dir: /var/lib/toxtunnel`, service: `toxtunnel.service`
+- Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data_dir: /var/lib/toxtunnel`, service: `toxtunnel.service` (Type=notify, `RemainAfterExit=yes`, enabled and started by postinst).
 - Linux (manual): `data_dir: ~/.config/toxtunnel/`, service: custom systemd unit
-- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`; MSI does not seed config or register a service
+- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. The MSI registers the **ToxTunnel** SCM service (Start="install", auto) pointing at `C:\ProgramData\ToxTunnel\config.yaml`. The MSI does NOT seed `config.yaml` itself; the daemon's `--service` soft-fail path lets first-boot exit 0 cleanly until the user creates one. `scripts/install.ps1` does seed it based on `--Mode`.
 - Windows (manual): `data_dir: %APPDATA%\toxtunnel\`, service: NSSM or Task Scheduler
 
 ## Step 1: Write Config Files
@@ -110,38 +137,48 @@ Only do this when the user explicitly asks for persistent service management.
 
 ### Linux DEB/RPM
 
-Postinst registers and enables `toxtunnel.service`, seeds
-`/etc/toxtunnel/config.yaml` if missing, and creates the `toxtunnel` user. The
-service is enabled but not started by default.
+Postinst creates the `toxtunnel` system user, seeds `/etc/toxtunnel/config.yaml`
+from the example if missing, registers `toxtunnel.service`, and runs
+`systemctl enable --now`. The unit is `Type=notify` with `RemainAfterExit=yes`,
+so a daemon that gates itself off (client mode without `allow_client_daemon`,
+or missing config under `--service`) shows as `active (exited)` rather than
+`inactive (dead)`.
 
 ```bash
-sudo vim /etc/toxtunnel/config.yaml
-sudo systemctl start toxtunnel
-sudo systemctl enable toxtunnel
+sudo vim /etc/toxtunnel/config.yaml      # already seeded; edit in place
+sudo systemctl restart toxtunnel         # apply changes
 sudo systemctl status toxtunnel
 ```
 
 ### macOS `.pkg`
 
-The package installs the binary, example config, and launchd plist, but does not
-load the job automatically.
+The pkg postinstall (`packaging/macos/postinstall.sh`) seeds
+`/usr/local/etc/toxtunnel/config.yaml` from the example if missing, installs
+`com.toxtunnel.daemon.plist` into `/Library/LaunchDaemons/`, and runs
+`launchctl bootstrap system`. The plist's `KeepAlive { SuccessfulExit: false }`
+means a config-gated exit-0 daemon stays stopped (won't loop). On newer macOS
+versions, `launchctl bootstrap` may require user approval in System Settings →
+Privacy & Security; the postinstall treats that failure as non-fatal.
 
 ```bash
-sudo mkdir -p /usr/local/etc/toxtunnel
-sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
-sudo vim /usr/local/etc/toxtunnel/config.yaml
-
-sudo cp /usr/local/share/toxtunnel/com.toxtunnel.daemon.plist /Library/LaunchDaemons/
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
-sudo launchctl bootout system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+sudo vim /usr/local/etc/toxtunnel/config.yaml          # already seeded; edit in place
+sudo launchctl kickstart -k system/com.toxtunnel.daemon  # apply changes
+sudo launchctl print system/com.toxtunnel.daemon | head
 ```
 
 ### Windows MSI
 
-The MSI installs files only. Create the service manually after you place a config.
+The MSI registers the **ToxTunnel** Windows SCM service automatically
+(`ServiceInstall` Type=ownProcess, Start=auto; `ServiceControl Start="install"`)
+pointing at `C:\Program Files\ToxTunnel\bin\toxtunnel.exe -c
+C:\ProgramData\ToxTunnel\config.yaml --service`. The MSI does NOT seed the
+config — the daemon's `--service` soft-fail path makes first boot exit 0 cleanly
+so SCM marks the service stopped (not failed). The user creates the YAML, then
+starts the service:
 
 ```powershell
-sc create ToxTunnel binPath= "\"C:\Program Files\ToxTunnel\bin\toxtunnel.exe\" -c \"C:\ProgramData\ToxTunnel\config.yaml\" --service" start= auto
+mkdir 'C:\ProgramData\ToxTunnel' -Force
+notepad 'C:\ProgramData\ToxTunnel\config.yaml'
 sc start ToxTunnel
 sc query ToxTunnel
 sc stop ToxTunnel
@@ -261,6 +298,37 @@ journalctl -u toxtunnel@server -f
 tail -f /usr/local/var/log/toxtunnel-server.log
 toxtunnel -m server -c server.yaml -l debug
 ```
+
+## Step 4.5: Known-Servers Registry (client side)
+
+After a successful client→server connection, the client persists an entry in
+`<data_dir>/known_servers.yaml`. Manage it from the CLI:
+
+```bash
+toxtunnel servers list                       # compact list of saved servers
+toxtunnel servers list --full                # show full 76-char Tox IDs
+toxtunnel servers show <alias_or_tox_id>     # full record incl. info disclosed by server
+toxtunnel servers add  <alias> <tox_id>      # name a Tox ID
+toxtunnel servers remove <alias_or_tox_id>   # forget
+```
+
+After `servers add homelab DE47F2...`, both `--server-id homelab` and
+`client.server_id: homelab` resolve from the registry at startup.
+
+For server-side info disclosure (defaults to nothing), uncomment the relevant
+fields under `server.disclose:` in `server.yaml`:
+
+```yaml
+server:
+  rules_file: rules.yaml
+  disclose:
+    hostname: true
+    os: true
+    arch: true
+```
+
+The disclosed snapshot is sent via `INFO_REPLY` (frame 0x07) when the client
+sends an `INFO_REQUEST` (frame 0x06) on first reaching online state.
 
 ## Step 5: Post-Deploy Verification
 

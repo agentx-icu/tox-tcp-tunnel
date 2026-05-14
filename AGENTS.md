@@ -52,6 +52,28 @@ CPack configuration lives in `cmake/Packaging.cmake`. Packaging assets are under
 
 ## Installation (from packages)
 
+### One-line install
+
+```bash
+# macOS / Linux (server default; pass `--mode client` for client scaffold)
+curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client
+```
+
+```powershell
+# Windows (Administrator PowerShell)
+irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+$env:TOXTUNNEL_MODE='client'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+```
+
+`scripts/install.sh` and `scripts/install.ps1` auto-detect arch, download the
+matching native package from GitHub Releases (`-latest` alias), install it, and
+seed `config.yaml` based on `--mode`. Client mode writes a config scaffold and
+leaves the system service idled (exit 0) until the user fills in
+`client.server_id` and sets `service.allow_client_daemon: true`.
+
+### Manual download
+
 Each release publishes both versioned and stable `-latest` aliases. Pull the
 latest assets from
 `https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-<System>-<arch>-latest.<ext>`
@@ -61,42 +83,73 @@ where `<System>` is `Linux` / `Darwin` / `Windows` and `<ext>` is `deb` / `rpm` 
 
 ```bash
 sudo dpkg -i toxtunnel-*.deb         # or: sudo rpm -i toxtunnel-*.rpm
-sudo systemctl start toxtunnel       # Start service (postinst already enables it)
+sudo systemctl start toxtunnel       # Usually unnecessary (postinst enables + starts)
 sudo systemctl enable toxtunnel      # Enable on boot (no-op if postinst already did this)
 ```
 
 Postinst seeds `/etc/toxtunnel/config.yaml` from `config.yaml.example` if absent,
-creates the `toxtunnel` system user, and enables the unit.
+creates the `toxtunnel` system user, reloads systemd, and runs `systemctl enable --now`.
 
-Config: `/etc/toxtunnel/config.yaml`, data: `/var/lib/toxtunnel`, binary: `/usr/bin/toxtunnel`.
+Packaged server configs seed `service.auto_start: true`; client-oriented configs default to an idle
+service unless `service.allow_client_daemon` is enabled — see `packaging/config.yaml.example`.
 
 ### macOS
 
 ```bash
 sudo installer -pkg toxtunnel-*.pkg -target /
 
-# The .pkg does NOT seed a config or load the launchd job — do that manually:
+# The .pkg installs the launchd plist under /Library/LaunchDaemons and bootstraps it.
+# You still need to seed /usr/local/etc/toxtunnel/config.yaml:
 sudo mkdir -p /usr/local/etc/toxtunnel
 sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
-sudo cp /usr/local/share/toxtunnel/com.toxtunnel.daemon.plist /Library/LaunchDaemons/
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
 ```
 
 Binary: `/usr/local/bin/toxtunnel`. Example config: `/usr/local/share/toxtunnel/config.yaml.example`.
 
 ### Windows
 
-Run the MSI installer as Administrator. It installs files into `C:\Program Files\ToxTunnel\`.
-The MSI does NOT register a Windows service or seed a config — register the service manually
-after writing a config file:
+Run the MSI installer as Administrator. It installs into `C:\Program Files\ToxTunnel\` and registers
+the **ToxTunnel** Windows service to run `toxtunnel.exe --service` with
+`-c C:\ProgramData\ToxTunnel\config.yaml`.
+
+Create the config before relying on the service:
 
 ```powershell
 mkdir 'C:\ProgramData\ToxTunnel'
 notepad 'C:\ProgramData\ToxTunnel\config.yaml'
 
-sc create ToxTunnel binPath= "\"C:\Program Files\ToxTunnel\bin\toxtunnel.exe\" -c \"C:\ProgramData\ToxTunnel\config.yaml\" --service" start= auto
 sc start ToxTunnel
 ```
+
+Optional manual registration/repair:
+
+```powershell
+& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'
+```
+
+## Known-Servers Registry (client side)
+
+Client persists every server it connects to under
+`<data_dir>/known_servers.yaml`: tox_id, optional alias, first/last connection
+timestamps, transport (UDP direct vs TCP relay), and any system info the
+server explicitly opted into via `server.disclose.*`.
+
+```bash
+toxtunnel servers list                  # list with short Tox IDs
+toxtunnel servers list --full           # show full 76-char Tox IDs
+toxtunnel servers show <alias_or_id>    # full record incl. disclosed info
+toxtunnel servers add <alias> <tox_id>  # register an alias
+toxtunnel servers remove <alias_or_id>  # forget
+```
+
+After `servers add homelab DE47F2...`, both `--server-id homelab` and
+`client.server_id: homelab` resolve from the registry at startup.
+
+Server-side disclosure is opt-in per field (defaults all `false`). Set under
+`server.disclose:` in YAML — see README.md for the full list of fields.
+Protocol additions: `INFO_REQUEST` (0x06) sent by client on friend-online,
+`INFO_REPLY` (0x07) returned by server filtered by its disclose policy. There
+is no remote command execution; only the metadata the server publishes.
 
 ## Code Style
 
@@ -149,7 +202,7 @@ third_party/c-toxcore/  # Git submodule
 cmake/Packaging.cmake   # CPack configuration
 packaging/              # Platform-specific packaging assets
   linux/                #   systemd unit, postinst/prerm scripts
-  macos/                #   launchd plist
+  macos/                #   launchd plist, pkg postinstall script
 ```
 
 ## Dependencies

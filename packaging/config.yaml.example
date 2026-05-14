@@ -1,6 +1,10 @@
 mode: server
 data_dir: /var/lib/toxtunnel
 
+service:
+  auto_start: true
+  allow_client_daemon: false
+
 logging:
   level: info
   file: /var/lib/toxtunnel/toxtunnel.log
@@ -11,4 +15,4 @@ tox:
   bootstrap_mode: auto
 
 server:
-  rules_file: /etc/toxtunnel/rules.yaml
+  # Add access-control settings here if you want to restrict what friends can reach.

@@ -109,7 +109,38 @@ Connect:  ssh -p 2222 localhost           → done
 
 ## Installation
 
-### From GitHub Releases (Recommended)
+### One-line install (recommended)
+
+Each installer auto-detects your architecture, downloads the latest
+release, installs the native package, seeds a config, and starts the
+service.
+
+**macOS / Linux** (DEB / RPM / .pkg auto-detected):
+
+```bash
+# Server (default — listens for clients, gets a Tox ID)
+curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
+
+# Client (writes a client config scaffold; service stays idle until you fill in server_id + flip allow_client_daemon)
+curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client
+```
+
+**Windows** (run PowerShell as Administrator):
+
+```powershell
+# Server
+irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+
+# Client (env var works around `iex` not passing args)
+$env:TOXTUNNEL_MODE = 'client'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+```
+
+The installers respect three env vars / flags: `TOXTUNNEL_MODE` (`server`|`client`),
+`TOXTUNNEL_VERSION` (`latest`|`vX.Y.Z`), `TOXTUNNEL_REPO` (`owner/repo`). After
+install you'll see the binary path, config path, and next-step instructions
+(get the Tox ID for server, fill in `server_id` for client).
+
+### From GitHub Releases (manual)
 
 Every release publishes both **versioned** assets
 (`toxtunnel-<version>-<System>-<arch>.<ext>`) and a stable **`-latest`** alias
@@ -131,7 +162,9 @@ The DEB package automatically:
 - Creates a `toxtunnel` system user and group
 - Creates data directory `/var/lib/toxtunnel`
 - Installs config template to `/etc/toxtunnel/config.yaml`
-- Registers a systemd service (not started by default)
+- Registers and **starts** the systemd service (`systemctl enable --now`)
+
+Background services honor `service.auto_start` / `service.allow_client_daemon` in the YAML config (server installs seed `service.auto_start: true`; client defaults keep the daemon idle unless explicitly enabled).
 
 Manage the service:
 
@@ -165,21 +198,21 @@ The package installs:
 - Example config to `/usr/local/share/toxtunnel/config.yaml.example`
 - Sample launchd plist to `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist`
 
-> The .pkg does NOT seed `/usr/local/etc/toxtunnel/config.yaml` and does NOT
-> load the launchd job — copy the files into place yourself before starting
-> the service.
+The installer **postinstall** copies the plist into `/Library/LaunchDaemons/` and runs `launchctl bootstrap`. You still need to create `/usr/local/etc/toxtunnel/config.yaml` before the daemon can run.
 
-Set up the service:
+Set up the config (one-time):
 
 ```bash
-# Seed the config (one-time)
 sudo mkdir -p /usr/local/etc/toxtunnel
 sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
+# Edit the config for your role (server vs client) and service policy.
+```
 
-# Install and load the launchd job
-sudo cp /usr/local/share/toxtunnel/com.toxtunnel.daemon.plist /Library/LaunchDaemons/
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
-sudo launchctl bootout    system /Library/LaunchDaemons/com.toxtunnel.daemon.plist
+Manage the job:
+
+```bash
+sudo launchctl print system/com.toxtunnel.daemon
+sudo launchctl kickstart -k system/com.toxtunnel.daemon   # reload after config edits
 ```
 
 #### Windows
@@ -188,25 +221,33 @@ sudo launchctl bootout    system /Library/LaunchDaemons/com.toxtunnel.daemon.pli
    `https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
    (use `toxtunnel-Windows-ARM64-latest.msi` for ARM)
 2. Run the installer as Administrator
-3. The installer places files in `C:\Program Files\ToxTunnel\`
+3. The installer places files in `C:\Program Files\ToxTunnel\` and registers a **ToxTunnel**
+   Windows service (auto-start) that runs `toxtunnel.exe --service` with
+   `-c C:\ProgramData\ToxTunnel\config.yaml`.
 
-> The MSI does NOT seed a config file or register a Windows service — both
-> have to be done manually after install.
-
-Register and manage the service (one-time setup):
+Create the config (required before the service can stay running):
 
 ```powershell
-# Place a config file. C:\ProgramData\ToxTunnel\ is a typical location.
-mkdir 'C:\ProgramData\ToxTunnel'
+mkdir 'C:\ProgramData\ToxTunnel' -Force
 notepad 'C:\ProgramData\ToxTunnel\config.yaml'
+```
 
-# Register the service
-sc create ToxTunnel binPath= "\"C:\Program Files\ToxTunnel\bin\toxtunnel.exe\" -c \"C:\ProgramData\ToxTunnel\config.yaml\" --service" start= auto
+Service policy (`service.auto_start` / `service.allow_client_daemon`) decides whether the service
+process stays resident or exits successfully without opening ports.
 
-sc start ToxTunnel     # Start
-sc stop ToxTunnel      # Stop
-sc query ToxTunnel     # Check status
-sc delete ToxTunnel    # Remove service
+Manage the service:
+
+```powershell
+sc start ToxTunnel
+sc stop ToxTunnel
+sc query ToxTunnel
+```
+
+To register/repair the service manually (optional):
+
+```powershell
+& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'
+& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' uninstall-windows-service
 ```
 
 ### From Source
@@ -393,6 +434,78 @@ ssh -p 2222 localhost
 
 ---
 
+## Known-Servers Registry (client side)
+
+Once the client successfully connects to a server, it persists a record under
+`<data_dir>/known_servers.yaml`:
+
+- 76-char Tox ID, optional alias, first/last connected timestamps
+- Last transport reported by toxcore (`udp` direct or `tcp` relay)
+- Server-disclosed system info (only what the server explicitly opted into via
+  its `server.disclose.*` config — see below)
+
+Manage the registry from the CLI:
+
+```bash
+toxtunnel servers list                       # list known servers (compact)
+toxtunnel servers list --full                # show full Tox IDs
+toxtunnel servers show homelab               # full record by alias or Tox ID
+toxtunnel servers add homelab DE47F2...      # name a Tox ID for later
+toxtunnel servers remove homelab             # forget by alias or Tox ID
+```
+
+After registering an alias you can use it anywhere a Tox ID is expected:
+
+```bash
+toxtunnel -m client --server-id homelab --pipe 127.0.0.1:22
+```
+
+```yaml
+# client.yaml
+client:
+  server_id: homelab     # resolved from known_servers.yaml at startup
+  forwards:
+    - { local_port: 2222, remote_host: 127.0.0.1, remote_port: 22 }
+```
+
+`servers list/show/add/remove` accept `-d/--data-dir DIR` (defaults to the same
+`~/.config/toxtunnel` used by `print-id`) or `-c/--config FILE` (reads
+`data_dir` from the config).
+
+The packaged installs ship `known_servers.yaml.example` next to
+`config.yaml.example` (`/usr/share/toxtunnel/` on Linux,
+`/usr/local/share/toxtunnel/` on macOS, `share/toxtunnel/` under the Windows
+install root) — useful as a schema reference if you'd rather pre-seed the
+registry by editing YAML directly.
+
+### Server self-disclosure (opt-in)
+
+When a client comes online it sends an `INFO_REQUEST` control frame. The
+server replies with `INFO_REPLY` carrying only the fields it has explicitly
+opted into. Defaults are all `false` — a default server discloses **nothing**.
+
+```yaml
+# server.yaml — opt in to specific fields
+server:
+  rules_file: rules.yaml
+  disclose:
+    hostname: true
+    os: true
+    arch: true
+    # os_version: false        (default)
+    # uptime: false            (default)
+    # toxtunnel_version: false (default)
+
+  # Or as a global toggle (useful in dev):
+  # disclose: true             # flips every field on
+  # disclose: false            # flips every field off (default)
+```
+
+ToxTunnel does **not** support remote command execution — disclosure is the
+only way the server publishes runtime metadata, and the server operator
+chooses each field. Old servers that don't know `INFO_REQUEST` simply ignore
+the frame; the client falls back to local-only metadata for that entry.
+
 ## CLI Reference
 
 ```
@@ -413,6 +526,17 @@ toxtunnel print-id [OPTIONS]
 | `--pipe HOST:PORT`      | Pipe mode: connect stdin/stdout to tunnel    |
 | `--service`             | Run as system service (systemd/SCM/launchd)  |
 | `-v, --version`         | Show version                                 |
+
+### servers Subcommand
+
+| Command                                            | Description                                  |
+| -------------------------------------------------- | -------------------------------------------- |
+| `toxtunnel servers list [--full] [-d DIR \| -c F]` | List known servers (alias, short Tox ID, last connection) |
+| `toxtunnel servers show <alias_or_id>`             | Full record including disclosed system info |
+| `toxtunnel servers add <alias> <tox_id> [--notes]` | Register an alias for a Tox ID              |
+| `toxtunnel servers remove <alias_or_id>`           | Forget a server                             |
+
+Once an alias is added, `--server-id` and `client.server_id` will accept it.
 
 ### print-id Subcommand
 

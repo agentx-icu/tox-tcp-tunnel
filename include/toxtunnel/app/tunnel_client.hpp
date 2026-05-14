@@ -1,6 +1,8 @@
 #pragma once
 
+#include <asio.hpp>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -8,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "toxtunnel/app/known_servers.hpp"
 #include "toxtunnel/app/stdio_pipe_bridge.hpp"
 #include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/core/tcp_listener.hpp"
@@ -146,6 +149,46 @@ class TunnelClient {
 
     /// Stored configuration.
     Config config_;
+
+    /// Server's full Tox ID (uppercase 76-hex). Used as the persistent
+    /// identity in `known_servers_`. Captured during initialize().
+    std::string server_tox_id_hex_;
+
+    /// Persistent registry of servers this client has connected to. Backed by
+    /// `<config.data_dir>/known_servers.yaml`. Lazily initialised once we
+    /// know data_dir.
+    std::unique_ptr<KnownServersStore> known_servers_;
+
+    /// Whether we have already sent an INFO_REQUEST in the current online
+    /// session. Reset when the friend goes offline. Prevents repeat probes
+    /// inside one connection.
+    std::atomic<bool> info_request_sent_{false};
+
+    /// Send an INFO_REQUEST control frame to the server. Safe to call
+    /// multiple times; the `info_request_sent_` guard avoids spam.
+    void send_info_request();
+
+    /// Re-arm the periodic INFO_REQUEST refresh timer so the registry's
+    /// `info` block stays fresh when the server's `disclose.*` policy
+    /// changes during a long online session. Default cadence: 1 hour.
+    /// No-op if the io_context is gone or the client is shutting down.
+    void schedule_info_refresh();
+
+    /// Background timer that re-issues INFO_REQUEST every kInfoRefreshInterval.
+    /// Owned by io_ctx_; cancelled on stop().
+    std::unique_ptr<asio::steady_timer> info_refresh_timer_;
+
+    /// How often to re-poll the server for system info while online.
+    static constexpr std::chrono::hours kInfoRefreshInterval{1};
+
+    /// Persist the latest connection metadata (last_connected_at, transport)
+    /// for this server into the known_servers registry. Called when the
+    /// friend transitions to online.
+    void record_server_connection();
+
+    /// Update the server's disclosed system info from an INFO_REPLY payload
+    /// (UTF-8 YAML bytes) and persist.
+    void record_server_info(std::string_view yaml_payload);
 };
 
 }  // namespace toxtunnel::app

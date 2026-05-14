@@ -80,9 +80,49 @@ struct LoggingConfig {
     }
 };
 
+/// Service / daemon policy for packaged installs (`--service`).
+/// Controls whether a platform service manager should keep the process running.
+///
+/// Defaults are intentionally asymmetric to match the packaging policy:
+/// - server: defaults to "online" so `dpkg -i` / pkg / MSI install -> reachable immediately,
+///   and so existing server YAML configs without a `service:` section keep running after upgrade.
+/// - client: defaults to "idle" so installing the package never silently opens local forward
+///   ports on a desktop that's only meant to dial out.
+struct ServiceConfig {
+    /// When true in server mode, `toxtunnel --service` runs the tunnel server.
+    /// Defaults to true: server installs are expected to be online.
+    bool auto_start = true;
+
+    /// When true in client mode, `toxtunnel --service` runs the tunnel client (local forwards).
+    /// Defaults to false: client installs do not auto-bind local ports.
+    bool allow_client_daemon = false;
+
+    bool operator==(const ServiceConfig& other) const {
+        return auto_start == other.auto_start && allow_client_daemon == other.allow_client_daemon;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Mode-specific configuration
 // ---------------------------------------------------------------------------
+
+/// Server-side INFO_REPLY disclosure policy. Each field is independently opt-in
+/// — defaults are all `false` (the server discloses nothing). Used by
+/// `gather_system_info` to decide which probes to actually run.
+struct ServerInfoDisclose {
+    bool hostname = false;
+    bool os = false;
+    bool os_version = false;
+    bool arch = false;
+    bool uptime = false;
+    bool toxtunnel_version = false;
+
+    [[nodiscard]] bool any() const noexcept {
+        return hostname || os || os_version || arch || uptime || toxtunnel_version;
+    }
+
+    bool operator==(const ServerInfoDisclose& other) const = default;
+};
 
 /// Server-specific configuration options.
 struct ServerConfig {
@@ -90,10 +130,12 @@ struct ServerConfig {
     bool udp_enabled = true;                           ///< Enable UDP for DHT
     std::vector<BootstrapNodeConfig> bootstrap_nodes;  ///< DHT bootstrap nodes
     std::optional<std::string> rules_file;             ///< Optional access rules file
+    ServerInfoDisclose disclose;                       ///< INFO_REPLY opt-in fields
 
     bool operator==(const ServerConfig& other) const {
         return tcp_port == other.tcp_port && udp_enabled == other.udp_enabled &&
-               bootstrap_nodes == other.bootstrap_nodes && rules_file == other.rules_file;
+               bootstrap_nodes == other.bootstrap_nodes && rules_file == other.rules_file &&
+               disclose == other.disclose;
     }
 };
 
@@ -128,6 +170,7 @@ struct Config {
     Mode mode = Mode::Server;
     std::filesystem::path data_dir;  ///< Directory for Tox save data
     LoggingConfig logging;
+    ServiceConfig service;
     ToxConfig tox;
 
     // Mode-specific options
@@ -192,10 +235,13 @@ struct Config {
     /// Get client configuration (throws if not in client mode).
     [[nodiscard]] const ClientConfig& client_config() const;
 
+    /// Whether `--service` should run the tunnel (vs exiting successfully without binding ports).
+    [[nodiscard]] bool should_run_as_service_daemon() const;
+
     bool operator==(const Config& other) const {
         return mode == other.mode && data_dir == other.data_dir && logging == other.logging &&
-               effective_tox_config() == other.effective_tox_config() && server == other.server &&
-               client == other.client;
+               service == other.service && effective_tox_config() == other.effective_tox_config() &&
+               server == other.server && client == other.client;
     }
 };
 
@@ -266,6 +312,18 @@ template <>
 struct convert<toxtunnel::LoggingConfig> {
     static Node encode(const toxtunnel::LoggingConfig& rhs);
     static bool decode(const Node& node, toxtunnel::LoggingConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::ServiceConfig> {
+    static Node encode(const toxtunnel::ServiceConfig& rhs);
+    static bool decode(const Node& node, toxtunnel::ServiceConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::ServerInfoDisclose> {
+    static Node encode(const toxtunnel::ServerInfoDisclose& rhs);
+    static bool decode(const Node& node, toxtunnel::ServerInfoDisclose& rhs);
 };
 
 template <>

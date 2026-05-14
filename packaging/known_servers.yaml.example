@@ -1,0 +1,46 @@
+# ToxTunnel client-side known-servers registry — sample / schema reference.
+#
+# This file is NOT loaded by toxtunnel directly. The live registry lives at
+# `<data_dir>/known_servers.yaml` and is created automatically the first time
+# the client successfully connects to a server. Use this template as a
+# reference for the on-disk format, or as a seed if you want to pre-register
+# aliases before the first connection.
+#
+# To pre-register entries from the CLI instead of editing YAML by hand:
+#
+#     toxtunnel servers add homelab DE47F247CE6D7BE29A5903A234A045A227C6CB969943A8317EA74F7D38810D10D43C53082F2B
+#     toxtunnel servers add prod    AB12...                                                                          --notes "PR/QA gateway"
+#
+# Once an entry exists, the alias resolves anywhere a Tox ID is expected:
+#     toxtunnel -m client --server-id homelab --pipe 127.0.0.1:22
+#     # or in client.yaml:
+#     #   client.server_id: homelab
+
+servers:
+  # Each entry MUST have a tox_id (76 uppercase hex characters). Other fields
+  # are optional and managed by the client itself on each successful connect.
+  - tox_id: "DE47F247CE6D7BE29A5903A234A045A227C6CB969943A8317EA74F7D38810D10D43C53082F2B"
+    alias: "homelab"
+    # Connection metadata — auto-populated. Both timestamps are UTC ISO-8601.
+    first_connected_at: "2026-05-13T03:00:00Z"
+    last_connected_at:  "2026-05-13T03:14:22Z"
+    # Transport reported by toxcore: "udp" (direct P2P), "tcp" (relay), or "none".
+    last_connection_type: "udp"
+    # System info disclosed by the server via INFO_REPLY. Only fields the
+    # server explicitly opted into (server.disclose.*) appear here.
+    info:
+      hostname: "nas-01"
+      os: "Linux"
+      os_version: "6.6.0-arm64"
+      arch: "aarch64"
+      uptime_seconds: 84221
+      toxtunnel_version: "0.1.11"
+      reported_at: "2026-05-13T03:14:22Z"
+    # Free-form user notes (never sent over the wire).
+    notes: "Synology DS920+ at home, Tox UDP direct on LAN"
+
+  # An entry with no alias and no disclosed info — what you'll see for a
+  # newly-connected server whose operator opted out of disclosure.
+  - tox_id: "AB12CD34EF560000000000000000000000000000000000000000000000000000000000000000"
+    last_connected_at:  "2026-05-12T18:02:10Z"
+    last_connection_type: "tcp"

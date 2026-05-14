@@ -307,6 +307,16 @@ jobs:
             exit 1
           }
 
+      - name: Verify Windows MSI service registration
+        if: matrix.target.platform == 'windows'
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path build -Filter "*.msi" | Select-Object -First 1
+          if (-not $msi) { throw "No MSI generated under build/" }
+          & "${{ github.workspace }}\tests\packaging\verify_windows_msi.ps1" `
+            -MsiPath $msi.FullName `
+            -CPackBuildDir build
+
       - name: Verify macOS package
         if: matrix.target.platform == 'macos'
         run: |

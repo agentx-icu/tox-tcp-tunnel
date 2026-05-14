@@ -58,6 +58,11 @@ data_dir: /var/lib/toxtunnel
     EXPECT_EQ(config.mode, Mode::Server);
     EXPECT_EQ(config.data_dir, "/var/lib/toxtunnel");
     EXPECT_TRUE(config.server.has_value());
+    // Absent `service:` keeps ServiceConfig defaults: auto_start=true (server is online by
+    // default), allow_client_daemon=false. This guarantees existing server YAML configs
+    // without a `service:` section keep being daemonized after upgrade.
+    EXPECT_TRUE(config.service.auto_start);
+    EXPECT_FALSE(config.service.allow_client_daemon);
 }
 
 TEST_F(ConfigTest, ParseMinimalClientConfig) {
@@ -75,6 +80,10 @@ server_id: 000000000000000000000000000000000000000000000000000000000000000000000
     EXPECT_TRUE(config.client.has_value());
     EXPECT_EQ(config.client->server_id,
               "0000000000000000000000000000000000000000000000000000000000000000000000000000");
+    // Absent `service:` keeps ServiceConfig defaults; allow_client_daemon=false means a
+    // packaged client install never auto-binds local forward ports.
+    EXPECT_FALSE(config.service.allow_client_daemon);
+    EXPECT_FALSE(config.should_run_as_service_daemon());
 }
 
 TEST_F(ConfigTest, ParseFullServerConfig) {
@@ -437,6 +446,8 @@ TEST_F(ConfigTest, DefaultServerConfig) {
     EXPECT_EQ(config.mode, Mode::Server);
     EXPECT_TRUE(config.server.has_value());
     EXPECT_FALSE(config.client.has_value());
+    EXPECT_TRUE(config.service.auto_start);
+    EXPECT_FALSE(config.service.allow_client_daemon);
 }
 
 TEST_F(ConfigTest, DefaultClientConfig) {
@@ -444,6 +455,8 @@ TEST_F(ConfigTest, DefaultClientConfig) {
     EXPECT_EQ(config.mode, Mode::Client);
     EXPECT_TRUE(config.client.has_value());
     EXPECT_FALSE(config.server.has_value());
+    EXPECT_FALSE(config.service.auto_start);
+    EXPECT_FALSE(config.service.allow_client_daemon);
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +553,7 @@ TEST_F(ConfigTest, RoundTripServer) {
     EXPECT_EQ(loaded.server->udp_enabled, original.server->udp_enabled);
     EXPECT_EQ(loaded.logging.level, original.logging.level);
     EXPECT_EQ(loaded.logging.file, original.logging.file);
+    EXPECT_EQ(loaded.service, original.service);
 }
 
 TEST_F(ConfigTest, RoundTripClient) {
@@ -567,6 +581,119 @@ TEST_F(ConfigTest, RoundTripClient) {
         EXPECT_EQ(loaded.client->forwards[i].remote_host, original.client->forwards[i].remote_host);
         EXPECT_EQ(loaded.client->forwards[i].remote_port, original.client->forwards[i].remote_port);
     }
+    EXPECT_EQ(loaded.service, original.service);
+}
+
+TEST_F(ConfigTest, ServerDiscloseDefaultsAllFalse) {
+    auto config = Config::default_server();
+    ASSERT_TRUE(config.server.has_value());
+    EXPECT_FALSE(config.server->disclose.hostname);
+    EXPECT_FALSE(config.server->disclose.os);
+    EXPECT_FALSE(config.server->disclose.os_version);
+    EXPECT_FALSE(config.server->disclose.arch);
+    EXPECT_FALSE(config.server->disclose.uptime);
+    EXPECT_FALSE(config.server->disclose.toxtunnel_version);
+    EXPECT_FALSE(config.server->disclose.any());
+}
+
+TEST_F(ConfigTest, ParseServerDiscloseExplicitFields) {
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+server:
+  disclose:
+    hostname: true
+    os: true
+    arch: true
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& cfg = result.value();
+    ASSERT_TRUE(cfg.server.has_value());
+    EXPECT_TRUE(cfg.server->disclose.hostname);
+    EXPECT_TRUE(cfg.server->disclose.os);
+    EXPECT_TRUE(cfg.server->disclose.arch);
+    EXPECT_FALSE(cfg.server->disclose.os_version);
+    EXPECT_FALSE(cfg.server->disclose.uptime);
+    EXPECT_TRUE(cfg.server->disclose.any());
+}
+
+TEST_F(ConfigTest, ParseServerDiscloseScalarTrueFlipsAllFields) {
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+server:
+  disclose: true
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& cfg = result.value();
+    ASSERT_TRUE(cfg.server.has_value());
+    EXPECT_TRUE(cfg.server->disclose.hostname);
+    EXPECT_TRUE(cfg.server->disclose.os);
+    EXPECT_TRUE(cfg.server->disclose.os_version);
+    EXPECT_TRUE(cfg.server->disclose.arch);
+    EXPECT_TRUE(cfg.server->disclose.uptime);
+    EXPECT_TRUE(cfg.server->disclose.toxtunnel_version);
+}
+
+TEST_F(ConfigTest, RoundTripServerDisclose) {
+    Config original = Config::default_server();
+    original.server->disclose.hostname = true;
+    original.server->disclose.arch = true;
+
+    auto yaml = original.to_yaml();
+    auto loaded = Config::from_string(yaml);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    EXPECT_EQ(loaded.value().server->disclose, original.server->disclose);
+}
+
+TEST_F(ConfigTest, ParseServiceSection) {
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+service:
+  auto_start: false
+  allow_client_daemon: true
+)";
+
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_FALSE(result.value().service.auto_start);
+    EXPECT_TRUE(result.value().service.allow_client_daemon);
+}
+
+TEST_F(ConfigTest, ShouldRunAsServiceDaemon) {
+    Config srv_on = Config::default_server();
+    ASSERT_TRUE(srv_on.should_run_as_service_daemon());
+
+    Config srv_off = Config::default_server();
+    srv_off.service.auto_start = false;
+    ASSERT_FALSE(srv_off.should_run_as_service_daemon());
+
+    Config cli_gate = Config::default_client();
+    ASSERT_FALSE(cli_gate.should_run_as_service_daemon());
+
+    Config cli_allow = cli_gate;
+    cli_allow.service.allow_client_daemon = true;
+    ASSERT_TRUE(cli_allow.should_run_as_service_daemon());
+
+    // Critical invariant: in client mode `auto_start` is IGNORED. Only
+    // `allow_client_daemon` may un-gate the daemon. Without this check the
+    // earlier assertions all pass by coincidence (default_client() zeros both
+    // flags), so a regression that read auto_start in client mode would slip.
+    Config cli_auto_only = Config::default_client();
+    cli_auto_only.service.auto_start = true;
+    cli_auto_only.service.allow_client_daemon = false;
+    ASSERT_FALSE(cli_auto_only.should_run_as_service_daemon())
+        << "client mode must ignore auto_start and only consult allow_client_daemon";
+
+    // Symmetric: in server mode `allow_client_daemon` is IGNORED.
+    Config srv_allow_only = Config::default_server();
+    srv_allow_only.service.auto_start = false;
+    srv_allow_only.service.allow_client_daemon = true;
+    ASSERT_FALSE(srv_allow_only.should_run_as_service_daemon())
+        << "server mode must ignore allow_client_daemon and only consult auto_start";
 }
 
 // ---------------------------------------------------------------------------

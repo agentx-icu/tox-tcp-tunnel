@@ -2,12 +2,12 @@
 
 #include <cstdio>
 #include <span>
-#include <thread>
 
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/system_info.hpp"
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -79,6 +79,16 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
         return util::unexpected(std::string("Invalid server Tox ID: ") + tox_id_result.error());
     }
 
+    // Key the known_servers registry off the canonical hex form. ToxId::to_hex()
+    // already returns uppercase, matching KnownServersStore's internal normalization.
+    server_tox_id_hex_ = tox_id_result.value().to_hex();
+
+    // Open the persistent known-servers registry alongside tox_save.dat.
+    known_servers_ = std::make_unique<KnownServersStore>(config.data_dir);
+    if (auto& err = known_servers_->last_load_error(); err.has_value()) {
+        util::Logger::warn("known_servers.yaml: {} (continuing with empty registry)", *err);
+    }
+
     auto peer_public_key = tox_id_result.value().public_key();
     auto friend_result = tox_adapter_->add_friend(tox_id_result.value(), "toxtunnel client");
     if (!friend_result) {
@@ -135,6 +145,8 @@ void TunnelClient::start() {
     auto address = tox_adapter_->get_address();
     util::Logger::info("Client Tox ID: {}", address.to_hex());
 
+    schedule_info_refresh();
+
     if (is_pipe_mode()) {
         util::Logger::info("Client running in stdio pipe mode");
         if (server_online_) {
@@ -162,6 +174,11 @@ void TunnelClient::stop() {
     }
 
     util::Logger::info("Stopping TunnelClient...");
+
+    if (info_refresh_timer_) {
+        info_refresh_timer_->cancel();
+        info_refresh_timer_.reset();
+    }
 
     // Stop all TCP listeners
     for (auto& listener : listeners_) {
@@ -216,11 +233,14 @@ void TunnelClient::setup_tox_callbacks() {
             server_online_ = connected;
             if (connected) {
                 util::Logger::info("Server friend {} is now online", friend_number);
+                record_server_connection();
+                send_info_request();
                 if (is_pipe_mode() && running_) {
                     io_ctx_->post([this] { start_pipe_mode(); });
                 }
             } else {
                 util::Logger::warn("Server friend {} went offline", friend_number);
+                info_request_sent_.store(false);
                 if (is_pipe_mode() && running_) {
                     request_stop();
                 }
@@ -249,6 +269,14 @@ void TunnelClient::setup_tox_callbacks() {
             return;
         }
 
+        // INFO_REPLY is a per-friend control frame outside the per-tunnel
+        // routing. Intercept it before route_frame so TunnelManager doesn't
+        // log a "no tunnel for id 0" warning.
+        if (frame_result.value().type() == tunnel::FrameType::INFO_REPLY) {
+            record_server_info(frame_result.value().as_info_reply_yaml());
+            return;
+        }
+
         tunnel_mgr_->route_frame(frame_result.value());
     });
 
@@ -263,12 +291,11 @@ void TunnelClient::setup_tox_callbacks() {
 }
 
 void TunnelClient::setup_tunnel_manager() {
-    // Send handler: serialize frame, prepend 0xA0 lossless prefix, send via ToxAdapter
+    // Send handler: serialize frame, prepend the lossless prefix, send via ToxAdapter.
     tunnel_mgr_->set_send_handler([this](const std::vector<uint8_t>& frame_data) -> bool {
-        // Prepend lossless packet prefix byte (0xA0)
         std::vector<uint8_t> packet;
         packet.reserve(1 + frame_data.size());
-        packet.push_back(0xA0);
+        packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), frame_data.begin(), frame_data.end());
 
         return tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
@@ -324,7 +351,7 @@ void TunnelClient::start_pipe_mode() {
         std::vector<uint8_t> frame_data(data.begin(), data.end());
         std::vector<uint8_t> packet;
         packet.reserve(1 + frame_data.size());
-        packet.push_back(0xA0);
+        packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), frame_data.begin(), frame_data.end());
         (void)tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
                                                  packet.size());
@@ -422,10 +449,9 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
         std::vector<uint8_t> frame_data(data.begin(), data.end());
 
-        // Prepend lossless packet prefix byte (0xA0)
         std::vector<uint8_t> packet;
         packet.reserve(1 + frame_data.size());
-        packet.push_back(0xA0);
+        packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), frame_data.begin(), frame_data.end());
 
         (void)tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
@@ -478,6 +504,119 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
 
     util::Logger::debug("Tunnel {} created and TUNNEL_OPEN sent to {}:{}", tunnel_id,
                         rule.remote_host, rule.remote_port);
+}
+
+// ---------------------------------------------------------------------------
+// Known-servers registry helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+KnownConnectionType to_known_connection_type(tox::FriendState state) {
+    switch (state) {
+        case tox::FriendState::UDP:
+            return KnownConnectionType::Udp;
+        case tox::FriendState::TCP:
+            return KnownConnectionType::Tcp;
+        case tox::FriendState::None:
+        default:
+            return KnownConnectionType::None;
+    }
+}
+
+}  // namespace
+
+void TunnelClient::schedule_info_refresh() {
+    if (!io_ctx_ || !running_.load())
+        return;
+
+    if (!info_refresh_timer_) {
+        info_refresh_timer_ = std::make_unique<asio::steady_timer>(io_ctx_->get_io_context());
+    }
+    info_refresh_timer_->expires_after(kInfoRefreshInterval);
+    info_refresh_timer_->async_wait([this](const asio::error_code& ec) {
+        if (ec || !running_.load()) {
+            // Timer was cancelled (stop()) or client is shutting down.
+            return;
+        }
+        if (server_online_.load()) {
+            // Reset the per-session de-dupe flag so send_info_request()'s
+            // compare_exchange_strong succeeds, then re-issue.
+            info_request_sent_.store(false);
+            send_info_request();
+        }
+        // Re-arm even if the server is offline; we'll just no-op until it
+        // comes back, and reconnect itself triggers a fresh send via the
+        // friend-online callback.
+        schedule_info_refresh();
+    });
+}
+
+void TunnelClient::send_info_request() {
+    bool expected = false;
+    if (!info_request_sent_.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    auto frame = tunnel::ProtocolFrame::make_info_request();
+    auto wire = frame.serialize();
+    std::vector<uint8_t> packet;
+    packet.reserve(1 + wire.size());
+    packet.push_back(tunnel::kLosslessPacketByte);
+    packet.insert(packet.end(), wire.begin(), wire.end());
+    const bool sent =
+        tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(), packet.size());
+    if (!sent) {
+        // The server may legitimately not implement INFO_REQUEST yet, or the
+        // send queue may be full; either way let the next online transition
+        // try again.
+        info_request_sent_.store(false);
+        util::Logger::debug("INFO_REQUEST send failed (will retry on next reconnect)");
+    } else {
+        util::Logger::debug("INFO_REQUEST sent to friend {}", server_friend_number_);
+    }
+}
+
+void TunnelClient::record_server_connection() {
+    if (!known_servers_ || server_tox_id_hex_.empty())
+        return;
+    const auto state = tox_adapter_->get_friend_connection_status(server_friend_number_);
+    const auto type = to_known_connection_type(state);
+    if (!known_servers_->record_connection(server_tox_id_hex_, type)) {
+        util::Logger::warn("known_servers: record_connection rejected tox_id");
+        return;
+    }
+    if (auto save = known_servers_->save(); !save) {
+        util::Logger::warn("known_servers: failed to save: {}", save.error());
+    }
+}
+
+void TunnelClient::record_server_info(std::string_view yaml_payload) {
+    if (!known_servers_ || server_tox_id_hex_.empty())
+        return;
+
+    const auto snap = util::snapshot_from_yaml(yaml_payload);
+    KnownServerInfo info;
+    info.hostname = snap.hostname;
+    info.os = snap.os;
+    info.os_version = snap.os_version;
+    info.arch = snap.arch;
+    info.uptime_seconds = snap.uptime_seconds;
+    info.toxtunnel_version = snap.toxtunnel_version;
+    info.reported_at = iso8601_utc_now();
+
+    util::Logger::info(
+        "Server disclosed system info ({} bytes): hostname={} os={} arch={} version={}",
+        yaml_payload.size(), info.hostname.value_or("(undisclosed)"),
+        info.os.value_or("(undisclosed)"), info.arch.value_or("(undisclosed)"),
+        info.toxtunnel_version.value_or("(undisclosed)"));
+
+    if (!known_servers_->record_info(server_tox_id_hex_, info)) {
+        util::Logger::warn("known_servers: record_info rejected tox_id");
+        return;
+    }
+    if (auto save = known_servers_->save(); !save) {
+        util::Logger::warn("known_servers: failed to save: {}", save.error());
+    }
 }
 
 }  // namespace toxtunnel::app

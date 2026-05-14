@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Injected into CPack-generated WiX by CPACK_WIX_PATCH_FILE
+  (see cmake/Packaging.cmake). Registers ToxTunnel as a Windows service
+  pointing at the installed binary, and starts it during MSI install so the
+  packaging policy ("packaged install -> service registered AND started")
+  matches Linux postinst (`systemctl enable --now`) and macOS postinstall
+  (`launchctl bootstrap`).
+
+  Service runtime behavior (whether the daemon stays resident or self-exits)
+  is then governed by `service.auto_start` / `service.allow_client_daemon`
+  in C:\ProgramData\ToxTunnel\config.yaml — see ServiceConfig.
+
+  !! REGEN REQUIRED AFTER EVERY CMAKE/CPACK/WIX TOOLCHAIN BUMP !!
+
+  The CPackWiXFragment Id below must match the Component Id that CPack-WiX
+  generates for `bin/toxtunnel.exe`. CPack derives Component Ids deterministically
+  from the install path: `CM_CP_<path-with-/-replaced-by-.>`. For the current
+  packaged layout this is `CM_CP_bin.toxtunnel.exe`. If CPack/WiX is upgraded or
+  the install path changes, this id MUST be updated — otherwise the patch silently
+  no-ops and the resulting MSI will install the binary but NOT register the service.
+
+  How to verify after a toolchain bump:
+    1. On Windows: `cmake -B build && cmake --build build && cd build && cpack -G WIX`
+    2. Grep generated files: `Get-ChildItem build\_CPack_Packages\*\WIX\*.wxs |
+       Select-String 'toxtunnel.exe'` — the surrounding `Component Id="..."` is
+       the value this fragment must target.
+    3. Update the `CPackWiXFragment Id="..."` attribute below to match.
+
+  The CI guard `tests/packaging/verify_windows_msi.ps1` runs on every PR and is
+  the ONLY automatic protection against silent regression here. Do not rely on
+  local Linux/macOS builds — they never exercise the WiX pipeline.
+
+  Account: omitted -> service runs as LocalSystem. ToxTunnel does not need that
+  level of privilege; future hardening should switch to `Account="NT AUTHORITY\LocalService"`
+  (and grant the config/state directory ACLs in postinstall) to mirror the Linux
+  `User=toxtunnel` posture.
+-->
+<CPackWiXPatch>
+  <CPackWiXFragment Id="CM_CP_bin.toxtunnel.exe">
+    <!-- Vital="no" so a service-start failure (e.g. C:\ProgramData\ToxTunnel\config.yaml
+         not yet created on a fresh install) does not roll back the MSI itself.
+         The service stays registered and will start on next boot or on the user's
+         next manual `sc start ToxTunnel` once config.yaml exists. -->
+    <ServiceInstall Id="ToxTunnelServiceInstall"
+                    Name="ToxTunnel"
+                    DisplayName="ToxTunnel"
+                    Description="ToxTunnel TCP forwarder over the Tox P2P network"
+                    Type="ownProcess"
+                    Start="auto"
+                    ErrorControl="normal"
+                    Vital="no"
+                    Arguments="-c &quot;C:\ProgramData\ToxTunnel\config.yaml&quot; --service"/>
+    <!-- Start="install" makes MSI try to start the service at the end of installation,
+         so packaged installs match Linux (`systemctl enable --now`) and macOS
+         (`launchctl bootstrap`) behavior. Stop="both" stops the service on both
+         install (for upgrades) and uninstall. Remove="uninstall" deletes the
+         service registration on uninstall. Wait="no" so we don't block the MSI on
+         the daemon's startup probe; the gate logic in cli/main.cpp may exit 0
+         immediately for client mode. -->
+    <ServiceControl Id="ToxTunnelServiceControl"
+                    Name="ToxTunnel"
+                    Start="install"
+                    Stop="both"
+                    Remove="uninstall"
+                    Wait="no"/>
+  </CPackWiXFragment>
+</CPackWiXPatch>

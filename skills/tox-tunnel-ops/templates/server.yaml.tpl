@@ -31,9 +31,26 @@ tox:
 {{#RULES_FILE}}
 server:
   rules_file: {{RULES_FILE}}
+  # System-info disclosure to clients via INFO_REQUEST/INFO_REPLY.
+  # Defaults are all false (server discloses nothing). Opt in per field if
+  # operators of connecting clients should be able to see this metadata.
+  # disclose:
+  #   hostname: false
+  #   os: false
+  #   os_version: false
+  #   arch: false
+  #   uptime: false
+  #   toxtunnel_version: false
 {{/RULES_FILE}}
 {{^RULES_FILE}}
 # Access control rules (recommended for production use)
 # server:
 #   rules_file: rules.yaml
+#   disclose:
+#     hostname: false
+#     os: false
+#     os_version: false
+#     arch: false
+#     uptime: false
+#     toxtunnel_version: false
 {{/RULES_FILE}}

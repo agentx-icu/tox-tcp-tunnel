@@ -78,10 +78,14 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(asio)
 
 # spdlog
+# v1.14+ ships a refreshed bundled fmt that compiles cleanly under newer
+# Apple Clang (Xcode 16/26) — earlier releases trip on the
+# "call to consteval function ... is not a constant expression" error
+# via FMT_STRING. v1.14.1 is the latest stable as of this bump.
 FetchContent_Declare(
     spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG v1.12.0
+    GIT_TAG v1.17.0
 )
 FetchContent_MakeAvailable(spdlog)
 
@@ -126,6 +130,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/tox/tox_thread.cpp
     src/tox/tox_connection.cpp
     src/tox/tox_adapter.cpp
+    src/app/known_servers.cpp
     src/app/rules_engine.cpp
     src/app/stdio_pipe_bridge.cpp
     src/app/tunnel_client.cpp
@@ -134,6 +139,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/util/error.cpp
     src/util/logger.cpp
     src/util/qr_code.cpp
+    src/util/system_info.cpp
     src/util/systemd_notify.cpp
     src/util/windows_service.cpp
 )
@@ -179,6 +185,12 @@ else()
             -Wno-stringop-overflow
         )
     endif()
+    # Apple Clang 17+ (Xcode 16/26) trips on `operator"" _buf` in asio 1.28's
+    # buffer.hpp under -Wpedantic. Asio's headers are out of our control, so
+    # silence this category for our targets that include asio.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(toxtunnel_lib PRIVATE -Wno-deprecated-literal-operator)
+    endif()
 endif()
 
 # Executable target
@@ -201,6 +213,9 @@ else()
             -Wno-stringop-overread
             -Wno-stringop-overflow
         )
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(toxtunnel PRIVATE -Wno-deprecated-literal-operator)
     endif()
 endif()
 
@@ -249,10 +264,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging")
         COMPONENT toxtunnel_runtime
         OPTIONAL
     )
+    install(FILES packaging/known_servers.yaml.example
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/toxtunnel
+        COMPONENT toxtunnel_runtime
+        OPTIONAL
+    )
     # Linux-specific files
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         install(FILES packaging/linux/toxtunnel.service
-            DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system
+            DESTINATION lib/systemd/system
             COMPONENT toxtunnel_runtime
             OPTIONAL
         )

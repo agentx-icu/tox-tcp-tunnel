@@ -150,13 +150,56 @@ rules:
 
 If no `rules_file` is configured, the server allows ALL connections from any friend.
 
+### Known-Servers Registry (client side)
+
+Every successful client→server connection updates
+`<data_dir>/known_servers.yaml` with: 76-char Tox ID, optional alias,
+first/last connected timestamps, last transport (`udp`|`tcp`|`none`), and any
+system info the server **explicitly opted into** disclosing.
+
+Resolution rule: anywhere a Tox ID is expected (`--server-id`,
+`client.server_id` in YAML), an alias from this registry is accepted and
+resolved at startup. Aliases stay local to the client; they never travel over
+the wire.
+
+CLI: `toxtunnel servers list|show|add|remove`. The default data_dir is
+`~/.config/toxtunnel`; override with `-d DIR` or `-c CONFIG_FILE`.
+
+### Server Self-Disclosure (`server.disclose`)
+
+When a client comes online it sends an `INFO_REQUEST` (frame type `0x06`,
+tunnel_id `0`, empty payload). The server replies with `INFO_REPLY` (`0x07`)
+carrying a small UTF-8 YAML map containing only the fields the operator has
+explicitly opted into via `server.disclose.*`. **All fields default false.**
+
+Available fields:
+- `hostname` — `gethostname()` / `GetComputerName`
+- `os` — `uname.sysname` / "Windows"
+- `os_version` — `uname.release` / Windows build number
+- `arch` — `uname.machine` / native arch
+- `uptime` — seconds since boot (Linux: /proc/uptime; macOS: kern.boottime; Windows: GetTickCount64)
+- `toxtunnel_version` — build version string
+
+Shorthand: `disclose: true` flips every field on; `disclose: false` (or
+omitted) flips every field off.
+
+Old servers that don't know `INFO_REQUEST` ignore it; the client times out
+silently and persists only locally observable metadata.
+
+**ToxTunnel does NOT implement remote command execution.** If you need to
+run shell commands on the server, forward port 22 and use SSH.
+
 ### CLI Reference
 
 ```
 toxtunnel -m server -c server.yaml
 toxtunnel -m client -c client.yaml
-toxtunnel -m client --server-id <ID> --pipe <host:port>   # pipe mode (SSH ProxyCommand)
-toxtunnel print-id [-d DATA_DIR] [--qr] [--color]         # print/display Tox ID
+toxtunnel -m client --server-id <ID|alias> --pipe <host:port>   # pipe mode (SSH ProxyCommand)
+toxtunnel print-id [-d DATA_DIR] [--qr] [--color]               # print/display Tox ID
+toxtunnel servers list [--full] [-d DIR | -c CONFIG]            # list known servers
+toxtunnel servers show <alias_or_id> [-d DIR | -c CONFIG]       # show one server's record
+toxtunnel servers add   <alias> <tox_id> [--notes "..."]        # register alias for a Tox ID
+toxtunnel servers remove <alias_or_id>                          # forget a server
 ```
 
 Key flags:
@@ -165,7 +208,7 @@ Key flags:
 - `-d, --data-dir`: data directory override
 - `-l, --log-level`: trace | debug | info | warn | error
 - `-p, --port`: TCP port (server mode)
-- `--server-id`: server Tox ID (client mode)
+- `--server-id`: server Tox ID OR alias from known_servers.yaml (client mode)
 - `--pipe`: pipe target host:port (client mode, for SSH ProxyCommand, POSIX only)
 - `--service`: run as system service (integrates with systemd/Windows SCM/launchd)
 - `-v, --version`: print version and exit
@@ -345,7 +388,7 @@ For **rules.yaml** (when access control is needed):
 #### 3. Execution Steps
 
 Numbered step-by-step:
-1. Install toxtunnel (prefer package from GitHub Releases; fall back to building from source)
+1. Install toxtunnel (prefer the one-line installer with `--mode {server|client}`; fall back to manual package download; build from source as last resort)
 2. Write config files to disk
 3. Start server, note the Tox ID from output (or use `toxtunnel print-id --qr` to display as QR code)
 4. Paste Tox ID into client config (scan QR code with phone to transfer ID between machines)
@@ -483,11 +526,14 @@ Read on demand:
 3. **Minimum privilege by default.** When generating rules.yaml, only allow the exact host:port combinations needed. Each friend gets their own rule entry with explicit 64-char hex public key.
 4. **No friend wildcards.** The `friend` field in rules.yaml must be an exact 64-character hex public key. Never use `*` for friend identity.
 5. **OS-aware.** Detect or ask the user's OS and tailor paths, commands, and service management:
-   - macOS (package): `binary: /usr/local/bin/toxtunnel`; example config at `/usr/local/share/toxtunnel/config.yaml.example`; user copies to `/usr/local/etc/toxtunnel/config.yaml` and moves the plist to `/Library/LaunchDaemons/` to enable launchd.
-   - Linux (package): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data: /var/lib/toxtunnel`, service: systemd (`toxtunnel.service`, enabled by postinst but not started).
-   - Windows (package): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`, service: Windows SCM — but the MSI does NOT register the service or seed a config; both must be done manually with `sc.exe` (or NSSM).
+   - macOS (package): `binary: /usr/local/bin/toxtunnel`; example config at `/usr/local/share/toxtunnel/config.yaml.example`. The pkg postinstall **automatically** seeds `/usr/local/etc/toxtunnel/config.yaml` from the example, installs `com.toxtunnel.daemon.plist` into `/Library/LaunchDaemons/`, and runs `launchctl bootstrap`. The daemon then honours `service.allow_client_daemon` / `service.auto_start` and exits 0 cleanly when gated off.
+   - Linux (package): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data: /var/lib/toxtunnel`, service: `toxtunnel.service` (`Type=notify`, `RemainAfterExit=yes`). The postinst seeds the config from the example and runs `systemctl enable --now`. Server installs come up online; client installs idle (`active (exited)`) until the user fills in `client.server_id` and sets `service.allow_client_daemon: true`.
+   - Windows (package): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. The MSI **does** register the **ToxTunnel** SCM service (`Start="install"`, `auto`) pointing at `C:\ProgramData\ToxTunnel\config.yaml`. The MSI does **not** seed `config.yaml` itself (the daemon's `--service` soft-fail path makes a missing config exit 0 cleanly so SCM doesn't loop); the user creates the YAML, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner additionally seeds the config based on `--Mode`.
    - For manual installs, use home-directory paths as before.
-6. **Prefer package installation.** When guiding users to install toxtunnel, recommend DEB/RPM/.pkg/MSI packages from GitHub Releases first. Only suggest building from source when no pre-built package exists for the target platform.
+6. **Prefer the one-line installer, then native packages, then source.** Recommend the one-liner first (it auto-detects arch + package format and seeds a mode-appropriate config):
+   - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode {server|client}`
+   - Windows (Administrator PowerShell): `$env:TOXTUNNEL_MODE='{server|client}'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex`
+   Fall back to direct DEB/RPM/.pkg/MSI download from GitHub Releases when the user can't pipe to sh/iex (locked-down environments). Only suggest building from source when no pre-built package exists for the target platform.
 7. **Safe defaults.** `bootstrap_mode: auto` unless confirmed LAN. `log_level: info` unless diagnosing. `tox.tcp_port: 33445` unless blocked.
 8. **Pipe mode for SSH.** Always mention SSH ProxyCommand as an alternative for SSH scenarios. Note: pipe mode is POSIX only and **not supported on Windows** — on Windows, always use the `forwards` port-mapping approach instead.
 9. **Security reminders.** Remind users: Tox ID = identity. Keep `tox_save.dat` backed up. Never share private keys.

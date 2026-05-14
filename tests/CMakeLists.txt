@@ -20,7 +20,9 @@ add_executable(unit_tests
     unit/test_expected.cpp
     unit/test_circular_buffer.cpp
     unit/test_config.cpp
+    unit/test_known_servers.cpp
     unit/test_pipe_mode.cpp
+    unit/test_protocol_info.cpp
     unit/test_qr_code.cpp
     unit/test_rules_engine.cpp
     unit/test_tox_adapter.cpp
@@ -48,6 +50,9 @@ else()
             -Wno-stringop-overread
             -Wno-stringop-overflow
         )
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(unit_tests PRIVATE -Wno-deprecated-literal-operator)
     endif()
 endif()
 gtest_discover_tests(unit_tests
@@ -85,6 +90,9 @@ else()
             -Wno-stringop-overread
             -Wno-stringop-overflow
         )
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(integration_tests PRIVATE -Wno-deprecated-literal-operator)
     endif()
 endif()
 gtest_discover_tests(integration_tests

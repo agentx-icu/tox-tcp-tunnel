@@ -204,6 +204,9 @@ Config Config::default_server() {
     Config config;
     config.mode = Mode::Server;
     config.data_dir = "/var/lib/toxtunnel";
+    // service.auto_start defaults to true at the struct level (see ServiceConfig);
+    // do not override here so that YAML-loaded server configs without a `service:` section
+    // pick up the same "server is online" default.
     config.server = ServerConfig{};
     sync_legacy_server_tox_fields(config);
     return config;
@@ -214,6 +217,11 @@ Config Config::default_client() {
     config.mode = Mode::Client;
     config.data_dir =
         std::filesystem::path(getenv("HOME") ? getenv("HOME") : ".") / ".config" / "toxtunnel";
+    // ServiceConfig::auto_start defaults to true (server-oriented). Override to false here so
+    // that a client config dumped via to_yaml() doesn't carry a misleading auto_start: true
+    // (the field is ignored in client mode — should_run_as_service_daemon() reads
+    // allow_client_daemon — but writing true would suggest otherwise).
+    config.service.auto_start = false;
     config.client = ClientConfig{};
     return config;
 }
@@ -446,6 +454,12 @@ std::string Config::to_yaml() const {
     }
     out << YAML::EndMap;
 
+    out << YAML::Key << "service";
+    out << YAML::BeginMap;
+    out << YAML::Key << "auto_start" << YAML::Value << service.auto_start;
+    out << YAML::Key << "allow_client_daemon" << YAML::Value << service.allow_client_daemon;
+    out << YAML::EndMap;
+
     out << YAML::Key << "tox" << YAML::Value << YAML::BeginMap;
     out << YAML::Key << "udp_enabled" << YAML::Value << effective_tox.udp_enabled;
     out << YAML::Key << "tcp_port" << YAML::Value << effective_tox.tcp_port;
@@ -470,6 +484,17 @@ std::string Config::to_yaml() const {
         out << YAML::Key << "server" << YAML::Value << YAML::BeginMap;
         if (server->rules_file) {
             out << YAML::Key << "rules_file" << YAML::Value << *server->rules_file;
+        }
+        if (server->disclose.any()) {
+            out << YAML::Key << "disclose" << YAML::Value << YAML::BeginMap;
+            out << YAML::Key << "hostname" << YAML::Value << server->disclose.hostname;
+            out << YAML::Key << "os" << YAML::Value << server->disclose.os;
+            out << YAML::Key << "os_version" << YAML::Value << server->disclose.os_version;
+            out << YAML::Key << "arch" << YAML::Value << server->disclose.arch;
+            out << YAML::Key << "uptime" << YAML::Value << server->disclose.uptime;
+            out << YAML::Key << "toxtunnel_version" << YAML::Value
+                << server->disclose.toxtunnel_version;
+            out << YAML::EndMap;
         }
         out << YAML::EndMap;
     }
@@ -537,6 +562,13 @@ const ClientConfig& Config::client_config() const {
     return *client;
 }
 
+bool Config::should_run_as_service_daemon() const {
+    if (mode == Mode::Client) {
+        return service.allow_client_daemon;
+    }
+    return service.auto_start;
+}
+
 }  // namespace toxtunnel
 
 // ---------------------------------------------------------------------------
@@ -553,6 +585,7 @@ using toxtunnel::LoggingConfig;
 using toxtunnel::Mode;
 using toxtunnel::PipeTarget;
 using toxtunnel::ServerConfig;
+using toxtunnel::ServiceConfig;
 using toxtunnel::ToxConfig;
 using toxtunnel::tox::BootstrapMode;
 using toxtunnel::tox::kPublicKeyHexLen;
@@ -750,6 +783,83 @@ bool convert<LoggingConfig>::decode(const Node& node, LoggingConfig& rhs) {
 }
 
 // ---------------------------------------------------------------------------
+// ServiceConfig
+// ---------------------------------------------------------------------------
+
+Node convert<ServiceConfig>::encode(const ServiceConfig& rhs) {
+    Node node;
+    node["auto_start"] = rhs.auto_start;
+    node["allow_client_daemon"] = rhs.allow_client_daemon;
+    return node;
+}
+
+bool convert<ServiceConfig>::decode(const Node& node, ServiceConfig& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["auto_start"]) {
+        rhs.auto_start = node["auto_start"].as<bool>();
+    }
+    if (node["allow_client_daemon"]) {
+        rhs.allow_client_daemon = node["allow_client_daemon"].as<bool>();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// ServerInfoDisclose
+// ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::ServerInfoDisclose>::encode(const toxtunnel::ServerInfoDisclose& rhs) {
+    Node node;
+    node["hostname"] = rhs.hostname;
+    node["os"] = rhs.os;
+    node["os_version"] = rhs.os_version;
+    node["arch"] = rhs.arch;
+    node["uptime"] = rhs.uptime;
+    node["toxtunnel_version"] = rhs.toxtunnel_version;
+    return node;
+}
+
+bool convert<toxtunnel::ServerInfoDisclose>::decode(const Node& node,
+                                                    toxtunnel::ServerInfoDisclose& rhs) {
+    if (node.IsScalar()) {
+        // Convenience: `disclose: false` / `disclose: true` as a global
+        // toggle that flips every field at once. Explicit per-field maps
+        // are still preferred for production use; this is only a shorthand.
+        bool flag = false;
+        try {
+            flag = node.as<bool>();
+        } catch (const YAML::Exception&) {
+            return false;
+        }
+        rhs.hostname = flag;
+        rhs.os = flag;
+        rhs.os_version = flag;
+        rhs.arch = flag;
+        rhs.uptime = flag;
+        rhs.toxtunnel_version = flag;
+        return true;
+    }
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["hostname"])
+        rhs.hostname = node["hostname"].as<bool>();
+    if (node["os"])
+        rhs.os = node["os"].as<bool>();
+    if (node["os_version"])
+        rhs.os_version = node["os_version"].as<bool>();
+    if (node["arch"])
+        rhs.arch = node["arch"].as<bool>();
+    if (node["uptime"])
+        rhs.uptime = node["uptime"].as<bool>();
+    if (node["toxtunnel_version"])
+        rhs.toxtunnel_version = node["toxtunnel_version"].as<bool>();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // ServerConfig
 // ---------------------------------------------------------------------------
 
@@ -762,6 +872,9 @@ Node convert<ServerConfig>::encode(const ServerConfig& rhs) {
     }
     if (rhs.rules_file) {
         node["rules_file"] = *rhs.rules_file;
+    }
+    if (rhs.disclose.any()) {
+        node["disclose"] = rhs.disclose;
     }
     return node;
 }
@@ -785,6 +898,10 @@ bool convert<ServerConfig>::decode(const Node& node, ServerConfig& rhs) {
 
     if (node["rules_file"]) {
         rhs.rules_file = node["rules_file"].as<std::string>();
+    }
+
+    if (node["disclose"]) {
+        rhs.disclose = node["disclose"].as<toxtunnel::ServerInfoDisclose>();
     }
 
     return true;
@@ -914,6 +1031,7 @@ Node convert<Config>::encode(const Config& rhs) {
     node["mode"] = rhs.mode;
     node["data_dir"] = rhs.data_dir.string();
     node["logging"] = rhs.logging;
+    node["service"] = rhs.service;
     node["tox"] = effective_tox;
 
     if (rhs.server) {
@@ -962,6 +1080,10 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
         rhs.logging = node["logging"].as<LoggingConfig>();
     }
 
+    if (node["service"]) {
+        rhs.service = node["service"].as<ServiceConfig>();
+    }
+
     if (node["tox"]) {
         rhs.tox = node["tox"].as<ToxConfig>();
     }
@@ -974,6 +1096,10 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
         if (server_node["rules_file"]) {
             rhs.server->rules_file = server_node["rules_file"].as<std::string>();
+        }
+
+        if (server_node["disclose"]) {
+            rhs.server->disclose = server_node["disclose"].as<toxtunnel::ServerInfoDisclose>();
         }
 
         if (!has_canonical_tox) {

@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 
+#include "toxtunnel/app/known_servers.hpp"
 #include "toxtunnel/app/tunnel_client.hpp"
 #include "toxtunnel/app/tunnel_server.hpp"
 #include "toxtunnel/tox/tox_adapter.hpp"
@@ -40,6 +41,175 @@ bool parse_log_level(const std::string& str, toxtunnel::util::LogLevel& out) {
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// `servers` subcommand helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the data_dir for the `servers` subcommands.
+///
+/// Priority:
+///   1. explicit --data-dir flag
+///   2. config file from --config (uses Config.data_dir)
+///   3. Config::default_client().data_dir
+///
+/// If `--config` is given but the file cannot be loaded (or the loaded config
+/// has an empty data_dir), this returns nullopt and writes a clear error to
+/// stderr — silently falling back to `~/.config/toxtunnel` would let the user
+/// believe they were operating on a specific data_dir while in fact the
+/// `add`/`remove` mutated the default registry.
+[[nodiscard]] std::optional<std::filesystem::path> resolve_servers_data_dir(
+    const std::string& explicit_data_dir, const std::string& config_path) {
+    if (!explicit_data_dir.empty()) {
+        return std::filesystem::path(explicit_data_dir);
+    }
+    if (!config_path.empty()) {
+        auto loaded = toxtunnel::Config::from_file(config_path);
+        if (!loaded) {
+            std::cerr << "Failed to load config '" << config_path << "': " << loaded.error()
+                      << "\n";
+            return std::nullopt;
+        }
+        if (loaded.value().data_dir.empty()) {
+            std::cerr << "Config '" << config_path
+                      << "' has an empty data_dir; specify --data-dir explicitly.\n";
+            return std::nullopt;
+        }
+        return loaded.value().data_dir;
+    }
+    return toxtunnel::Config::default_client().data_dir;
+}
+
+/// Truncate a long Tox ID for table display: first 12 + ellipsis + last 4.
+std::string short_tox_id(std::string_view tox_id) {
+    if (tox_id.size() <= 20)
+        return std::string(tox_id);
+    return std::string(tox_id.substr(0, 12)) + ".." + std::string(tox_id.substr(tox_id.size() - 4));
+}
+
+int cmd_servers_list(const std::filesystem::path& data_dir, bool full_ids) {
+    toxtunnel::app::KnownServersStore store(data_dir);
+    if (auto& err = store.last_load_error(); err.has_value()) {
+        std::cerr << "Warning: " << *err << "\n";
+    }
+
+    if (store.empty()) {
+        std::cout << "(no known servers in " << store.path().string() << ")\n";
+        return 0;
+    }
+
+    const auto entries = store.entries();
+    std::cout << "Known servers (" << store.path().string() << "):\n";
+    for (const auto& s : entries) {
+        const auto id_to_print = full_ids ? s.tox_id : short_tox_id(s.tox_id);
+        std::cout << "  - " << (s.alias ? *s.alias : std::string("(no alias)")) << "  "
+                  << id_to_print << "  type=" << to_string(s.last_connection_type)
+                  << "  last=" << s.last_connected_at.value_or("never");
+        if (s.info.hostname)
+            std::cout << "  host=" << *s.info.hostname;
+        if (s.info.os)
+            std::cout << "  os=" << *s.info.os;
+        std::cout << "\n";
+    }
+    return 0;
+}
+
+int cmd_servers_show(const std::filesystem::path& data_dir, const std::string& alias_or_id) {
+    toxtunnel::app::KnownServersStore store(data_dir);
+    const auto* entry = store.find_by_alias(alias_or_id);
+    if (!entry) {
+        const auto resolved = store.resolve_tox_id(alias_or_id);
+        entry = store.find_by_tox_id(resolved);
+    }
+    if (!entry) {
+        std::cerr << "No known server matching '" << alias_or_id << "'\n";
+        return 1;
+    }
+    std::cout << "tox_id:               " << entry->tox_id << "\n";
+    std::cout << "alias:                " << (entry->alias ? *entry->alias : "(none)") << "\n";
+    std::cout << "first_connected_at:   " << entry->first_connected_at.value_or("(never)") << "\n";
+    std::cout << "last_connected_at:    " << entry->last_connected_at.value_or("(never)") << "\n";
+    std::cout << "last_connection_type: " << to_string(entry->last_connection_type) << "\n";
+    if (!entry->notes.empty())
+        std::cout << "notes:                " << entry->notes << "\n";
+    if (entry->info.hostname)
+        std::cout << "info.hostname:        " << *entry->info.hostname << "\n";
+    if (entry->info.os)
+        std::cout << "info.os:              " << *entry->info.os << "\n";
+    if (entry->info.os_version)
+        std::cout << "info.os_version:      " << *entry->info.os_version << "\n";
+    if (entry->info.arch)
+        std::cout << "info.arch:            " << *entry->info.arch << "\n";
+    if (entry->info.uptime_seconds)
+        std::cout << "info.uptime_seconds:  " << *entry->info.uptime_seconds << "\n";
+    if (entry->info.toxtunnel_version)
+        std::cout << "info.version:         " << *entry->info.toxtunnel_version << "\n";
+    if (entry->info.reported_at)
+        std::cout << "info.reported_at:     " << *entry->info.reported_at << "\n";
+    return 0;
+}
+
+int cmd_servers_add(const std::filesystem::path& data_dir, const std::string& alias,
+                    const std::string& tox_id, const std::string& notes) {
+    toxtunnel::app::KnownServersStore store(data_dir);
+
+    // If we already know this Tox ID, start from its current record so that
+    // first/last_connected_at, last_connection_type, info{} and existing notes
+    // survive a re-add. `upsert` does a wholesale replace by design, so the
+    // merge has to happen here in the caller.
+    toxtunnel::app::KnownServer entry;
+    if (const auto* existing = store.find_by_tox_id(tox_id)) {
+        entry = *existing;
+    }
+    entry.tox_id = tox_id;
+    entry.alias = alias;
+    if (!notes.empty()) {
+        entry.notes = notes;
+    }
+
+    if (!store.upsert(entry)) {
+        std::cerr << "Failed to add: tox_id is invalid (must be 76 hex chars) or alias collides "
+                     "with a different tox_id.\n";
+        return 1;
+    }
+    if (auto save = store.save(); !save) {
+        std::cerr << "Failed to save: " << save.error() << "\n";
+        return 1;
+    }
+    std::cout << "Added '" << alias << "' -> " << short_tox_id(tox_id) << " ("
+              << store.path().string() << ")\n";
+    return 0;
+}
+
+int cmd_servers_remove(const std::filesystem::path& data_dir, const std::string& alias_or_id) {
+    toxtunnel::app::KnownServersStore store(data_dir);
+    if (!store.remove(alias_or_id)) {
+        std::cerr << "No known server matching '" << alias_or_id << "'\n";
+        return 1;
+    }
+    if (auto save = store.save(); !save) {
+        std::cerr << "Failed to save: " << save.error() << "\n";
+        return 1;
+    }
+    std::cout << "Removed '" << alias_or_id << "'\n";
+    return 0;
+}
+
+/// Drive a clean SERVICE_STOPPED transition when a packaged --service install can't
+/// start (config missing or invalid). Exit code 0 so launchd KeepAlive
+/// { SuccessfulExit: false }, systemd Restart=on-failure, and Windows SCM auto-restart
+/// don't loop on a misconfigured install. The user creates / fixes the config and
+/// restarts the service. Logger is not initialized at the call sites, so this writes
+/// to stderr.
+[[nodiscard]] int exit_service_idle(const std::string& reason) {
+    std::cerr << "Service idle: " << reason << "\n";
+#if defined(_WIN32)
+    return toxtunnel::util::run_windows_service_main("ToxTunnel", []() { return 0; });
+#else
+    toxtunnel::util::notify_service_ready();
+    return 0;
+#endif
 }
 
 /// Run the tunnel server until a signal is received.
@@ -204,6 +374,69 @@ int main(int argc, char* argv[]) {
     print_id_cmd->add_flag("--qr", print_id_qr, "Render Tox ID as terminal QR code");
     print_id_cmd->add_flag("--color", print_id_color, "Use ANSI colors with QR output");
 
+    // ----- `servers` group ---------------------------------------------------
+    // Per-client persistent registry of previously-connected servers. Each
+    // subcommand resolves the registry path from --data-dir, --config, or
+    // Config::default_client().data_dir.
+    auto* servers_cmd = app.add_subcommand(
+        "servers",
+        "Manage the known-servers registry. "
+        "WARNING: the on-disk file is single-writer — stop the toxtunnel daemon "
+        "before running `add`/`remove`, otherwise your edit will race with the "
+        "daemon's on-connect updates and one side will be lost.");
+    servers_cmd->require_subcommand(1);
+
+    std::string servers_data_dir;
+    std::string servers_config_path;
+    auto add_common_servers_opts = [&](CLI::App* sub) {
+        sub->add_option("-d,--data-dir", servers_data_dir,
+                        "Data directory holding known_servers.yaml");
+        sub->add_option("-c,--config", servers_config_path,
+                        "Read data_dir from this config file (overridden by --data-dir)");
+    };
+
+    bool servers_list_full = false;
+    auto* servers_list_cmd = servers_cmd->add_subcommand("list", "List known servers");
+    add_common_servers_opts(servers_list_cmd);
+    servers_list_cmd->add_flag("--full", servers_list_full, "Show full 76-char Tox IDs");
+
+    std::string servers_show_target;
+    auto* servers_show_cmd =
+        servers_cmd->add_subcommand("show", "Show details for one known server");
+    add_common_servers_opts(servers_show_cmd);
+    servers_show_cmd
+        ->add_option("alias_or_tox_id", servers_show_target, "Alias or full 76-char Tox ID")
+        ->required();
+
+    std::string servers_add_alias;
+    std::string servers_add_tox_id;
+    std::string servers_add_notes;
+    auto* servers_add_cmd =
+        servers_cmd->add_subcommand("add", "Add or update a known server entry");
+    add_common_servers_opts(servers_add_cmd);
+    servers_add_cmd->add_option("alias", servers_add_alias, "Short user-defined alias")->required();
+    servers_add_cmd->add_option("tox_id", servers_add_tox_id, "76-char hex Tox ID")->required();
+    servers_add_cmd->add_option("--notes", servers_add_notes, "Free-form notes");
+
+    std::string servers_remove_target;
+    auto* servers_remove_cmd =
+        servers_cmd->add_subcommand("remove", "Remove a known server by alias or Tox ID");
+    add_common_servers_opts(servers_remove_cmd);
+    servers_remove_cmd
+        ->add_option("alias_or_tox_id", servers_remove_target, "Alias or full 76-char Tox ID")
+        ->required();
+
+#if defined(_WIN32)
+    auto* install_win_svc =
+        app.add_subcommand("install-windows-service", "Register ToxTunnel as a Windows service");
+    std::string install_svc_config;
+    install_win_svc->add_option("-c,--config", install_svc_config,
+                                "Path to config.yaml used by the service");
+
+    auto* uninstall_win_svc =
+        app.add_subcommand("uninstall-windows-service", "Unregister the ToxTunnel Windows service");
+#endif
+
     app.add_option("-c,--config", config_path, "Path to YAML config file");
 
     app.add_option("-m,--mode", mode_str, "Operating mode: server or client")
@@ -224,6 +457,54 @@ int main(int argc, char* argv[]) {
     app.set_version_flag("-v,--version", kVersion);
 
     CLI11_PARSE(app, argc, argv);
+
+#if defined(_WIN32)
+    if (*install_win_svc) {
+        std::string cfg = install_svc_config;
+        if (cfg.empty()) {
+            const char* pd = std::getenv("ProgramData");
+            cfg = std::string(pd ? pd : "C:\\ProgramData") + "\\ToxTunnel\\config.yaml";
+        }
+        if (!util::register_packaged_toxtunnel_service(cfg)) {
+            std::cerr << "Failed to register Windows service (run as Administrator).\n";
+            return 1;
+        }
+        std::cerr << "Registered Windows service ToxTunnel.\n";
+        return 0;
+    }
+    if (*uninstall_win_svc) {
+        if (!util::unregister_packaged_toxtunnel_service()) {
+            std::cerr << "Failed to unregister Windows service (run as Administrator).\n";
+            return 1;
+        }
+        std::cerr << "Unregistered Windows service ToxTunnel.\n";
+        return 0;
+    }
+#endif
+
+    if (*servers_cmd) {
+        // Resolve once; if the user passed --config but it's missing/invalid we
+        // surface the error and refuse to silently mutate ~/.config/toxtunnel.
+        auto servers_dir = resolve_servers_data_dir(servers_data_dir, servers_config_path);
+        if (!servers_dir) {
+            return 1;
+        }
+        if (*servers_list_cmd) {
+            return cmd_servers_list(*servers_dir, servers_list_full);
+        }
+        if (*servers_show_cmd) {
+            return cmd_servers_show(*servers_dir, servers_show_target);
+        }
+        if (*servers_add_cmd) {
+            return cmd_servers_add(*servers_dir, servers_add_alias, servers_add_tox_id,
+                                   servers_add_notes);
+        }
+        if (*servers_remove_cmd) {
+            return cmd_servers_remove(*servers_dir, servers_remove_target);
+        }
+        std::cerr << "Unknown 'servers' subcommand. Try --help.\n";
+        return 2;
+    }
 
     if (*print_id_cmd) {
         if (print_id_color && !print_id_qr) {
@@ -269,6 +550,11 @@ int main(int argc, char* argv[]) {
         // Explicit config file specified
         auto result = Config::from_file(config_path);
         if (!result.has_value()) {
+            if (run_as_service) {
+                return exit_service_idle("cannot load config at " + config_path + " (" +
+                                         result.error() +
+                                         "). Create the file and restart the service to enable.");
+            }
             // Logger not initialized yet, use std::cerr for bootstrap errors
             std::cerr << "Error loading config: " << result.error() << "\n";
             return 1;
@@ -326,6 +612,10 @@ int main(int argc, char* argv[]) {
     }
 
     if (!server_id.empty()) {
+        // `--server-id` may be a 76-char Tox ID or a known-servers alias.
+        // The resolution itself happens after merge_cli_overrides() below, so
+        // both this CLI value and any YAML `client.server_id` go through the
+        // same single resolve_tox_id() call against the post-merge data_dir.
         if (!overrides.client) {
             overrides.client = ClientConfig{};
         }
@@ -351,10 +641,34 @@ int main(int argc, char* argv[]) {
     }
 
     // -----------------------------------------------------------------------
+    // Resolve known-servers aliases in client.server_id (from YAML or
+    // `--server-id`) against the registry under the post-merge data_dir.
+    // Single pass so the "Resolved alias …" message fires at most once per run.
+    // -----------------------------------------------------------------------
+    if (config.is_client() && config.client.has_value() && !config.client->server_id.empty() &&
+        config.client->server_id.size() != 76) {
+        toxtunnel::app::KnownServersStore lookup(config.data_dir);
+        const auto original = config.client->server_id;
+        const auto resolved = lookup.resolve_tox_id(original);
+        if (resolved != original) {
+            std::cerr << "Resolved alias '" << original << "' to "
+                      << (resolved.size() == 76 ? resolved.substr(0, 12) + "..." : resolved)
+                      << "\n";
+            config.client->server_id = resolved;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Validate configuration
     // -----------------------------------------------------------------------
     auto validation = config.validate();
     if (!validation.has_value()) {
+        if (run_as_service) {
+            return exit_service_idle(
+                "invalid config at " +
+                (config_path.empty() ? std::string("<defaults>") : config_path) + ": " +
+                validation.error() + ". Fix the config and restart the service.");
+        }
         std::cerr << "Configuration error: " << validation.error() << "\n";
         return 1;
     }
@@ -382,11 +696,16 @@ int main(int argc, char* argv[]) {
     // On Windows, use service framework if --service is specified
     if (run_as_service) {
         exit_code = util::run_windows_service_main("ToxTunnel", [&]() {
+            if (!config.should_run_as_service_daemon()) {
+                Logger::info(
+                    "Service idle: disabled by config (service.auto_start / "
+                    "service.allow_client_daemon); exiting.");
+                return 0;
+            }
             if (config.is_server()) {
                 return run_server(config, true);
-            } else {
-                return run_client(config, true);
             }
+            return run_client(config, true);
         });
     } else {
         if (config.is_server()) {
@@ -396,6 +715,16 @@ int main(int argc, char* argv[]) {
         }
     }
 #else
+    if (run_as_service && !config.should_run_as_service_daemon()) {
+        Logger::info(
+            "Service idle: disabled by config (service.auto_start / "
+            "service.allow_client_daemon); exiting.");
+        util::notify_service_ready();
+        Logger::info("ToxTunnel exiting with code {}", 0);
+        Logger::shutdown();
+        return 0;
+    }
+
     if (config.is_server()) {
         exit_code = run_server(config, run_as_service);
     } else {
