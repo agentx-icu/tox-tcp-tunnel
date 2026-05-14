@@ -44,8 +44,16 @@ if(WIN32)
     set(CPACK_GENERATOR "WIX")
     set(CPACK_WIX_UPGRADE_GUID "F8A3B2C1-7D6E-4A5F-9B0C-1E2D3F4A5B6C")
     set(CPACK_PACKAGE_INSTALL_DIRECTORY "ToxTunnel")
-    list(APPEND CPACK_WIX_PATCH_FILE
-        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows/wix-service-patch.xml")
+    # NOTE: packaging/windows/wix-service-patch.xml is staged but DISABLED for now.
+    # CPack-WiX in CMake 3.31 hashes component path parts, so the literal
+    # `CM_CP_bin.toxtunnel.exe` Id in the patch never matches a generated component
+    # and cpack fails. Until we discover the real hashed Id (or rewrite the patch
+    # as a CPACK_WIX_EXTRA_SOURCES fragment), users register the service manually
+    # via `toxtunnel install-windows-service` after MSI install. See the
+    # `install-windows-service` / `uninstall-windows-service` subcommands in
+    # cli/main.cpp and the README's Windows install section.
+    # list(APPEND CPACK_WIX_PATCH_FILE
+    #     "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows/wix-service-patch.xml")
 endif()
 
 include(CPack)
