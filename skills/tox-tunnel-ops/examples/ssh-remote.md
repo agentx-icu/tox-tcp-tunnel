@@ -91,6 +91,15 @@ Host remote-via-tox
 
 Then simply: `ssh remote-via-tox`
 
+> **Tip:** if you connect to the same server frequently, register an alias once
+> and use it in place of the 76-char Tox ID:
+>
+> ```bash
+> toxtunnel servers add remote-host <FULL_76_CHAR_TOX_ID>
+> # then in ~/.ssh/config:
+> #   ProxyCommand toxtunnel -m client --server-id remote-host --pipe 127.0.0.1:22
+> ```
+
 ## Verification
 
 ```bash

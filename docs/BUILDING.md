@@ -1,5 +1,22 @@
 # Building ToxTunnel
 
+> **Most users do not need to build from source.** Released `.deb` / `.rpm` /
+> `.pkg` / `.msi` packages are published for every tag, and the one-line
+> installers handle download + install + service registration:
+>
+> ```bash
+> # macOS / Linux
+> curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
+> ```
+>
+> ```powershell
+> # Windows (Administrator PowerShell)
+> irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+> ```
+>
+> Build from source when you need: a non-released git revision, a custom
+> compile flag, a cross-compile target, or development on the daemon itself.
+
 ## Prerequisites
 
 | Dependency   | Version                           | Notes                                                      |

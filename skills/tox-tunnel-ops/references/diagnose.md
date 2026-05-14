@@ -21,8 +21,14 @@ Run through these layers in order. Stop at the first failure and propose a fix.
 - Does `data_dir` exist and is it writable?
 - Does `tox_save.dat` exist? (first run creates it)
 - Client-specific:
-  - Is `server_id` set and exactly 76 characters?
+  - Is `server_id` set?
   - Is `server_id` not the placeholder `<PASTE_SERVER_TOX_ID_HERE>`?
+  - If `server_id` is exactly 76 hex characters → treat as literal Tox ID.
+  - If `server_id` is shorter → treat as an alias and check that
+    `<data_dir>/known_servers.yaml` exists and contains an entry whose `alias:`
+    matches. (`toxtunnel servers list -d <data_dir>` resolves this quickly.)
+    A non-76-char `server_id` with no matching alias is a misconfiguration —
+    the daemon will fail validation at startup.
   - Are `forwards` entries present with valid port numbers?
 - Server-specific:
   - If `rules_file` is set, does the file exist?

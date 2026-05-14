@@ -105,7 +105,7 @@ netstat -an | findstr :PORT   # Windows
 - macOS (manual/source build): `data_dir: ~/Library/Application Support/toxtunnel/` or `~/.config/toxtunnel/`, service: launchd user agent
 - Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data_dir: /var/lib/toxtunnel`, service: `toxtunnel.service` (Type=notify, `RemainAfterExit=yes`, enabled and started by postinst).
 - Linux (manual): `data_dir: ~/.config/toxtunnel/`, service: custom systemd unit
-- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. The MSI registers the **ToxTunnel** SCM service (Start="install", auto) pointing at `C:\ProgramData\ToxTunnel\config.yaml`. The MSI does NOT seed `config.yaml` itself; the daemon's `--service` soft-fail path lets first-boot exit 0 cleanly until the user creates one. `scripts/install.ps1` does seed it based on `--Mode`.
+- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **In v0.2.0 the MSI does NOT auto-register the SCM service** — the WiX patch is shelved (`cmake/Packaging.cmake` has the rationale). The user creates `C:\ProgramData\ToxTunnel\config.yaml`, then runs `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'` from an Administrator PowerShell, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner does all of this automatically.
 - Windows (manual): `data_dir: %APPDATA%\toxtunnel\`, service: NSSM or Task Scheduler
 
 ## Step 1: Write Config Files
@@ -168,21 +168,26 @@ sudo launchctl print system/com.toxtunnel.daemon | head
 
 ### Windows MSI
 
-The MSI registers the **ToxTunnel** Windows SCM service automatically
-(`ServiceInstall` Type=ownProcess, Start=auto; `ServiceControl Start="install"`)
-pointing at `C:\Program Files\ToxTunnel\bin\toxtunnel.exe -c
-C:\ProgramData\ToxTunnel\config.yaml --service`. The MSI does NOT seed the
-config — the daemon's `--service` soft-fail path makes first boot exit 0 cleanly
-so SCM marks the service stopped (not failed). The user creates the YAML, then
-starts the service:
+**In v0.2.0 the MSI does NOT auto-register the SCM service** (the WiX patch is
+shelved — see `cmake/Packaging.cmake` for context). Workflow: install MSI →
+create config → register the service with the bundled subcommand → start it.
 
 ```powershell
 mkdir 'C:\ProgramData\ToxTunnel' -Force
 notepad 'C:\ProgramData\ToxTunnel\config.yaml'
+
+# Register the service (run as Administrator):
+& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service `
+    -c 'C:\ProgramData\ToxTunnel\config.yaml'
+
 sc start ToxTunnel
 sc query ToxTunnel
 sc stop ToxTunnel
 ```
+
+> The one-line installer `scripts/install.ps1` automates all of the above. Use
+> it unless the user explicitly needs the manual flow. Remove the service with
+> `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' uninstall-windows-service`.
 
 ### Manual source-build service templates
 
@@ -243,10 +248,17 @@ Install with:
 Install with:
 `cp com.toxtunnel.MODE.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.toxtunnel.MODE.plist`
 
-#### Windows `sc.exe`
+#### Windows `sc.exe` (raw)
 
 ```cmd
 sc create ToxTunnel binPath= "\"C:\path\to\toxtunnel.exe\" -c \"C:\path\to\config.yaml\" --service" start= auto
+sc start ToxTunnel
+```
+
+Or use the bundled subcommand (same effect, fewer footguns around quoting):
+
+```cmd
+"C:\path\to\toxtunnel.exe" install-windows-service -c "C:\path\to\config.yaml"
 sc start ToxTunnel
 ```
 

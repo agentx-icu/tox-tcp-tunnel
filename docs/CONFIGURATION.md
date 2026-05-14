@@ -10,6 +10,9 @@ Default data directories are `/var/lib/toxtunnel` in server mode and
 mode: server
 data_dir: /var/lib/toxtunnel
 
+service:                            # service-manager policy (--service flag)
+  auto_start: true                  # server default: be online when daemonized
+
 logging:
   level: info
   file: /var/log/toxtunnel.log     # optional
@@ -25,6 +28,13 @@ tox:
 
 server:
   rules_file: /etc/toxtunnel/rules.yaml   # optional access control
+  disclose:                              # optional system-info opt-in (all default false)
+    hostname: false
+    os: false
+    os_version: false
+    arch: false
+    uptime: false
+    toxtunnel_version: false
 ```
 
 ## Client Configuration
@@ -32,6 +42,12 @@ server:
 ```yaml
 mode: client
 data_dir: ~/.config/toxtunnel
+
+service:                                 # service-manager policy (--service flag)
+  auto_start: false                       # ignored in client mode
+  allow_client_daemon: false              # set true to actually bind local forward
+                                          # ports under --service; defaults false so
+                                          # packaged installs don't silently listen
 
 logging:
   level: info
@@ -42,7 +58,9 @@ tox:
   bootstrap_nodes: []
 
 client:
-  server_id: "AABBCCDD..."               # 76 hex characters (full Tox address)
+  # Either a 76-char Tox ID, or an alias registered with `toxtunnel servers add`.
+  # Aliases resolve from <data_dir>/known_servers.yaml at startup.
+  server_id: "AABBCCDD..."               # or e.g. server_id: homelab
 
   forwards:
     - local_port: 2222
@@ -53,6 +71,22 @@ client:
       remote_host: 192.168.1.100
       remote_port: 80                     # local:8080 -> remote:80
 ```
+
+## Service Policy (`service:`)
+
+Controls whether `toxtunnel --service` (run under systemd / launchd / Windows SCM)
+keeps the process resident or exits 0 cleanly.
+
+| Key | Mode | Default | Effect |
+|---|---|---|---|
+| `auto_start` | server | `true` | When false, the daemon under `--service` logs "Service idle…" and exits 0. Linux unit stays `active (exited)`; macOS `KeepAlive { SuccessfulExit: false }` does not respawn. |
+| `allow_client_daemon` | client | `false` | When false, the client daemon under `--service` exits 0 immediately — local forward ports are NOT bound. Flip to true once `client.server_id` and `forwards` are set. |
+| `auto_start` | client | n/a | Ignored. Client gating reads `allow_client_daemon` only. |
+| `allow_client_daemon` | server | n/a | Ignored. Server gating reads `auto_start` only. |
+
+The soft-fail exit-0 also fires when the config file is missing or fails
+validation under `--service`, so a packaged install never loops on a broken
+config.
 
 ## Tox Network Configuration
 
@@ -178,8 +212,82 @@ The `data_dir` stores:
 | ------------------------- | ---------------------------------- |
 | `tox_save.dat`            | Tox identity (private key)         |
 | `bootstrap_nodes.json`    | Cached bootstrap node list         |
+| `known_servers.yaml`      | Client-only: registry of previously-connected servers (alias, last connection, disclosed system info) |
 
 **Important**: Back up `tox_save.dat` to preserve your Tox identity.
+
+## Known-Servers Registry (client side)
+
+Each successful client→server connection writes an entry to
+`<data_dir>/known_servers.yaml`: 76-char Tox ID, optional alias, first/last
+connection timestamps, transport (`udp` direct or `tcp` relay), and any system
+info the server explicitly opted into disclosing.
+
+Manage the registry from the CLI:
+
+```bash
+toxtunnel servers list                       # compact list
+toxtunnel servers list --full                # full 76-char IDs
+toxtunnel servers show <alias_or_tox_id>     # full record
+toxtunnel servers add <alias> <tox_id>       # register an alias
+toxtunnel servers remove <alias_or_tox_id>   # forget
+```
+
+Each subcommand accepts `-d/--data-dir DIR` (defaults to the same
+`~/.config/toxtunnel` used by `print-id`) or `-c/--config FILE` (reads
+`data_dir` from the config).
+
+Once an alias is registered it can be used anywhere a Tox ID is expected
+(`--server-id <alias>`, `client.server_id: <alias>` in YAML). The CLI prints a
+`Resolved alias '<alias>' to <prefix>...` line on stderr when this happens.
+
+**Concurrency caveat:** the on-disk file is treated as single-writer. Stop the
+toxtunnel daemon before running `servers add`/`remove`, otherwise your edit
+will race with the daemon's on-connect updates and one side will be lost.
+
+## Server Self-Disclosure (`server.disclose:`)
+
+When a client comes online it sends an `INFO_REQUEST` (frame `0x06`). The server
+replies with `INFO_REPLY` (`0x07`) containing a small YAML map of only the
+fields its operator has explicitly opted into.
+
+All disclosure fields default to `false`. A default server discloses **nothing**.
+
+| Field | Source |
+|---|---|
+| `hostname` | `gethostname()` / `GetComputerName` |
+| `os` | `uname.sysname` / `"Windows"` |
+| `os_version` | `uname.release` / Windows build number |
+| `arch` | `uname.machine` / native arch |
+| `uptime` | Linux `/proc/uptime`; macOS `kern.boottime`; Windows `GetTickCount64` |
+| `toxtunnel_version` | Build version string |
+
+Per-field map:
+
+```yaml
+server:
+  disclose:
+    hostname: true
+    os: true
+    arch: true
+    # remaining fields default false
+```
+
+Or scalar shorthand (useful in dev / private deployments):
+
+```yaml
+server:
+  disclose: true     # flips every field on
+  # disclose: false  # equivalent to the default (everything off)
+```
+
+Old servers (pre-v0.2.0) that don't know `INFO_REQUEST` ignore the frame; the
+client times out silently and persists only locally-observable metadata
+(`tox_id`, `last_connection_type`, timestamps).
+
+> **ToxTunnel does NOT implement remote command execution.** Disclosure is the
+> only way the server publishes runtime metadata, and the operator opts in
+> per field.
 
 ## Logging
 
@@ -236,3 +344,7 @@ Host my-tox-server
 ```
 
 Then: `ssh my-tox-server`
+
+> `SERVER_ADDRESS` may be a 76-char Tox ID or a known-servers alias (see the
+> Known-Servers Registry section above). After `toxtunnel servers add homelab
+> <FULL_ID>` you can write `--server-id homelab` directly.

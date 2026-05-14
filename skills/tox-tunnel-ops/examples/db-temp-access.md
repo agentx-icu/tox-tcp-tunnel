@@ -65,7 +65,9 @@ The `friend` value must be the contractor's 64-character hex public key. They ca
 
 1. Start server with rules
 2. Share the server Tox ID with the contractor (via secure channel)
-3. Contractor installs toxtunnel and starts client
+3. Contractor installs toxtunnel and starts client. Optionally, the contractor
+   registers an alias once so subsequent runs only need the short name:
+   `toxtunnel servers add client-db <SERVER_TOX_ID>`
 4. Wait for friend connection
 5. Contractor connects: `psql -h 127.0.0.1 -p 15432 -U db_user -d mydb`
 

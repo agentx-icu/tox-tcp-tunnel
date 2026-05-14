@@ -19,18 +19,20 @@
 
 ## Components
 
-| Component       | Description                                                      |
-| --------------- | ---------------------------------------------------------------- |
-| `TunnelServer`  | Accepts Tox friend connections, forwards to local TCP services   |
-| `TunnelClient`  | Listens on local TCP ports, tunnels through Tox to the server    |
-| `TunnelManager` | Manages multiple concurrent tunnels per friend connection        |
-| `Tunnel`        | State machine for a single bidirectional tunnel                  |
-| `ProtocolFrame` | Binary frame serialization/deserialization                       |
-| `ToxAdapter`    | High-level wrapper for the toxcore C API                         |
-| `ToxThread`     | Dedicated thread for the toxcore event loop                      |
-| `RulesEngine`   | Per-friend access control (allow/deny rules)                     |
-| `IoContext`     | Async I/O thread pool wrapping asio                              |
-| `Config`        | YAML configuration loading, validation, and CLI override merging |
+| Component           | Description                                                      |
+| ------------------- | ---------------------------------------------------------------- |
+| `TunnelServer`      | Accepts Tox friend connections, forwards to local TCP services. Replies to `INFO_REQUEST` with a `server.disclose.*`-filtered `INFO_REPLY`. |
+| `TunnelClient`      | Listens on local TCP ports, tunnels through Tox to the server. Sends `INFO_REQUEST` on friend-online; persists results to `KnownServersStore`. |
+| `TunnelManager`     | Manages multiple concurrent tunnels per friend connection        |
+| `Tunnel`            | State machine for a single bidirectional tunnel                  |
+| `ProtocolFrame`     | Binary frame serialization/deserialization                       |
+| `ToxAdapter`        | High-level wrapper for the toxcore C API                         |
+| `ToxThread`         | Dedicated thread for the toxcore event loop                      |
+| `RulesEngine`       | Per-friend access control (allow/deny rules)                     |
+| `KnownServersStore` | Client-only YAML-backed registry of previously-connected servers (`<data_dir>/known_servers.yaml`); provides alias resolution for `--server-id` and `client.server_id`. |
+| `SystemInfo`        | Server-side platform probes gated by `ServerInfoDisclose` policy (hostname / os / arch / uptime / version). Used to build `INFO_REPLY` payloads. |
+| `IoContext`         | Async I/O thread pool wrapping asio                              |
+| `Config`            | YAML configuration loading, validation, and CLI override merging |
 
 ## Configuration Model
 
@@ -60,15 +62,22 @@ Offset  Size  Field
 
 ### Frame Types
 
-| Type           | Value | Description                    |
-| -------------- | ----- | ------------------------------ |
-| `TUNNEL_OPEN`  | 0x01  | Request to open a new tunnel   |
-| `TUNNEL_DATA`  | 0x02  | Data frame                     |
-| `TUNNEL_CLOSE` | 0x03  | Close tunnel gracefully        |
-| `TUNNEL_ACK`   | 0x04  | Acknowledge tunnel open        |
-| `TUNNEL_ERROR` | 0x05  | Error (connect failed, etc.)   |
-| `PING`         | 0x10  | Keep-alive ping                |
-| `PONG`         | 0x11  | Keep-alive response            |
+| Type            | Value | Description                                       |
+| --------------- | ----- | ------------------------------------------------- |
+| `TUNNEL_OPEN`   | 0x01  | Request to open a new tunnel                      |
+| `TUNNEL_DATA`   | 0x02  | Data frame                                        |
+| `TUNNEL_CLOSE`  | 0x03  | Close tunnel gracefully                           |
+| `TUNNEL_ACK`    | 0x04  | Acknowledge tunnel open                           |
+| `TUNNEL_ERROR`  | 0x05  | Error (connect failed, etc.)                      |
+| `INFO_REQUEST`  | 0x06  | Client → Server: ask peer for system info (`tunnel_id` = 0, empty payload). Sent once when the friend transitions to online. |
+| `INFO_REPLY`    | 0x07  | Server → Client response (`tunnel_id` = 0, UTF-8 YAML map filtered by `server.disclose.*`). Empty payload = "policy is to disclose nothing"; client persists the result to `known_servers.yaml`. Old servers ignore `INFO_REQUEST` — client falls back to locally-observable metadata only. |
+| `PING`          | 0x10  | Keep-alive ping                                   |
+| `PONG`          | 0x11  | Keep-alive response                               |
+
+> Every frame is prepended with a single `kLosslessPacketByte` (0xA0) when
+> handed to toxcore's lossless custom packet API. ToxTunnel does **not**
+> implement remote command execution — `INFO_REPLY` is the only metadata
+> channel and the server operator opts in per field.
 
 ## Threading Model
 
@@ -128,7 +137,7 @@ Offset  Size  Field
 | ------------------------------------------------ | ------- | ----------------------------------------------- |
 | [c-toxcore](https://github.com/TokTok/c-toxcore) | v0.2.22 | Tox protocol (git submodule, built from source) |
 | [asio](https://github.com/chriskohlhoff/asio)    | 1.28.0  | Async I/O (FetchContent, header-only)           |
-| [spdlog](https://github.com/gabime/spdlog)       | 1.12.0  | Logging (FetchContent)                          |
+| [spdlog](https://github.com/gabime/spdlog)       | 1.17.0  | Logging (FetchContent; bumped from 1.12 for Apple Clang 17 compat) |
 | [CLI11](https://github.com/CLIUtils/CLI11)       | 2.6.2   | CLI argument parsing (FetchContent)             |
 | [yaml-cpp](https://github.com/jbeder/yaml-cpp)   | 0.9.0   | YAML parsing (FetchContent)                     |
 | libsodium                                        | system  | Cryptography (required by toxcore)              |

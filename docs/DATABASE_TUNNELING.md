@@ -60,6 +60,10 @@ SELECT * FROM test_table;
 
 Copy the server's Tox address from the output.
 
+> Aliases registered with `toxtunnel servers add <alias> <tox_id>` work
+> anywhere a Tox ID is expected — see `docs/CONFIGURATION.md`'s
+> "Known-Servers Registry" section.
+
 ### Start ToxTunnel Client
 
 ```bash

@@ -41,6 +41,12 @@ npx http-server -p 8888 /tmp
 
 Copy the server's Tox address from the output (76 hex characters).
 
+> If you'll connect to this server often, register an alias once
+> (`toxtunnel servers add http-demo "$SERVER_ID"`) and substitute the alias
+> wherever a Tox ID is expected (`--server-id http-demo`,
+> `client.server_id: http-demo`) — see `docs/CONFIGURATION.md`'s
+> "Known-Servers Registry" section.
+
 ### Start ToxTunnel Client
 
 ```bash

@@ -221,15 +221,19 @@ sudo launchctl kickstart -k system/com.toxtunnel.daemon   # reload after config 
    `https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
    (use `toxtunnel-Windows-ARM64-latest.msi` for ARM)
 2. Run the installer as Administrator
-3. The installer places files in `C:\Program Files\ToxTunnel\` and registers a **ToxTunnel**
-   Windows service (auto-start) that runs `toxtunnel.exe --service` with
-   `-c C:\ProgramData\ToxTunnel\config.yaml`.
+3. The installer places files in `C:\Program Files\ToxTunnel\`. **In v0.2.0 the MSI does
+   not auto-register the Windows service** — you register it yourself after creating the config
+   (one command, shown below). Subsequent releases will register it automatically.
 
-Create the config (required before the service can stay running):
+Create the config and register the service:
 
 ```powershell
 mkdir 'C:\ProgramData\ToxTunnel' -Force
 notepad 'C:\ProgramData\ToxTunnel\config.yaml'
+
+# One-time service registration (run as Administrator):
+& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service `
+    -c 'C:\ProgramData\ToxTunnel\config.yaml'
 ```
 
 Service policy (`service.auto_start` / `service.allow_client_daemon`) decides whether the service
@@ -243,12 +247,14 @@ sc stop ToxTunnel
 sc query ToxTunnel
 ```
 
-To register/repair the service manually (optional):
+Remove the service registration:
 
 ```powershell
-& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'
 & 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' uninstall-windows-service
 ```
+
+> **Tip:** The bundled `scripts/install.ps1` one-line installer handles all of the above
+> in a single command — see the "One-line install" section above.
 
 ### From Source
 
@@ -511,6 +517,9 @@ the frame; the client falls back to local-only metadata for that entry.
 ```
 toxtunnel [OPTIONS]
 toxtunnel print-id [OPTIONS]
+toxtunnel servers {list|show|add|remove} [OPTIONS]
+toxtunnel install-windows-service [OPTIONS]      # Windows only
+toxtunnel uninstall-windows-service              # Windows only
 ```
 
 ### Main Command
@@ -522,7 +531,7 @@ toxtunnel print-id [OPTIONS]
 | `-d, --data-dir DIR`    | Override data directory (`/var/lib/toxtunnel` for server, `$HOME/.config/toxtunnel` for client) |
 | `-l, --log-level LEVEL` | `trace`, `debug`, `info`, `warn`, `error`    |
 | `-p, --port PORT`       | TCP relay port override (server mode)        |
-| `--server-id ID`        | Server's 76-char Tox address (client mode)   |
+| `--server-id ID`        | Server's 76-char Tox address OR an alias from `known_servers.yaml` (client mode) |
 | `--pipe HOST:PORT`      | Pipe mode: connect stdin/stdout to tunnel    |
 | `--service`             | Run as system service (systemd/SCM/launchd)  |
 | `-v, --version`         | Show version                                 |

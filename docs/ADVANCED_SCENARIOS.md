@@ -43,6 +43,12 @@ rsync --daemon --no-detach --config=/tmp/rsyncd.conf
 
 Copy the server's Tox address.
 
+> For multi-host or repeated scenarios it's worth registering each server once:
+> `toxtunnel servers add <alias> <tox_id>`, then use `--server-id <alias>` or
+> `client.server_id: <alias>` everywhere below. The registry lives at
+> `<data_dir>/known_servers.yaml` and survives reconnects. See the
+> "Known-Servers Registry" section of `docs/CONFIGURATION.md`.
+
 ```bash
 # Terminal 3: Start ToxTunnel client
 SERVER_ID="PASTE_SERVER_TOX_ADDRESS_HERE"

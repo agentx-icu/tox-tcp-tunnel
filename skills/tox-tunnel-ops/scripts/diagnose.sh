@@ -117,12 +117,20 @@ sys.exit(0)
             if [ -n "$SERVER_ID" ] && [ "$SERVER_ID" != "<PASTE_SERVER_TOX_ID_HERE>" ]; then
                 ID_LEN=${#SERVER_ID}
                 if [ "$ID_LEN" -eq 76 ]; then
-                    info "server_id is 76 chars (correct length)"
+                    info "server_id is 76 chars (literal Tox ID)"
                 else
-                    fail "server_id is $ID_LEN chars (expected 76)"
+                    # v0.2.0+: a non-76-char server_id is treated as an alias
+                    # that resolves via <data_dir>/known_servers.yaml at startup.
+                    KS="${DATA_DIR:-}/known_servers.yaml"
+                    if [ -n "${DATA_DIR:-}" ] && [ -f "$KS" ] && \
+                       grep -qE "^[[:space:]]*alias:[[:space:]]*\"?${SERVER_ID}\"?[[:space:]]*$" "$KS"; then
+                        info "server_id is alias '$SERVER_ID' — resolves via $KS"
+                    else
+                        fail "server_id '$SERVER_ID' is $ID_LEN chars and has no matching alias in ${KS:-known_servers.yaml} (need 76-char Tox ID or registered alias)"
+                    fi
                 fi
             else
-                fail "server_id is not set — paste the server's Tox ID"
+                fail "server_id is not set — paste the server's Tox ID or an alias from 'toxtunnel servers list'"
             fi
 
             # Check forwards

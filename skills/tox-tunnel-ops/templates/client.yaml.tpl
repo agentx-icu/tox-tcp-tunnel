@@ -11,6 +11,14 @@ mode: client
 # Windows: %APPDATA%\toxtunnel\client
 data_dir: {{DATA_DIR}}
 
+# Service policy when this config is run under `--service` (systemd, launchd, SCM).
+# Client installs default to "idle" so a packaged daemon never silently binds
+# local forward ports on a desktop. Flip allow_client_daemon: true once forwards
+# are configured below.
+# service:
+#   auto_start: false           # ignored in client mode
+#   allow_client_daemon: false  # set true to actually bind local ports under --service
+
 logging:
   level: {{LOG_LEVEL|info}}
   # file: /var/log/toxtunnel/client.log   # uncomment for file logging
@@ -20,8 +28,11 @@ tox:
   bootstrap_mode: {{BOOTSTRAP_MODE|auto}}
 
 client:
-  # Paste the server's 76-character Tox ID here.
-  # You can find it in the server's startup log output.
+  # Either paste the server's 76-character Tox ID here, or use an alias that
+  # has been registered with `toxtunnel servers add <alias> <tox_id>`. Aliases
+  # resolve from <data_dir>/known_servers.yaml at startup.
+  # You can find a literal Tox ID in the server's startup log output, or via
+  # `toxtunnel print-id` on the server side.
   server_id: {{SERVER_ID|<PASTE_SERVER_TOX_ID_HERE>}}
 
   # Port forwarding rules: local_port on this machine → remote_host:remote_port on server side
