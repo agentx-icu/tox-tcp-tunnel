@@ -3,9 +3,9 @@
   Injected into CPack-generated WiX by CPACK_WIX_PATCH_FILE
   (see cmake/Packaging.cmake). Registers ToxTunnel as a Windows service
   pointing at the installed binary, and starts it during MSI install so the
-  packaging policy ("packaged install -> service registered AND started")
-  matches Linux postinst (`systemctl enable --now`) and macOS postinstall
-  (`launchctl bootstrap`).
+  packaging policy ("packaged install => service registered AND started")
+  matches Linux postinst (systemctl enable+start) and macOS postinstall
+  (launchctl bootstrap).
 
   Service runtime behavior (whether the daemon stays resident or self-exits)
   is then governed by `service.auto_start` / `service.allow_client_daemon`
@@ -21,11 +21,11 @@
   no-ops and the resulting MSI will install the binary but NOT register the service.
 
   How to verify after a toolchain bump:
-    1. On Windows: `cmake -B build && cmake --build build && cd build && cpack -G WIX`
-    2. Grep generated files: `Get-ChildItem build\_CPack_Packages\*\WIX\*.wxs |
-       Select-String 'toxtunnel.exe'` — the surrounding `Component Id="..."` is
-       the value this fragment must target.
-    3. Update the `CPackWiXFragment Id="..."` attribute below to match.
+    1. On Windows: configure + build + cpack -G WIX from this repo.
+    2. Grep generated files under build\_CPack_Packages\*\WIX\*.wxs for
+       toxtunnel.exe; the surrounding Component Id="..." is the value this
+       fragment must target.
+    3. Update the CPackWiXFragment Id="..." attribute below to match.
 
   The CI guard `tests/packaging/verify_windows_msi.ps1` runs on every PR and is
   the ONLY automatic protection against silent regression here. Do not rely on
@@ -52,8 +52,8 @@
                     Vital="no"
                     Arguments="-c &quot;C:\ProgramData\ToxTunnel\config.yaml&quot; --service"/>
     <!-- Start="install" makes MSI try to start the service at the end of installation,
-         so packaged installs match Linux (`systemctl enable --now`) and macOS
-         (`launchctl bootstrap`) behavior. Stop="both" stops the service on both
+         so packaged installs match Linux (systemctl enable+start) and macOS
+         (launchctl bootstrap) behavior. Stop="both" stops the service on both
          install (for upgrades) and uninstall. Remove="uninstall" deletes the
          service registration on uninstall. Wait="no" so we don't block the MSI on
          the daemon's startup probe; the gate logic in cli/main.cpp may exit 0
