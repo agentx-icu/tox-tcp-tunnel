@@ -1068,3 +1068,97 @@ TEST_F(ConfigTest, ToYamlEmitsCanonicalToxBlock) {
     EXPECT_TRUE(yaml.find("tcp_port: 12345") != std::string::npos);
     EXPECT_TRUE(yaml.find("rules_file: /etc/toxtunnel/rules.conf") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Tilde expansion in YAML path fields
+//
+// Regression test for the bug where `data_dir: ~/.config/toxtunnel` in a YAML
+// config was passed verbatim to KnownServersStore, causing alias resolution to
+// silently miss the registry file (manifesting as a confusing
+// "Server ID must be 76 characters, got 7" validation error).
+// ---------------------------------------------------------------------------
+
+TEST_F(ConfigTest, TildeInDataDirIsExpanded) {
+    const char* fake_home = "/tmp/toxtunnel-tilde-test-home";
+#ifdef _WIN32
+    _putenv_s("HOME", fake_home);
+#else
+    setenv("HOME", fake_home, /*overwrite=*/1);
+#endif
+
+    const char* yaml = R"(
+mode: server
+data_dir: ~/.config/toxtunnel
+server: {}
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result.value().data_dir,
+              std::filesystem::path(fake_home) / ".config" / "toxtunnel");
+}
+
+TEST_F(ConfigTest, TildeInRulesFileIsExpanded) {
+    const char* fake_home = "/tmp/toxtunnel-tilde-test-home";
+#ifdef _WIN32
+    _putenv_s("HOME", fake_home);
+#else
+    setenv("HOME", fake_home, /*overwrite=*/1);
+#endif
+
+    const char* yaml = R"(
+mode: server
+data_dir: /tmp/data
+server:
+  rules_file: ~/rules.yaml
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().server.has_value());
+    ASSERT_TRUE(result.value().server->rules_file.has_value());
+    EXPECT_EQ(*result.value().server->rules_file,
+              std::string(fake_home) + "/rules.yaml");
+}
+
+TEST_F(ConfigTest, BareTildeIsExpandedToHome) {
+    // YAML parses bare `~` as null, so the user must quote it to pass a literal
+    // tilde. This is a YAML quirk independent of our expansion logic — we just
+    // confirm the quoted form round-trips through the expander correctly.
+    const char* fake_home = "/tmp/toxtunnel-tilde-test-home";
+#ifdef _WIN32
+    _putenv_s("HOME", fake_home);
+#else
+    setenv("HOME", fake_home, /*overwrite=*/1);
+#endif
+
+    const char* yaml = R"(
+mode: server
+data_dir: '~'
+server: {}
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result.value().data_dir, fake_home);
+}
+
+TEST_F(ConfigTest, NonTildePathIsUnchanged) {
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+server: {}
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result.value().data_dir, "/var/lib/toxtunnel");
+}
+
+TEST_F(ConfigTest, TildeUsernameFormIsNotExpanded) {
+    // `~user/path` is POSIX-only and requires getpwnam. Out of scope — pass through.
+    const char* yaml = R"(
+mode: server
+data_dir: ~someuser/data
+server: {}
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result.value().data_dir, "~someuser/data");
+}

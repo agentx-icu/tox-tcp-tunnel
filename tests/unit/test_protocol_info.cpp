@@ -107,6 +107,13 @@ TEST(SystemInfoGather, ToxTunnelVersionPolicyFillsVersion) {
     auto snap = gather_system_info(policy);
     ASSERT_TRUE(snap.toxtunnel_version.has_value());
     EXPECT_FALSE(snap.toxtunnel_version->empty());
+    // Regression guard: system_info.cpp lives in toxtunnel_lib, and prior to
+    // CMake fix the TOXTUNNEL_VERSION macro was only defined on the `toxtunnel`
+    // executable target, so the lib silently fell back to "0.0.0-dev" and
+    // INFO_REPLY reported a fake version. The macro must reach the lib now.
+    EXPECT_NE(*snap.toxtunnel_version, "0.0.0-dev")
+        << "TOXTUNNEL_VERSION isn't reaching toxtunnel_lib — check "
+           "target_compile_definitions in CMakeLists.txt";
 }
 
 TEST(SystemInfoGather, AllPolicyFillsAllProbedFields) {

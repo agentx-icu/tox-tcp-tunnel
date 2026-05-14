@@ -13,6 +13,24 @@ tox:
   udp_enabled: true
   tcp_port: 33445
   bootstrap_mode: auto
+  # `auto` fetches https://nodes.tox.chat/json at startup. The explicit list
+  # below is a fallback used in addition to (or in place of) the fetched list
+  # when nodes.tox.chat is unreachable (restrictive corporate firewalls, NAT'd
+  # VMs, intermittent HTTPS egress). Curated from the same upstream source —
+  # safe to delete the whole `bootstrap_nodes:` block if you don't want it.
+  bootstrap_nodes:
+    - address: 172.105.109.31
+      port: 33445
+      public_key: D46E97CF995DC1820B92B7D899E152A217D36ABE22730FEA4B6BF1BFC06C617C
+    - address: 144.217.167.73
+      port: 33445
+      public_key: 7E5668E0EE09E19F320AD47902419331FFEE147BB3606769CFBE921A2A2FD34C
+    - address: 3.0.24.15
+      port: 33445
+      public_key: E20ABCF38CDBFFD7D04B29C956B33F7B27A3BB7AF0618101617B036E4AEA402D
+    - address: 205.185.115.131
+      port: 53
+      public_key: 3091C6BEB2A993F1C6300C16549FABA67098FF3D62C6D253828B531470B53D68
 
 server:
   # Add access-control settings here if you want to restrict what friends can reach.

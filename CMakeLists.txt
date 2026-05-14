@@ -156,6 +156,7 @@ target_link_libraries(toxtunnel_lib PUBLIC
 target_compile_definitions(toxtunnel_lib PUBLIC
     ASIO_STANDALONE
     ASIO_NO_DEPRECATED
+    TOXTUNNEL_VERSION="${TOXTUNNEL_VERSION}"
 )
 if(WIN32 AND TOXTUNNEL_PORTABLE_RELEASE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
     # Windows 7 API floor for x64 release artifacts.
@@ -196,7 +197,8 @@ endif()
 # Executable target
 add_executable(toxtunnel cli/main.cpp)
 target_link_libraries(toxtunnel PRIVATE toxtunnel_lib CLI11::CLI11)
-target_compile_definitions(toxtunnel PRIVATE TOXTUNNEL_VERSION="${TOXTUNNEL_VERSION}")
+# TOXTUNNEL_VERSION is propagated from toxtunnel_lib via its PUBLIC compile defs
+# so both system_info.cpp (in the lib) and main.cpp (in the exe) see the same value.
 if(MSVC)
     target_compile_options(toxtunnel PRIVATE /W4)
     if(TOXTUNNEL_WARNINGS_AS_ERRORS)

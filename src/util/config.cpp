@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
@@ -52,6 +53,46 @@ const char* bootstrap_mode_to_string(toxtunnel::tox::BootstrapMode mode) {
         default:
             return "auto";
     }
+}
+
+// Expand leading `~` / `~/` in a YAML-supplied path to the user's home directory.
+// Shells normally do this before exec, but YAML strings are passed verbatim — so
+// `data_dir: ~/.config/toxtunnel` would otherwise reach KnownServersStore as a
+// literal `~/...` and silently miss the registry file.
+//
+// POSIX: HOME is authoritative. Windows: USERPROFILE is the standard, with
+// HOMEDRIVE+HOMEPATH as the documented fallback.
+//
+// `~username` (POSIX-only, requires getpwnam) is not supported — left unchanged.
+std::string expand_user_path(const std::string& path) {
+    if (path.empty() || path[0] != '~') {
+        return path;
+    }
+    // Reject `~user/...` form: only bare `~` or `~/...`.
+    if (path.size() > 1 && path[1] != '/' && path[1] != '\\') {
+        return path;
+    }
+
+    std::string home;
+    if (const char* h = std::getenv("HOME"); h && *h) {
+        home = h;
+    } else if (const char* up = std::getenv("USERPROFILE"); up && *up) {
+        home = up;
+    } else {
+        const char* drive = std::getenv("HOMEDRIVE");
+        const char* hpath = std::getenv("HOMEPATH");
+        if (drive && hpath) {
+            home = std::string(drive) + hpath;
+        }
+    }
+    if (home.empty()) {
+        return path;  // No home to expand against — fall back to literal.
+    }
+
+    if (path.size() == 1) {
+        return home;
+    }
+    return home + path.substr(1);
 }
 
 util::Expected<void, std::string> validate_bootstrap_nodes(
@@ -776,7 +817,7 @@ bool convert<LoggingConfig>::decode(const Node& node, LoggingConfig& rhs) {
     }
 
     if (node["file"]) {
-        rhs.file = node["file"].as<std::string>();
+        rhs.file = toxtunnel::expand_user_path(node["file"].as<std::string>());
     }
 
     return true;
@@ -897,7 +938,7 @@ bool convert<ServerConfig>::decode(const Node& node, ServerConfig& rhs) {
     }
 
     if (node["rules_file"]) {
-        rhs.rules_file = node["rules_file"].as<std::string>();
+        rhs.rules_file = toxtunnel::expand_user_path(node["rules_file"].as<std::string>());
     }
 
     if (node["disclose"]) {
@@ -1072,7 +1113,7 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
     // Data directory
     if (node["data_dir"]) {
-        rhs.data_dir = node["data_dir"].as<std::string>();
+        rhs.data_dir = toxtunnel::expand_user_path(node["data_dir"].as<std::string>());
     }
 
     // Logging
@@ -1095,7 +1136,8 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
         const bool has_canonical_tox = node["tox"] && node["tox"].IsMap();
 
         if (server_node["rules_file"]) {
-            rhs.server->rules_file = server_node["rules_file"].as<std::string>();
+            rhs.server->rules_file =
+                toxtunnel::expand_user_path(server_node["rules_file"].as<std::string>());
         }
 
         if (server_node["disclose"]) {

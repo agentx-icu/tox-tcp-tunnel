@@ -35,7 +35,12 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('server', 'client')]
+    # NOTE: do NOT add [ValidateSet] here. The script is documented to be invoked
+    # as `irm <url> | iex`, which executes the content as a script block. In that
+    # mode PowerShell initializes [string]$Mode to '' before our env-var fallback
+    # runs, and [ValidateSet] rejects the empty string at param-binding time,
+    # breaking the documented one-liner. The manual check below provides the
+    # equivalent validation without the early-binding hazard.
     [string]$Mode,
     [string]$Version,
     [string]$Repo
@@ -115,6 +120,22 @@ tox:
   udp_enabled: true
   tcp_port: 33445
   bootstrap_mode: auto
+  # Fallback bootstrap nodes — used in addition to https://nodes.tox.chat/json,
+  # which can be intermittent from VMs/restricted networks. Delete this block
+  # if you only want the live list.
+  bootstrap_nodes:
+    - address: 172.105.109.31
+      port: 33445
+      public_key: D46E97CF995DC1820B92B7D899E152A217D36ABE22730FEA4B6BF1BFC06C617C
+    - address: 144.217.167.73
+      port: 33445
+      public_key: 7E5668E0EE09E19F320AD47902419331FFEE147BB3606769CFBE921A2A2FD34C
+    - address: 3.0.24.15
+      port: 33445
+      public_key: E20ABCF38CDBFFD7D04B29C956B33F7B27A3BB7AF0618101617B036E4AEA402D
+    - address: 205.185.115.131
+      port: 53
+      public_key: 3091C6BEB2A993F1C6300C16549FABA67098FF3D62C6D253828B531470B53D68
 
 server:
   # Add access-control settings (rules_file: ...) here to restrict what
