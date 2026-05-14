@@ -1093,8 +1093,7 @@ server: {}
 )";
     auto result = Config::from_string(yaml);
     ASSERT_TRUE(result.has_value()) << result.error();
-    EXPECT_EQ(result.value().data_dir,
-              std::filesystem::path(fake_home) / ".config" / "toxtunnel");
+    EXPECT_EQ(result.value().data_dir, std::filesystem::path(fake_home) / ".config" / "toxtunnel");
 }
 
 TEST_F(ConfigTest, TildeInRulesFileIsExpanded) {
@@ -1115,8 +1114,7 @@ server:
     ASSERT_TRUE(result.has_value()) << result.error();
     ASSERT_TRUE(result.value().server.has_value());
     ASSERT_TRUE(result.value().server->rules_file.has_value());
-    EXPECT_EQ(*result.value().server->rules_file,
-              std::string(fake_home) + "/rules.yaml");
+    EXPECT_EQ(*result.value().server->rules_file, std::string(fake_home) + "/rules.yaml");
 }
 
 TEST_F(ConfigTest, BareTildeIsExpandedToHome) {
