@@ -26,9 +26,13 @@ jobs:
 
       - name: Configure CMake with coverage
         run: |
+          # -fprofile-update=atomic: TcpConnection now serialises work
+          # through an asio::strand running on a multi-threaded IO pool, so
+          # several worker threads bump the same gcov counters concurrently.
+          # Without atomic updates lcov sees negative counts and aborts.
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_FLAGS="--coverage" \
+            -DCMAKE_CXX_FLAGS="--coverage -fprofile-update=atomic" \
             -DCMAKE_EXE_LINKER_FLAGS="--coverage"
 
       - name: Build
@@ -39,7 +43,7 @@ jobs:
         run: |
           ctest --output-on-failure --parallel
           lcov --capture --directory . --output-file coverage.info \
-            --ignore-errors mismatch \
+            --ignore-errors mismatch,negative \
             --rc geninfo_unexecuted_blocks=1
           lcov --remove coverage.info '/usr/*' --output-file coverage.info
           lcov --remove coverage.info '*/build/_deps/*' --output-file coverage.info
