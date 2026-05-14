@@ -248,36 +248,45 @@ void TunnelClient::setup_tox_callbacks() {
         }
     });
 
-    // Lossless packet handler: deserialize and route to TunnelManager
+    // Lossless packet handler: deserialize and route to TunnelManager.
+    //
+    // The lambda fires on the ToxAdapter iterate thread. Cheap pre-filtering
+    // (friend match, min length) happens there; the actual deserialize + route
+    // work is posted onto the IO pool so toxcore can keep iterating without
+    // waiting on our frame handlers (whose tail eventually calls
+    // TcpConnection::write — itself another post). Costs one extra vector
+    // copy of the inbound packet.
     tox_adapter_->set_on_lossless_packet([this](uint32_t friend_number, const uint8_t* data,
                                                 std::size_t length) {
         if (friend_number != server_friend_number_) {
             util::Logger::warn("Received lossless packet from unexpected friend {}", friend_number);
             return;
         }
-
         if (length < 2) {
             util::Logger::warn("Lossless packet too short ({} bytes)", length);
             return;
         }
 
-        // Skip byte 0 (lossless packet prefix byte), deserialize from byte 1
-        auto frame_data = std::span<const uint8_t>(data + 1, length - 1);
-        auto frame_result = tunnel::ProtocolFrame::deserialize(frame_data);
-        if (!frame_result) {
-            util::Logger::error("Failed to deserialize ProtocolFrame from lossless packet");
-            return;
-        }
+        std::vector<uint8_t> packet(data, data + length);
+        asio::post(io_ctx_->get_io_context(), [this, packet = std::move(packet)]() {
+            // Skip byte 0 (lossless packet prefix byte), deserialize from byte 1.
+            auto frame_data = std::span<const uint8_t>(packet.data() + 1, packet.size() - 1);
+            auto frame_result = tunnel::ProtocolFrame::deserialize(frame_data);
+            if (!frame_result) {
+                util::Logger::error("Failed to deserialize ProtocolFrame from lossless packet");
+                return;
+            }
 
-        // INFO_REPLY is a per-friend control frame outside the per-tunnel
-        // routing. Intercept it before route_frame so TunnelManager doesn't
-        // log a "no tunnel for id 0" warning.
-        if (frame_result.value().type() == tunnel::FrameType::INFO_REPLY) {
-            record_server_info(frame_result.value().as_info_reply_yaml());
-            return;
-        }
+            // INFO_REPLY is a per-friend control frame outside the per-tunnel
+            // routing. Intercept it before route_frame so TunnelManager
+            // doesn't log a "no tunnel for id 0" warning.
+            if (frame_result.value().type() == tunnel::FrameType::INFO_REPLY) {
+                record_server_info(frame_result.value().as_info_reply_yaml());
+                return;
+            }
 
-        tunnel_mgr_->route_frame(frame_result.value());
+            tunnel_mgr_->route_frame(frame_result.value());
+        });
     });
 
     // Self connection status (DHT connectivity)
@@ -348,11 +357,10 @@ void TunnelClient::start_pipe_mode() {
     auto* tunnel_raw = tunnel.get();
 
     tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
-        std::vector<uint8_t> frame_data(data.begin(), data.end());
         std::vector<uint8_t> packet;
-        packet.reserve(1 + frame_data.size());
+        packet.reserve(1 + data.size());
         packet.push_back(tunnel::kLosslessPacketByte);
-        packet.insert(packet.end(), frame_data.begin(), frame_data.end());
+        packet.insert(packet.end(), data.begin(), data.end());
         (void)tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
                                                  packet.size());
     });
@@ -444,15 +452,14 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     // Set the TCP connection on the tunnel
     tunnel->set_tcp_connection(conn);
 
-    // Wire callback: when TunnelImpl wants to send data to Tox, serialize and
-    // send via the TunnelManager's send handler
+    // Wire callback: when TunnelImpl wants to send data to Tox, prepend the
+    // lossless packet prefix and forward to ToxAdapter. The frame is already
+    // serialized — no need to round-trip through deserialize / re-serialize.
     tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
-        std::vector<uint8_t> frame_data(data.begin(), data.end());
-
         std::vector<uint8_t> packet;
-        packet.reserve(1 + frame_data.size());
+        packet.reserve(1 + data.size());
         packet.push_back(tunnel::kLosslessPacketByte);
-        packet.insert(packet.end(), frame_data.begin(), frame_data.end());
+        packet.insert(packet.end(), data.begin(), data.end());
 
         (void)tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
                                                  packet.size());

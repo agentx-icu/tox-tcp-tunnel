@@ -94,7 +94,17 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
 
     tox_adapter_->set_on_lossless_packet(
         [this](uint32_t friend_number, const uint8_t* data, std::size_t length) {
-            on_lossless_packet(friend_number, data, length);
+            // Fires on the ToxAdapter iterate thread. Copy + post onto the IO
+            // pool so subsequent frame deserialization, tunnel routing, and
+            // TCP egress writes don't block the next tox_iterate tick. Costs
+            // one extra vector copy per inbound packet (at most ~1373 B); the
+            // win is keeping the Tox thread free to push outbound packets at
+            // the next 50ms tick rather than waiting for our processing.
+            std::vector<uint8_t> packet(data, data + length);
+            asio::post(io_context_->get_io_context(),
+                       [this, friend_number, packet = std::move(packet)]() {
+                           on_lossless_packet(friend_number, packet.data(), packet.size());
+                       });
         });
 
     tox_adapter_->set_on_self_connection([this](bool connected) { on_self_connection(connected); });
@@ -383,13 +393,20 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
 
     auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(io_context_->get_io_context(),
                                                               tunnel_id, friend_number);
-    server_tunnel->set_on_send_to_tox([manager_ptr](std::span<const uint8_t> data) {
-        auto parsed = tunnel::ProtocolFrame::deserialize(data);
-        if (!parsed) {
-            return;
-        }
-        (void)manager_ptr->send_frame(parsed.value());
-    });
+    // Already-serialized frame from TunnelImpl: prepend the lossless prefix
+    // byte and send directly. Going via manager_ptr->send_frame would force a
+    // deserialize + re-serialize round trip plus a redundant byte copy.
+    server_tunnel->set_on_send_to_tox(
+        [this, manager_ptr, friend_number](std::span<const uint8_t> data) {
+            std::vector<uint8_t> packet;
+            packet.reserve(1 + data.size());
+            packet.push_back(tunnel::kLosslessPacketByte);
+            packet.insert(packet.end(), data.begin(), data.end());
+            if (tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size())) {
+                manager_ptr->record_frame_sent();
+                manager_ptr->record_bytes_sent(data.size());
+            }
+        });
     manager_ptr->add_tunnel(tunnel_id, std::move(server_tunnel));
 
     // Create a TCP connection to the target host:port.

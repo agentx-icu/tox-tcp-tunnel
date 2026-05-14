@@ -64,15 +64,18 @@ void TcpListener::stop() {
 // ===========================================================================
 
 void TcpListener::on_connection_closed() {
-    if (connection_count_ > 0) {
-        --connection_count_;
-        util::Logger::debug("TcpListener: connection closed (active: {}/{})", connection_count_,
-                            max_connections_);
+    std::size_t prev = connection_count_.load(std::memory_order_relaxed);
+    while (prev > 0) {
+        if (connection_count_.compare_exchange_weak(prev, prev - 1, std::memory_order_relaxed)) {
+            util::Logger::debug("TcpListener: connection closed (active: {}/{})", prev - 1,
+                                max_connections_);
+            break;
+        }
     }
 
     // If the accept loop was paused because we hit the connection limit,
     // resume it now that there is room for a new connection.
-    if (accepting_ && connection_count_ < max_connections_) {
+    if (accepting_ && connection_count_.load(std::memory_order_relaxed) < max_connections_) {
         do_accept();
     }
 }
@@ -83,7 +86,7 @@ void TcpListener::set_max_connections(std::size_t max) {
     util::Logger::debug("TcpListener: max connections set to {}", max_connections_);
 
     // If we now have room, resume accepting.
-    if (accepting_ && connection_count_ < max_connections_) {
+    if (accepting_ && connection_count_.load(std::memory_order_relaxed) < max_connections_) {
         do_accept();
     }
 }
@@ -122,9 +125,10 @@ void TcpListener::do_accept() {
         return;
     }
 
-    if (connection_count_ >= max_connections_) {
+    std::size_t current = connection_count_.load(std::memory_order_relaxed);
+    if (current >= max_connections_) {
         util::Logger::warn("TcpListener: connection limit reached ({}/{}), pausing accept loop",
-                           connection_count_, max_connections_);
+                           current, max_connections_);
         return;
     }
 
@@ -140,13 +144,13 @@ void TcpListener::do_accept() {
             return;
         }
 
-        ++connection_count_;
+        std::size_t new_count = connection_count_.fetch_add(1, std::memory_order_relaxed) + 1;
 
         // Wrap the accepted socket in a TcpConnection.
         auto conn = std::make_shared<TcpConnection>(std::move(peer_socket));
 
         util::Logger::debug("TcpListener: accepted connection from {} (active: {}/{})",
-                            conn->remote_endpoint().address().to_string(), connection_count_,
+                            conn->remote_endpoint().address().to_string(), new_count,
                             max_connections_);
 
         if (accept_handler_) {

@@ -3,6 +3,7 @@
 #include <toxcore/tox.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -445,6 +446,14 @@ class ToxAdapter {
 
     /// Flag signalling the iterate thread to stop.
     std::atomic<bool> running_{false};
+
+    /// Wakeup primitive that lets the iterate loop sleep for up to
+    /// tox_iteration_interval() ms but exit early when there is new data to
+    /// send or when stop() is called. Critical for interactive latency: idle
+    /// iteration intervals run ~50ms, so a fresh outbound packet without this
+    /// could sit waiting in toxcore's queue for that long before being pushed.
+    mutable std::mutex wake_mutex_;
+    std::condition_variable wake_cv_;
 
     /// Whether initialize() has been called successfully.
     std::atomic<bool> initialized_{false};

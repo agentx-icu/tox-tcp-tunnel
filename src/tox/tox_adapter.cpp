@@ -250,6 +250,9 @@ void ToxAdapter::stop() {
     }
 
     running_.store(false);
+    // Wake the iterate loop so shutdown doesn't sit through the final
+    // wake_cv_.wait_for() window before joining.
+    wake_cv_.notify_all();
 
     if (iterate_thread_.joinable()) {
         iterate_thread_.join();
@@ -574,17 +577,23 @@ bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const uint8_t* dat
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_CUSTOM_PACKET err;
-    bool ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
+        TOX_ERR_FRIEND_CUSTOM_PACKET err;
+        ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
 
-    if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
-        util::Logger::debug("Send lossless packet failed for friend {}: error {}", friend_number,
-                            static_cast<int>(err));
-        return false;
+        if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
+            util::Logger::debug("Send lossless packet failed for friend {}: error {}",
+                                friend_number, static_cast<int>(err));
+            return false;
+        }
     }
 
+    // Wake the iterate loop so the packet hits the network now rather than at
+    // the next 50ms tick.
+    wake_cv_.notify_one();
     return true;
 }
 
@@ -602,6 +611,9 @@ bool ToxAdapter::send_lossy_packet(uint32_t friend_number, const uint8_t* data,
 
     TOX_ERR_FRIEND_CUSTOM_PACKET err;
     bool ok = tox_friend_send_lossy_packet(tox_.get(), friend_number, data, length, &err);
+    if (ok) {
+        wake_cv_.notify_one();
+    }
 
     if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
         util::Logger::debug("Send lossy packet failed for friend {}: error {}", friend_number,
@@ -739,8 +751,11 @@ void ToxAdapter::run_loop() {
 
         dispatch_pending_events();
 
-        // Sleep for the interval recommended by toxcore.
-        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+        // Sleep up to the recommended interval, but wake immediately when an
+        // outbound send or stop() pings wake_cv_. Spurious wakeups just run an
+        // extra tox_iterate — harmless and self-correcting.
+        std::unique_lock<std::mutex> wake_lock(wake_mutex_);
+        wake_cv_.wait_for(wake_lock, std::chrono::milliseconds(interval));
     }
 
     util::Logger::debug("Tox iterate loop stopped");
@@ -769,64 +784,55 @@ void ToxAdapter::dispatch_pending_events() {
         events.swap(pending_events_);
     }
 
+    // Snapshot all callbacks once instead of relocking callback_mutex_ for every
+    // event. With bursty inbound traffic (many TUNNEL_DATA frames per dispatch)
+    // this avoids N mutex acquisitions per dispatch cycle.
+    FriendRequestCallback on_friend_request;
+    FriendConnectionCallback on_friend_connection;
+    FriendLosslessPacketCallback on_lossless_packet;
+    FriendLossyPacketCallback on_lossy_packet;
+    FriendMessageCallback on_friend_message;
+    SelfConnectionCallback on_self_connection;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        on_friend_request = on_friend_request_;
+        on_friend_connection = on_friend_connection_;
+        on_lossless_packet = on_lossless_packet_;
+        on_lossy_packet = on_lossy_packet_;
+        on_friend_message = on_friend_message_;
+        on_self_connection = on_self_connection_;
+    }
+
     for (auto& event : events) {
         std::visit(
-            [this](auto&& current) {
+            [&](auto&& current) {
                 using Event = std::decay_t<decltype(current)>;
 
                 if constexpr (std::is_same_v<Event, FriendRequestEvent>) {
-                    FriendRequestCallback cb;
-                    {
-                        std::lock_guard<std::mutex> lock(callback_mutex_);
-                        cb = on_friend_request_;
-                    }
-                    if (cb) {
-                        cb(current.public_key, current.message);
+                    if (on_friend_request) {
+                        on_friend_request(current.public_key, current.message);
                     }
                 } else if constexpr (std::is_same_v<Event, FriendConnectionEvent>) {
-                    FriendConnectionCallback cb;
-                    {
-                        std::lock_guard<std::mutex> lock(callback_mutex_);
-                        cb = on_friend_connection_;
-                    }
-                    if (cb) {
-                        cb(current.friend_number, current.connected);
+                    if (on_friend_connection) {
+                        on_friend_connection(current.friend_number, current.connected);
                     }
                 } else if constexpr (std::is_same_v<Event, FriendLosslessPacketEvent>) {
-                    FriendLosslessPacketCallback cb;
-                    {
-                        std::lock_guard<std::mutex> lock(callback_mutex_);
-                        cb = on_lossless_packet_;
-                    }
-                    if (cb) {
-                        cb(current.friend_number, current.data.data(), current.data.size());
+                    if (on_lossless_packet) {
+                        on_lossless_packet(current.friend_number, current.data.data(),
+                                           current.data.size());
                     }
                 } else if constexpr (std::is_same_v<Event, FriendLossyPacketEvent>) {
-                    FriendLossyPacketCallback cb;
-                    {
-                        std::lock_guard<std::mutex> lock(callback_mutex_);
-                        cb = on_lossy_packet_;
-                    }
-                    if (cb) {
-                        cb(current.friend_number, current.data.data(), current.data.size());
+                    if (on_lossy_packet) {
+                        on_lossy_packet(current.friend_number, current.data.data(),
+                                        current.data.size());
                     }
                 } else if constexpr (std::is_same_v<Event, FriendMessageEvent>) {
-                    FriendMessageCallback cb;
-                    {
-                        std::lock_guard<std::mutex> lock(callback_mutex_);
-                        cb = on_friend_message_;
-                    }
-                    if (cb) {
-                        cb(current.friend_number, current.message);
+                    if (on_friend_message) {
+                        on_friend_message(current.friend_number, current.message);
                     }
                 } else if constexpr (std::is_same_v<Event, SelfConnectionEvent>) {
-                    SelfConnectionCallback cb;
-                    {
-                        std::lock_guard<std::mutex> lock(callback_mutex_);
-                        cb = on_self_connection_;
-                    }
-                    if (cb) {
-                        cb(current.connected);
+                    if (on_self_connection) {
+                        on_self_connection(current.connected);
                     }
                 }
             },

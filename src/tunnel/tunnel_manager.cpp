@@ -25,7 +25,7 @@ TunnelManager::~TunnelManager() {
 // ===========================================================================
 
 void TunnelManager::set_send_handler(SendHandler handler) {
-    std::unique_lock lock(mutex_);
+    std::lock_guard<std::mutex> lock(handler_mutex_);
     send_handler_ = std::move(handler);
 }
 
@@ -201,20 +201,20 @@ uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
 
     SendHandler handler;
     {
-        std::shared_lock lock(mutex_);
+        std::lock_guard<std::mutex> lock(handler_mutex_);
         handler = send_handler_;
     }
 
-    if (handler) {
-        auto wire = open_frame.serialize();
-        if (!handler(wire)) {
-            util::Logger::warn("TunnelManager::create_tunnel: failed to send TUNNEL_OPEN for {}",
-                               tunnel_id);
-            release_tunnel_id(tunnel_id);
-            return 0;
-        }
-    } else {
+    if (!handler) {
         // No send handler - cannot create tunnel
+        release_tunnel_id(tunnel_id);
+        return 0;
+    }
+
+    auto wire = open_frame.serialize();
+    if (!handler(wire)) {
+        util::Logger::warn("TunnelManager::create_tunnel: failed to send TUNNEL_OPEN for {}",
+                           tunnel_id);
         release_tunnel_id(tunnel_id);
         return 0;
     }
@@ -371,7 +371,7 @@ bool TunnelManager::handle_incoming_open(const ProtocolFrame& frame) {
 bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     SendHandler handler;
     {
-        std::shared_lock lock(mutex_);
+        std::lock_guard<std::mutex> lock(handler_mutex_);
         handler = send_handler_;
     }
 

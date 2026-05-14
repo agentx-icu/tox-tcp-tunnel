@@ -180,29 +180,19 @@ std::string_view ProtocolFrame::as_info_reply_yaml() const {
 // ===========================================================================
 
 std::vector<uint8_t> ProtocolFrame::serialize() const {
-    std::vector<uint8_t> result;
-    result.reserve(kFrameHeaderSize + payload_.size());
-
-    // [type:1]
-    result.push_back(static_cast<uint8_t>(type_));
-
-    // [tunnel_id:2] -- big-endian
-    uint8_t tid_buf[2];
-    write_u16_be(tid_buf, tunnel_id_);
-    result.push_back(tid_buf[0]);
-    result.push_back(tid_buf[1]);
-
-    // [length:2] -- big-endian
     auto payload_len =
         static_cast<uint16_t>(std::min<std::size_t>(payload_.size(), kMaxPayloadSize));
-    uint8_t len_buf[2];
-    write_u16_be(len_buf, payload_len);
-    result.push_back(len_buf[0]);
-    result.push_back(len_buf[1]);
 
-    // [payload:N]
-    result.insert(result.end(), payload_.begin(), payload_.begin() + payload_len);
-
+    // One allocation + direct writes; previously a string of push_back/insert
+    // calls re-walked the size guards each time. Hot path on every outbound
+    // frame, so keep it tight.
+    std::vector<uint8_t> result(kFrameHeaderSize + payload_len);
+    result[0] = static_cast<uint8_t>(type_);
+    write_u16_be(&result[1], tunnel_id_);
+    write_u16_be(&result[3], payload_len);
+    if (payload_len > 0) {
+        std::memcpy(&result[kFrameHeaderSize], payload_.data(), payload_len);
+    }
     return result;
 }
 

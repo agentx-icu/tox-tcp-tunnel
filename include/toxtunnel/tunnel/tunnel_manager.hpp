@@ -296,8 +296,13 @@ class TunnelManager {
     /// Backpressure threshold in bytes.
     std::size_t backpressure_threshold_{64 * 1024};
 
-    /// Handler for sending frames.
+    /// Handler for sending frames. Guarded by handler_mutex_ rather than the
+    /// general mutex_ so the (low-frequency) control-frame send path doesn't
+    /// contend with the (high-frequency) tunnels_ lookups in route_frame.
+    /// The hot TUNNEL_DATA outbound path doesn't pass through this handler at
+    /// all — it goes via Tunnel::on_send_to_tox directly into ToxAdapter.
     SendHandler send_handler_;
+    mutable std::mutex handler_mutex_;
 
     /// Callback when a tunnel is created.
     TunnelCreatedCallback on_tunnel_created_;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <asio.hpp>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -57,9 +58,11 @@ using ErrorCallback = std::function<void(const std::error_code&)>;
 /// - Graceful shutdown that drains the write queue before closing
 /// - Event callbacks for connect, data-received, disconnect, and error
 ///
-/// All operations must be invoked from the strand that owns this object
-/// (which is the executor of the underlying socket).  The callbacks are
-/// also dispatched on that strand.
+/// Public operations may be invoked from any thread. All internal access
+/// to the socket and queue state is serialized through an internal
+/// asio::strand so the TCP I/O thread pool and the Tox iteration thread
+/// can both call write()/close() safely. Callbacks fire on the strand,
+/// which is bound to one of the io_context worker threads.
 ///
 /// Typical usage:
 /// @code
@@ -88,13 +91,14 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// acceptor).  The connection state is set to Connected.
     explicit TcpConnection(asio::ip::tcp::socket socket);
 
-    /// Non-copyable.
+    /// Non-copyable, non-movable. Atomic state members preclude default moves,
+    /// and the class is always handled via shared_ptr (acceptor hand-off
+    /// passes the socket by value, then constructs a fresh TcpConnection in
+    /// place via make_shared).
     TcpConnection(const TcpConnection&) = delete;
     TcpConnection& operator=(const TcpConnection&) = delete;
-
-    /// Movable (needed for acceptor hand-off).
-    TcpConnection(TcpConnection&&) = default;
-    TcpConnection& operator=(TcpConnection&&) = default;
+    TcpConnection(TcpConnection&&) = delete;
+    TcpConnection& operator=(TcpConnection&&) = delete;
 
     ~TcpConnection();
 
@@ -214,17 +218,28 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // -----------------------------------------------------------------
 
     asio::ip::tcp::socket socket_;
-    ConnectionState state_ = ConnectionState::Disconnected;
 
-    // Read state
+    /// Strand serializing all socket ops + queue mutations. Bound to one of
+    /// the io_context's worker threads; public methods may be called from any
+    /// thread and post their work here.
+    asio::strand<asio::any_io_executor> strand_;
+
+    /// Atomic so external threads (e.g. is_connected() probe from the Tox
+    /// thread) can read it without taking a lock. All transitions happen
+    /// inside the strand.
+    std::atomic<ConnectionState> state_{ConnectionState::Disconnected};
+
+    // Read state — touched only inside the strand.
     std::vector<uint8_t> read_buffer_;
 
-    // Write state
+    // Write state — touched only inside the strand.
     struct WriteBuffer {
         std::vector<uint8_t> data;
     };
     std::deque<WriteBuffer> write_queue_;
-    std::size_t write_buffer_bytes_ = 0;  ///< Total bytes across all queued buffers.
+    /// Atomic so write() can do a fast pre-check before posting onto the
+    /// strand. Updated only from inside the strand.
+    std::atomic<std::size_t> write_buffer_bytes_{0};
     bool write_in_progress_ = false;
 
     // Limits

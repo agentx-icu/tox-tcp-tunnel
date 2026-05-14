@@ -1,6 +1,7 @@
 #pragma once
 
 #include <asio.hpp>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -125,7 +126,9 @@ class TcpListener {
 
     /// Return the current number of active connections accepted by this
     /// listener (as tracked via `on_connection_closed()`).
-    [[nodiscard]] std::size_t connection_count() const noexcept { return connection_count_; }
+    [[nodiscard]] std::size_t connection_count() const noexcept {
+        return connection_count_.load(std::memory_order_relaxed);
+    }
 
     /// Return the configured maximum number of connections.
     [[nodiscard]] std::size_t max_connections() const noexcept { return max_connections_; }
@@ -156,7 +159,11 @@ class TcpListener {
     AcceptHandler accept_handler_;
 
     std::uint16_t port_;
-    std::size_t connection_count_{0};
+    /// Incremented from the IO thread on accept completion and decremented
+    /// from arbitrary threads via `on_connection_closed()`. Atomic ensures
+    /// the increment/decrement and the `connection_count()` accessor are
+    /// race-free.
+    std::atomic<std::size_t> connection_count_{0};
     std::size_t max_connections_{kDefaultMaxConnections};
     bool accepting_{false};
 };
