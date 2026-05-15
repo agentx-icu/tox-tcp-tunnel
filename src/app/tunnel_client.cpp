@@ -710,14 +710,14 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     // Wire state change: when Connected (ACK received), start TCP read loop.
     // Latch the open + active-gauge bookkeeping so the same tunnel can't
     // be double-counted across the Connecting -> Connected -> Closed flow.
-    auto open_counted = std::make_shared<std::atomic_flag>();
-    auto active_dec_latch = std::make_shared<std::atomic_flag>();
+    auto open_counted = std::make_shared<std::atomic<bool>>(false);
+    auto active_dec_latch = std::make_shared<std::atomic<bool>>(false);
     tunnel->set_on_state_change(
         [conn, tunnel_id, open_counted, active_dec_latch](tunnel::Tunnel::State new_state) {
             if (new_state == tunnel::Tunnel::State::Connected) {
                 util::Logger::debug("Tunnel {} connected, starting TCP read", tunnel_id);
                 conn->start_read();
-                if (!open_counted->test_and_set()) {
+                if (!open_counted->exchange(true)) {
                     util::MetricsRegistry::instance().inc_tunnels_opened(
                         util::MetricsRegistry::OpenResult::Ok);
                     util::MetricsRegistry::instance().inc_tunnels_active(
@@ -727,8 +727,8 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
                        new_state == tunnel::Tunnel::State::Error) {
                 util::Logger::debug("Tunnel {} state: {}", tunnel_id, to_string(new_state));
                 conn->close();
-                if (open_counted->test(std::memory_order_acquire) &&
-                    !active_dec_latch->test_and_set()) {
+                if (open_counted->load(std::memory_order_acquire) &&
+                    !active_dec_latch->exchange(true)) {
                     util::MetricsRegistry::instance().dec_tunnels_active(
                         util::MetricsRegistry::Role::Client);
                 }
@@ -803,9 +803,9 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
 
     // The reply gate latch ensures the listener's reply callback is invoked
     // exactly once across all possible state transitions of this tunnel.
-    auto reply_sent = std::make_shared<std::atomic_flag>();
-    auto open_counted = std::make_shared<std::atomic_flag>();
-    auto active_dec_latch = std::make_shared<std::atomic_flag>();
+    auto reply_sent = std::make_shared<std::atomic<bool>>(false);
+    auto open_counted = std::make_shared<std::atomic<bool>>(false);
+    auto active_dec_latch = std::make_shared<std::atomic<bool>>(false);
     auto reply_cb = std::make_shared<std::function<void(bool)>>(std::move(on_tunnel_state));
     // Wrap initial_payload in a shared_ptr so the state-change lambda can drain
     // it exactly once. Bytes that arrived past the SOCKS/CONNECT handshake go
@@ -816,7 +816,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
                                  active_dec_latch, reply_cb,
                                  initial_payload_holder](tunnel::Tunnel::State new_state) {
         if (new_state == tunnel::Tunnel::State::Connected) {
-            if (!reply_sent->test_and_set()) {
+            if (!reply_sent->exchange(true)) {
                 (*reply_cb)(true);
             }
             if (!initial_payload_holder->empty()) {
@@ -826,7 +826,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
             }
             util::Logger::debug("SOCKS5 tunnel {} connected, starting TCP read", tunnel_id);
             conn->start_read();
-            if (!open_counted->test_and_set()) {
+            if (!open_counted->exchange(true)) {
                 util::MetricsRegistry::instance().inc_tunnels_opened(
                     util::MetricsRegistry::OpenResult::Ok);
                 util::MetricsRegistry::instance().inc_tunnels_active(
@@ -834,13 +834,13 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
             }
         } else if (new_state == tunnel::Tunnel::State::Closed ||
                    new_state == tunnel::Tunnel::State::Error) {
-            if (!reply_sent->test_and_set()) {
+            if (!reply_sent->exchange(true)) {
                 (*reply_cb)(false);
             }
             util::Logger::debug("SOCKS5 tunnel {} state: {}", tunnel_id, to_string(new_state));
             conn->close();
-            if (open_counted->test(std::memory_order_acquire) &&
-                !active_dec_latch->test_and_set()) {
+            if (open_counted->load(std::memory_order_acquire) &&
+                !active_dec_latch->exchange(true)) {
                 util::MetricsRegistry::instance().dec_tunnels_active(
                     util::MetricsRegistry::Role::Client);
             }
@@ -860,7 +860,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     bool opened = tunnel->open(host, port);
     if (!opened) {
         util::Logger::error("Failed to open SOCKS5 tunnel {} to {}:{}", tunnel_id, host, port);
-        if (!reply_sent->test_and_set()) {
+        if (!reply_sent->exchange(true)) {
             (*reply_cb)(false);
         }
         conn->close();
