@@ -478,7 +478,8 @@ TEST_F(HttpTunnelTest, MultipleHttpStreams) {
     ASSERT_TRUE(client_tunnel);
     ASSERT_TRUE(server_tunnel);
 
-    // Server tracks incoming requests
+    client_tunnel->configure_coalesce(0, 1362);
+
     std::vector<std::string> received_requests;
     std::mutex requests_mutex;
 

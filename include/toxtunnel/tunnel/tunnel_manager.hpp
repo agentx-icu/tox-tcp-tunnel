@@ -2,12 +2,14 @@
 
 #include <asio.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <vector>
 
 #include "toxtunnel/tunnel/tunnel.hpp"
@@ -16,6 +18,27 @@ namespace toxtunnel::tunnel {
 
 // Forward declarations
 class ProtocolFrame;
+
+/// Read-only snapshot of one Tunnel's state, safe to render off-thread.
+/// Plain values only — no pointers into live Tunnel state.
+struct TunnelSnapshot {
+    uint16_t id{0};
+    std::string target_host;
+    uint16_t target_port{0};
+    std::string state;   ///< Human-readable Tunnel::State.
+    std::size_t bytes_in{0};
+    std::size_t bytes_out{0};
+    std::chrono::seconds idle_seconds{0};
+};
+
+/// Read-only snapshot of a TunnelManager, suitable for IPC inspection.
+struct ManagerSnapshot {
+    std::size_t bytes_in{0};
+    std::size_t bytes_out{0};
+    std::size_t frames_in{0};
+    std::size_t frames_out{0};
+    std::vector<TunnelSnapshot> tunnels;
+};
 
 /// Callback type for sending frames to the Tox peer.
 using SendHandler = std::function<bool(const std::vector<uint8_t>&)>;
@@ -248,6 +271,13 @@ class TunnelManager {
 
     /// Get a list of all tunnel IDs.
     [[nodiscard]] std::vector<uint16_t> get_tunnel_ids() const;
+
+    /// Capture a point-in-time read-only snapshot of all tunnels.
+    ///
+    /// Holds the internal shared lock only while copying primitive fields
+    /// out of each tunnel — the returned ManagerSnapshot contains no
+    /// references to live state and is safe to serialize off-thread.
+    [[nodiscard]] ManagerSnapshot snapshot() const;
 
     /// Iterate over all tunnels.
     ///

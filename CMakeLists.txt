@@ -136,8 +136,10 @@ target_sources(toxtunnel_lib PRIVATE
     src/app/tunnel_client.cpp
     src/app/tunnel_server.cpp
     src/util/config.cpp
+    src/util/config_reload.cpp
     src/util/error.cpp
     src/util/logger.cpp
+    src/util/metrics.cpp
     src/util/qr_code.cpp
     src/util/system_info.cpp
     src/util/systemd_notify.cpp

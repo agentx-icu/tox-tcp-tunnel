@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -68,6 +69,21 @@ class TunnelServer {
 
     /// Return true if the server is currently running.
     [[nodiscard]] bool is_running() const noexcept;
+
+    /// Hot-reload the reloadable subset of the configuration. Currently:
+    ///   - `server.rules_file` contents (re-read + atomic RulesEngine swap)
+    ///   - `logging.level` (forwarded to `spdlog::set_level`)
+    ///
+    /// Non-reloadable fields are rejected via `util::check_reloadable`. The
+    /// caller is expected to have already re-read and validated the new
+    /// `Config` from disk. On any error the running server keeps its previous
+    /// state — this is a strict no-op-on-failure contract so SIGHUP cannot
+    /// brick the daemon.
+    ///
+    /// Thread-safe: safe to call from a signal handler thread; rules are
+    /// swapped under a writer lock that briefly blocks concurrent
+    /// `RulesEngine::evaluate()` callers on the IO pool.
+    [[nodiscard]] util::Expected<void, std::string> reload(const Config& new_config);
 
     // -----------------------------------------------------------------
     // Accessors
@@ -142,8 +158,12 @@ class TunnelServer {
     /// Tox network adapter.
     std::unique_ptr<tox::ToxAdapter> tox_adapter_;
 
-    /// Access control engine.
+    /// Access control engine. Reads (`evaluate()`) take a shared lock,
+    /// SIGHUP reload (`reload()`) takes a unique lock to swap the engine in
+    /// place. Without the shared_mutex, a concurrent IO-thread read during
+    /// reload would race with the move-assignment.
     RulesEngine rules_engine_;
+    mutable std::shared_mutex rules_mutex_;
 
     /// Map of friend_number -> TunnelManager.
     std::unordered_map<uint32_t, std::unique_ptr<tunnel::TunnelManager>> managers_;

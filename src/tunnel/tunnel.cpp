@@ -47,7 +47,7 @@ TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t fr
     : Tunnel(tunnel_id, io_ctx),
       friend_number_(friend_number),
       send_window_size_(send_window),
-      last_activity_(std::chrono::steady_clock::now()) {
+      last_activity_ns_(std::chrono::steady_clock::now().time_since_epoch().count()) {
     util::Logger::debug("Tunnel created: id={}, friend={}, window={}", tunnel_id_, friend_number_,
                         send_window_size_);
 }
@@ -70,7 +70,14 @@ uint16_t TunnelImpl::target_port() const noexcept {
 }
 
 std::chrono::steady_clock::time_point TunnelImpl::last_activity() const {
-    return last_activity_;
+    return std::chrono::steady_clock::time_point(
+        std::chrono::steady_clock::duration(last_activity_ns_.load(std::memory_order_relaxed)));
+}
+
+int64_t TunnelImpl::IdleNanos() const noexcept {
+    const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    const int64_t last_ns = last_activity_ns_.load(std::memory_order_relaxed);
+    return now_ns - last_ns;
 }
 
 // ===========================================================================
@@ -194,8 +201,6 @@ void TunnelImpl::handle_frame(const ProtocolFrame& frame) {
         }
     }
 
-    update_activity();
-
     switch (frame.type()) {
         case FrameType::TUNNEL_OPEN:
             handle_tunnel_open_frame(frame);
@@ -253,6 +258,8 @@ void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
     if (data.empty()) {
         return;
     }
+
+    BumpActivity();
 
     // Update receive statistics
     std::size_t data_size = data.size();
@@ -359,7 +366,6 @@ void TunnelImpl::handle_ping_frame(const ProtocolFrame& /*frame*/) {
 }
 
 void TunnelImpl::handle_pong_frame(const ProtocolFrame& /*frame*/) {
-    // PONG received - update activity timestamp (already done)
     util::Logger::debug("Tunnel {} received PONG", tunnel_id_);
 }
 
@@ -396,6 +402,8 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
 
     // Update window
     send_window_used_.fetch_add(data_size, std::memory_order_relaxed);
+
+    BumpActivity();
 
     // Update statistics
     total_bytes_sent_.fetch_add(data_size, std::memory_order_relaxed);
@@ -512,8 +520,9 @@ void TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
     }
 }
 
-void TunnelImpl::update_activity() {
-    last_activity_ = std::chrono::steady_clock::now();
+void TunnelImpl::BumpActivity() noexcept {
+    last_activity_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                            std::memory_order_relaxed);
 }
 
 }  // namespace toxtunnel::tunnel

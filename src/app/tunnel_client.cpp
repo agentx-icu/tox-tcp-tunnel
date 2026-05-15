@@ -6,6 +6,7 @@
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
+#include "toxtunnel/util/config_reload.hpp"
 #include "toxtunnel/util/logger.hpp"
 #include "toxtunnel/util/system_info.hpp"
 
@@ -161,12 +162,14 @@ void TunnelClient::start() {
             io_ctx_->post([this] { start_pipe_mode(); });
         }
     } else {
-        // Start all TCP listeners
+        // Start all TCP listeners. Capture `rule` by value: SIGHUP reload may
+        // mutate `forward_rules_` (add/remove listeners) and a reference
+        // capture into a vector that gets resized would dangle.
         for (std::size_t i = 0; i < listeners_.size(); ++i) {
-            const auto& rule = forward_rules_[i];
+            const auto rule = forward_rules_[i];
             auto& listener = listeners_[i];
 
-            listener->start_accept([this, &rule](std::shared_ptr<core::TcpConnection> conn) {
+            listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
                 on_tcp_connection_accepted(std::move(conn), rule);
             });
 
@@ -220,6 +223,60 @@ bool TunnelClient::is_running() const noexcept {
 void TunnelClient::wait_until_stopped() {
     std::unique_lock<std::mutex> lock(stop_mutex_);
     stop_cv_.wait(lock, [this] { return !running_.load(std::memory_order_acquire); });
+}
+
+util::Expected<void, std::string> TunnelClient::reload(const Config& new_config) {
+    if (auto check = util::check_reloadable(config_, new_config); !check) {
+        return util::make_unexpected(check.error());
+    }
+
+    const auto& new_client = new_config.client.value();
+    const auto diff = util::diff_forwards(forward_rules_, new_client.forwards);
+
+    if (is_pipe_mode()) {
+        if (!diff.empty()) {
+            return util::make_unexpected(std::string(
+                "client is in pipe mode; forwards cannot be reloaded (restart to switch modes)"));
+        }
+    } else if (!diff.empty()) {
+        for (const auto& removed : diff.removed) {
+            for (std::size_t i = 0; i < forward_rules_.size();) {
+                if (forward_rules_[i] == removed) {
+                    listeners_[i]->stop();
+                    listeners_.erase(listeners_.begin() + static_cast<std::ptrdiff_t>(i));
+                    forward_rules_.erase(forward_rules_.begin() +
+                                         static_cast<std::ptrdiff_t>(i));
+                    util::Logger::info("Stopped listener on local port {} -> {}:{}",
+                                       removed.local_port, removed.remote_host,
+                                       removed.remote_port);
+                } else {
+                    ++i;
+                }
+            }
+        }
+
+        for (const auto& added : diff.added) {
+            auto listener =
+                std::make_unique<core::TcpListener>(io_ctx_->get_io_context(), added.local_port);
+            const auto rule = added;
+            listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
+                on_tcp_connection_accepted(std::move(conn), rule);
+            });
+            listeners_.push_back(std::move(listener));
+            forward_rules_.push_back(added);
+            util::Logger::info("Started listener on local port {} -> {}:{}", added.local_port,
+                               added.remote_host, added.remote_port);
+        }
+    }
+
+    if (config_.logging.level != new_config.logging.level) {
+        util::Logger::set_level(new_config.logging.level);
+    }
+
+    config_ = new_config;
+    util::Logger::info("config reloaded (forwards: +{} -{})", diff.added.size(),
+                       diff.removed.size());
+    return {};
 }
 
 // -------------------------------------------------------------------------

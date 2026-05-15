@@ -1,11 +1,13 @@
 #include "toxtunnel/app/tunnel_server.hpp"
 
 #include <algorithm>
+#include <shared_mutex>
 #include <span>
 
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
+#include "toxtunnel/util/config_reload.hpp"
 #include "toxtunnel/util/logger.hpp"
 #include "toxtunnel/util/system_info.hpp"
 
@@ -171,6 +173,35 @@ void TunnelServer::stop() {
 
 bool TunnelServer::is_running() const noexcept {
     return running_.load(std::memory_order_acquire);
+}
+
+util::Expected<void, std::string> TunnelServer::reload(const Config& new_config) {
+    if (auto check = util::check_reloadable(config_, new_config); !check) {
+        return util::make_unexpected(check.error());
+    }
+
+    std::size_t rule_count = 0;
+    if (new_config.server.has_value() && new_config.server->rules_file.has_value()) {
+        auto rules_result = RulesEngine::from_file(new_config.server->rules_file.value());
+        if (!rules_result) {
+            return util::make_unexpected(std::string("Failed to load rules file: ") +
+                                         rules_result.error());
+        }
+        rule_count = rules_result.value().rules().size();
+        std::unique_lock rules_lock(rules_mutex_);
+        rules_engine_ = std::move(rules_result.value());
+    } else {
+        std::unique_lock rules_lock(rules_mutex_);
+        rules_engine_ = RulesEngine{};
+    }
+
+    if (config_.logging.level != new_config.logging.level) {
+        util::Logger::set_level(new_config.logging.level);
+    }
+
+    config_ = new_config;
+    util::Logger::info("config reloaded (rules: {} rules)", rule_count);
+    return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +387,11 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     access_req.target_host = target_host;
     access_req.target_port = target_port;
 
-    auto access_result = rules_engine_.evaluate(access_req);
+    AccessResult access_result;
+    {
+        std::shared_lock rules_lock(rules_mutex_);
+        access_result = rules_engine_.evaluate(access_req);
+    }
     if (access_result == AccessResult::Denied) {
         util::Logger::warn("Access denied for friend {} to {}:{}", pk_hex, target_host,
                            target_port);

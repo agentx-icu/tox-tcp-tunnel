@@ -216,6 +216,13 @@ class TunnelImpl : public Tunnel {
     /// Return the time of last activity.
     [[nodiscard]] std::chrono::steady_clock::time_point last_activity() const;
 
+    /// Return nanoseconds elapsed since the tunnel last saw TUNNEL_DATA activity.
+    ///
+    /// "Activity" is defined narrowly: only TUNNEL_DATA frames in either
+    /// direction reset the timer. PING/PONG keep-alives, ACKs, and control
+    /// frames are NOT activity for the reaper's purposes.
+    [[nodiscard]] int64_t IdleNanos() const noexcept;
+
     // -----------------------------------------------------------------
     // TCP connection management
     // -----------------------------------------------------------------
@@ -346,8 +353,9 @@ class TunnelImpl : public Tunnel {
     /// Send a frame to the Tox peer via the callback.
     void send_frame_to_tox(const ProtocolFrame& frame);
 
-    /// Update last activity timestamp.
-    void update_activity();
+    /// Bump the last-activity timestamp to "now". Called only on TUNNEL_DATA
+    /// in either direction; keep-alive and control frames do NOT bump.
+    void BumpActivity() noexcept;
 
     /// Transition to a new state and invoke callback.
     void transition_state(State new_state);
@@ -395,8 +403,9 @@ class TunnelImpl : public Tunnel {
     /// Total bytes sent.
     std::atomic<std::size_t> total_bytes_sent_{0};
 
-    /// Last activity timestamp.
-    std::chrono::steady_clock::time_point last_activity_;
+    /// Last activity timestamp as nanoseconds since steady_clock epoch.
+    /// Atomic so the reaper thread can sample without taking the tunnel mutex.
+    std::atomic<int64_t> last_activity_ns_;
 
     /// Protects non-atomic members.
     mutable std::mutex mutex_;

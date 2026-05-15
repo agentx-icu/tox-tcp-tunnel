@@ -1,5 +1,6 @@
 #include <CLI/CLI.hpp>
 #include <asio.hpp>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -16,6 +17,12 @@
 #include "toxtunnel/util/qr_code.hpp"
 #include "toxtunnel/util/systemd_notify.hpp"
 #include "toxtunnel/util/windows_service.hpp"
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <signal.h>
+#endif
 
 namespace {
 
@@ -212,8 +219,112 @@ int cmd_servers_remove(const std::filesystem::path& data_dir, const std::string&
 #endif
 }
 
+/// Re-read + validate the config file used at startup. Returns nullopt on any
+/// failure; the caller logs and keeps the previously-loaded config (this is
+/// the no-op-on-failure contract for SIGHUP reloads).
+[[maybe_unused]] std::optional<toxtunnel::Config> reload_config_from_disk(
+    const std::string& config_path) {
+    if (config_path.empty()) {
+        toxtunnel::util::Logger::warn(
+            "reload requested but no --config was supplied at startup; ignoring");
+        return std::nullopt;
+    }
+    auto result = toxtunnel::Config::from_file(config_path);
+    if (!result.has_value()) {
+        toxtunnel::util::Logger::error("reload failed: cannot load {}: {}", config_path,
+                                       result.error());
+        return std::nullopt;
+    }
+    auto validation = result.value().validate();
+    if (!validation.has_value()) {
+        toxtunnel::util::Logger::error("reload failed: invalid config in {}: {}", config_path,
+                                       validation.error());
+        return std::nullopt;
+    }
+    return std::move(result).value();
+}
+
+#if defined(_WIN32)
+/// Windows lacks SIGHUP, so reload is triggered by writing "RELOAD\n" to a
+/// per-pid named pipe. The pipe name encodes the pid so multiple toxtunnel
+/// instances on one host don't collide. A dedicated thread serves the pipe
+/// and posts the reload via `on_reload`; the thread exits when `running` is
+/// cleared and any pending CreateFile probe completes.
+class WindowsReloadPipeServer {
+   public:
+    WindowsReloadPipeServer(std::function<void()> on_reload)
+        : on_reload_(std::move(on_reload)) {
+        pipe_name_ = "\\\\.\\pipe\\toxtunnel-reload-" + std::to_string(GetCurrentProcessId());
+    }
+
+    ~WindowsReloadPipeServer() { stop(); }
+
+    void start() {
+        running_.store(true);
+        thread_ = std::thread([this] { run(); });
+    }
+
+    void stop() {
+        if (!running_.exchange(false)) {
+            return;
+        }
+        // Unblock a server thread waiting in ConnectNamedPipe by opening a
+        // client handle to our own pipe.
+        HANDLE wake = CreateFileA(pipe_name_.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                                  nullptr);
+        if (wake != INVALID_HANDLE_VALUE) {
+            CloseHandle(wake);
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    [[nodiscard]] const std::string& pipe_name() const { return pipe_name_; }
+
+   private:
+    void run() {
+        while (running_.load()) {
+            HANDLE pipe = CreateNamedPipeA(
+                pipe_name_.c_str(), PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 512, 512, 0, nullptr);
+            if (pipe == INVALID_HANDLE_VALUE) {
+                toxtunnel::util::Logger::warn(
+                    "reload pipe CreateNamedPipe failed ({}); reload IPC unavailable",
+                    GetLastError());
+                return;
+            }
+            const BOOL connected = ConnectNamedPipe(pipe, nullptr) ||
+                                   GetLastError() == ERROR_PIPE_CONNECTED;
+            if (!running_.load()) {
+                CloseHandle(pipe);
+                return;
+            }
+            if (connected) {
+                char buf[16] = {};
+                DWORD read = 0;
+                if (ReadFile(pipe, buf, sizeof(buf) - 1, &read, nullptr) && read > 0) {
+                    std::string msg(buf, read);
+                    if (msg.find("RELOAD") != std::string::npos) {
+                        on_reload_();
+                    }
+                }
+            }
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
+    }
+
+    std::function<void()> on_reload_;
+    std::string pipe_name_;
+    std::atomic<bool> running_{false};
+    std::thread thread_;
+};
+#endif  // _WIN32
+
 /// Run the tunnel server until a signal is received.
-int run_server(const toxtunnel::Config& config, bool run_as_service) {
+int run_server(const toxtunnel::Config& config, bool run_as_service,
+               [[maybe_unused]] const std::string& config_path) {
     using Logger = toxtunnel::util::Logger;
 
     toxtunnel::app::TunnelServer server;
@@ -726,7 +837,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (config.is_server()) {
-        exit_code = run_server(config, run_as_service);
+        exit_code = run_server(config, run_as_service, config_path);
     } else {
         exit_code = run_client(config, run_as_service);
     }

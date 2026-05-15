@@ -6,6 +6,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "toxtunnel/util/metrics.hpp"
+
 namespace toxtunnel {
 
 // ---------------------------------------------------------------------------
@@ -304,6 +306,18 @@ util::Expected<void, std::string> Config::validate() const {
         return bootstrap_validation;
     }
 
+    if (metrics.enabled) {
+        std::string host;
+        uint16_t port = 0;
+        if (!util::MetricsServer::parse_listen(metrics.listen, host, port)) {
+            return util::make_unexpected(std::string("Invalid metrics.listen value: ") +
+                                         metrics.listen);
+        }
+        if (metrics.path.empty() || metrics.path.front() != '/') {
+            return util::make_unexpected(std::string("metrics.path must start with '/'"));
+        }
+    }
+
     if (effective_tox.bootstrap_mode == BootstrapMode::Lan && !effective_tox.udp_enabled) {
         return util::make_unexpected(
             std::string("LAN bootstrap mode requires tox.udp_enabled to be true"));
@@ -501,6 +515,16 @@ std::string Config::to_yaml() const {
     out << YAML::Key << "allow_client_daemon" << YAML::Value << service.allow_client_daemon;
     out << YAML::EndMap;
 
+    if (metrics.enabled || metrics.listen != MetricsConfig{}.listen ||
+        metrics.path != MetricsConfig{}.path) {
+        out << YAML::Key << "metrics";
+        out << YAML::BeginMap;
+        out << YAML::Key << "enabled" << YAML::Value << metrics.enabled;
+        out << YAML::Key << "listen" << YAML::Value << metrics.listen;
+        out << YAML::Key << "path" << YAML::Value << metrics.path;
+        out << YAML::EndMap;
+    }
+
     out << YAML::Key << "tox" << YAML::Value << YAML::BeginMap;
     out << YAML::Key << "udp_enabled" << YAML::Value << effective_tox.udp_enabled;
     out << YAML::Key << "tcp_port" << YAML::Value << effective_tox.tcp_port;
@@ -625,6 +649,7 @@ using toxtunnel::ForwardRule;
 using toxtunnel::LoggingConfig;
 using toxtunnel::Mode;
 using toxtunnel::PipeTarget;
+using toxtunnel::MetricsConfig;
 using toxtunnel::ServerConfig;
 using toxtunnel::ServiceConfig;
 using toxtunnel::ToxConfig;
@@ -843,6 +868,102 @@ bool convert<ServiceConfig>::decode(const Node& node, ServiceConfig& rhs) {
     }
     if (node["allow_client_daemon"]) {
         rhs.allow_client_daemon = node["allow_client_daemon"].as<bool>();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// MetricsConfig
+// ---------------------------------------------------------------------------
+
+Node convert<MetricsConfig>::encode(const MetricsConfig& rhs) {
+    Node node;
+    node["enabled"] = rhs.enabled;
+    node["listen"] = rhs.listen;
+    node["path"] = rhs.path;
+    return node;
+}
+
+bool convert<MetricsConfig>::decode(const Node& node, MetricsConfig& rhs) {
+    if (node.IsScalar()) {
+        try {
+            rhs.enabled = node.as<bool>();
+            return true;
+        } catch (const YAML::Exception&) {
+            return false;
+        }
+    }
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["enabled"]) {
+        rhs.enabled = node["enabled"].as<bool>();
+    }
+    if (node["listen"]) {
+        rhs.listen = node["listen"].as<std::string>();
+    }
+    if (node["path"]) {
+        rhs.path = node["path"].as<std::string>();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// InspectConfig
+// ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::InspectConfig>::encode(const toxtunnel::InspectConfig& rhs) {
+    Node node;
+    node["enabled"] = rhs.enabled;
+    return node;
+}
+
+bool convert<toxtunnel::InspectConfig>::decode(const Node& node, toxtunnel::InspectConfig& rhs) {
+    if (node.IsScalar()) {
+        try {
+            rhs.enabled = node.as<bool>();
+            return true;
+        } catch (const YAML::Exception&) {
+            return false;
+        }
+    }
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["enabled"]) {
+        rhs.enabled = node["enabled"].as<bool>();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// TunnelConfig
+// ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs) {
+    Node node;
+    node["coalesce_max_delay_us"] = rhs.coalesce_max_delay_us;
+    node["coalesce_max_bytes"] = rhs.coalesce_max_bytes;
+    node["idle_timeout_seconds"] = rhs.idle_timeout_seconds;
+    node["reaper_tick_seconds"] = rhs.reaper_tick_seconds;
+    return node;
+}
+
+bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::TunnelConfig& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["coalesce_max_delay_us"]) {
+        rhs.coalesce_max_delay_us = node["coalesce_max_delay_us"].as<uint32_t>();
+    }
+    if (node["coalesce_max_bytes"]) {
+        rhs.coalesce_max_bytes = node["coalesce_max_bytes"].as<uint32_t>();
+    }
+    if (node["idle_timeout_seconds"]) {
+        rhs.idle_timeout_seconds = node["idle_timeout_seconds"].as<uint32_t>();
+    }
+    if (node["reaper_tick_seconds"]) {
+        rhs.reaper_tick_seconds = node["reaper_tick_seconds"].as<uint32_t>();
     }
     return true;
 }
@@ -1074,6 +1195,10 @@ Node convert<Config>::encode(const Config& rhs) {
     node["logging"] = rhs.logging;
     node["service"] = rhs.service;
     node["tox"] = effective_tox;
+    if (rhs.metrics.enabled || rhs.metrics.listen != MetricsConfig{}.listen ||
+        rhs.metrics.path != MetricsConfig{}.path) {
+        node["metrics"] = rhs.metrics;
+    }
 
     if (rhs.server) {
         Node server_node;
@@ -1127,6 +1252,10 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
     if (node["tox"]) {
         rhs.tox = node["tox"].as<ToxConfig>();
+    }
+
+    if (node["metrics"]) {
+        rhs.metrics = node["metrics"].as<MetricsConfig>();
     }
 
     // Mode-specific config

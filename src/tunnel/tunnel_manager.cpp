@@ -475,6 +475,36 @@ std::vector<uint16_t> TunnelManager::get_tunnel_ids() const {
     return ids;
 }
 
+ManagerSnapshot TunnelManager::snapshot() const {
+    ManagerSnapshot out;
+    out.bytes_in = total_bytes_received();
+    out.bytes_out = total_bytes_sent();
+    out.frames_in = frames_received();
+    out.frames_out = frames_sent();
+
+    const auto now = std::chrono::steady_clock::now();
+
+    std::shared_lock lock(mutex_);
+    out.tunnels.reserve(tunnels_.size());
+    for (const auto& [id, tunnel] : tunnels_) {
+        TunnelSnapshot t;
+        t.id = id;
+        t.state = to_string(tunnel->state());
+        // Only TunnelImpl carries target host/port + byte counters; the
+        // abstract base used in unit tests does not.
+        if (const auto* impl = dynamic_cast<const TunnelImpl*>(tunnel.get())) {
+            t.target_host = impl->target_host();
+            t.target_port = impl->target_port();
+            t.bytes_in = impl->bytes_received();
+            t.bytes_out = impl->bytes_sent();
+            t.idle_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                now - impl->last_activity());
+        }
+        out.tunnels.push_back(std::move(t));
+    }
+    return out;
+}
+
 // ===========================================================================
 // Internal helpers
 // ===========================================================================

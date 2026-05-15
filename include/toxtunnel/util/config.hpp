@@ -80,6 +80,57 @@ struct LoggingConfig {
     }
 };
 
+/// Optional Prometheus /metrics HTTP endpoint configuration.
+///
+/// Off by default — operators opt in by setting `enabled: true`. The endpoint
+/// binds to a single host:port and serves one URL path; everything else 404s.
+struct MetricsConfig {
+    bool enabled = false;
+    std::string listen = "127.0.0.1:9100";
+    std::string path = "/metrics";
+
+    bool operator==(const MetricsConfig& other) const {
+        return enabled == other.enabled && listen == other.listen && path == other.path;
+    }
+};
+
+/// Runtime inspection (local IPC) configuration.
+///
+/// Default-on: the daemon listens on a local-only Unix socket (POSIX) or
+/// named pipe (Windows) bounded to the current user. This is the channel
+/// for `toxtunnel inspect`. It is read-only and never crosses the network.
+struct InspectConfig {
+    bool enabled = true;
+
+    bool operator==(const InspectConfig& other) const = default;
+};
+
+/// Per-tunnel data-path tunables. Currently exposes only the write-side
+/// coalescing knobs; future fields (idle reaper, etc.) live here too.
+///
+/// Coalescing buffers small writes from the IO pool into full-MTU
+/// TUNNEL_DATA frames before they cross the Tox-thread boundary, cutting
+/// per-byte hops on chatty workloads (SSH keystrokes, Redis pings).
+/// Default `coalesce_max_delay_us = 200` keeps added latency well below
+/// human-perceptible thresholds; setting it to 0 disables coalescing.
+struct TunnelConfig {
+    uint32_t coalesce_max_delay_us = 200;  ///< 0 disables coalescing
+    uint32_t coalesce_max_bytes = 1362;    ///< Max TUNNEL_DATA payload per frame
+
+    /// Idle-tunnel reaper. Closes tunnels with no TUNNEL_DATA traffic for at
+    /// least this many seconds, reclaiming the per-friend tunnel slot from
+    /// stuck or dead connections. 0 disables the reaper (default).
+    uint32_t idle_timeout_seconds = 0;
+
+    /// How often the reaper scans the tunnel set. Must be > 0 when the reaper
+    /// is enabled; ignored when idle_timeout_seconds == 0.
+    uint32_t reaper_tick_seconds = 10;
+
+    [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }
+
+    bool operator==(const TunnelConfig& other) const = default;
+};
+
 /// Service / daemon policy for packaged installs (`--service`).
 /// Controls whether a platform service manager should keep the process running.
 ///
@@ -172,6 +223,9 @@ struct Config {
     LoggingConfig logging;
     ServiceConfig service;
     ToxConfig tox;
+    MetricsConfig metrics;
+    InspectConfig inspect;
+    TunnelConfig tunnel;
 
     // Mode-specific options
     std::optional<ServerConfig> server;
@@ -241,6 +295,7 @@ struct Config {
     bool operator==(const Config& other) const {
         return mode == other.mode && data_dir == other.data_dir && logging == other.logging &&
                service == other.service && effective_tox_config() == other.effective_tox_config() &&
+               metrics == other.metrics && inspect == other.inspect && tunnel == other.tunnel &&
                server == other.server && client == other.client;
     }
 };
@@ -318,6 +373,24 @@ template <>
 struct convert<toxtunnel::ServiceConfig> {
     static Node encode(const toxtunnel::ServiceConfig& rhs);
     static bool decode(const Node& node, toxtunnel::ServiceConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::MetricsConfig> {
+    static Node encode(const toxtunnel::MetricsConfig& rhs);
+    static bool decode(const Node& node, toxtunnel::MetricsConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::InspectConfig> {
+    static Node encode(const toxtunnel::InspectConfig& rhs);
+    static bool decode(const Node& node, toxtunnel::InspectConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::TunnelConfig> {
+    static Node encode(const toxtunnel::TunnelConfig& rhs);
+    static bool decode(const Node& node, toxtunnel::TunnelConfig& rhs);
 };
 
 template <>

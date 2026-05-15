@@ -77,6 +77,17 @@ class TunnelClient {
     /// Block until stop() has completed.
     void wait_until_stopped();
 
+    /// Hot-reload the reloadable subset of the configuration. Currently:
+    ///   - `client.forwards` — diff against active listeners, stop removed,
+    ///     start added, leave unchanged ones alone. Existing tunnels through
+    ///     a removed listener drain naturally (the listener stops accepting,
+    ///     but already-accepted connections finish on their own).
+    ///   - `logging.level` (forwarded to `spdlog::set_level`)
+    ///
+    /// Non-reloadable fields are rejected via `util::check_reloadable`. On
+    /// any error the running client keeps its previous state.
+    [[nodiscard]] util::Expected<void, std::string> reload(const Config& new_config);
+
     // -----------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------
