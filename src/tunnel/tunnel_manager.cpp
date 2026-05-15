@@ -597,8 +597,8 @@ ManagerSnapshot TunnelManager::snapshot() const {
             t.target_port = impl->target_port();
             t.bytes_in = impl->bytes_received();
             t.bytes_out = impl->bytes_sent();
-            t.idle_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-                now - impl->last_activity());
+            t.idle_seconds =
+                std::chrono::duration_cast<std::chrono::seconds>(now - impl->last_activity());
         }
         out.tunnels.push_back(std::move(t));
     }

@@ -25,7 +25,7 @@ struct TunnelSnapshot {
     uint16_t id{0};
     std::string target_host;
     uint16_t target_port{0};
-    std::string state;   ///< Human-readable Tunnel::State.
+    std::string state;  ///< Human-readable Tunnel::State.
     std::size_t bytes_in{0};
     std::size_t bytes_out{0};
     std::chrono::seconds idle_seconds{0};
