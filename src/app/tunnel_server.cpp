@@ -107,10 +107,9 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
             // win is keeping the Tox thread free to push outbound packets at
             // the next 50ms tick rather than waiting for our processing.
             std::vector<uint8_t> packet(data, data + length);
-            asio::post(*inbound_strand_,
-                       [this, friend_number, packet = std::move(packet)]() {
-                           on_lossless_packet(friend_number, packet.data(), packet.size());
-                       });
+            asio::post(*inbound_strand_, [this, friend_number, packet = std::move(packet)]() {
+                on_lossless_packet(friend_number, packet.data(), packet.size());
+            });
         });
 
     tox_adapter_->set_on_self_connection([this](bool connected) { on_self_connection(connected); });
