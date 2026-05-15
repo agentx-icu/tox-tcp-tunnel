@@ -20,6 +20,7 @@ add_executable(unit_tests
     unit/test_expected.cpp
     unit/test_circular_buffer.cpp
     unit/test_config.cpp
+    unit/config_reload_test.cpp
     unit/test_known_servers.cpp
     unit/test_pipe_mode.cpp
     unit/test_protocol_info.cpp
@@ -71,6 +72,7 @@ add_executable(integration_tests
     integration/test_inspect_ipc.cpp
     integration/test_pipe_bridge.cpp
     integration/test_rules_integration.cpp
+    integration/test_sighup_reload.cpp
     integration/test_tcp_loopback.cpp
     integration/test_tunnel_data_flow.cpp
 )

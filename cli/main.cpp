@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -457,6 +458,53 @@ int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subact
     return 0;
 }
 
+/// Trigger a hot-reload on a running daemon.
+///
+/// POSIX: a no-op for the binary itself — we just print the equivalent
+/// `kill -HUP <pid>` for the operator to run, since asking the toxtunnel
+/// binary to deliver SIGHUP would require us to chase a pid file we don't
+/// universally write. This keeps the subcommand discoverable from `--help`
+/// without inventing extra IPC where the kernel already has it.
+///
+/// Windows: connects to `\\.\pipe\toxtunnel-reload-<pid>` and writes
+/// "RELOAD\n". The pid comes from TOXTUNNEL_RELOAD_PID or, failing that, the
+/// `toxtunnel.pid` file under data_dir (same lookup the inspect CLI uses).
+[[nodiscard]] int cmd_reload([[maybe_unused]] const std::filesystem::path& data_dir) {
+#if defined(_WIN32)
+    std::string pid;
+    if (const char* pid_override = std::getenv("TOXTUNNEL_RELOAD_PID")) {
+        pid = pid_override;
+    } else {
+        const auto pid_path = data_dir / "toxtunnel.pid";
+        std::ifstream pid_file(pid_path);
+        if (!pid_file) {
+            std::cerr << "reload: no pid file at " << pid_path.string()
+                      << "; set TOXTUNNEL_RELOAD_PID to the daemon pid.\n";
+            return 1;
+        }
+        pid_file >> pid;
+    }
+    const std::string pipe_name = "\\\\.\\pipe\\toxtunnel-reload-" + pid;
+    HANDLE pipe =
+        CreateFileA(pipe_name.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        std::cerr << "reload: cannot connect to " << pipe_name << " (is the daemon running?)\n";
+        return 1;
+    }
+    const char msg[] = "RELOAD\n";
+    DWORD written = 0;
+    WriteFile(pipe, msg, sizeof(msg) - 1, &written, nullptr);
+    CloseHandle(pipe);
+    std::cout << "Sent RELOAD to " << pipe_name << "\n";
+    return 0;
+#else
+    std::cout << "On POSIX, send SIGHUP to the running toxtunnel process:\n"
+              << "  kill -HUP $(pgrep -x toxtunnel)\n"
+              << "or, if you have the pid:  kill -HUP <pid>\n";
+    return 0;
+#endif
+}
+
 /// Drive a clean SERVICE_STOPPED transition when a packaged --service install can't
 /// start (config missing or invalid). Exit code 0 so launchd KeepAlive
 /// { SuccessfulExit: false }, systemd Restart=on-failure, and Windows SCM auto-restart
@@ -476,8 +524,7 @@ int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subact
 /// Re-read + validate the config file used at startup. Returns nullopt on any
 /// failure; the caller logs and keeps the previously-loaded config (this is
 /// the no-op-on-failure contract for SIGHUP reloads).
-[[maybe_unused]] std::optional<toxtunnel::Config> reload_config_from_disk(
-    const std::string& config_path) {
+std::optional<toxtunnel::Config> reload_config_from_disk(const std::string& config_path) {
     if (config_path.empty()) {
         toxtunnel::util::Logger::warn(
             "reload requested but no --config was supplied at startup; ignoring");
@@ -577,7 +624,7 @@ class WindowsReloadPipeServer {
 
 /// Run the tunnel server until a signal is received.
 int run_server(const toxtunnel::Config& config, bool run_as_service,
-               [[maybe_unused]] const std::string& config_path) {
+               const std::string& config_path) {
     using Logger = toxtunnel::util::Logger;
 
     toxtunnel::app::TunnelServer server;
@@ -611,6 +658,45 @@ int run_server(const toxtunnel::Config& config, bool run_as_service,
         }
     });
 
+    // Centralised reload entry point: re-read config from disk, run it through
+    // the no-op-on-failure validation gate, then ask the server to apply the
+    // reloadable subset. Used both by SIGHUP (POSIX) and the named-pipe
+    // server (Windows). Safe to call from a non-IO thread because
+    // TunnelServer::reload is itself thread-safe.
+    auto do_reload = [&server, &config_path]() {
+        auto new_cfg = reload_config_from_disk(config_path);
+        if (!new_cfg)
+            return;
+        auto apply = server.reload(*new_cfg);
+        if (!apply) {
+            toxtunnel::util::Logger::error("reload rejected: {}", apply.error());
+        }
+    };
+
+#if !defined(_WIN32)
+    // POSIX: SIGHUP triggers reload. signal_set re-arms itself in the
+    // callback so repeated SIGHUPs all fire. signal_ctx is a single-threaded
+    // io_context, so the reload runs serialized with shutdown signals and
+    // can't race with stop().
+    asio::signal_set reload_signals(signal_ctx, SIGHUP);
+    std::function<void(const asio::error_code&, int)> on_reload_signal =
+        [&](const asio::error_code& ec, int /*signum*/) {
+            if (ec)
+                return;
+            toxtunnel::util::Logger::info("SIGHUP received, reloading config from {}",
+                                          config_path.empty() ? "<no config>" : config_path);
+            do_reload();
+            reload_signals.async_wait(on_reload_signal);
+        };
+    reload_signals.async_wait(on_reload_signal);
+#else
+    // Windows: stand up a named-pipe server that listens for "RELOAD\n" from
+    // the `toxtunnel reload` subcommand. The pipe lives only as long as the
+    // daemon; the client uses the same per-pid naming convention.
+    WindowsReloadPipeServer reload_pipe(do_reload);
+    reload_pipe.start();
+#endif
+
     // Start the server (non-blocking)
     server.start();
     Logger::info("Server started");
@@ -629,6 +715,7 @@ int run_server(const toxtunnel::Config& config, bool run_as_service,
     } else {
         signal_ctx.run();
     }
+    reload_pipe.stop();
 #else
     // Block on signal wait
     signal_ctx.run();
@@ -642,7 +729,8 @@ int run_server(const toxtunnel::Config& config, bool run_as_service,
 }
 
 /// Run the tunnel client until a signal is received.
-int run_client(const toxtunnel::Config& config, bool run_as_service) {
+int run_client(const toxtunnel::Config& config, bool run_as_service,
+               const std::string& config_path) {
     using Logger = toxtunnel::util::Logger;
 
     toxtunnel::app::TunnelClient client;
@@ -670,6 +758,33 @@ int run_client(const toxtunnel::Config& config, bool run_as_service) {
         }
     });
 
+    auto do_reload = [&client, &config_path]() {
+        auto new_cfg = reload_config_from_disk(config_path);
+        if (!new_cfg)
+            return;
+        auto apply = client.reload(*new_cfg);
+        if (!apply) {
+            toxtunnel::util::Logger::error("reload rejected: {}", apply.error());
+        }
+    };
+
+#if !defined(_WIN32)
+    asio::signal_set reload_signals(signal_ctx, SIGHUP);
+    std::function<void(const asio::error_code&, int)> on_reload_signal =
+        [&](const asio::error_code& ec, int /*signum*/) {
+            if (ec)
+                return;
+            toxtunnel::util::Logger::info("SIGHUP received, reloading config from {}",
+                                          config_path.empty() ? "<no config>" : config_path);
+            do_reload();
+            reload_signals.async_wait(on_reload_signal);
+        };
+    reload_signals.async_wait(on_reload_signal);
+#else
+    WindowsReloadPipeServer reload_pipe(do_reload);
+    reload_pipe.start();
+#endif
+
     // Start the client (non-blocking)
     client.start();
     Logger::info("Client started");
@@ -693,6 +808,7 @@ int run_client(const toxtunnel::Config& config, bool run_as_service) {
         client.wait_until_stopped();
         signal_ctx.stop();
     }
+    reload_pipe.stop();
 #else
     client.wait_until_stopped();
     signal_ctx.stop();
@@ -810,6 +926,20 @@ int main(int argc, char* argv[]) {
                      "Resource to inspect: tunnels (default) | status")
         ->check(CLI::IsMember({"tunnels", "status"}));
 
+    // ----- `reload` ----------------------------------------------------------
+    // Trigger a hot-reload of the running daemon's reloadable config subset
+    // (server.rules_file contents, client.forwards, logging.level). On POSIX
+    // this prints the equivalent `kill -HUP <pid>`; on Windows it writes
+    // "RELOAD\n" to a per-pid named pipe served by the daemon.
+    auto* reload_cmd =
+        app.add_subcommand("reload", "Hot-reload rules/forwards/log-level on a running daemon");
+    std::string reload_data_dir;
+    std::string reload_config_path;
+    reload_cmd->add_option("-d,--data-dir", reload_data_dir,
+                           "Daemon data directory (Windows: holds toxtunnel.pid)");
+    reload_cmd->add_option("-c,--config", reload_config_path,
+                           "Read data_dir from this config file (overridden by --data-dir)");
+
 #if defined(_WIN32)
     auto* install_win_svc =
         app.add_subcommand("install-windows-service", "Register ToxTunnel as a Windows service");
@@ -898,6 +1028,14 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return cmd_inspect(*inspect_dir, inspect_subaction, inspect_json);
+    }
+
+    if (*reload_cmd) {
+        auto reload_dir = resolve_servers_data_dir(reload_data_dir, reload_config_path);
+        if (!reload_dir) {
+            return 1;
+        }
+        return cmd_reload(*reload_dir);
     }
 
     if (*print_id_cmd) {
@@ -1097,15 +1235,15 @@ int main(int argc, char* argv[]) {
                 return 0;
             }
             if (config.is_server()) {
-                return run_server(config, true);
+                return run_server(config, true, config_path);
             }
-            return run_client(config, true);
+            return run_client(config, true, config_path);
         });
     } else {
         if (config.is_server()) {
-            exit_code = run_server(config, false);
+            exit_code = run_server(config, false, config_path);
         } else {
-            exit_code = run_client(config, false);
+            exit_code = run_client(config, false, config_path);
         }
     }
 #else
@@ -1122,7 +1260,7 @@ int main(int argc, char* argv[]) {
     if (config.is_server()) {
         exit_code = run_server(config, run_as_service, config_path);
     } else {
-        exit_code = run_client(config, run_as_service);
+        exit_code = run_client(config, run_as_service, config_path);
     }
 #endif
 
