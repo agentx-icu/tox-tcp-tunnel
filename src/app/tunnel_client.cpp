@@ -245,8 +245,9 @@ void TunnelClient::start() {
             auto err = socks5_listener_->start(
                 io_ctx_->get_io_context(), s5_host, s5_port,
                 [this](std::shared_ptr<core::TcpConnection> conn, std::string host, uint16_t port,
-                       std::function<void(bool)> reply_cb) {
-                    open_socks5_tunnel(std::move(conn), std::move(host), port, std::move(reply_cb));
+                       std::vector<uint8_t> initial_payload, std::function<void(bool)> reply_cb) {
+                    open_socks5_tunnel(std::move(conn), std::move(host), port,
+                                       std::move(initial_payload), std::move(reply_cb));
                 });
             if (!err.empty()) {
                 util::Logger::warn("SOCKS5 listener disabled: {}", err);
@@ -767,7 +768,8 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
 }
 
 void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
-                                      uint16_t port, std::function<void(bool)> on_tunnel_state) {
+                                      uint16_t port, std::vector<uint8_t> initial_payload,
+                                      std::function<void(bool)> on_tunnel_state) {
     if (!server_online_) {
         util::Logger::warn("SOCKS5 destination {}:{} requested but server is offline", host, port);
         on_tunnel_state(false);
@@ -797,17 +799,30 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     tunnel->set_on_data_for_tcp(
         [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
 
+    auto* tunnel_raw = tunnel.get();
+
     // The reply gate latch ensures the listener's reply callback is invoked
     // exactly once across all possible state transitions of this tunnel.
     auto reply_sent = std::make_shared<std::atomic_flag>();
     auto open_counted = std::make_shared<std::atomic_flag>();
     auto active_dec_latch = std::make_shared<std::atomic_flag>();
     auto reply_cb = std::make_shared<std::function<void(bool)>>(std::move(on_tunnel_state));
-    tunnel->set_on_state_change([conn, tunnel_id, reply_sent, open_counted, active_dec_latch,
-                                 reply_cb](tunnel::Tunnel::State new_state) {
+    // Wrap initial_payload in a shared_ptr so the state-change lambda can drain
+    // it exactly once. Bytes that arrived past the SOCKS/CONNECT handshake go
+    // upstream BEFORE we start_read so the tunnel sees them in original order.
+    auto initial_payload_holder =
+        std::make_shared<std::vector<uint8_t>>(std::move(initial_payload));
+    tunnel->set_on_state_change([conn, tunnel_id, tunnel_raw, reply_sent, open_counted,
+                                 active_dec_latch, reply_cb,
+                                 initial_payload_holder](tunnel::Tunnel::State new_state) {
         if (new_state == tunnel::Tunnel::State::Connected) {
             if (!reply_sent->test_and_set()) {
                 (*reply_cb)(true);
+            }
+            if (!initial_payload_holder->empty()) {
+                tunnel_raw->on_tcp_data_received(initial_payload_holder->data(),
+                                                 initial_payload_holder->size());
+                initial_payload_holder->clear();
             }
             util::Logger::debug("SOCKS5 tunnel {} connected, starting TCP read", tunnel_id);
             conn->start_read();
@@ -837,8 +852,6 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         util::Logger::debug("SOCKS5 tunnel {} on_close, removing from manager", tunnel_id);
         tunnel_mgr_ptr->remove_tunnel(tunnel_id);
     });
-
-    auto* tunnel_raw = tunnel.get();
     conn->set_on_data([tunnel_raw](const uint8_t* data, std::size_t length) {
         tunnel_raw->on_tcp_data_received(data, length);
     });

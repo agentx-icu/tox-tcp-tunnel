@@ -116,6 +116,11 @@ struct HttpConnectResult {
 ///     it manages.
 ///   - Wire the supplied `conn` to that tunnel (start_read on connect, route
 ///     bytes, etc.).
+///   - Forward any `initial_payload` bytes upstream as the first tunnel write
+///     once the tunnel reaches Connected. These are bytes that already arrived
+///     on `conn` (pipelined past the handshake) and were buffered by the
+///     listener. Naive clients that send e.g. a TLS ClientHello immediately
+///     after `CONNECT host:port` without waiting for `200 OK` land here.
 ///   - Invoke `on_tunnel_state` exactly once: `true` once the tunnel reaches
 ///     Connected (so the listener can write the protocol-specific success
 ///     reply), or `false` on any pre-connected error.
@@ -123,7 +128,8 @@ struct HttpConnectResult {
 /// Encapsulating the wiring behind a callback keeps Socks5Listener free of
 /// TunnelClient dependencies and trivially testable.
 using OpenTunnelFn = std::function<void(std::shared_ptr<core::TcpConnection> conn, std::string host,
-                                        uint16_t port, std::function<void(bool)> on_tunnel_state)>;
+                                        uint16_t port, std::vector<uint8_t> initial_payload,
+                                        std::function<void(bool)> on_tunnel_state)>;
 
 /// Listener that accepts SOCKS5 or HTTP CONNECT requests and forwards each
 /// accepted connection to the TunnelClient via the supplied OpenTunnelFn.

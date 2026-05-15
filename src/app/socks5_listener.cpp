@@ -274,19 +274,21 @@ struct Socks5Session : std::enable_shared_from_this<Socks5Session> {
     }
 
     void handoff_to_tunnel(std::string host, uint16_t port) {
-        // Detach our on_data hook before the tunnel layer attaches its own;
-        // any bytes that arrive between now and the tunnel taking over will
-        // be lost, but SOCKS5 / HTTP CONNECT specs require the server to send
-        // its reply *before* the client speaks, so the client should not be
-        // transmitting yet.
+        // Detach our on_data hook before the tunnel layer attaches its own.
+        // Any bytes we already read past the handshake live in `buffer` and
+        // must be passed to the tunnel as initial payload — naive clients
+        // (and HTTP CONNECT clients in particular) often pipeline the
+        // request and the first stream bytes into one TCP segment.
         auto self_conn = conn;
         auto self = shared_from_this();
         conn->set_on_data(nullptr);
         conn->set_on_disconnect(nullptr);
 
         const auto sniffed_protocol = protocol;
+        std::vector<uint8_t> initial_payload = std::move(buffer);
+        buffer.clear();
 
-        open_tunnel(std::move(self_conn), std::move(host), port,
+        open_tunnel(std::move(self_conn), std::move(host), port, std::move(initial_payload),
                     [self, sniffed_protocol](bool connected) {
                         // Reply with the protocol-appropriate success/failure
                         // line once the tunnel layer reports back. The session

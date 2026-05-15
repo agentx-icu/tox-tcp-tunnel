@@ -308,8 +308,12 @@ class TunnelClient {
     /// Open a brand-new tunnel for a SOCKS5-supplied destination. Wires up
     /// the same TCP-to-tunnel plumbing as `on_tcp_connection_accepted`, but
     /// defers the success reply to the listener via `on_tunnel_state`.
+    /// `initial_payload` carries bytes the listener buffered past the
+    /// SOCKS/CONNECT handshake (e.g. a pipelined TLS ClientHello). They are
+    /// pushed upstream as the first tunnel write once Connected.
     void open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
-                            uint16_t port, std::function<void(bool)> on_tunnel_state);
+                            uint16_t port, std::vector<uint8_t> initial_payload,
+                            std::function<void(bool)> on_tunnel_state);
 };
 
 }  // namespace toxtunnel::app

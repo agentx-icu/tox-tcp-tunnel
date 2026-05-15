@@ -235,13 +235,13 @@ class Socks5ListenerLifecycleTest : public ::testing::Test {
 };
 
 TEST_F(Socks5ListenerLifecycleTest, StartsBindsRandomPort) {
-    start_listener([](auto, auto, auto, auto) {});
+    start_listener([](auto, auto, auto, auto, auto) {});
     EXPECT_TRUE(listener_->is_running());
     EXPECT_GT(listener_->bound_port(), 0);
 }
 
 TEST_F(Socks5ListenerLifecycleTest, StopIsIdempotent) {
-    start_listener([](auto, auto, auto, auto) {});
+    start_listener([](auto, auto, auto, auto, auto) {});
     listener_->stop();
     EXPECT_FALSE(listener_->is_running());
     listener_->stop();  // Second call is a no-op.
@@ -255,7 +255,8 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
     std::function<void(bool)> captured_reply_cb;
 
     start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string host,
-                       uint16_t port, std::function<void(bool)> reply_cb) {
+                       uint16_t port, std::vector<uint8_t> /*initial_payload*/,
+                       std::function<void(bool)> reply_cb) {
         got_host = std::move(host);
         got_port = port;
         captured_reply_cb = std::move(reply_cb);
@@ -297,7 +298,7 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
 TEST_F(Socks5ListenerLifecycleTest, RejectsClientThatOffersNoNoAuth) {
     std::atomic<bool> got_dest{false};
     start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
-                       std::function<void(bool)>) { got_dest.store(true); });
+                       std::vector<uint8_t>, std::function<void(bool)>) { got_dest.store(true); });
 
     asio::io_context client_io;
     asio::ip::tcp::socket sock(client_io);
@@ -316,7 +317,7 @@ TEST_F(Socks5ListenerLifecycleTest, RejectsClientThatOffersNoNoAuth) {
 TEST_F(Socks5ListenerLifecycleTest, RejectsBindCommandAtRequest) {
     std::atomic<bool> got_dest{false};
     start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
-                       std::function<void(bool)>) { got_dest.store(true); });
+                       std::vector<uint8_t>, std::function<void(bool)>) { got_dest.store(true); });
 
     asio::io_context client_io;
     asio::ip::tcp::socket sock(client_io);
@@ -343,7 +344,8 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesHttpConnectAndInvokesOpenTunnel) {
     std::function<void(bool)> captured_reply_cb;
 
     start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string host,
-                       uint16_t port, std::function<void(bool)> reply_cb) {
+                       uint16_t port, std::vector<uint8_t> /*initial_payload*/,
+                       std::function<void(bool)> reply_cb) {
         got_host = std::move(host);
         got_port = port;
         captured_reply_cb = std::move(reply_cb);
@@ -377,7 +379,7 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesHttpConnectAndInvokesOpenTunnel) {
 TEST_F(Socks5ListenerLifecycleTest, HttpConnectReturns502OnTunnelFailure) {
     std::function<void(bool)> captured_reply_cb;
     start_listener(
-        [&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
+        [&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t, std::vector<uint8_t>,
             std::function<void(bool)> reply_cb) { captured_reply_cb = std::move(reply_cb); });
 
     asio::io_context client_io;
@@ -397,4 +399,76 @@ TEST_F(Socks5ListenerLifecycleTest, HttpConnectReturns502OnTunnelFailure) {
     auto reply = read_some(sock, 12);
     const std::string reply_str(reply.begin(), reply.end());
     EXPECT_NE(reply_str.find("HTTP/1.1 502"), std::string::npos);
+}
+
+// Regression: a SOCKS5 client that coalesces the CONNECT request with the
+// first stream bytes in a single TCP write must not lose those bytes.
+TEST_F(Socks5ListenerLifecycleTest, Socks5HandoffForwardsPipelinedPayload) {
+    std::atomic<bool> got_dest{false};
+    std::vector<uint8_t> captured_payload;
+    start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string /*host*/,
+                       uint16_t /*port*/, std::vector<uint8_t> initial_payload,
+                       std::function<void(bool)> /*reply_cb*/) {
+        captured_payload = std::move(initial_payload);
+        got_dest.store(true);
+    });
+
+    asio::io_context client_io;
+    asio::ip::tcp::socket sock(client_io);
+    sock.connect({asio::ip::make_address("127.0.0.1"), listener_->bound_port()});
+
+    const uint8_t greeting[] = {0x05, 0x01, 0x00};
+    asio::write(sock, asio::buffer(greeting, sizeof(greeting)));
+    (void)read_some(sock, 2);
+
+    // Request + 4 bytes of pipelined payload, all in one write — simulates a
+    // naive client that doesn't wait for the success reply before streaming.
+    const uint8_t req_plus_payload[] = {
+        0x05, 0x01, 0x00, 0x01, 10, 0, 0, 7, 0x01, 0xBB,  // SOCKS5 CONNECT 10.0.0.7:443
+        0xDE, 0xAD, 0xBE, 0xEF                            // first 4 stream bytes
+    };
+    asio::write(sock, asio::buffer(req_plus_payload, sizeof(req_plus_payload)));
+
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!got_dest.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_TRUE(got_dest.load());
+    ASSERT_EQ(captured_payload.size(), 4u);
+    EXPECT_EQ(captured_payload[0], 0xDE);
+    EXPECT_EQ(captured_payload[1], 0xAD);
+    EXPECT_EQ(captured_payload[2], 0xBE);
+    EXPECT_EQ(captured_payload[3], 0xEF);
+}
+
+// Regression: same hazard for HTTP CONNECT — naive clients (and some TLS
+// libraries doing TCP fast-open) write the CONNECT line and a TLS ClientHello
+// in the same TCP segment without waiting for `200 OK`.
+TEST_F(Socks5ListenerLifecycleTest, HttpConnectHandoffForwardsPipelinedPayload) {
+    std::atomic<bool> got_dest{false};
+    std::vector<uint8_t> captured_payload;
+    start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string /*host*/,
+                       uint16_t /*port*/, std::vector<uint8_t> initial_payload,
+                       std::function<void(bool)> /*reply_cb*/) {
+        captured_payload = std::move(initial_payload);
+        got_dest.store(true);
+    });
+
+    asio::io_context client_io;
+    asio::ip::tcp::socket sock(client_io);
+    sock.connect({asio::ip::make_address("127.0.0.1"), listener_->bound_port()});
+
+    const std::string req = "CONNECT host.example:443 HTTP/1.1\r\nHost: host.example:443\r\n\r\n";
+    const std::vector<uint8_t> client_hello = {0x16, 0x03, 0x01, 0x00, 0x05,
+                                               'h',  'e',  'l',  'l',  'o'};
+    std::vector<uint8_t> combined(req.begin(), req.end());
+    combined.insert(combined.end(), client_hello.begin(), client_hello.end());
+    asio::write(sock, asio::buffer(combined));
+
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!got_dest.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_TRUE(got_dest.load());
+    EXPECT_EQ(captured_payload, client_hello);
 }

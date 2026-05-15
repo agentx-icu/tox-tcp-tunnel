@@ -1051,6 +1051,52 @@ server: {}
     EXPECT_FALSE(validation.has_value());
 }
 
+TEST_F(ConfigTest, ValidateRejectsNonLoopbackSocks5Listen) {
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/toxtunnel
+tox:
+  udp_enabled: true
+  tcp_port: 33445
+  bootstrap_mode: auto
+client:
+  server_id: "DE47F247CE6D7BE29A5903A234A045A227C6CB969943A8317EA74F7D38810D10D43C53082F2B"
+  socks5:
+    enabled: true
+    listen: "0.0.0.0:1080"
+)";
+
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    auto validation = result.value().validate();
+    ASSERT_FALSE(validation.has_value());
+    EXPECT_NE(validation.error().find("loopback"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateAcceptsLoopbackSocks5Variants) {
+    const char* yaml_template = R"(
+mode: client
+data_dir: /tmp/toxtunnel
+tox:
+  udp_enabled: true
+  tcp_port: 33445
+  bootstrap_mode: auto
+client:
+  server_id: "DE47F247CE6D7BE29A5903A234A045A227C6CB969943A8317EA74F7D38810D10D43C53082F2B"
+  socks5:
+    enabled: true
+    listen: ")";
+
+    for (const std::string& listen :
+         {"127.0.0.1:1080", "127.42.13.7:9999", "[::1]:1080", "localhost:1080", "LocalHost:8080"}) {
+        const std::string yaml = std::string(yaml_template) + listen + "\"";
+        auto result = Config::from_string(yaml);
+        ASSERT_TRUE(result.has_value()) << "listen=" << listen << " err=" << result.error();
+        auto validation = result.value().validate();
+        EXPECT_TRUE(validation.has_value()) << "listen=" << listen << " err=" << validation.error();
+    }
+}
+
 TEST_F(ConfigTest, ToYamlEmitsCanonicalToxBlock) {
     Config config = Config::default_server();
     config.data_dir = "/test/path";

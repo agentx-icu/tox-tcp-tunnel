@@ -122,6 +122,28 @@ util::Expected<void, std::string> validate_bootstrap_nodes(
     return {};
 }
 
+// SOCKS5 has no authentication in v1, so the listener must bind to a loopback
+// address. Accepts: "localhost" (case-insensitive), any 127.0.0.0/8 address,
+// or "::1". Anything else exposes an unauthenticated proxy on the LAN and is
+// rejected at config-validation time.
+bool is_loopback_host(const std::string& host) {
+    if (host.empty()) {
+        return false;
+    }
+    if (host == "::1") {
+        return true;
+    }
+    if (host.size() >= 4 && host.compare(0, 4, "127.") == 0) {
+        return true;
+    }
+    std::string lower;
+    lower.reserve(host.size());
+    for (char c : host) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return lower == "localhost";
+}
+
 void sync_legacy_server_tox_fields(toxtunnel::Config& config) {
     if (!config.server.has_value()) {
         return;
@@ -426,6 +448,13 @@ util::Expected<void, std::string> Config::validate() const {
             if (!util::parse_listen_spec(client->socks5.listen, host, s5_port)) {
                 return util::make_unexpected(std::string("Invalid client.socks5.listen value: ") +
                                              client->socks5.listen);
+            }
+            if (!is_loopback_host(host)) {
+                return util::make_unexpected(
+                    std::string("client.socks5.listen must bind to a loopback address "
+                                "(127.0.0.0/8, ::1, or localhost); SOCKS5 v1 is unauthenticated. "
+                                "Got: ") +
+                    host);
             }
             if (client->pipe_target.has_value()) {
                 return util::make_unexpected(
