@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "toxtunnel/app/inspect_server.hpp"
 #include "toxtunnel/app/known_servers.hpp"
 #include "toxtunnel/app/stdio_pipe_bridge.hpp"
 #include "toxtunnel/core/io_context.hpp"
@@ -209,6 +210,11 @@ class TunnelClient {
     /// Update the server's disclosed system info from an INFO_REPLY payload
     /// (UTF-8 YAML bytes) and persist.
     void record_server_info(std::string_view yaml_payload);
+
+    /// Local IPC server backing `toxtunnel inspect`. Owned here so its
+    /// lifetime is tied to the io_context — the inspect server posts onto
+    /// the IO pool, so it must shut down before io_ctx_ does.
+    std::unique_ptr<InspectServer> inspect_server_;
 };
 
 }  // namespace toxtunnel::app

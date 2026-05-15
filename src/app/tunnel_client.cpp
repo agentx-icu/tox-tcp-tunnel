@@ -154,6 +154,37 @@ void TunnelClient::start() {
     auto address = tox_adapter_->get_address();
     util::Logger::info("Client Tox ID: {}", address.to_hex());
 
+    // Stand up the local inspect IPC before listeners come up. Failing to
+    // bind only disables introspection — the client still proceeds.
+    if (config_.inspect.enabled) {
+        inspect_server_ = std::make_unique<InspectServer>();
+        InspectProviders providers;
+        providers.mode = [] { return std::string("client"); };
+        providers.version = [] { return std::string(TOXTUNNEL_VERSION); };
+        providers.friends_online = [this]() -> std::size_t {
+            return server_online_.load(std::memory_order_acquire) ? 1u : 0u;
+        };
+        providers.friend_pk_prefix = [this](uint16_t /*tunnel_id*/) -> std::string {
+            // Client mode talks to exactly one server, so every tunnel maps
+            // to that single peer; ignore tunnel_id and return the prefix
+            // directly.
+            return server_tox_id_hex_.size() > 8 ? server_tox_id_hex_.substr(0, 8)
+                                                 : server_tox_id_hex_;
+        };
+        providers.snapshot = [this]() -> tunnel::ManagerSnapshot {
+            if (!tunnel_mgr_) {
+                return {};
+            }
+            return tunnel_mgr_->snapshot();
+        };
+        auto inspect_ok = inspect_server_->start(io_ctx_->get_io_context(), config_.data_dir,
+                                                 std::move(providers));
+        if (!inspect_ok) {
+            util::Logger::warn("Inspect IPC disabled: {}", inspect_ok.error());
+            inspect_server_.reset();
+        }
+    }
+
     schedule_info_refresh();
 
     if (is_pipe_mode()) {
@@ -185,6 +216,11 @@ void TunnelClient::stop() {
     }
 
     util::Logger::info("Stopping TunnelClient...");
+
+    if (inspect_server_) {
+        inspect_server_->stop();
+        inspect_server_.reset();
+    }
 
     if (info_refresh_timer_) {
         info_refresh_timer_->cancel();
@@ -244,8 +280,7 @@ util::Expected<void, std::string> TunnelClient::reload(const Config& new_config)
                 if (forward_rules_[i] == removed) {
                     listeners_[i]->stop();
                     listeners_.erase(listeners_.begin() + static_cast<std::ptrdiff_t>(i));
-                    forward_rules_.erase(forward_rules_.begin() +
-                                         static_cast<std::ptrdiff_t>(i));
+                    forward_rules_.erase(forward_rules_.begin() + static_cast<std::ptrdiff_t>(i));
                     util::Logger::info("Stopped listener on local port {} -> {}:{}",
                                        removed.local_port, removed.remote_host,
                                        removed.remote_port);

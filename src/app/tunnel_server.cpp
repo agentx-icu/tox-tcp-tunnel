@@ -140,6 +140,51 @@ void TunnelServer::start() {
     auto address = tox_adapter_->get_address();
     util::Logger::info("Tox ID: {}", address.to_hex());
 
+    // Bring up the local IPC inspector after the rest of the daemon so a
+    // failing inspect bind cannot prevent the tunnel server from servicing
+    // tunnels — the daemon must keep working even if /run is read-only.
+    if (config_.inspect.enabled) {
+        inspect_server_ = std::make_unique<InspectServer>();
+        InspectProviders providers;
+        providers.mode = [] { return std::string("server"); };
+        providers.version = [] { return std::string(TOXTUNNEL_VERSION); };
+        providers.friends_online = [this]() -> std::size_t {
+            std::lock_guard lock(managers_mutex_);
+            return managers_.size();
+        };
+        providers.friend_pk_prefix = [this](uint16_t tunnel_id) -> std::string {
+            std::lock_guard lock(managers_mutex_);
+            for (const auto& [friend_number, manager] : managers_) {
+                if (manager->has_tunnel(tunnel_id)) {
+                    auto hex = get_friend_pk_hex(friend_number);
+                    return hex.size() > 8 ? hex.substr(0, 8) : hex;
+                }
+            }
+            return {};
+        };
+        providers.snapshot = [this] {
+            tunnel::ManagerSnapshot combined;
+            std::lock_guard lock(managers_mutex_);
+            for (const auto& [_, manager] : managers_) {
+                auto snap = manager->snapshot();
+                combined.bytes_in += snap.bytes_in;
+                combined.bytes_out += snap.bytes_out;
+                combined.frames_in += snap.frames_in;
+                combined.frames_out += snap.frames_out;
+                combined.tunnels.insert(combined.tunnels.end(),
+                                        std::make_move_iterator(snap.tunnels.begin()),
+                                        std::make_move_iterator(snap.tunnels.end()));
+            }
+            return combined;
+        };
+        auto inspect_ok = inspect_server_->start(io_context_->get_io_context(), config_.data_dir,
+                                                 std::move(providers));
+        if (!inspect_ok) {
+            util::Logger::warn("Inspect IPC disabled: {}", inspect_ok.error());
+            inspect_server_.reset();
+        }
+    }
+
     running_.store(true, std::memory_order_release);
     util::Logger::info("TunnelServer started");
 }
@@ -150,6 +195,12 @@ void TunnelServer::stop() {
     }
 
     util::Logger::info("TunnelServer stopping...");
+
+    // Tear down inspect before io_context so its acceptor cancels cleanly.
+    if (inspect_server_) {
+        inspect_server_->stop();
+        inspect_server_.reset();
+    }
 
     // Close all tunnel managers.
     {

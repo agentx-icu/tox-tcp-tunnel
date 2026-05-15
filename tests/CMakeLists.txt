@@ -26,6 +26,7 @@ add_executable(unit_tests
     unit/test_qr_code.cpp
     unit/test_rules_engine.cpp
     unit/test_inbound_strand.cpp
+    unit/test_inspect_server.cpp
     unit/test_tox_adapter.cpp
     unit/test_tunnel.cpp
     unit/test_tunnel_manager.cpp
@@ -65,6 +66,7 @@ gtest_discover_tests(unit_tests
 add_executable(integration_tests
     integration/test_config_pipeline.cpp
     integration/test_http_scenarios.cpp
+    integration/test_inspect_ipc.cpp
     integration/test_pipe_bridge.cpp
     integration/test_rules_integration.cpp
     integration/test_tcp_loopback.cpp

@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "toxtunnel/app/inspect_server.hpp"
 #include "toxtunnel/app/rules_engine.hpp"
 #include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
@@ -174,6 +175,11 @@ class TunnelServer {
 
     /// Whether the server is running.
     std::atomic<bool> running_{false};
+
+    /// Local IPC server backing `toxtunnel inspect`. Owned here so its
+    /// lifetime is tied to the io_context — the inspect server posts onto
+    /// the IO pool, so it must shut down before io_context_ does.
+    std::unique_ptr<InspectServer> inspect_server_;
 };
 
 }  // namespace toxtunnel::app

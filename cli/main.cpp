@@ -1,11 +1,16 @@
 #include <CLI/CLI.hpp>
 #include <asio.hpp>
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "toxtunnel/app/known_servers.hpp"
@@ -22,6 +27,9 @@
 #include <windows.h>
 #else
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -203,6 +211,252 @@ int cmd_servers_remove(const std::filesystem::path& data_dir, const std::string&
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// `inspect` subcommand
+// ---------------------------------------------------------------------------
+
+// We deliberately do NOT link the inspect CLI client against our asio-backed
+// InspectServer code — the CLI runs in its own short-lived process with no
+// io_context. A direct, blocking syscall keeps the CLI binary slim and
+// dependency-free.
+std::optional<std::string> inspect_send_request(const std::filesystem::path& data_dir,
+                                                const std::string& request) {
+#if defined(_WIN32)
+    // The named pipe is per-pid so the CLI has to discover it. The daemon
+    // doesn't currently publish a pid file, so for now we probe the
+    // hard-coded path used when the daemon shares a host with the CLI:
+    // %ProgramData%\ToxTunnel\toxtunnel.pid. If absent, surface a clear
+    // error so the user can supply a pid manually via env override.
+    std::string pipe_name = "\\\\.\\pipe\\toxtunnel-";
+    if (const char* pid_override = std::getenv("TOXTUNNEL_INSPECT_PID")) {
+        pipe_name += pid_override;
+    } else {
+        const auto pid_path = data_dir / "toxtunnel.pid";
+        std::ifstream pid_file(pid_path);
+        if (!pid_file) {
+            std::cerr << "Inspect: no pid file at " << pid_path.string()
+                      << "; set TOXTUNNEL_INSPECT_PID to the daemon pid.\n";
+            return std::nullopt;
+        }
+        std::string pid;
+        pid_file >> pid;
+        pipe_name += pid;
+    }
+    HANDLE pipe = CreateFileA(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        std::cerr << "Inspect: cannot connect to " << pipe_name << " (is the daemon running?)\n";
+        return std::nullopt;
+    }
+    DWORD written = 0;
+    WriteFile(pipe, request.data(), static_cast<DWORD>(request.size()), &written, nullptr);
+    std::string out;
+    char buf[1024];
+    DWORD read = 0;
+    while (ReadFile(pipe, buf, sizeof(buf), &read, nullptr) && read > 0) {
+        out.append(buf, read);
+    }
+    CloseHandle(pipe);
+    return out;
+#else
+    const auto socket_path = data_dir / "toxtunnel.sock";
+    if (!std::filesystem::exists(socket_path)) {
+        std::cerr << "Inspect: no socket at " << socket_path.string()
+                  << " (is the daemon running?)\n";
+        return std::nullopt;
+    }
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        std::cerr << "Inspect: socket() failed\n";
+        return std::nullopt;
+    }
+    ::sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    const auto path_str = socket_path.string();
+    if (path_str.size() >= sizeof(addr.sun_path)) {
+        std::cerr << "Inspect: socket path too long: " << path_str << "\n";
+        ::close(fd);
+        return std::nullopt;
+    }
+    std::memcpy(addr.sun_path, path_str.data(), path_str.size());
+    if (::connect(fd, reinterpret_cast< ::sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "Inspect: connect() to " << path_str << " failed (is the daemon running?)\n";
+        ::close(fd);
+        return std::nullopt;
+    }
+    ::write(fd, request.data(), request.size());
+    std::string out;
+    char buf[1024];
+    ssize_t n = 0;
+    while ((n = ::read(fd, buf, sizeof(buf))) > 0) {
+        out.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    return out;
+#endif
+}
+
+// Minimal best-effort JSON walker used to render the human table. We avoid
+// pulling a JSON library in — the daemon's wire format is tiny and stable.
+// On any unexpected shape we just fall back to printing the raw JSON so the
+// operator can still see something useful.
+struct JsonCursor {
+    std::string_view src;
+    std::size_t pos = 0;
+
+    void skip_ws() {
+        while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
+    }
+    bool consume(char c) {
+        skip_ws();
+        if (pos < src.size() && src[pos] == c) {
+            ++pos;
+            return true;
+        }
+        return false;
+    }
+    std::optional<std::string> parse_string() {
+        skip_ws();
+        if (pos >= src.size() || src[pos] != '"')
+            return std::nullopt;
+        ++pos;
+        std::string out;
+        while (pos < src.size() && src[pos] != '"') {
+            if (src[pos] == '\\' && pos + 1 < src.size()) {
+                char c = src[pos + 1];
+                pos += 2;
+                switch (c) {
+                    case 'n':
+                        out += '\n';
+                        break;
+                    case 't':
+                        out += '\t';
+                        break;
+                    case '"':
+                        out += '"';
+                        break;
+                    case '\\':
+                        out += '\\';
+                        break;
+                    default:
+                        out += c;
+                        break;
+                }
+            } else {
+                out += src[pos++];
+            }
+        }
+        if (pos < src.size())
+            ++pos;
+        return out;
+    }
+    std::optional<std::string> parse_scalar() {
+        skip_ws();
+        std::size_t start = pos;
+        while (pos < src.size() && src[pos] != ',' && src[pos] != '}' && src[pos] != ']') ++pos;
+        std::string out(src.substr(start, pos - start));
+        while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) {
+            out.pop_back();
+        }
+        return out.empty() ? std::optional<std::string>{} : std::optional<std::string>(out);
+    }
+};
+
+void render_tunnels_table(const std::string& json) {
+    // Find the "tunnels":[ array. If we can't parse it, just dump the JSON.
+    const auto pos = json.find("\"tunnels\"");
+    if (pos == std::string::npos) {
+        std::cout << json << "\n";
+        return;
+    }
+    auto br = json.find('[', pos);
+    auto end = json.find(']', br);
+    if (br == std::string::npos || end == std::string::npos) {
+        std::cout << json << "\n";
+        return;
+    }
+    std::cout << "ID    TARGET                          STATE         BYTES_IN     BYTES_OUT   "
+                 "IDLE_S  PEER\n";
+    std::cout << "----  ------------------------------  ------------  -----------  ----------  "
+                 "------  ----------\n";
+    std::string_view body(json.data() + br + 1, end - br - 1);
+    JsonCursor c{body};
+    while (c.pos < c.src.size()) {
+        c.skip_ws();
+        if (!c.consume('{'))
+            break;
+        std::string id, target, state, bytes_in, bytes_out, idle, pk;
+        while (c.pos < c.src.size() && c.src[c.pos] != '}') {
+            auto key = c.parse_string();
+            if (!key)
+                break;
+            c.consume(':');
+            std::optional<std::string> v;
+            c.skip_ws();
+            if (c.pos < c.src.size() && c.src[c.pos] == '"') {
+                v = c.parse_string();
+            } else {
+                v = c.parse_scalar();
+            }
+            if (!v)
+                break;
+            if (*key == "id")
+                id = *v;
+            else if (*key == "target")
+                target = *v;
+            else if (*key == "state")
+                state = *v;
+            else if (*key == "bytes_in")
+                bytes_in = *v;
+            else if (*key == "bytes_out")
+                bytes_out = *v;
+            else if (*key == "idle_seconds")
+                idle = *v;
+            else if (*key == "friend_pk_prefix")
+                pk = *v;
+            c.consume(',');
+        }
+        c.consume('}');
+        c.consume(',');
+        std::cout << id;
+        for (int i = static_cast<int>(id.size()); i < 6; ++i) std::cout << ' ';
+        std::cout << target;
+        for (int i = static_cast<int>(target.size()); i < 32; ++i) std::cout << ' ';
+        std::cout << state;
+        for (int i = static_cast<int>(state.size()); i < 14; ++i) std::cout << ' ';
+        std::cout << bytes_in;
+        for (int i = static_cast<int>(bytes_in.size()); i < 13; ++i) std::cout << ' ';
+        std::cout << bytes_out;
+        for (int i = static_cast<int>(bytes_out.size()); i < 12; ++i) std::cout << ' ';
+        std::cout << (idle.empty() ? "-" : idle);
+        for (int i = static_cast<int>(idle.empty() ? 1 : idle.size()); i < 8; ++i) std::cout << ' ';
+        std::cout << pk << "\n";
+    }
+}
+
+int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subaction, bool as_json) {
+    std::string request;
+    if (subaction == "status") {
+        request = "GET /status\n";
+    } else {
+        request = "GET /tunnels\n";
+    }
+    auto reply = inspect_send_request(data_dir, request);
+    if (!reply) {
+        return 1;
+    }
+    // Drop trailing newline if present.
+    while (!reply->empty() && (reply->back() == '\n' || reply->back() == '\r')) {
+        reply->pop_back();
+    }
+    if (as_json || subaction == "status") {
+        std::cout << *reply << "\n";
+        return 0;
+    }
+    render_tunnels_table(*reply);
+    return 0;
+}
+
 /// Drive a clean SERVICE_STOPPED transition when a packaged --service install can't
 /// start (config missing or invalid). Exit code 0 so launchd KeepAlive
 /// { SuccessfulExit: false }, systemd Restart=on-failure, and Windows SCM auto-restart
@@ -252,8 +506,7 @@ int cmd_servers_remove(const std::filesystem::path& data_dir, const std::string&
 /// cleared and any pending CreateFile probe completes.
 class WindowsReloadPipeServer {
    public:
-    WindowsReloadPipeServer(std::function<void()> on_reload)
-        : on_reload_(std::move(on_reload)) {
+    WindowsReloadPipeServer(std::function<void()> on_reload) : on_reload_(std::move(on_reload)) {
         pipe_name_ = "\\\\.\\pipe\\toxtunnel-reload-" + std::to_string(GetCurrentProcessId());
     }
 
@@ -270,8 +523,8 @@ class WindowsReloadPipeServer {
         }
         // Unblock a server thread waiting in ConnectNamedPipe by opening a
         // client handle to our own pipe.
-        HANDLE wake = CreateFileA(pipe_name_.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
-                                  nullptr);
+        HANDLE wake =
+            CreateFileA(pipe_name_.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (wake != INVALID_HANDLE_VALUE) {
             CloseHandle(wake);
         }
@@ -285,17 +538,17 @@ class WindowsReloadPipeServer {
    private:
     void run() {
         while (running_.load()) {
-            HANDLE pipe = CreateNamedPipeA(
-                pipe_name_.c_str(), PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 512, 512, 0, nullptr);
+            HANDLE pipe = CreateNamedPipeA(pipe_name_.c_str(), PIPE_ACCESS_DUPLEX,
+                                           PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 512,
+                                           512, 0, nullptr);
             if (pipe == INVALID_HANDLE_VALUE) {
                 toxtunnel::util::Logger::warn(
                     "reload pipe CreateNamedPipe failed ({}); reload IPC unavailable",
                     GetLastError());
                 return;
             }
-            const BOOL connected = ConnectNamedPipe(pipe, nullptr) ||
-                                   GetLastError() == ERROR_PIPE_CONNECTED;
+            const BOOL connected =
+                ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
             if (!running_.load()) {
                 CloseHandle(pipe);
                 return;
@@ -489,12 +742,12 @@ int main(int argc, char* argv[]) {
     // Per-client persistent registry of previously-connected servers. Each
     // subcommand resolves the registry path from --data-dir, --config, or
     // Config::default_client().data_dir.
-    auto* servers_cmd = app.add_subcommand(
-        "servers",
-        "Manage the known-servers registry. "
-        "WARNING: the on-disk file is single-writer — stop the toxtunnel daemon "
-        "before running `add`/`remove`, otherwise your edit will race with the "
-        "daemon's on-connect updates and one side will be lost.");
+    auto* servers_cmd =
+        app.add_subcommand("servers",
+                           "Manage the known-servers registry. "
+                           "WARNING: the on-disk file is single-writer — stop the toxtunnel daemon "
+                           "before running `add`/`remove`, otherwise your edit will race with the "
+                           "daemon's on-connect updates and one side will be lost.");
     servers_cmd->require_subcommand(1);
 
     std::string servers_data_dir;
@@ -536,6 +789,26 @@ int main(int argc, char* argv[]) {
     servers_remove_cmd
         ->add_option("alias_or_tox_id", servers_remove_target, "Alias or full 76-char Tox ID")
         ->required();
+
+    // ----- `inspect` ---------------------------------------------------------
+    // Read-only IPC client. Connects to the running daemon's Unix socket
+    // (POSIX) or named pipe (Windows), sends one request line, prints the
+    // JSON (or a rendered table).
+    auto* inspect_cmd =
+        app.add_subcommand("inspect", "Inspect a running toxtunnel daemon via local IPC");
+    std::string inspect_data_dir;
+    std::string inspect_config_path;
+    std::string inspect_subaction = "tunnels";
+    bool inspect_json = false;
+    inspect_cmd->add_option("-d,--data-dir", inspect_data_dir,
+                            "Daemon data directory (holds toxtunnel.sock)");
+    inspect_cmd->add_option("-c,--config", inspect_config_path,
+                            "Read data_dir from this config file (overridden by --data-dir)");
+    inspect_cmd->add_flag("--json", inspect_json, "Print raw JSON instead of a table");
+    inspect_cmd
+        ->add_option("subaction", inspect_subaction,
+                     "Resource to inspect: tunnels (default) | status")
+        ->check(CLI::IsMember({"tunnels", "status"}));
 
 #if defined(_WIN32)
     auto* install_win_svc =
@@ -615,6 +888,16 @@ int main(int argc, char* argv[]) {
         }
         std::cerr << "Unknown 'servers' subcommand. Try --help.\n";
         return 2;
+    }
+
+    if (*inspect_cmd) {
+        // data_dir resolution mirrors `servers` and `print-id`: explicit
+        // --data-dir wins, else a --config path, else the platform default.
+        auto inspect_dir = resolve_servers_data_dir(inspect_data_dir, inspect_config_path);
+        if (!inspect_dir) {
+            return 1;
+        }
+        return cmd_inspect(*inspect_dir, inspect_subaction, inspect_json);
     }
 
     if (*print_id_cmd) {
