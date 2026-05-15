@@ -121,6 +121,32 @@ class TunnelManager {
     void set_backpressure_threshold(std::size_t bytes);
 
     // -----------------------------------------------------------------
+    // Idle-tunnel reaper
+    // -----------------------------------------------------------------
+
+    /// Enable the idle-tunnel reaper.
+    ///
+    /// Schedules a periodic scan over all tunnels that closes any whose
+    /// last TUNNEL_DATA activity is older than `idle_timeout_seconds`.
+    /// Tunnels still in the Connecting state are skipped so a slow
+    /// open-handshake never gets reaped mid-flight. Calling this with
+    /// `idle_timeout_seconds == 0` (or `tick_seconds == 0`) is a no-op
+    /// and leaves any previously scheduled reaper running; use
+    /// `disable_reaper()` to stop it.
+    void enable_reaper(uint32_t idle_timeout_seconds, uint32_t tick_seconds);
+
+    /// Cancel the reaper timer if one is scheduled.
+    ///
+    /// Idempotent and safe to call from the destructor.
+    void disable_reaper();
+
+    /// Run one reaper pass synchronously, regardless of timer state.
+    ///
+    /// Exposed for tests; in production the timer drives it.
+    /// Returns the number of tunnels closed during this pass.
+    std::size_t reap_idle_tunnels_once();
+
+    // -----------------------------------------------------------------
     // Tunnel ID allocation
     // -----------------------------------------------------------------
 
@@ -304,6 +330,9 @@ class TunnelManager {
     /// Find the next available tunnel ID.
     [[nodiscard]] uint16_t find_available_id();
 
+    /// Arm `reaper_timer_` to fire `reaper_tick_` from now.
+    void schedule_reaper_tick();
+
     // -----------------------------------------------------------------
     // Data members
     // -----------------------------------------------------------------
@@ -354,6 +383,21 @@ class TunnelManager {
 
     /// Protects tunnels_, used_ids_, next_tunnel_id_.
     mutable std::shared_mutex mutex_;
+
+    /// Reaper timer; default-constructed but only armed when the reaper
+    /// is enabled. Cancelled in disable_reaper() and the destructor.
+    asio::steady_timer reaper_timer_;
+
+    /// Idle threshold in nanoseconds. 0 means the reaper is disabled.
+    std::atomic<int64_t> reaper_idle_timeout_ns_{0};
+
+    /// Configured tick interval (seconds). Read on the io_ctx thread.
+    std::chrono::seconds reaper_tick_{0};
+
+    /// Set to true while a reaper tick is scheduled; flipped back to
+    /// false from the timer's completion handler. Lets disable_reaper()
+    /// distinguish "armed" from "idle" without racing the io_ctx thread.
+    std::atomic<bool> reaper_active_{false};
 };
 
 }  // namespace toxtunnel::tunnel

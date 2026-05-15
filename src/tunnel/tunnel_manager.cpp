@@ -11,12 +11,14 @@ namespace toxtunnel::tunnel {
 // Construction
 // ===========================================================================
 
-TunnelManager::TunnelManager(asio::io_context& io_ctx) : io_ctx_(io_ctx), used_ids_(65536, false) {
+TunnelManager::TunnelManager(asio::io_context& io_ctx)
+    : io_ctx_(io_ctx), used_ids_(65536, false), reaper_timer_(io_ctx) {
     // ID 0 is reserved for control frames (PING/PONG)
     used_ids_[0] = true;
 }
 
 TunnelManager::~TunnelManager() {
+    disable_reaper();
     close_all();
 }
 
@@ -47,6 +49,104 @@ void TunnelManager::set_max_tunnels(std::size_t max) {
 void TunnelManager::set_backpressure_threshold(std::size_t bytes) {
     std::unique_lock lock(mutex_);
     backpressure_threshold_ = bytes;
+}
+
+// ===========================================================================
+// Idle-tunnel reaper
+// ===========================================================================
+
+void TunnelManager::enable_reaper(uint32_t idle_timeout_seconds, uint32_t tick_seconds) {
+    if (idle_timeout_seconds == 0 || tick_seconds == 0) {
+        return;
+    }
+
+    const auto idle_ns =
+        std::chrono::nanoseconds(std::chrono::seconds(idle_timeout_seconds)).count();
+    reaper_idle_timeout_ns_.store(static_cast<int64_t>(idle_ns), std::memory_order_relaxed);
+    reaper_tick_ = std::chrono::seconds(tick_seconds);
+
+    // Re-entering enable_reaper() while already armed is fine — schedule_reaper_tick()
+    // is idempotent in the sense that the new expiry replaces the old.
+    schedule_reaper_tick();
+
+    util::Logger::info("TunnelManager: reaper enabled (idle={}s, tick={}s)", idle_timeout_seconds,
+                       tick_seconds);
+}
+
+void TunnelManager::disable_reaper() {
+    reaper_idle_timeout_ns_.store(0, std::memory_order_relaxed);
+    if (reaper_active_.exchange(false, std::memory_order_acq_rel)) {
+        reaper_timer_.cancel();
+    }
+}
+
+void TunnelManager::schedule_reaper_tick() {
+    reaper_active_.store(true, std::memory_order_release);
+    reaper_timer_.expires_after(reaper_tick_);
+    reaper_timer_.async_wait([this](const asio::error_code& ec) {
+        if (ec == asio::error::operation_aborted) {
+            return;
+        }
+        // Stash & re-read the timeout: disable_reaper() may have raced in.
+        if (reaper_idle_timeout_ns_.load(std::memory_order_relaxed) == 0) {
+            reaper_active_.store(false, std::memory_order_release);
+            return;
+        }
+
+        reap_idle_tunnels_once();
+
+        if (reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0) {
+            schedule_reaper_tick();
+        } else {
+            reaper_active_.store(false, std::memory_order_release);
+        }
+    });
+}
+
+std::size_t TunnelManager::reap_idle_tunnels_once() {
+    const int64_t idle_timeout_ns = reaper_idle_timeout_ns_.load(std::memory_order_relaxed);
+    if (idle_timeout_ns <= 0) {
+        return 0;
+    }
+
+    // Snapshot the candidate set under shared lock so the scan never blocks
+    // route_frame on the hot path. Only TunnelImpl exposes IdleNanos();
+    // abstract Tunnels used in some tests are skipped.
+    std::vector<uint16_t> to_close;
+    {
+        std::shared_lock lock(mutex_);
+        to_close.reserve(tunnels_.size());
+        for (const auto& [id, tunnel] : tunnels_) {
+            const auto* impl = dynamic_cast<const TunnelImpl*>(tunnel.get());
+            if (impl == nullptr) {
+                continue;
+            }
+            if (impl->state() == Tunnel::State::Connecting) {
+                continue;
+            }
+            if (impl->IdleNanos() >= idle_timeout_ns) {
+                to_close.push_back(id);
+            }
+        }
+    }
+
+    std::size_t closed = 0;
+    for (uint16_t id : to_close) {
+        // remove_tunnel() invokes Tunnel::close() under its own lock, which
+        // emits TUNNEL_CLOSE to the peer before erasing the entry. A tunnel
+        // may have already been removed between the scan and now — that's
+        // fine; remove_tunnel() is a no-op on missing IDs.
+        if (has_tunnel(id)) {
+            remove_tunnel(id);
+            ++closed;
+        }
+    }
+
+    if (closed > 0) {
+        util::Logger::info("TunnelManager: reaper closed {} idle tunnels (timeout={}s)", closed,
+                           idle_timeout_ns / 1'000'000'000);
+    }
+    return closed;
 }
 
 // ===========================================================================
