@@ -95,35 +95,17 @@ struct MetricsConfig {
 };
 
 /// Runtime inspection (local IPC) configuration.
-///
-/// Default-on: the daemon listens on a local-only Unix socket (POSIX) or
-/// named pipe (Windows) bounded to the current user. This is the channel
-/// for `toxtunnel inspect`. It is read-only and never crosses the network.
 struct InspectConfig {
     bool enabled = true;
 
     bool operator==(const InspectConfig& other) const = default;
 };
 
-/// Per-tunnel data-path tunables. Currently exposes only the write-side
-/// coalescing knobs; future fields (idle reaper, etc.) live here too.
-///
-/// Coalescing buffers small writes from the IO pool into full-MTU
-/// TUNNEL_DATA frames before they cross the Tox-thread boundary, cutting
-/// per-byte hops on chatty workloads (SSH keystrokes, Redis pings).
-/// Default `coalesce_max_delay_us = 200` keeps added latency well below
-/// human-perceptible thresholds; setting it to 0 disables coalescing.
+/// Per-tunnel data-path tunables (write coalescing + idle reaper).
 struct TunnelConfig {
-    uint32_t coalesce_max_delay_us = 200;  ///< 0 disables coalescing
-    uint32_t coalesce_max_bytes = 1362;    ///< Max TUNNEL_DATA payload per frame
-
-    /// Idle-tunnel reaper. Closes tunnels with no TUNNEL_DATA traffic for at
-    /// least this many seconds, reclaiming the per-friend tunnel slot from
-    /// stuck or dead connections. 0 disables the reaper (default).
+    uint32_t coalesce_max_delay_us = 200;
+    uint32_t coalesce_max_bytes = 1362;
     uint32_t idle_timeout_seconds = 0;
-
-    /// How often the reaper scans the tunnel set. Must be > 0 when the reaper
-    /// is enabled; ignored when idle_timeout_seconds == 0.
     uint32_t reaper_tick_seconds = 10;
 
     [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }

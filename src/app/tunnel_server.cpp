@@ -9,6 +9,7 @@
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/util/config_reload.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/metrics.hpp"
 #include "toxtunnel/util/system_info.hpp"
 
 namespace toxtunnel::app {
@@ -129,6 +130,18 @@ void TunnelServer::start() {
     // Start IoContext thread pool.
     io_context_->run();
 
+    // Start the Prometheus /metrics HTTP server if the operator opted in.
+    if (config_.metrics.enabled) {
+        util::MetricsRegistry::instance().set_build_info(TOXTUNNEL_VERSION, "");
+        metrics_server_ = std::make_unique<util::MetricsServer>(io_context_->get_io_context(),
+                                                                util::MetricsRegistry::instance());
+        auto err = metrics_server_->start(config_.metrics.listen, config_.metrics.path);
+        if (!err.empty()) {
+            util::Logger::warn("Metrics endpoint disabled: {}", err);
+            metrics_server_.reset();
+        }
+    }
+
     // Start ToxAdapter iteration thread.
     tox_adapter_->start();
 
@@ -212,6 +225,13 @@ void TunnelServer::stop() {
         managers_.clear();
     }
 
+    // Stop the metrics HTTP server first so it doesn't keep posting to the
+    // io_context after we've torn down the acceptor.
+    if (metrics_server_) {
+        metrics_server_->stop();
+        metrics_server_.reset();
+    }
+
     // Stop ToxAdapter.
     tox_adapter_->stop();
 
@@ -292,6 +312,10 @@ void TunnelServer::on_friend_connection(uint32_t friend_number, bool connected) 
         util::Logger::info("Friend {} (pk={}) disconnected", friend_number, pk_hex);
         teardown_tunnel_manager(friend_number);
     }
+    // Recompute from the canonical source (managers_ map) so churn during
+    // a Tox reconnect can't drift the gauge.
+    std::lock_guard lock(managers_mutex_);
+    util::MetricsRegistry::instance().set_friends_online(managers_.size());
 }
 
 void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* data,
@@ -446,6 +470,8 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     if (access_result == AccessResult::Denied) {
         util::Logger::warn("Access denied for friend {} to {}:{}", pk_hex, target_host,
                            target_port);
+        util::MetricsRegistry::instance().inc_tunnels_opened(
+            util::MetricsRegistry::OpenResult::Denied);
 
         // Send error frame back.
         std::lock_guard lock(managers_mutex_);
@@ -515,6 +541,8 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
             if (ec) {
                 util::Logger::error("Failed to resolve {}:{} for tunnel {}: {}", target_host,
                                     target_port, tunnel_id, ec.message());
+                util::MetricsRegistry::instance().inc_tunnels_opened(
+                    util::MetricsRegistry::OpenResult::Failed);
 
                 // Send error and close the tunnel.
                 std::lock_guard lock(managers_mutex_);
@@ -536,6 +564,8 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                 if (connect_ec) {
                     util::Logger::error("Failed to connect to {}:{} for tunnel {}: {}", target_host,
                                         target_port, tunnel_id, connect_ec.message());
+                    util::MetricsRegistry::instance().inc_tunnels_opened(
+                        util::MetricsRegistry::OpenResult::Failed);
 
                     std::lock_guard lock(managers_mutex_);
                     auto it = managers_.find(friend_number);
@@ -632,6 +662,20 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
 
     // Transition the tunnel to Connected state and send ACK to the remote peer.
     tunnel_impl->set_state(tunnel::Tunnel::State::Connected);
+    util::MetricsRegistry::instance().inc_tunnels_opened(util::MetricsRegistry::OpenResult::Ok);
+    util::MetricsRegistry::instance().inc_tunnels_active(util::MetricsRegistry::Role::Server);
+    // Decrement the active gauge once the tunnel reaches a terminal state.
+    // Latch via shared_ptr<atomic_flag> so multiple state callbacks (Closed
+    // and then Error, or vice versa) never double-decrement.
+    auto active_dec_latch = std::make_shared<std::atomic_flag>();
+    tunnel_impl->set_on_state_change([active_dec_latch](tunnel::Tunnel::State new_state) {
+        if ((new_state == tunnel::Tunnel::State::Closed ||
+             new_state == tunnel::Tunnel::State::Error) &&
+            !active_dec_latch->test_and_set()) {
+            util::MetricsRegistry::instance().dec_tunnels_active(
+                util::MetricsRegistry::Role::Server);
+        }
+    });
 
     // Send TUNNEL_ACK to confirm the tunnel is open.
     auto ack_frame = tunnel::ProtocolFrame::make_tunnel_ack(tunnel_id, 0);

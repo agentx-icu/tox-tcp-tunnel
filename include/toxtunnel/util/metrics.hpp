@@ -2,177 +2,203 @@
 
 #include <asio.hpp>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
+#include <unordered_map>
 
 namespace toxtunnel::util {
 
 // ---------------------------------------------------------------------------
-// Metric kinds
+// MetricsRegistry
 // ---------------------------------------------------------------------------
 
-/// Prometheus text-format metric kinds we support.
-enum class MetricType : uint8_t {
-    Counter,  ///< monotonically increasing sample
-    Gauge,    ///< instantaneous sample, may go up or down
-    Summary,  ///< running count + sum + max (no quantiles)
-};
-
-/// One {label, value} pair attached to a metric series.
-struct Label {
-    std::string name;
-    std::string value;
-
-    bool operator<(const Label& other) const {
-        if (name != other.name) {
-            return name < other.name;
-        }
-        return value < other.value;
-    }
-};
-
-using Labels = std::vector<Label>;
-
-// ---------------------------------------------------------------------------
-// Series storage
-// ---------------------------------------------------------------------------
-
-/// Numeric storage for counter / gauge series.
+/// Thread-safe Prometheus-compatible metrics registry.
 ///
-/// Backed by std::atomic<uint64_t> holding bit-cast double — counters bump from
-/// many I/O threads, so the read path must be lock-free.
-class Sample {
-   public:
-    Sample() noexcept = default;
-    Sample(const Sample&) = delete;
-    Sample& operator=(const Sample&) = delete;
-
-    void inc(double v = 1.0) noexcept;
-    void set(double v) noexcept;
-    [[nodiscard]] double value() const noexcept;
-
-   private:
-    std::atomic<uint64_t> bits_{0};
-};
-
-/// Backing storage for summary (count + sum + max).
-class SummarySample {
-   public:
-    void observe(double v) noexcept;
-    [[nodiscard]] uint64_t count() const noexcept;
-    [[nodiscard]] double sum() const noexcept;
-    [[nodiscard]] double max() const noexcept;
-
-   private:
-    std::atomic<uint64_t> count_{0};
-    std::atomic<uint64_t> sum_bits_{0};
-    std::atomic<uint64_t> max_bits_{0};
-};
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
-
-/// A thread-safe registry of named metrics with optional labels.
+/// Holds the counters, gauges, and a single summary (tox iterate lag) that
+/// the /metrics HTTP endpoint exposes. The hot inc/dec paths are lock-free
+/// atomics; the labelled counter/gauge maps (e.g. tunnels_active{role=...})
+/// are protected by a mutex but only touched on tunnel open/close — never
+/// on the per-frame fast path.
 ///
-/// Designed for the single-process toxtunnel daemon: metric families are
-/// registered once at startup (via the helper accessors below) and from then
-/// on series are cheaply incremented from any thread.
-///
-/// Render output follows the Prometheus exposition format 0.0.4: one HELP and
-/// one TYPE line per family, then one sample line per series.
+/// Use `MetricsRegistry::instance()` for the global registry the
+/// application wires its counters into. Each public method is safe to call
+/// concurrently from any thread.
 class MetricsRegistry {
    public:
-    MetricsRegistry();
-    ~MetricsRegistry() = default;
+    /// Return the process-wide singleton registry.
+    static MetricsRegistry& instance();
 
-    MetricsRegistry(const MetricsRegistry&) = delete;
-    MetricsRegistry& operator=(const MetricsRegistry&) = delete;
+    /// Reset all counters/gauges/observations. For tests only.
+    void reset();
 
-    /// Register a metric family. Idempotent — repeat calls with the same name
-    /// are no-ops as long as type/help match. Returns false on type/help mismatch.
-    bool register_family(std::string name, MetricType type, std::string help);
+    // -----------------------------------------------------------------
+    // Build info
+    // -----------------------------------------------------------------
 
-    /// Increment a counter series. Creates the series the first time it is
-    /// seen. Returns false if the family doesn't exist or isn't a counter.
-    bool counter_inc(std::string_view name, const Labels& labels, double v = 1.0);
+    /// Record the build version + git sha exposed as a `toxtunnel_build_info`
+    /// gauge fixed at 1. Calling this multiple times overwrites the labels.
+    void set_build_info(std::string_view version, std::string_view git_sha);
 
-    /// Set a gauge series.
-    bool gauge_set(std::string_view name, const Labels& labels, double v);
+    // -----------------------------------------------------------------
+    // Tunnel lifecycle counters / gauges
+    // -----------------------------------------------------------------
 
-    /// Increment a gauge by a delta.
-    bool gauge_inc(std::string_view name, const Labels& labels, double v = 1.0);
+    enum class Role : uint8_t { Server, Client };
+    enum class OpenResult : uint8_t { Ok, Denied, Failed };
+    enum class CloseReason : uint8_t { Local, Remote, Timeout, Error };
 
-    /// Observe one sample on a summary series.
-    bool summary_observe(std::string_view name, const Labels& labels, double v);
+    /// Increment `toxtunnel_tunnels_active{role=...}`.
+    void inc_tunnels_active(Role role);
+    /// Decrement `toxtunnel_tunnels_active{role=...}`. Saturates at zero
+    /// so a paired-up close after a force-stop cannot underflow.
+    void dec_tunnels_active(Role role);
+    /// Increment `toxtunnel_tunnels_opened_total{result=...}`.
+    void inc_tunnels_opened(OpenResult result);
+    /// Increment `toxtunnel_tunnels_closed_total{reason=...}`.
+    void inc_tunnels_closed(CloseReason reason);
 
-    /// Read counter value (mostly for tests).
-    [[nodiscard]] double counter_value(std::string_view name, const Labels& labels) const;
+    // -----------------------------------------------------------------
+    // Bytes counters
+    // -----------------------------------------------------------------
 
-    /// Read gauge value (mostly for tests).
-    [[nodiscard]] double gauge_value(std::string_view name, const Labels& labels) const;
+    /// Add to `toxtunnel_bytes_in_total` (bytes received from Tox peer).
+    void add_bytes_in(std::size_t n);
+    /// Add to `toxtunnel_bytes_out_total` (bytes sent to Tox peer).
+    void add_bytes_out(std::size_t n);
 
-    /// Render the registry to Prometheus text exposition format 0.0.4.
+    // -----------------------------------------------------------------
+    // Friends gauge
+    // -----------------------------------------------------------------
+
+    /// Set the absolute count of online friends. Callers compute the delta
+    /// from their own state; the registry only stores the latest value.
+    void set_friends_online(std::size_t n);
+
+    // -----------------------------------------------------------------
+    // Tox iterate lag summary
+    // -----------------------------------------------------------------
+
+    /// Record a single tox_iterate elapsed-time observation (ms).
+    void observe_iterate_lag_ms(double ms);
+
+    // -----------------------------------------------------------------
+    // Rendering
+    // -----------------------------------------------------------------
+
+    /// Render every metric in Prometheus text format 0.0.4.
+    /// Output ends with a trailing newline as required by the spec.
     [[nodiscard]] std::string render() const;
 
+    // -----------------------------------------------------------------
+    // Read accessors (for tests / introspection)
+    // -----------------------------------------------------------------
+
+    [[nodiscard]] std::uint64_t tunnels_active(Role role) const;
+    [[nodiscard]] std::uint64_t tunnels_opened(OpenResult result) const;
+    [[nodiscard]] std::uint64_t tunnels_closed(CloseReason reason) const;
+    [[nodiscard]] std::uint64_t bytes_in() const;
+    [[nodiscard]] std::uint64_t bytes_out() const;
+    [[nodiscard]] std::uint64_t friends_online() const;
+
    private:
-    struct Family {
-        std::string name;
-        MetricType type;
-        std::string help;
-        std::map<Labels, std::unique_ptr<Sample>> samples;
-        std::map<Labels, std::unique_ptr<SummarySample>> summaries;
-    };
+    MetricsRegistry() = default;
 
-    Family* find_family(std::string_view name);
-    [[nodiscard]] const Family* find_family(std::string_view name) const;
+    // Labelled counters/gauges. Indices map to enum values so we avoid
+    // any hashing in the hot path.
+    std::atomic<std::int64_t> tunnels_active_[2]{};
+    std::atomic<std::uint64_t> tunnels_opened_[3]{};
+    std::atomic<std::uint64_t> tunnels_closed_[4]{};
 
-    mutable std::shared_mutex mutex_;
-    std::map<std::string, Family, std::less<>> families_;
+    std::atomic<std::uint64_t> bytes_in_{0};
+    std::atomic<std::uint64_t> bytes_out_{0};
+    std::atomic<std::uint64_t> friends_online_{0};
+
+    // Iterate-lag summary: sum + count + max give Prometheus enough to
+    // chart average + tail; full quantile estimation isn't worth the
+    // memory + CAS cost on the Tox-thread hot path.
+    std::atomic<std::uint64_t> iterate_lag_count_{0};
+    std::atomic<double> iterate_lag_sum_ms_{0.0};
+    std::atomic<double> iterate_lag_max_ms_{0.0};
+
+    mutable std::mutex labels_mutex_;
+    std::string build_version_;
+    std::string build_git_sha_;
 };
 
 // ---------------------------------------------------------------------------
-// HTTP server
+// MetricsServer
 // ---------------------------------------------------------------------------
 
-/// Tiny asio-based HTTP server that exposes a single GET endpoint and serves
-/// the rendered text from a MetricsRegistry. Any other method / path returns
-/// 404. Designed for trusted operator networks, not for the public internet.
+/// Minimal HTTP server that serves a single Prometheus /metrics endpoint.
+///
+/// Built on top of an existing asio::io_context — we never spawn extra
+/// threads. The acceptor is single-shot (one connection at a time is fine
+/// for a scrape endpoint; Prometheus polls in series and the response is
+/// small enough that even busy clusters complete a request in well under
+/// the scrape interval).
+///
+/// Requests must be `GET <configured path>` or the server responds with
+/// `404 Not Found`. Anything other than HTTP/1.x GET on a recognised path
+/// becomes 404 too — we intentionally keep the parsing surface tiny.
 class MetricsServer {
    public:
-    MetricsServer(asio::io_context& io, MetricsRegistry& registry, std::string listen_addr,
-                  std::string path);
+    /// Construct against an io_context. The registry pointer must outlive
+    /// the server.
+    MetricsServer(asio::io_context& io_ctx, MetricsRegistry& registry);
+    ~MetricsServer();
 
-    /// Bind the listening socket and start accepting. Returns an error string
-    /// on bind / parse failure, empty string on success.
-    [[nodiscard]] std::string start();
+    MetricsServer(const MetricsServer&) = delete;
+    MetricsServer& operator=(const MetricsServer&) = delete;
+    MetricsServer(MetricsServer&&) = delete;
+    MetricsServer& operator=(MetricsServer&&) = delete;
 
-    /// Stop accepting and tear down the listener.
+    /// Bind + start accepting on `host:port`. `host` may be a numeric
+    /// address ("127.0.0.1") or "0.0.0.0". Returns an empty optional on
+    /// success, or an error message describing the failure (port in use,
+    /// bad host, ...). The server is started in the supplied io_context's
+    /// executor — the caller is responsible for running that context.
+    ///
+    /// `metrics_path` is the URL path (e.g. "/metrics") that returns the
+    /// rendered registry; anything else returns 404.
+    [[nodiscard]] std::string start(std::string_view listen_spec, std::string_view metrics_path);
+
+    /// Stop accepting and close the listening socket. Safe to call from
+    /// any thread; idempotent.
     void stop();
 
-    [[nodiscard]] uint16_t bound_port() const;
-
-    /// Parse "host:port" into (host, port). host may be a bare IP or a name.
-    /// Returns false if the spec is malformed.
-    static bool parse_listen(std::string_view spec, std::string& host_out, uint16_t& port_out);
+    /// Return the bound local port, or 0 if not started. Useful for tests
+    /// that bind to port 0 and then need to know which ephemeral port the
+    /// kernel assigned.
+    [[nodiscard]] std::uint16_t local_port() const noexcept;
 
    private:
     void do_accept();
-    void handle_connection(std::shared_ptr<asio::ip::tcp::socket> socket);
 
-    asio::io_context& io_;
+    asio::io_context& io_ctx_;
     MetricsRegistry& registry_;
-    std::string listen_addr_;
-    std::string path_;
     std::unique_ptr<asio::ip::tcp::acceptor> acceptor_;
-    uint16_t bound_port_{0};
+    std::string metrics_path_;
+    std::atomic<bool> running_{false};
+    std::atomic<std::uint16_t> bound_port_{0};
 };
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Parse "host:port" into its components. Returns false if the spec is
+/// malformed or the port is out of range. IPv6 bracketed form
+/// ("[::1]:9100") is supported.
+[[nodiscard]] bool parse_listen_spec(std::string_view spec, std::string& host_out,
+                                     std::uint16_t& port_out);
+
+/// Escape a Prometheus label value per spec 0.0.4: backslash, double quote,
+/// and newline are escaped; everything else is passed through.
+[[nodiscard]] std::string escape_label_value(std::string_view value);
 
 }  // namespace toxtunnel::util

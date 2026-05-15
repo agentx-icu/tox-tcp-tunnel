@@ -4,6 +4,8 @@
 #include <limits>
 #include <utility>
 
+#include "toxtunnel/util/metrics.hpp"
+
 namespace toxtunnel::tunnel {
 
 namespace {
@@ -168,6 +170,7 @@ void TunnelImpl::close() {
     // Send TUNNEL_CLOSE frame
     auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
     send_frame_to_tox(frame);
+    util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Local);
 
     // Transition to Disconnecting state
     transition_state(State::Disconnecting);
@@ -274,6 +277,7 @@ void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
     std::size_t data_size = data.size();
     total_bytes_received_.fetch_add(data_size, std::memory_order_relaxed);
     bytes_received_since_ack_.fetch_add(data_size, std::memory_order_relaxed);
+    util::MetricsRegistry::instance().add_bytes_in(data_size);
 
     // Forward data to TCP connection
     SendToTcpCallback cb;
@@ -292,6 +296,8 @@ void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
 
 void TunnelImpl::handle_tunnel_close_frame(const ProtocolFrame& /*frame*/) {
     util::Logger::info("Tunnel {} received TUNNEL_CLOSE", tunnel_id_);
+    util::MetricsRegistry::instance().inc_tunnels_closed(
+        util::MetricsRegistry::CloseReason::Remote);
 
     // Close TCP connection
     {
@@ -353,6 +359,7 @@ void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
 
     util::Logger::error("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
                         payload->error_code, payload->description);
+    util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Error);
 
     transition_state(State::Error);
 
@@ -416,6 +423,7 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
 
     // Update statistics
     total_bytes_sent_.fetch_add(data_size, std::memory_order_relaxed);
+    util::MetricsRegistry::instance().add_bytes_out(data_size);
 
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
 

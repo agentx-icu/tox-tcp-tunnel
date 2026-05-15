@@ -17,6 +17,7 @@
 #include "toxtunnel/tox/tox_adapter.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
 #include "toxtunnel/util/config.hpp"
+#include "toxtunnel/util/metrics.hpp"
 
 namespace toxtunnel::app {
 
@@ -176,10 +177,11 @@ class TunnelServer {
     /// Whether the server is running.
     std::atomic<bool> running_{false};
 
-    /// Local IPC server backing `toxtunnel inspect`. Owned here so its
-    /// lifetime is tied to the io_context — the inspect server posts onto
-    /// the IO pool, so it must shut down before io_context_ does.
+    /// Local IPC server backing `toxtunnel inspect`.
     std::unique_ptr<InspectServer> inspect_server_;
+
+    /// Optional Prometheus /metrics HTTP server (only when config.metrics.enabled).
+    std::unique_ptr<util::MetricsServer> metrics_server_;
 };
 
 }  // namespace toxtunnel::app

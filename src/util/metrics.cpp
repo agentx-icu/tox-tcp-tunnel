@@ -1,14 +1,13 @@
 #include "toxtunnel/util/metrics.hpp"
 
 #include <algorithm>
-#include <bit>
-#include <cctype>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <sstream>
-#include <system_error>
 #include <utility>
 
 #include "toxtunnel/util/logger.hpp"
@@ -17,51 +16,288 @@ namespace toxtunnel::util {
 
 namespace {
 
-// std::atomic<double> isn't always lock-free across platforms, so we route
-// every double through its bit-pattern in a uint64. memory_order_relaxed is
-// fine here: metrics readers tolerate slightly-stale samples in exchange for
-// avoiding contention with hot-path writers.
-inline double bits_to_double(uint64_t bits) noexcept {
-    return std::bit_cast<double>(bits);
+// Per-spec maximum HTTP request line we'll consider. Keep this tight so
+// a malicious client can't make us allocate. Real Prometheus scrapers
+// send a few hundred bytes; 8 KiB is generous and bounded.
+constexpr std::size_t kMaxRequestBytes = 8 * 1024;
+
+const char* role_label(MetricsRegistry::Role role) {
+    return role == MetricsRegistry::Role::Server ? "server" : "client";
 }
 
-inline uint64_t double_to_bits(double v) noexcept {
-    return std::bit_cast<uint64_t>(v);
+const char* open_result_label(MetricsRegistry::OpenResult r) {
+    switch (r) {
+        case MetricsRegistry::OpenResult::Ok:
+            return "ok";
+        case MetricsRegistry::OpenResult::Denied:
+            return "denied";
+        case MetricsRegistry::OpenResult::Failed:
+            return "failed";
+    }
+    return "unknown";
 }
 
+const char* close_reason_label(MetricsRegistry::CloseReason r) {
+    switch (r) {
+        case MetricsRegistry::CloseReason::Local:
+            return "local";
+        case MetricsRegistry::CloseReason::Remote:
+            return "remote";
+        case MetricsRegistry::CloseReason::Timeout:
+            return "timeout";
+        case MetricsRegistry::CloseReason::Error:
+            return "error";
+    }
+    return "unknown";
+}
+
+void atomic_add_double(std::atomic<double>& target, double delta) {
+    double current = target.load(std::memory_order_relaxed);
+    while (!target.compare_exchange_weak(current, current + delta, std::memory_order_relaxed)) {
+        // current is updated by compare_exchange_weak on failure; loop.
+    }
+}
+
+void atomic_max_double(std::atomic<double>& target, double value) {
+    double current = target.load(std::memory_order_relaxed);
+    while (value > current &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+        // current is updated by compare_exchange_weak on failure; loop.
+    }
+}
+
+// Render a Prometheus-formatted floating point number. We use std::to_string
+// for simplicity (sub-millisecond precision is plenty for ms summaries and
+// integer-valued gauges/counters render correctly).
 std::string format_double(double v) {
-    if (std::isnan(v)) {
-        return "NaN";
+    if (std::isnan(v) || std::isinf(v)) {
+        return "0";
     }
-    if (std::isinf(v)) {
-        return v < 0 ? "-Inf" : "+Inf";
-    }
-    // Drop trailing .0 for integer-valued counters so the wire stays small.
-    if (v == static_cast<double>(static_cast<int64_t>(v)) && std::abs(v) < 1e15) {
-        return std::to_string(static_cast<int64_t>(v));
-    }
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%.6g", v);
-    return std::string(buf);
+    char buf[64];
+    // %g picks the shortest representation; 17 digits is enough to
+    // round-trip a double if anyone cares.
+    std::snprintf(buf, sizeof(buf), "%.17g", v);
+    return buf;
 }
 
-const char* type_to_prom(MetricType t) {
-    switch (t) {
-        case MetricType::Counter:
-            return "counter";
-        case MetricType::Gauge:
-            return "gauge";
-        case MetricType::Summary:
-            return "summary";
-    }
-    return "untyped";
+}  // namespace
+
+// ===========================================================================
+// MetricsRegistry
+// ===========================================================================
+
+MetricsRegistry& MetricsRegistry::instance() {
+    static MetricsRegistry global;
+    return global;
 }
 
-// Prometheus 0.0.4 label-value escaping: backslash, double-quote, newline.
-std::string escape_label_value(std::string_view v) {
+void MetricsRegistry::reset() {
+    for (auto& v : tunnels_active_) v.store(0, std::memory_order_relaxed);
+    for (auto& v : tunnels_opened_) v.store(0, std::memory_order_relaxed);
+    for (auto& v : tunnels_closed_) v.store(0, std::memory_order_relaxed);
+    bytes_in_.store(0, std::memory_order_relaxed);
+    bytes_out_.store(0, std::memory_order_relaxed);
+    friends_online_.store(0, std::memory_order_relaxed);
+    iterate_lag_count_.store(0, std::memory_order_relaxed);
+    iterate_lag_sum_ms_.store(0.0, std::memory_order_relaxed);
+    iterate_lag_max_ms_.store(0.0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(labels_mutex_);
+    build_version_.clear();
+    build_git_sha_.clear();
+}
+
+void MetricsRegistry::set_build_info(std::string_view version, std::string_view git_sha) {
+    std::lock_guard<std::mutex> lock(labels_mutex_);
+    build_version_ = std::string(version);
+    build_git_sha_ = std::string(git_sha);
+}
+
+void MetricsRegistry::inc_tunnels_active(Role role) {
+    tunnels_active_[static_cast<std::size_t>(role)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::dec_tunnels_active(Role role) {
+    auto& slot = tunnels_active_[static_cast<std::size_t>(role)];
+    // Saturate at zero so paired open/close that races a teardown can't
+    // produce a negative gauge in the rendered output.
+    std::int64_t current = slot.load(std::memory_order_relaxed);
+    while (current > 0 &&
+           !slot.compare_exchange_weak(current, current - 1, std::memory_order_relaxed)) {
+        // retry
+    }
+}
+
+void MetricsRegistry::inc_tunnels_opened(OpenResult result) {
+    tunnels_opened_[static_cast<std::size_t>(result)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_tunnels_closed(CloseReason reason) {
+    tunnels_closed_[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::add_bytes_in(std::size_t n) {
+    bytes_in_.fetch_add(n, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::add_bytes_out(std::size_t n) {
+    bytes_out_.fetch_add(n, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::set_friends_online(std::size_t n) {
+    friends_online_.store(n, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::observe_iterate_lag_ms(double ms) {
+    if (ms < 0.0 || std::isnan(ms)) {
+        return;
+    }
+    iterate_lag_count_.fetch_add(1, std::memory_order_relaxed);
+    atomic_add_double(iterate_lag_sum_ms_, ms);
+    atomic_max_double(iterate_lag_max_ms_, ms);
+}
+
+std::uint64_t MetricsRegistry::tunnels_active(Role role) const {
+    auto v = tunnels_active_[static_cast<std::size_t>(role)].load(std::memory_order_relaxed);
+    return v < 0 ? 0 : static_cast<std::uint64_t>(v);
+}
+std::uint64_t MetricsRegistry::tunnels_opened(OpenResult result) const {
+    return tunnels_opened_[static_cast<std::size_t>(result)].load(std::memory_order_relaxed);
+}
+std::uint64_t MetricsRegistry::tunnels_closed(CloseReason reason) const {
+    return tunnels_closed_[static_cast<std::size_t>(reason)].load(std::memory_order_relaxed);
+}
+std::uint64_t MetricsRegistry::bytes_in() const {
+    return bytes_in_.load(std::memory_order_relaxed);
+}
+std::uint64_t MetricsRegistry::bytes_out() const {
+    return bytes_out_.load(std::memory_order_relaxed);
+}
+std::uint64_t MetricsRegistry::friends_online() const {
+    return friends_online_.load(std::memory_order_relaxed);
+}
+
+std::string MetricsRegistry::render() const {
+    std::ostringstream out;
+
+    // Build info: gauge fixed at 1, labels carry the data. Snapshot the
+    // label strings under the lock so concurrent set_build_info doesn't
+    // tear them mid-render.
+    std::string version;
+    std::string git_sha;
+    {
+        std::lock_guard<std::mutex> lock(labels_mutex_);
+        version = build_version_;
+        git_sha = build_git_sha_;
+    }
+    out << "# HELP toxtunnel_build_info Build information for the running toxtunnel binary.\n"
+           "# TYPE toxtunnel_build_info gauge\n"
+           "toxtunnel_build_info{version=\""
+        << escape_label_value(version) << "\",git_sha=\"" << escape_label_value(git_sha)
+        << "\"} 1\n";
+
+    // tunnels_active gauge
+    out << "# HELP toxtunnel_tunnels_active Currently open tunnels.\n"
+           "# TYPE toxtunnel_tunnels_active gauge\n";
+    for (auto role : {Role::Server, Role::Client}) {
+        out << "toxtunnel_tunnels_active{role=\"" << role_label(role) << "\"} "
+            << tunnels_active(role) << "\n";
+    }
+
+    // tunnels_opened_total counter
+    out << "# HELP toxtunnel_tunnels_opened_total Tunnel open attempts by outcome.\n"
+           "# TYPE toxtunnel_tunnels_opened_total counter\n";
+    for (auto r : {OpenResult::Ok, OpenResult::Denied, OpenResult::Failed}) {
+        out << "toxtunnel_tunnels_opened_total{result=\"" << open_result_label(r) << "\"} "
+            << tunnels_opened(r) << "\n";
+    }
+
+    // tunnels_closed_total counter
+    out << "# HELP toxtunnel_tunnels_closed_total Tunnel closes by reason.\n"
+           "# TYPE toxtunnel_tunnels_closed_total counter\n";
+    for (auto r :
+         {CloseReason::Local, CloseReason::Remote, CloseReason::Timeout, CloseReason::Error}) {
+        out << "toxtunnel_tunnels_closed_total{reason=\"" << close_reason_label(r) << "\"} "
+            << tunnels_closed(r) << "\n";
+    }
+
+    // bytes counters
+    out << "# HELP toxtunnel_bytes_in_total Bytes received from Tox peers.\n"
+           "# TYPE toxtunnel_bytes_in_total counter\n"
+           "toxtunnel_bytes_in_total "
+        << bytes_in() << "\n";
+    out << "# HELP toxtunnel_bytes_out_total Bytes sent to Tox peers.\n"
+           "# TYPE toxtunnel_bytes_out_total counter\n"
+           "toxtunnel_bytes_out_total "
+        << bytes_out() << "\n";
+
+    // friends_online gauge
+    out << "# HELP toxtunnel_friends_online Number of currently-online Tox friends.\n"
+           "# TYPE toxtunnel_friends_online gauge\n"
+           "toxtunnel_friends_online "
+        << friends_online() << "\n";
+
+    // iterate-lag summary (count + sum + a `_max` companion gauge for
+    // the maximum observation since process start)
+    const auto count = iterate_lag_count_.load(std::memory_order_relaxed);
+    const auto sum = iterate_lag_sum_ms_.load(std::memory_order_relaxed);
+    const auto max = iterate_lag_max_ms_.load(std::memory_order_relaxed);
+    out << "# HELP toxtunnel_tox_iterate_lag_milliseconds tox_iterate() elapsed time per tick.\n"
+           "# TYPE toxtunnel_tox_iterate_lag_milliseconds summary\n"
+           "toxtunnel_tox_iterate_lag_milliseconds_count "
+        << count << "\n"
+        << "toxtunnel_tox_iterate_lag_milliseconds_sum " << format_double(sum) << "\n";
+    out << "# HELP toxtunnel_tox_iterate_lag_milliseconds_max Maximum observed iterate lag.\n"
+           "# TYPE toxtunnel_tox_iterate_lag_milliseconds_max gauge\n"
+           "toxtunnel_tox_iterate_lag_milliseconds_max "
+        << format_double(max) << "\n";
+
+    return out.str();
+}
+
+// ===========================================================================
+// Helpers
+// ===========================================================================
+
+bool parse_listen_spec(std::string_view spec, std::string& host_out, std::uint16_t& port_out) {
+    if (spec.empty()) {
+        return false;
+    }
+    // IPv6 bracketed form: [::1]:9100
+    if (spec.front() == '[') {
+        auto close = spec.find(']');
+        if (close == std::string_view::npos || close + 1 >= spec.size() || spec[close + 1] != ':') {
+            return false;
+        }
+        host_out.assign(spec.substr(1, close - 1));
+        const auto port_sv = spec.substr(close + 2);
+        unsigned int port = 0;
+        auto [ptr, ec] = std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), port);
+        if (ec != std::errc{} || ptr != port_sv.data() + port_sv.size() || port > 65535) {
+            return false;
+        }
+        port_out = static_cast<std::uint16_t>(port);
+        return true;
+    }
+
+    auto colon = spec.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 >= spec.size()) {
+        return false;
+    }
+    host_out.assign(spec.substr(0, colon));
+    const auto port_sv = spec.substr(colon + 1);
+    unsigned int port = 0;
+    auto [ptr, ec] = std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), port);
+    if (ec != std::errc{} || ptr != port_sv.data() + port_sv.size() || port > 65535) {
+        return false;
+    }
+    port_out = static_cast<std::uint16_t>(port);
+    return true;
+}
+
+std::string escape_label_value(std::string_view value) {
     std::string out;
-    out.reserve(v.size());
-    for (char c : v) {
+    out.reserve(value.size());
+    for (char c : value) {
         switch (c) {
             case '\\':
                 out += "\\\\";
@@ -80,449 +316,176 @@ std::string escape_label_value(std::string_view v) {
     return out;
 }
 
-// HELP escaping is narrower than label-value: only backslash and newline.
-std::string escape_help(std::string_view v) {
-    std::string out;
-    out.reserve(v.size());
-    for (char c : v) {
-        switch (c) {
-            case '\\':
-                out += "\\\\";
-                break;
-            case '\n':
-                out += "\\n";
-                break;
-            default:
-                out += c;
-                break;
-        }
-    }
-    return out;
-}
-
-void append_labels(std::string& out, const Labels& labels, const Label* extra = nullptr) {
-    if (labels.empty() && !extra) {
-        return;
-    }
-    out += '{';
-    bool first = true;
-    for (const auto& l : labels) {
-        if (!first) {
-            out += ',';
-        }
-        first = false;
-        out += l.name;
-        out += "=\"";
-        out += escape_label_value(l.value);
-        out += '"';
-    }
-    if (extra) {
-        if (!first) {
-            out += ',';
-        }
-        out += extra->name;
-        out += "=\"";
-        out += escape_label_value(extra->value);
-        out += '"';
-    }
-    out += '}';
-}
-
-}  // namespace
-
-// ===========================================================================
-// Sample
-// ===========================================================================
-
-void Sample::inc(double v) noexcept {
-    uint64_t old = bits_.load(std::memory_order_relaxed);
-    while (true) {
-        double new_val = bits_to_double(old) + v;
-        uint64_t desired = double_to_bits(new_val);
-        if (bits_.compare_exchange_weak(old, desired, std::memory_order_relaxed)) {
-            return;
-        }
-    }
-}
-
-void Sample::set(double v) noexcept {
-    bits_.store(double_to_bits(v), std::memory_order_relaxed);
-}
-
-double Sample::value() const noexcept {
-    return bits_to_double(bits_.load(std::memory_order_relaxed));
-}
-
-// ===========================================================================
-// SummarySample
-// ===========================================================================
-
-void SummarySample::observe(double v) noexcept {
-    count_.fetch_add(1, std::memory_order_relaxed);
-
-    uint64_t old_sum = sum_bits_.load(std::memory_order_relaxed);
-    while (true) {
-        double new_sum = bits_to_double(old_sum) + v;
-        if (sum_bits_.compare_exchange_weak(old_sum, double_to_bits(new_sum),
-                                            std::memory_order_relaxed)) {
-            break;
-        }
-    }
-
-    uint64_t old_max = max_bits_.load(std::memory_order_relaxed);
-    while (true) {
-        double current_max =
-            (count_.load(std::memory_order_relaxed) == 1 || old_max == 0)
-                ? -std::numeric_limits<double>::infinity()
-                : bits_to_double(old_max);
-        if (v <= current_max) {
-            break;
-        }
-        if (max_bits_.compare_exchange_weak(old_max, double_to_bits(v),
-                                            std::memory_order_relaxed)) {
-            break;
-        }
-    }
-}
-
-uint64_t SummarySample::count() const noexcept {
-    return count_.load(std::memory_order_relaxed);
-}
-
-double SummarySample::sum() const noexcept {
-    return bits_to_double(sum_bits_.load(std::memory_order_relaxed));
-}
-
-double SummarySample::max() const noexcept {
-    uint64_t b = max_bits_.load(std::memory_order_relaxed);
-    if (count_.load(std::memory_order_relaxed) == 0) {
-        return 0.0;
-    }
-    return bits_to_double(b);
-}
-
-// ===========================================================================
-// MetricsRegistry
-// ===========================================================================
-
-MetricsRegistry::MetricsRegistry() = default;
-
-bool MetricsRegistry::register_family(std::string name, MetricType type, std::string help) {
-    std::unique_lock lock(mutex_);
-    auto it = families_.find(name);
-    if (it != families_.end()) {
-        return it->second.type == type && it->second.help == help;
-    }
-    Family f;
-    f.name = name;
-    f.type = type;
-    f.help = std::move(help);
-    families_.emplace(std::move(name), std::move(f));
-    return true;
-}
-
-MetricsRegistry::Family* MetricsRegistry::find_family(std::string_view name) {
-    auto it = families_.find(name);
-    return (it == families_.end()) ? nullptr : &it->second;
-}
-
-const MetricsRegistry::Family* MetricsRegistry::find_family(std::string_view name) const {
-    auto it = families_.find(name);
-    return (it == families_.end()) ? nullptr : &it->second;
-}
-
-bool MetricsRegistry::counter_inc(std::string_view name, const Labels& labels, double v) {
-    std::unique_lock lock(mutex_);
-    auto* f = find_family(name);
-    if (!f || f->type != MetricType::Counter) {
-        return false;
-    }
-    auto it = f->samples.find(labels);
-    if (it == f->samples.end()) {
-        it = f->samples.emplace(labels, std::make_unique<Sample>()).first;
-    }
-    it->second->inc(v);
-    return true;
-}
-
-bool MetricsRegistry::gauge_set(std::string_view name, const Labels& labels, double v) {
-    std::unique_lock lock(mutex_);
-    auto* f = find_family(name);
-    if (!f || f->type != MetricType::Gauge) {
-        return false;
-    }
-    auto it = f->samples.find(labels);
-    if (it == f->samples.end()) {
-        it = f->samples.emplace(labels, std::make_unique<Sample>()).first;
-    }
-    it->second->set(v);
-    return true;
-}
-
-bool MetricsRegistry::gauge_inc(std::string_view name, const Labels& labels, double v) {
-    std::unique_lock lock(mutex_);
-    auto* f = find_family(name);
-    if (!f || f->type != MetricType::Gauge) {
-        return false;
-    }
-    auto it = f->samples.find(labels);
-    if (it == f->samples.end()) {
-        it = f->samples.emplace(labels, std::make_unique<Sample>()).first;
-    }
-    it->second->inc(v);
-    return true;
-}
-
-bool MetricsRegistry::summary_observe(std::string_view name, const Labels& labels, double v) {
-    std::unique_lock lock(mutex_);
-    auto* f = find_family(name);
-    if (!f || f->type != MetricType::Summary) {
-        return false;
-    }
-    auto it = f->summaries.find(labels);
-    if (it == f->summaries.end()) {
-        it = f->summaries.emplace(labels, std::make_unique<SummarySample>()).first;
-    }
-    it->second->observe(v);
-    return true;
-}
-
-double MetricsRegistry::counter_value(std::string_view name, const Labels& labels) const {
-    std::shared_lock lock(mutex_);
-    const auto* f = find_family(name);
-    if (!f) {
-        return 0.0;
-    }
-    auto it = f->samples.find(labels);
-    return (it == f->samples.end()) ? 0.0 : it->second->value();
-}
-
-double MetricsRegistry::gauge_value(std::string_view name, const Labels& labels) const {
-    return counter_value(name, labels);
-}
-
-std::string MetricsRegistry::render() const {
-    std::shared_lock lock(mutex_);
-    std::string out;
-    out.reserve(2048);
-
-    for (const auto& [name, family] : families_) {
-        out += "# HELP ";
-        out += name;
-        out += ' ';
-        out += escape_help(family.help);
-        out += '\n';
-        out += "# TYPE ";
-        out += name;
-        out += ' ';
-        out += type_to_prom(family.type);
-        out += '\n';
-
-        if (family.type == MetricType::Summary) {
-            for (const auto& [labels, summary] : family.summaries) {
-                Label count_label{"", ""};  // not used; we emit explicit suffixes
-                (void)count_label;
-                // toxtunnel_xxx_count{labels...}
-                out += name;
-                out += "_count";
-                append_labels(out, labels);
-                out += ' ';
-                out += format_double(static_cast<double>(summary->count()));
-                out += '\n';
-
-                out += name;
-                out += "_sum";
-                append_labels(out, labels);
-                out += ' ';
-                out += format_double(summary->sum());
-                out += '\n';
-
-                out += name;
-                out += "_max";
-                append_labels(out, labels);
-                out += ' ';
-                out += format_double(summary->max());
-                out += '\n';
-            }
-        } else {
-            for (const auto& [labels, sample] : family.samples) {
-                out += name;
-                append_labels(out, labels);
-                out += ' ';
-                out += format_double(sample->value());
-                out += '\n';
-            }
-        }
-    }
-
-    return out;
-}
-
 // ===========================================================================
 // MetricsServer
 // ===========================================================================
 
-MetricsServer::MetricsServer(asio::io_context& io, MetricsRegistry& registry,
-                             std::string listen_addr, std::string path)
-    : io_(io),
-      registry_(registry),
-      listen_addr_(std::move(listen_addr)),
-      path_(std::move(path)) {}
+MetricsServer::MetricsServer(asio::io_context& io_ctx, MetricsRegistry& registry)
+    : io_ctx_(io_ctx), registry_(registry) {}
 
-bool MetricsServer::parse_listen(std::string_view spec, std::string& host_out,
-                                 uint16_t& port_out) {
-    // IPv6: [::1]:9100
-    if (!spec.empty() && spec.front() == '[') {
-        const auto rb = spec.find(']');
-        if (rb == std::string_view::npos || rb + 2 > spec.size() || spec[rb + 1] != ':') {
-            return false;
-        }
-        host_out = std::string(spec.substr(1, rb - 1));
-        const auto port_str = spec.substr(rb + 2);
-        uint16_t port = 0;
-        auto result = std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
-        if (result.ec != std::errc{} || port == 0) {
-            return false;
-        }
-        port_out = port;
-        return true;
-    }
-
-    const auto colon = spec.rfind(':');
-    if (colon == std::string_view::npos || colon == 0 || colon + 1 >= spec.size()) {
-        return false;
-    }
-    host_out = std::string(spec.substr(0, colon));
-    const auto port_str = spec.substr(colon + 1);
-    uint16_t port = 0;
-    auto result = std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
-    if (result.ec != std::errc{} || port == 0) {
-        return false;
-    }
-    port_out = port;
-    return true;
+MetricsServer::~MetricsServer() {
+    stop();
 }
 
-std::string MetricsServer::start() {
+std::string MetricsServer::start(std::string_view listen_spec, std::string_view metrics_path) {
+    if (running_.exchange(true)) {
+        return "MetricsServer already running";
+    }
+
     std::string host;
-    uint16_t port = 0;
-    if (!parse_listen(listen_addr_, host, port)) {
-        return "invalid metrics.listen syntax: " + listen_addr_;
+    std::uint16_t port = 0;
+    if (!parse_listen_spec(listen_spec, host, port)) {
+        running_ = false;
+        return "Invalid listen spec: " + std::string(listen_spec);
     }
 
     asio::error_code ec;
-    auto addr = asio::ip::make_address(host, ec);
+    asio::ip::address addr = asio::ip::make_address(host, ec);
     if (ec) {
-        return "invalid metrics.listen address '" + host + "': " + ec.message();
+        running_ = false;
+        return "Invalid listen address '" + host + "': " + ec.message();
     }
 
-    acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(io_);
-    asio::ip::tcp::endpoint endpoint(addr, port);
+    metrics_path_.assign(metrics_path);
 
+    asio::ip::tcp::endpoint endpoint(addr, port);
+    acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(io_ctx_);
     acceptor_->open(endpoint.protocol(), ec);
     if (ec) {
-        return "metrics acceptor open failed: " + ec.message();
+        acceptor_.reset();
+        running_ = false;
+        return "acceptor.open: " + ec.message();
     }
     acceptor_->set_option(asio::socket_base::reuse_address(true), ec);
+    // reuse_address failing is non-fatal — proceed without it.
     acceptor_->bind(endpoint, ec);
     if (ec) {
-        return "metrics bind failed for " + listen_addr_ + ": " + ec.message();
+        acceptor_.reset();
+        running_ = false;
+        return "acceptor.bind " + host + ":" + std::to_string(port) + ": " + ec.message();
     }
     acceptor_->listen(asio::socket_base::max_listen_connections, ec);
     if (ec) {
-        return "metrics listen failed: " + ec.message();
+        acceptor_.reset();
+        running_ = false;
+        return "acceptor.listen: " + ec.message();
     }
 
     bound_port_ = acceptor_->local_endpoint().port();
-    do_accept();
+    Logger::info("Metrics endpoint listening on {}:{} {}", host, bound_port_.load(), metrics_path_);
 
-    Logger::info("Metrics endpoint listening on {} (path={})", listen_addr_, path_);
+    do_accept();
     return {};
 }
 
 void MetricsServer::stop() {
-    if (!acceptor_) {
+    if (!running_.exchange(false)) {
         return;
     }
-    asio::error_code ec;
-    acceptor_->cancel(ec);
-    acceptor_->close(ec);
-    acceptor_.reset();
+    if (acceptor_) {
+        asio::error_code ec;
+        acceptor_->close(ec);
+        // ec ignored: closing an already-closed acceptor is fine.
+    }
+    bound_port_ = 0;
 }
 
-uint16_t MetricsServer::bound_port() const {
-    return bound_port_;
+std::uint16_t MetricsServer::local_port() const noexcept {
+    return bound_port_.load();
 }
 
 void MetricsServer::do_accept() {
-    auto sock = std::make_shared<asio::ip::tcp::socket>(io_);
-    acceptor_->async_accept(*sock, [this, sock](const asio::error_code& ec) {
+    if (!running_.load() || !acceptor_) {
+        return;
+    }
+    auto socket = std::make_shared<asio::ip::tcp::socket>(io_ctx_);
+    acceptor_->async_accept(*socket, [this, socket](const asio::error_code& ec) {
         if (ec) {
-            // Cancellation during stop() is expected.
-            if (ec != asio::error::operation_aborted) {
-                Logger::debug("Metrics accept error: {}", ec.message());
+            // Acceptor closed (stop()) or transient error; just bail if
+            // we're shutting down, otherwise schedule another accept.
+            if (running_.load()) {
+                Logger::warn("Metrics accept error: {}", ec.message());
+                do_accept();
             }
             return;
         }
-        handle_connection(sock);
+
+        // Read the request line. We don't care about headers — for a
+        // /metrics endpoint we only need the first line ("GET /path HTTP/1.x").
+        auto buffer = std::make_shared<asio::streambuf>(kMaxRequestBytes);
+        asio::async_read_until(
+            *socket, *buffer, "\r\n\r\n",
+            [this, socket, buffer](const asio::error_code& read_ec, std::size_t) {
+                // Even on EOF we may have a usable first line in the buffer.
+                std::string request_line;
+                if (buffer->size() > 0) {
+                    std::istream is(buffer.get());
+                    std::getline(is, request_line);
+                    // Strip a trailing CR if present.
+                    if (!request_line.empty() && request_line.back() == '\r') {
+                        request_line.pop_back();
+                    }
+                }
+
+                std::string response;
+                bool ok = false;
+                // Expected form: "GET /metrics HTTP/1.1"
+                if (request_line.starts_with("GET ")) {
+                    auto space2 = request_line.find(' ', 4);
+                    if (space2 != std::string::npos) {
+                        std::string path = request_line.substr(4, space2 - 4);
+                        // Drop query string if any.
+                        auto qmark = path.find('?');
+                        if (qmark != std::string::npos) {
+                            path.resize(qmark);
+                        }
+                        if (path == metrics_path_) {
+                            ok = true;
+                        }
+                    }
+                }
+
+                if (ok) {
+                    const std::string body = registry_.render();
+                    response =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                        "Content-Length: " +
+                        std::to_string(body.size()) +
+                        "\r\n"
+                        "Connection: close\r\n"
+                        "\r\n" +
+                        body;
+                } else {
+                    const std::string body = "Not Found\n";
+                    response =
+                        "HTTP/1.1 404 Not Found\r\n"
+                        "Content-Type: text/plain; charset=utf-8\r\n"
+                        "Content-Length: " +
+                        std::to_string(body.size()) +
+                        "\r\n"
+                        "Connection: close\r\n"
+                        "\r\n" +
+                        body;
+                }
+                // Ignore read_ec — even partial requests with no CRLF can
+                // still produce a usable first line, and async_write below
+                // will surface the real failure.
+                (void)read_ec;
+
+                auto response_buf = std::make_shared<std::string>(std::move(response));
+                asio::async_write(*socket, asio::buffer(*response_buf),
+                                  [socket, response_buf](const asio::error_code& /*write_ec*/,
+                                                         std::size_t /*bytes*/) {
+                                      asio::error_code ignore;
+                                      socket->shutdown(asio::ip::tcp::socket::shutdown_both,
+                                                       ignore);
+                                      socket->close(ignore);
+                                  });
+            });
+
         do_accept();
     });
-}
-
-void MetricsServer::handle_connection(std::shared_ptr<asio::ip::tcp::socket> socket) {
-    auto buffer = std::make_shared<asio::streambuf>();
-    asio::async_read_until(
-        *socket, *buffer, "\r\n\r\n",
-        [this, socket, buffer](const asio::error_code& ec, std::size_t /*bytes*/) {
-            if (ec) {
-                return;
-            }
-            std::istream is(buffer.get());
-            std::string request_line;
-            std::getline(is, request_line);
-            if (!request_line.empty() && request_line.back() == '\r') {
-                request_line.pop_back();
-            }
-
-            std::string method;
-            std::string uri;
-            {
-                std::istringstream iss(request_line);
-                iss >> method >> uri;
-            }
-
-            auto write_response = [socket](std::string status, std::string body,
-                                           const char* content_type) {
-                auto resp = std::make_shared<std::string>();
-                *resp = "HTTP/1.1 " + std::move(status) + "\r\n";
-                *resp += "Content-Type: ";
-                *resp += content_type;
-                *resp += "\r\n";
-                *resp += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-                *resp += "Connection: close\r\n\r\n";
-                *resp += body;
-                asio::async_write(*socket, asio::buffer(*resp),
-                                  [socket, resp](const asio::error_code&, std::size_t) {
-                                      asio::error_code ig;
-                                      socket->shutdown(asio::ip::tcp::socket::shutdown_both, ig);
-                                      socket->close(ig);
-                                  });
-            };
-
-            if (method != "GET") {
-                write_response("405 Method Not Allowed", "Method Not Allowed\n", "text/plain");
-                return;
-            }
-            // Ignore query string when matching the configured path.
-            auto qpos = uri.find('?');
-            std::string uri_path = (qpos == std::string::npos) ? uri : uri.substr(0, qpos);
-            if (uri_path != path_) {
-                write_response("404 Not Found", "Not Found\n", "text/plain");
-                return;
-            }
-
-            write_response("200 OK", registry_.render(), "text/plain; version=0.0.4");
-        });
 }
 
 }  // namespace toxtunnel::util

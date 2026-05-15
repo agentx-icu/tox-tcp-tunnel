@@ -309,7 +309,7 @@ util::Expected<void, std::string> Config::validate() const {
     if (metrics.enabled) {
         std::string host;
         uint16_t port = 0;
-        if (!util::MetricsServer::parse_listen(metrics.listen, host, port)) {
+        if (!util::parse_listen_spec(metrics.listen, host, port)) {
             return util::make_unexpected(std::string("Invalid metrics.listen value: ") +
                                          metrics.listen);
         }
@@ -515,8 +515,7 @@ std::string Config::to_yaml() const {
     out << YAML::Key << "allow_client_daemon" << YAML::Value << service.allow_client_daemon;
     out << YAML::EndMap;
 
-    if (metrics.enabled || metrics.listen != MetricsConfig{}.listen ||
-        metrics.path != MetricsConfig{}.path) {
+    if (metrics != MetricsConfig{}) {
         out << YAML::Key << "metrics";
         out << YAML::BeginMap;
         out << YAML::Key << "enabled" << YAML::Value << metrics.enabled;
@@ -1194,6 +1193,9 @@ Node convert<Config>::encode(const Config& rhs) {
     node["data_dir"] = rhs.data_dir.string();
     node["logging"] = rhs.logging;
     node["service"] = rhs.service;
+    if (rhs.metrics != toxtunnel::MetricsConfig{}) {
+        node["metrics"] = rhs.metrics;
+    }
     node["tox"] = effective_tox;
     if (rhs.metrics.enabled || rhs.metrics.listen != MetricsConfig{}.listen ||
         rhs.metrics.path != MetricsConfig{}.path) {
@@ -1248,6 +1250,10 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
     if (node["service"]) {
         rhs.service = node["service"].as<ServiceConfig>();
+    }
+
+    if (node["metrics"]) {
+        rhs.metrics = node["metrics"].as<toxtunnel::MetricsConfig>();
     }
 
     if (node["tox"]) {

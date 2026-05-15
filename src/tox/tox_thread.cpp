@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/metrics.hpp"
 
 namespace toxtunnel::tox {
 
@@ -153,7 +154,11 @@ void ToxThread::run_loop() {
         // 1. Let toxcore process network events and invoke our callbacks.
         //    The `this` pointer is passed as user_data so that the static
         //    callback trampolines can reach the ToxThread instance.
+        const auto iterate_start = std::chrono::steady_clock::now();
         tox_iterate(tox_.get(), this);
+        const auto iterate_end = std::chrono::steady_clock::now();
+        util::MetricsRegistry::instance().observe_iterate_lag_ms(
+            std::chrono::duration<double, std::milli>(iterate_end - iterate_start).count());
 
         // 2. Dispatch commands queued from other threads.
         process_commands();

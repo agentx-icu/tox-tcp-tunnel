@@ -22,6 +22,7 @@ add_executable(unit_tests
     unit/test_config.cpp
     unit/config_reload_test.cpp
     unit/test_known_servers.cpp
+    unit/test_metrics.cpp
     unit/test_pipe_mode.cpp
     unit/test_protocol_info.cpp
     unit/test_qr_code.cpp

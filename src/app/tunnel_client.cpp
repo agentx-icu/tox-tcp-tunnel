@@ -8,6 +8,7 @@
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/util/config_reload.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/metrics.hpp"
 #include "toxtunnel/util/system_info.hpp"
 
 #ifndef _WIN32
@@ -143,6 +144,18 @@ void TunnelClient::start() {
     // Start IoContext thread pool
     io_ctx_->run();
 
+    // Start the Prometheus /metrics HTTP server if the operator opted in.
+    if (config_.metrics.enabled) {
+        util::MetricsRegistry::instance().set_build_info(TOXTUNNEL_VERSION, "");
+        metrics_server_ = std::make_unique<util::MetricsServer>(io_ctx_->get_io_context(),
+                                                                util::MetricsRegistry::instance());
+        auto err = metrics_server_->start(config_.metrics.listen, config_.metrics.path);
+        if (!err.empty()) {
+            util::Logger::warn("Metrics endpoint disabled: {}", err);
+            metrics_server_.reset();
+        }
+    }
+
     // Start ToxAdapter iteration thread
     tox_adapter_->start();
 
@@ -235,6 +248,11 @@ void TunnelClient::stop() {
     if (pipe_bridge_) {
         pipe_bridge_->stop();
         pipe_bridge_.reset();
+    }
+
+    if (metrics_server_) {
+        metrics_server_->stop();
+        metrics_server_.reset();
     }
 
     // Close all tunnels
@@ -331,6 +349,7 @@ void TunnelClient::setup_tox_callbacks() {
     tox_adapter_->set_on_friend_connection([this](uint32_t friend_number, bool connected) {
         if (friend_number == server_friend_number_) {
             server_online_ = connected;
+            util::MetricsRegistry::instance().set_friends_online(connected ? 1 : 0);
             if (connected) {
                 util::Logger::info("Server friend {} is now online", friend_number);
                 record_server_connection();
@@ -573,17 +592,33 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     tunnel->set_on_data_for_tcp(
         [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
 
-    // Wire state change: when Connected (ACK received), start TCP read loop
-    tunnel->set_on_state_change([conn, tunnel_id](tunnel::Tunnel::State new_state) {
-        if (new_state == tunnel::Tunnel::State::Connected) {
-            util::Logger::debug("Tunnel {} connected, starting TCP read", tunnel_id);
-            conn->start_read();
-        } else if (new_state == tunnel::Tunnel::State::Closed ||
-                   new_state == tunnel::Tunnel::State::Error) {
-            util::Logger::debug("Tunnel {} state: {}", tunnel_id, to_string(new_state));
-            conn->close();
-        }
-    });
+    // Wire state change: when Connected (ACK received), start TCP read loop.
+    // Latch the open + active-gauge bookkeeping so the same tunnel can't
+    // be double-counted across the Connecting -> Connected -> Closed flow.
+    auto open_counted = std::make_shared<std::atomic_flag>();
+    auto active_dec_latch = std::make_shared<std::atomic_flag>();
+    tunnel->set_on_state_change(
+        [conn, tunnel_id, open_counted, active_dec_latch](tunnel::Tunnel::State new_state) {
+            if (new_state == tunnel::Tunnel::State::Connected) {
+                util::Logger::debug("Tunnel {} connected, starting TCP read", tunnel_id);
+                conn->start_read();
+                if (!open_counted->test_and_set()) {
+                    util::MetricsRegistry::instance().inc_tunnels_opened(
+                        util::MetricsRegistry::OpenResult::Ok);
+                    util::MetricsRegistry::instance().inc_tunnels_active(
+                        util::MetricsRegistry::Role::Client);
+                }
+            } else if (new_state == tunnel::Tunnel::State::Closed ||
+                       new_state == tunnel::Tunnel::State::Error) {
+                util::Logger::debug("Tunnel {} state: {}", tunnel_id, to_string(new_state));
+                conn->close();
+                if (open_counted->test(std::memory_order_acquire) &&
+                    !active_dec_latch->test_and_set()) {
+                    util::MetricsRegistry::instance().dec_tunnels_active(
+                        util::MetricsRegistry::Role::Client);
+                }
+            }
+        });
 
     // Wire tunnel close callback
     auto* tunnel_mgr_ptr = tunnel_mgr_.get();

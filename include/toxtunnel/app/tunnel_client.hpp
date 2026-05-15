@@ -19,6 +19,7 @@
 #include "toxtunnel/tox/tox_adapter.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
 #include "toxtunnel/util/config.hpp"
+#include "toxtunnel/util/metrics.hpp"
 
 namespace toxtunnel::app {
 
@@ -198,6 +199,10 @@ class TunnelClient {
     /// Background timer that re-issues INFO_REQUEST every kInfoRefreshInterval.
     /// Owned by io_ctx_; cancelled on stop().
     std::unique_ptr<asio::steady_timer> info_refresh_timer_;
+
+    /// Optional Prometheus /metrics HTTP server (only started when
+    /// config.metrics.enabled is true).
+    std::unique_ptr<util::MetricsServer> metrics_server_;
 
     /// How often to re-poll the server for system info while online.
     static constexpr std::chrono::hours kInfoRefreshInterval{1};
