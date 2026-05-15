@@ -285,7 +285,11 @@ std::optional<std::string> inspect_send_request(const std::filesystem::path& dat
         ::close(fd);
         return std::nullopt;
     }
-    ::write(fd, request.data(), request.size());
+    if (::write(fd, request.data(), request.size()) < 0) {
+        std::cerr << "Inspect: write() to " << path_str << " failed\n";
+        ::close(fd);
+        return std::nullopt;
+    }
     std::string out;
     char buf[1024];
     ssize_t n = 0;

@@ -78,7 +78,7 @@ std::string send_request(const std::filesystem::path& sock_path, const std::stri
         ::close(fd);
         return {};
     }
-    ::write(fd, line.data(), line.size());
+    static_cast<void>(::write(fd, line.data(), line.size()));
     std::string out;
     char buf[1024];
     ssize_t n = 0;

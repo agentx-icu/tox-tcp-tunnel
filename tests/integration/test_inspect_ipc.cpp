@@ -46,7 +46,7 @@ std::string request_via_socket(const std::filesystem::path& sock_path, const std
         ::close(fd);
         return {};
     }
-    ::write(fd, line.data(), line.size());
+    static_cast<void>(::write(fd, line.data(), line.size()));
     std::string out;
     char buf[1024];
     ssize_t n = 0;
