@@ -29,6 +29,12 @@ std::string_view to_string(ConnectionState state) noexcept {
 // Construction / Destruction
 // ===========================================================================
 
+// NOLINTBEGIN(clang-analyzer-core.NullDereference)
+// asio's any_executor type-erasure layer trips clang's path-sensitive
+// null-pointer checker (object_fns_->target() can look null in the
+// abstract domain even though it's always set by make_strand). The
+// false positive is reproducible at every make_strand<any_io_executor>
+// call site; suppress at the source.
 TcpConnection::TcpConnection(asio::io_context& io_ctx)
     : socket_(io_ctx),
       strand_(asio::make_strand(io_ctx.get_executor())),
@@ -46,6 +52,7 @@ TcpConnection::TcpConnection(asio::ip::tcp::socket socket)
     std::error_code nodelay_ec;
     socket_.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
 }
+// NOLINTEND(clang-analyzer-core.NullDereference)
 
 TcpConnection::~TcpConnection() {
     // No async ops can be in flight: each held a shared_ptr<TcpConnection>, so
