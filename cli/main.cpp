@@ -842,6 +842,7 @@ int main(int argc, char* argv[]) {
     std::string log_level_str;
     uint16_t port = 0;
     std::string server_id;
+    std::vector<std::string> fallback_server_ids;
     std::string pipe_target;
     std::string print_id_data_dir;
     bool print_id_qr = false;
@@ -965,6 +966,10 @@ int main(int argc, char* argv[]) {
         ->check(CLI::Range(static_cast<uint16_t>(1), static_cast<uint16_t>(65535)));
 
     app.add_option("--server-id", server_id, "Override server Tox ID (client mode)");
+    app.add_option("--server-id-fallback", fallback_server_ids,
+                   "Fallback server Tox ID or alias (client mode). May be repeated; "
+                   "tried in order if the primary stays offline.")
+        ->take_all();
     app.add_option("--pipe", pipe_target, "Pipe mode target host:port (client mode)");
     app.add_flag("--service", run_as_service, "Run as background service");
 
@@ -1155,6 +1160,16 @@ int main(int argc, char* argv[]) {
         has_overrides = true;
     }
 
+    if (!fallback_server_ids.empty()) {
+        // `--server-id-fallback` is repeatable; each value may be a Tox ID or
+        // alias. Resolution happens in the same alias-resolution pass below.
+        if (!overrides.client) {
+            overrides.client = ClientConfig{};
+        }
+        overrides.client->fallback_server_ids = fallback_server_ids;
+        has_overrides = true;
+    }
+
     if (!pipe_target.empty()) {
         auto pipe_result = parse_pipe_target(pipe_target);
         if (!pipe_result) {
@@ -1173,20 +1188,30 @@ int main(int argc, char* argv[]) {
     }
 
     // -----------------------------------------------------------------------
-    // Resolve known-servers aliases in client.server_id (from YAML or
-    // `--server-id`) against the registry under the post-merge data_dir.
-    // Single pass so the "Resolved alias …" message fires at most once per run.
+    // Resolve known-servers aliases in client.server_id and
+    // client.fallback_server_ids (from YAML or `--server-id` /
+    // `--server-id-fallback`) against the registry under the post-merge
+    // data_dir. Single pass so the "Resolved alias …" message fires at most
+    // once per id per run.
     // -----------------------------------------------------------------------
-    if (config.is_client() && config.client.has_value() && !config.client->server_id.empty() &&
-        config.client->server_id.size() != 76) {
+    if (config.is_client() && config.client.has_value()) {
         toxtunnel::app::KnownServersStore lookup(config.data_dir);
-        const auto original = config.client->server_id;
-        const auto resolved = lookup.resolve_tox_id(original);
-        if (resolved != original) {
-            std::cerr << "Resolved alias '" << original << "' to "
-                      << (resolved.size() == 76 ? resolved.substr(0, 12) + "..." : resolved)
-                      << "\n";
-            config.client->server_id = resolved;
+        auto try_resolve = [&](std::string& id) {
+            if (id.empty() || id.size() == 76) {
+                return;
+            }
+            const auto original = id;
+            const auto resolved = lookup.resolve_tox_id(original);
+            if (resolved != original) {
+                std::cerr << "Resolved alias '" << original << "' to "
+                          << (resolved.size() == 76 ? resolved.substr(0, 12) + "..." : resolved)
+                          << "\n";
+                id = resolved;
+            }
+        };
+        try_resolve(config.client->server_id);
+        for (auto& fb : config.client->fallback_server_ids) {
+            try_resolve(fb);
         }
     }
 

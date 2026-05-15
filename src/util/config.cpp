@@ -355,6 +355,47 @@ util::Expected<void, std::string> Config::validate() const {
                                          toxid_result.error());
         }
 
+        // Validate fallback server IDs (must already be resolved to 76-hex by
+        // the alias-resolution step in main.cpp). Empty list is fine.
+        for (const auto& fb : client->fallback_server_ids) {
+            if (fb.empty()) {
+                return util::make_unexpected(std::string("Fallback server ID cannot be empty"));
+            }
+            if (fb.length() != tox::kToxIdHexLen) {
+                return util::make_unexpected(
+                    std::string("Fallback server ID must be ") + std::to_string(tox::kToxIdHexLen) +
+                    std::string(" characters, got ") + std::to_string(fb.length()));
+            }
+            auto fb_result = tox::ToxId::from_hex(fb);
+            if (!fb_result) {
+                return util::make_unexpected(std::string("Invalid fallback server Tox ID: ") +
+                                             fb_result.error());
+            }
+            if (fb == client->server_id) {
+                return util::make_unexpected(
+                    std::string("Fallback server ID duplicates the primary server ID"));
+            }
+        }
+        // Reject duplicates within the fallback list itself.
+        for (std::size_t i = 0; i < client->fallback_server_ids.size(); ++i) {
+            for (std::size_t j = i + 1; j < client->fallback_server_ids.size(); ++j) {
+                if (client->fallback_server_ids[i] == client->fallback_server_ids[j]) {
+                    return util::make_unexpected(std::string("Duplicate fallback server ID: ") +
+                                                 client->fallback_server_ids[i]);
+                }
+            }
+        }
+
+        // Failover policy sanity (zero would never trigger a failover, which
+        // defeats the point of listing fallbacks).
+        if (!client->fallback_server_ids.empty()) {
+            if (client->failover.timeout_seconds == 0) {
+                return util::make_unexpected(
+                    std::string("client.failover.timeout_seconds must be > 0 when "
+                                "fallback servers are configured"));
+            }
+        }
+
         // Validate forwarding rules
         for (const auto& fwd : client->forwards) {
             if (fwd.local_port == 0) {
@@ -454,6 +495,11 @@ void Config::merge_cli_overrides(const Config& overrides) {
     if (overrides.client && client) {
         if (!overrides.client->server_id.empty()) {
             client->server_id = overrides.client->server_id;
+        }
+        if (!overrides.client->fallback_server_ids.empty()) {
+            // CLI replaces the YAML list rather than appending — same
+            // policy as forwards and bootstrap_nodes above.
+            client->fallback_server_ids = overrides.client->fallback_server_ids;
         }
         if (!overrides.client->forwards.empty()) {
             client->forwards = overrides.client->forwards;
@@ -567,7 +613,27 @@ std::string Config::to_yaml() const {
     if (client) {
         out << YAML::Key << "client" << YAML::Value << YAML::BeginMap;
         if (!client->server_id.empty()) {
-            out << YAML::Key << "server_id" << YAML::Value << client->server_id;
+            if (!client->fallback_server_ids.empty()) {
+                out << YAML::Key << "server_id" << YAML::Value << YAML::BeginSeq;
+                out << client->server_id;
+                for (const auto& fb : client->fallback_server_ids) {
+                    out << fb;
+                }
+                out << YAML::EndSeq;
+            } else {
+                out << YAML::Key << "server_id" << YAML::Value << client->server_id;
+            }
+        }
+        {
+            const FailoverConfig defaults{};
+            if (!(client->failover == defaults)) {
+                out << YAML::Key << "failover" << YAML::Value << YAML::BeginMap;
+                out << YAML::Key << "timeout_seconds" << YAML::Value
+                    << client->failover.timeout_seconds;
+                out << YAML::Key << "prefer_primary_grace_seconds" << YAML::Value
+                    << client->failover.prefer_primary_grace_seconds;
+                out << YAML::EndMap;
+            }
         }
         if (client->pipe_target.has_value()) {
             out << YAML::Key << "pipe" << YAML::Value << YAML::BeginMap;
@@ -1074,12 +1140,31 @@ bool convert<ServerConfig>::decode(const Node& node, ServerConfig& rhs) {
 
 Node convert<ClientConfig>::encode(const ClientConfig& rhs) {
     Node node;
-    node["server_id"] = rhs.server_id;
+    // Emit as a list only when there are fallbacks, otherwise stay
+    // backwards-compatible with the simple string form.
+    if (!rhs.fallback_server_ids.empty()) {
+        Node ids(NodeType::Sequence);
+        ids.push_back(rhs.server_id);
+        for (const auto& fb : rhs.fallback_server_ids) {
+            ids.push_back(fb);
+        }
+        node["server_id"] = ids;
+    } else {
+        node["server_id"] = rhs.server_id;
+    }
     if (rhs.pipe_target.has_value()) {
         node["pipe"] = *rhs.pipe_target;
     }
     if (!rhs.forwards.empty()) {
         node["forwards"] = rhs.forwards;
+    }
+    // Only emit failover block when it differs from defaults.
+    const toxtunnel::FailoverConfig defaults{};
+    if (!(rhs.failover == defaults)) {
+        Node fo;
+        fo["timeout_seconds"] = rhs.failover.timeout_seconds;
+        fo["prefer_primary_grace_seconds"] = rhs.failover.prefer_primary_grace_seconds;
+        node["failover"] = fo;
     }
     return node;
 }
@@ -1090,7 +1175,22 @@ bool convert<ClientConfig>::decode(const Node& node, ClientConfig& rhs) {
     }
 
     if (node["server_id"]) {
-        rhs.server_id = node["server_id"].as<std::string>();
+        const auto& sid_node = node["server_id"];
+        if (sid_node.IsSequence()) {
+            // List form: first entry is primary, rest are fallbacks.
+            rhs.server_id.clear();
+            rhs.fallback_server_ids.clear();
+            for (const auto& item : sid_node) {
+                auto s = item.as<std::string>();
+                if (rhs.server_id.empty()) {
+                    rhs.server_id = std::move(s);
+                } else {
+                    rhs.fallback_server_ids.push_back(std::move(s));
+                }
+            }
+        } else {
+            rhs.server_id = sid_node.as<std::string>();
+        }
     }
 
     if (node["pipe"]) {
@@ -1099,6 +1199,17 @@ bool convert<ClientConfig>::decode(const Node& node, ClientConfig& rhs) {
 
     if (node["forwards"]) {
         rhs.forwards = node["forwards"].as<std::vector<ForwardRule>>();
+    }
+
+    if (node["failover"] && node["failover"].IsMap()) {
+        const auto& fo = node["failover"];
+        if (fo["timeout_seconds"]) {
+            rhs.failover.timeout_seconds = fo["timeout_seconds"].as<uint32_t>();
+        }
+        if (fo["prefer_primary_grace_seconds"]) {
+            rhs.failover.prefer_primary_grace_seconds =
+                fo["prefer_primary_grace_seconds"].as<uint32_t>();
+        }
     }
 
     return true;
@@ -1213,7 +1324,23 @@ Node convert<Config>::encode(const Config& rhs) {
     if (rhs.client) {
         Node client_node;
         if (!rhs.client->server_id.empty()) {
-            client_node["server_id"] = rhs.client->server_id;
+            if (!rhs.client->fallback_server_ids.empty()) {
+                Node ids(NodeType::Sequence);
+                ids.push_back(rhs.client->server_id);
+                for (const auto& fb : rhs.client->fallback_server_ids) {
+                    ids.push_back(fb);
+                }
+                client_node["server_id"] = ids;
+            } else {
+                client_node["server_id"] = rhs.client->server_id;
+            }
+        }
+        const toxtunnel::FailoverConfig defaults{};
+        if (!(rhs.client->failover == defaults)) {
+            Node fo;
+            fo["timeout_seconds"] = rhs.client->failover.timeout_seconds;
+            fo["prefer_primary_grace_seconds"] = rhs.client->failover.prefer_primary_grace_seconds;
+            client_node["failover"] = fo;
         }
         if (rhs.client->pipe_target.has_value()) {
             client_node["pipe"] = *rhs.client->pipe_target;
@@ -1307,7 +1434,21 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
         const Node client_node = node["client"] ? node["client"] : node;
 
         if (client_node["server_id"]) {
-            rhs.client->server_id = client_node["server_id"].as<std::string>();
+            const auto& sid_node = client_node["server_id"];
+            if (sid_node.IsSequence()) {
+                rhs.client->server_id.clear();
+                rhs.client->fallback_server_ids.clear();
+                for (const auto& item : sid_node) {
+                    auto s = item.as<std::string>();
+                    if (rhs.client->server_id.empty()) {
+                        rhs.client->server_id = std::move(s);
+                    } else {
+                        rhs.client->fallback_server_ids.push_back(std::move(s));
+                    }
+                }
+            } else {
+                rhs.client->server_id = sid_node.as<std::string>();
+            }
         }
 
         if (client_node["pipe"]) {
@@ -1316,6 +1457,17 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
         if (client_node["forwards"]) {
             rhs.client->forwards = client_node["forwards"].as<std::vector<ForwardRule>>();
+        }
+
+        if (client_node["failover"] && client_node["failover"].IsMap()) {
+            const auto& fo = client_node["failover"];
+            if (fo["timeout_seconds"]) {
+                rhs.client->failover.timeout_seconds = fo["timeout_seconds"].as<uint32_t>();
+            }
+            if (fo["prefer_primary_grace_seconds"]) {
+                rhs.client->failover.prefer_primary_grace_seconds =
+                    fo["prefer_primary_grace_seconds"].as<uint32_t>();
+            }
         }
     }
 

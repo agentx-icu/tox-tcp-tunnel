@@ -172,15 +172,57 @@ struct ServerConfig {
     }
 };
 
+/// Failover policy for multi-server clients.
+///
+/// When `client.server_id` resolves to more than one Tox ID, the client adds
+/// every server as a Tox friend at startup and tracks one "active" server at
+/// a time. If the active server stays offline for `timeout_seconds`, the
+/// client promotes the next online candidate. Once the configured primary
+/// (index 0) comes back online and stays online for `prefer_primary_grace_seconds`,
+/// the client switches back.
+struct FailoverConfig {
+    /// How long the active server must stay offline before failing over.
+    uint32_t timeout_seconds = 60;
+    /// How long the primary must be continuously online before we switch back
+    /// to it from a fallback.
+    uint32_t prefer_primary_grace_seconds = 30;
+
+    bool operator==(const FailoverConfig& other) const = default;
+};
+
 /// Client-specific configuration options.
 struct ClientConfig {
-    std::string server_id;                  ///< Server's Tox ID (76 hex chars)
+    /// Primary server's Tox ID (76 hex chars) or known-servers alias.
+    /// When the YAML provides a list, this holds the first entry.
+    std::string server_id;
+    /// Additional fallback servers tried, in order, when the primary is
+    /// unreachable. May be Tox IDs or known-servers aliases. When the YAML
+    /// provides a list under `server_id`, entries 1..N populate this.
+    std::vector<std::string> fallback_server_ids;
     std::vector<ForwardRule> forwards;      ///< Port forwarding rules
     std::optional<PipeTarget> pipe_target;  ///< Optional stdio pipe target
+    FailoverConfig failover;                ///< Multi-server failover policy
+
+    /// Return the ordered list of all server IDs (primary first, then fallbacks).
+    /// Skips empty entries.
+    [[nodiscard]] std::vector<std::string> all_server_ids() const {
+        std::vector<std::string> ids;
+        ids.reserve(1 + fallback_server_ids.size());
+        if (!server_id.empty()) {
+            ids.push_back(server_id);
+        }
+        for (const auto& id : fallback_server_ids) {
+            if (!id.empty()) {
+                ids.push_back(id);
+            }
+        }
+        return ids;
+    }
 
     bool operator==(const ClientConfig& other) const {
-        return server_id == other.server_id && forwards == other.forwards &&
-               pipe_target == other.pipe_target;
+        return server_id == other.server_id && fallback_server_ids == other.fallback_server_ids &&
+               forwards == other.forwards && pipe_target == other.pipe_target &&
+               failover == other.failover;
     }
 };
 

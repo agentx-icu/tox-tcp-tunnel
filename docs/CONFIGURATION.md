@@ -72,6 +72,37 @@ client:
       remote_port: 80                     # local:8080 -> remote:80
 ```
 
+### Multi-Server Failover
+
+`client.server_id` accepts either a single string (the form above) or a list:
+the first entry is the primary server; every subsequent entry is a fallback
+tried in order if the primary becomes unreachable. Each entry may be a 76-char
+Tox ID or a known-servers alias. The same `--server-id <primary>` plus
+repeated `--server-id-fallback <id-or-alias>` CLI flags are equivalent.
+
+```yaml
+client:
+  server_id:
+    - "AABBCCDD..."         # primary
+    - homelab-backup        # alias from known_servers.yaml
+    - "112233...76hex"      # explicit fallback Tox ID
+
+  failover:
+    timeout_seconds: 60                 # active-server-offline threshold
+    prefer_primary_grace_seconds: 30    # primary-back-online dwell time
+```
+
+The client adds every listed server as a Tox friend at startup and tracks
+one active endpoint at a time. When the active server stays offline for
+`failover.timeout_seconds` (default `60`), the client promotes the
+lowest-index online fallback. When the configured primary (index 0) comes
+back online and stays online for `failover.prefer_primary_grace_seconds`
+(default `30`), the client switches back. Switchovers are logged at INFO
+level, and any tunnels routed through the previous endpoint are torn down
+via local `TUNNEL_CLOSE`; TCP listeners rebuild tunnels through the new
+active server on the next accepted connection. The single-string `server_id`
+form remains fully supported and behaves exactly as before.
+
 ## Service Policy (`service:`)
 
 Controls whether `toxtunnel --service` (run under systemd / launchd / Windows SCM)

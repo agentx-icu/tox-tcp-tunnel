@@ -34,6 +34,7 @@ add_executable(unit_tests
     unit/test_tunnel_manager.cpp
     unit/tunnel_reaper_test.cpp
     unit/tunnel_coalesce_test.cpp
+    unit/client_failover_test.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     toxtunnel_lib

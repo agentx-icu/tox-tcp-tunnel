@@ -23,6 +23,43 @@
 
 namespace toxtunnel::app {
 
+/// One configured server endpoint. The client adds every endpoint as a Tox
+/// friend at startup; the failover state machine tracks which one is currently
+/// the "active" tunnel route.
+struct ClientServerEndpoint {
+    /// 76-char uppercase hex Tox ID (post alias-resolution).
+    std::string tox_id_hex;
+    /// Friend number returned by ToxAdapter::add_friend / add_friend_norequest.
+    uint32_t friend_number = 0;
+    /// Most recently reported online/offline state from toxcore.
+    bool online = false;
+    /// Timestamp (steady_clock) of the most recent online->offline transition
+    /// (or the initial seed at construction). Zero for never observed.
+    std::chrono::steady_clock::time_point offline_since{};
+    /// Timestamp (steady_clock) of the most recent offline->online transition.
+    /// Used by the primary-prefer switchback grace window.
+    std::chrono::steady_clock::time_point online_since{};
+};
+
+/// Pure decision function for the failover state machine. Returns the index
+/// of the endpoint that should become active, or std::nullopt if the current
+/// active endpoint should remain active.
+///
+/// Decision logic, in order:
+///   1. If `endpoints[active_index]` has been offline for at least
+///      `failover.timeout_seconds`, and a non-active endpoint is online,
+///      promote the lowest-index online candidate.
+///   2. Otherwise, if `active_index != 0` and the primary (index 0) has been
+///      continuously online for at least `failover.prefer_primary_grace_seconds`,
+///      switch back to the primary.
+///   3. Otherwise, return std::nullopt.
+///
+/// Pure — no I/O, no logging, no toxcore. Extracted from TunnelClient so the
+/// state machine is unit-testable in isolation.
+[[nodiscard]] std::optional<std::size_t> decide_failover_switch(
+    const std::vector<ClientServerEndpoint>& endpoints, std::size_t active_index,
+    const FailoverConfig& failover, std::chrono::steady_clock::time_point now);
+
 /// Client-side application that listens on local TCP ports and forwards
 /// traffic through Tox tunnels to the server.
 ///
@@ -154,11 +191,54 @@ class TunnelClient {
     /// Forwarding rules from configuration (parallel with listeners_).
     std::vector<ForwardRule> forward_rules_;
 
-    /// Friend number of the server peer (set after add_friend).
-    uint32_t server_friend_number_{0};
+    /// Friend number of the currently-active server peer (updated on failover).
+    /// Kept as an atomic so callbacks racing with a switchover read a coherent
+    /// value; the integer itself never spans a word.
+    std::atomic<uint32_t> server_friend_number_{0};
 
-    /// Whether the server friend is currently online.
+    /// Whether the currently-active server friend is online. Mirrors the
+    /// `online` flag of `endpoints_[active_index_]` and is updated under
+    /// `endpoints_mutex_`.
     std::atomic<bool> server_online_{false};
+
+    /// All configured server endpoints (primary at index 0, then fallbacks in
+    /// the order given). Mutated only under `endpoints_mutex_`.
+    std::vector<ClientServerEndpoint> endpoints_;
+
+    /// Index into `endpoints_` of the currently-active server. Always
+    /// 0 <= active_index_ < endpoints_.size() after initialize() succeeds.
+    std::size_t active_index_{0};
+
+    /// Guards `endpoints_`, `active_index_` and the failover bookkeeping.
+    mutable std::mutex endpoints_mutex_;
+
+    /// Background timer driving the failover state machine.
+    std::unique_ptr<asio::steady_timer> failover_timer_;
+
+    /// Tick interval for the failover state machine. Coarse enough that we
+    /// don't burn CPU but fine enough that the configured timeouts are
+    /// honoured within a couple of seconds.
+    static constexpr std::chrono::seconds kFailoverTickInterval{1};
+
+    /// Re-arm the periodic failover state machine tick. No-op if the
+    /// io_context is gone or the client is shutting down.
+    void schedule_failover_tick();
+
+    /// Run one pass of the failover state machine. Inspects per-endpoint
+    /// online/offline timestamps against `client.failover.*` thresholds and
+    /// promotes a new active endpoint when warranted.
+    void run_failover_tick();
+
+    /// Switch the active endpoint to `new_index`. Logs the transition, tears
+    /// down existing tunnels (TUNNEL_CLOSE), and updates server_friend_number_
+    /// + the known-servers registry.
+    /// MUST be called from within the io_ctx_ executor; takes endpoints_mutex_
+    /// internally for short critical sections.
+    void switch_active_endpoint(std::size_t new_index);
+
+    /// Return the index of an online endpoint (excluding the current active),
+    /// or std::nullopt. Prefers lower indices (i.e. closer to primary).
+    [[nodiscard]] std::optional<std::size_t> pick_next_online_locked() const;
 
     /// Whether the client is running.
     std::atomic<bool> running_{false};

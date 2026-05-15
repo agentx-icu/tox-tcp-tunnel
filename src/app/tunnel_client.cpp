@@ -83,42 +83,78 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
                                 init_result.error());
     }
 
-    // Parse server Tox ID and add as friend
-    auto tox_id_result = tox::ToxId::from_hex(client_cfg.server_id);
-    if (!tox_id_result) {
-        return util::unexpected(std::string("Invalid server Tox ID: ") + tox_id_result.error());
-    }
-
-    // Key the known_servers registry off the canonical hex form. ToxId::to_hex()
-    // already returns uppercase, matching KnownServersStore's internal normalization.
-    server_tox_id_hex_ = tox_id_result.value().to_hex();
-
     // Open the persistent known-servers registry alongside tox_save.dat.
     known_servers_ = std::make_unique<KnownServersStore>(config.data_dir);
     if (auto& err = known_servers_->last_load_error(); err.has_value()) {
         util::Logger::warn("known_servers.yaml: {} (continuing with empty registry)", *err);
     }
 
-    auto peer_public_key = tox_id_result.value().public_key();
-    auto friend_result = tox_adapter_->add_friend(tox_id_result.value(), "toxtunnel client");
-    if (!friend_result) {
-        auto existing_friend = tox_adapter_->friend_by_public_key(peer_public_key);
-        if (existing_friend) {
-            server_friend_number_ = existing_friend.value();
-        } else {
-            // The friend may already exist; try adding by public key without request
-            auto noreq_result = tox_adapter_->add_friend_norequest(peer_public_key);
-            if (!noreq_result) {
-                return util::unexpected(std::string("Failed to add server as friend: ") +
-                                        noreq_result.error());
-            }
-            server_friend_number_ = noreq_result.value();
-        }
-    } else {
-        server_friend_number_ = friend_result.value();
+    // Resolve every configured server ID (primary + fallbacks) into a Tox
+    // friend. We add every endpoint upfront so toxcore can start probing all
+    // of them concurrently; the failover state machine then picks the active
+    // one at runtime.
+    const auto all_ids = client_cfg.all_server_ids();
+    if (all_ids.empty()) {
+        return util::unexpected(std::string("No server IDs configured"));
     }
 
-    util::Logger::info("Server friend added with friend number {}", server_friend_number_);
+    endpoints_.clear();
+    endpoints_.reserve(all_ids.size());
+    for (std::size_t i = 0; i < all_ids.size(); ++i) {
+        const auto& id_str = all_ids[i];
+        auto parse_result = tox::ToxId::from_hex(id_str);
+        if (!parse_result) {
+            return util::unexpected(std::string("Invalid Tox ID at position ") + std::to_string(i) +
+                                    ": " + parse_result.error());
+        }
+        ClientServerEndpoint ep;
+        ep.tox_id_hex = parse_result.value().to_hex();
+
+        auto peer_public_key = parse_result.value().public_key();
+        auto friend_result = tox_adapter_->add_friend(parse_result.value(), "toxtunnel client");
+        if (!friend_result) {
+            auto existing_friend = tox_adapter_->friend_by_public_key(peer_public_key);
+            if (existing_friend) {
+                ep.friend_number = existing_friend.value();
+            } else {
+                auto noreq_result = tox_adapter_->add_friend_norequest(peer_public_key);
+                if (!noreq_result) {
+                    return util::unexpected(std::string("Failed to add server as friend (") +
+                                            ep.tox_id_hex.substr(0, 12) +
+                                            "...): " + noreq_result.error());
+                }
+                ep.friend_number = noreq_result.value();
+            }
+        } else {
+            ep.friend_number = friend_result.value();
+        }
+
+        if (i == 0) {
+            util::Logger::info("Primary server friend added with friend number {} ({}...)",
+                               ep.friend_number, ep.tox_id_hex.substr(0, 12));
+        } else {
+            util::Logger::info("Fallback server #{} friend added with friend number {} ({}...)", i,
+                               ep.friend_number, ep.tox_id_hex.substr(0, 12));
+        }
+        endpoints_.push_back(std::move(ep));
+    }
+
+    // Seed offline_since on every endpoint so the failover timer has a
+    // baseline to count against — without this, an endpoint that has never
+    // come online has offline_since == 0 and the state machine would treat
+    // it as "newly observed offline" forever.
+    {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& ep : endpoints_) {
+            ep.offline_since = now;
+        }
+    }
+
+    // Start with the primary as the active endpoint. The failover state
+    // machine may promote a fallback later if the primary stays offline.
+    active_index_ = 0;
+    server_friend_number_.store(endpoints_[0].friend_number, std::memory_order_release);
+    server_tox_id_hex_ = endpoints_[0].tox_id_hex;
 
     // Create TunnelManager
     tunnel_mgr_ = std::make_unique<tunnel::TunnelManager>(io_ctx_->get_io_context());
@@ -199,6 +235,7 @@ void TunnelClient::start() {
     }
 
     schedule_info_refresh();
+    schedule_failover_tick();
 
     if (is_pipe_mode()) {
         util::Logger::info("Client running in stdio pipe mode");
@@ -238,6 +275,11 @@ void TunnelClient::stop() {
     if (info_refresh_timer_) {
         info_refresh_timer_->cancel();
         info_refresh_timer_.reset();
+    }
+
+    if (failover_timer_) {
+        failover_timer_->cancel();
+        failover_timer_.reset();
     }
 
     // Stop all TCP listeners
@@ -345,11 +387,39 @@ std::string TunnelClient::get_tox_address() const {
 // -------------------------------------------------------------------------
 
 void TunnelClient::setup_tox_callbacks() {
-    // Friend connection status changes
+    // Friend connection status changes. We track per-endpoint online/offline
+    // timestamps; the failover state machine tick consumes them.
     tox_adapter_->set_on_friend_connection([this](uint32_t friend_number, bool connected) {
-        if (friend_number == server_friend_number_) {
-            server_online_ = connected;
-            util::MetricsRegistry::instance().set_friends_online(connected ? 1 : 0);
+        const auto now = std::chrono::steady_clock::now();
+        std::size_t hit_index = endpoints_.size();
+        bool is_active = false;
+        {
+            std::lock_guard<std::mutex> lock(endpoints_mutex_);
+            for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+                if (endpoints_[i].friend_number == friend_number) {
+                    hit_index = i;
+                    break;
+                }
+            }
+            if (hit_index == endpoints_.size()) {
+                return;  // Not one of our configured servers.
+            }
+            auto& ep = endpoints_[hit_index];
+            if (connected && !ep.online) {
+                ep.online_since = now;
+            }
+            if (!connected && ep.online) {
+                ep.offline_since = now;
+            }
+            ep.online = connected;
+            is_active = (hit_index == active_index_);
+            if (is_active) {
+                server_online_.store(connected, std::memory_order_release);
+                util::MetricsRegistry::instance().set_friends_online(connected ? 1 : 0);
+            }
+        }
+
+        if (is_active) {
             if (connected) {
                 util::Logger::info("Server friend {} is now online", friend_number);
                 record_server_connection();
@@ -364,6 +434,11 @@ void TunnelClient::setup_tox_callbacks() {
                     request_stop();
                 }
             }
+        } else {
+            // Non-active endpoint state change — informational only; the
+            // failover state machine tick will decide whether to switch.
+            util::Logger::debug("Fallback server friend {} is now {}", friend_number,
+                                connected ? "online" : "offline");
         }
     });
 
@@ -377,8 +452,12 @@ void TunnelClient::setup_tox_callbacks() {
     // copy of the inbound packet.
     tox_adapter_->set_on_lossless_packet([this](uint32_t friend_number, const uint8_t* data,
                                                 std::size_t length) {
-        if (friend_number != server_friend_number_) {
-            util::Logger::warn("Received lossless packet from unexpected friend {}", friend_number);
+        if (friend_number != server_friend_number_.load(std::memory_order_acquire)) {
+            // Could be a stale packet from a freshly-demoted fallback, or
+            // genuinely an unexpected friend. Either way, ignore.
+            util::Logger::debug("Received lossless packet from non-active friend {} (active is {})",
+                                friend_number,
+                                server_friend_number_.load(std::memory_order_acquire));
             return;
         }
         if (length < 2) {
@@ -426,8 +505,8 @@ void TunnelClient::setup_tunnel_manager() {
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), frame_data.begin(), frame_data.end());
 
-        return tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
-                                                  packet.size());
+        return tox_adapter_->send_lossless_packet(
+            server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
     // Tunnel closed callback
@@ -471,8 +550,9 @@ void TunnelClient::start_pipe_mode() {
 #endif
 
     const uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
-    auto tunnel = std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
-                                                       server_friend_number_);
+    auto tunnel = std::make_unique<tunnel::TunnelImpl>(
+        io_ctx_->get_io_context(), tunnel_id,
+        server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
     auto* tunnel_raw = tunnel.get();
@@ -482,8 +562,8 @@ void TunnelClient::start_pipe_mode() {
         packet.reserve(1 + data.size());
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), data.begin(), data.end());
-        (void)tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
-                                                 packet.size());
+        (void)tox_adapter_->send_lossless_packet(
+            server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
     tunnel->set_on_data_for_tcp([this](std::span<const uint8_t> data) {
@@ -567,8 +647,9 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     util::Logger::debug("New TCP connection on port {}, creating tunnel {} -> {}:{}",
                         rule.local_port, tunnel_id, rule.remote_host, rule.remote_port);
 
-    auto tunnel = std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
-                                                       server_friend_number_);
+    auto tunnel = std::make_unique<tunnel::TunnelImpl>(
+        io_ctx_->get_io_context(), tunnel_id,
+        server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
 
@@ -584,8 +665,8 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), data.begin(), data.end());
 
-        (void)tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(),
-                                                 packet.size());
+        (void)tox_adapter_->send_lossless_packet(
+            server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
     // Wire callback: when data arrives from Tox for this tunnel, write to TCP
@@ -709,8 +790,8 @@ void TunnelClient::send_info_request() {
     packet.reserve(1 + wire.size());
     packet.push_back(tunnel::kLosslessPacketByte);
     packet.insert(packet.end(), wire.begin(), wire.end());
-    const bool sent =
-        tox_adapter_->send_lossless_packet(server_friend_number_, packet.data(), packet.size());
+    const uint32_t fn = server_friend_number_.load(std::memory_order_acquire);
+    const bool sent = tox_adapter_->send_lossless_packet(fn, packet.data(), packet.size());
     if (!sent) {
         // The server may legitimately not implement INFO_REQUEST yet, or the
         // send queue may be full; either way let the next online transition
@@ -718,14 +799,15 @@ void TunnelClient::send_info_request() {
         info_request_sent_.store(false);
         util::Logger::debug("INFO_REQUEST send failed (will retry on next reconnect)");
     } else {
-        util::Logger::debug("INFO_REQUEST sent to friend {}", server_friend_number_);
+        util::Logger::debug("INFO_REQUEST sent to friend {}", fn);
     }
 }
 
 void TunnelClient::record_server_connection() {
     if (!known_servers_ || server_tox_id_hex_.empty())
         return;
-    const auto state = tox_adapter_->get_friend_connection_status(server_friend_number_);
+    const auto state = tox_adapter_->get_friend_connection_status(
+        server_friend_number_.load(std::memory_order_acquire));
     const auto type = to_known_connection_type(state);
     if (!known_servers_->record_connection(server_tox_id_hex_, type)) {
         util::Logger::warn("known_servers: record_connection rejected tox_id");
@@ -763,6 +845,152 @@ void TunnelClient::record_server_info(std::string_view yaml_payload) {
     if (auto save = known_servers_->save(); !save) {
         util::Logger::warn("known_servers: failed to save: {}", save.error());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Failover state machine
+// ---------------------------------------------------------------------------
+
+std::optional<std::size_t> decide_failover_switch(
+    const std::vector<ClientServerEndpoint>& endpoints, std::size_t active_index,
+    const FailoverConfig& failover, std::chrono::steady_clock::time_point now) {
+    if (endpoints.size() <= 1 || active_index >= endpoints.size()) {
+        return std::nullopt;
+    }
+
+    auto lowest_index_online_except = [&](std::size_t exclude) -> std::optional<std::size_t> {
+        for (std::size_t i = 0; i < endpoints.size(); ++i) {
+            if (i == exclude) {
+                continue;
+            }
+            if (endpoints[i].online) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto& active = endpoints[active_index];
+
+    // Rule 1: active offline long enough -> promote.
+    if (!active.online && active.offline_since != std::chrono::steady_clock::time_point{}) {
+        const auto offline_for =
+            std::chrono::duration_cast<std::chrono::seconds>(now - active.offline_since);
+        if (offline_for.count() >= static_cast<int64_t>(failover.timeout_seconds)) {
+            if (auto candidate = lowest_index_online_except(active_index); candidate.has_value()) {
+                return candidate;
+            }
+        }
+    }
+
+    // Rule 2: switch back to primary after grace period.
+    if (active_index != 0) {
+        const auto& primary = endpoints[0];
+        if (primary.online && primary.online_since != std::chrono::steady_clock::time_point{}) {
+            const auto online_for =
+                std::chrono::duration_cast<std::chrono::seconds>(now - primary.online_since);
+            if (online_for.count() >= static_cast<int64_t>(failover.prefer_primary_grace_seconds)) {
+                return std::size_t{0};
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<std::size_t> TunnelClient::pick_next_online_locked() const {
+    // Prefer the lowest-index online endpoint that isn't currently active.
+    // Lower index == closer to the configured primary.
+    for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+        if (i == active_index_) {
+            continue;
+        }
+        if (endpoints_[i].online) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+void TunnelClient::switch_active_endpoint(std::size_t new_index) {
+    std::string old_id_prefix;
+    std::string new_id_prefix;
+    uint32_t new_friend_number = 0;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        if (new_index >= endpoints_.size() || new_index == active_index_) {
+            return;
+        }
+        old_id_prefix = endpoints_[active_index_].tox_id_hex.substr(0, 12);
+        active_index_ = new_index;
+        new_friend_number = endpoints_[new_index].friend_number;
+        new_id_prefix = endpoints_[new_index].tox_id_hex.substr(0, 12);
+        server_tox_id_hex_ = endpoints_[new_index].tox_id_hex;
+        server_online_.store(endpoints_[new_index].online, std::memory_order_release);
+    }
+    server_friend_number_.store(new_friend_number, std::memory_order_release);
+
+    util::Logger::info("Failover: switching active server {}... -> {}... (friend {})",
+                       old_id_prefix, new_id_prefix, new_friend_number);
+
+    // Tear down tunnels routed through the previous active endpoint. The
+    // listeners will re-open new tunnels through the new server on the next
+    // accepted TCP connection. (For already-established TCP connections, the
+    // close propagates back to the local TCP side, which matches the
+    // "rebuild on switchover" semantics described in the spec.)
+    info_request_sent_.store(false);
+    if (tunnel_mgr_) {
+        tunnel_mgr_->close_all();
+    }
+
+    // Refresh known-servers metadata if the new endpoint is already online.
+    if (server_online_.load(std::memory_order_acquire)) {
+        record_server_connection();
+        send_info_request();
+    }
+}
+
+void TunnelClient::run_failover_tick() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!config_.client.has_value()) {
+        return;
+    }
+    const auto& failover_cfg = config_.client->failover;
+    const auto now = std::chrono::steady_clock::now();
+
+    std::optional<std::size_t> switch_to;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        switch_to = decide_failover_switch(endpoints_, active_index_, failover_cfg, now);
+    }
+
+    if (switch_to.has_value()) {
+        switch_active_endpoint(*switch_to);
+    }
+}
+
+void TunnelClient::schedule_failover_tick() {
+    if (!io_ctx_ || !running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    // No fallbacks configured -> the state machine has nothing to do; skip
+    // arming the timer entirely to keep the io_context idle.
+    if (endpoints_.size() <= 1) {
+        return;
+    }
+    if (!failover_timer_) {
+        failover_timer_ = std::make_unique<asio::steady_timer>(io_ctx_->get_io_context());
+    }
+    failover_timer_->expires_after(kFailoverTickInterval);
+    failover_timer_->async_wait([this](const asio::error_code& ec) {
+        if (ec || !running_.load(std::memory_order_acquire)) {
+            return;
+        }
+        run_failover_tick();
+        schedule_failover_tick();
+    });
 }
 
 }  // namespace toxtunnel::app
