@@ -25,6 +25,7 @@ add_executable(unit_tests
     unit/test_protocol_info.cpp
     unit/test_qr_code.cpp
     unit/test_rules_engine.cpp
+    unit/test_inbound_strand.cpp
     unit/test_tox_adapter.cpp
     unit/test_tunnel.cpp
     unit/test_tunnel_manager.cpp

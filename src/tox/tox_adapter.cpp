@@ -751,9 +751,19 @@ void ToxAdapter::run_loop() {
 
         dispatch_pending_events();
 
-        // Sleep up to the recommended interval, but wake immediately when an
-        // outbound send or stop() pings wake_cv_. Spurious wakeups just run an
-        // extra tox_iterate — harmless and self-correcting.
+        // tox_iteration_interval() returns up to ~50ms when idle. wake_cv_
+        // already short-circuits the wait when we have outbound work, but
+        // there is no equivalent signal for inbound network activity —
+        // toxcore reads its sockets inside tox_iterate, so any inbound
+        // friend packet sits unread until the next cycle. For an SSH-style
+        // ping-pong both directions pay this cost, producing ~50ms per
+        // round-trip even on localhost. Cap the idle wait so interactive
+        // workloads stay snappy; iterate-when-idle is cheap (a few µs).
+        constexpr uint32_t kMaxIdleIntervalMs = 5;
+        if (interval > kMaxIdleIntervalMs) {
+            interval = kMaxIdleIntervalMs;
+        }
+
         std::unique_lock<std::mutex> wake_lock(wake_mutex_);
         wake_cv_.wait_for(wake_lock, std::chrono::milliseconds(interval));
     }

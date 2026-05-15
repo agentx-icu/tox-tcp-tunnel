@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -116,6 +117,14 @@ class TunnelClient {
 
     /// Thread pool for async I/O.
     std::unique_ptr<core::IoContext> io_ctx_;
+
+    /// Serializes inbound lossless-packet dispatch on top of io_ctx_'s pool.
+    /// Without this, ACK and DATA frames that arrive back-to-back from Tox
+    /// can be picked up by different worker threads and processed out of
+    /// order — a DATA frame can land while the tunnel is still in Connecting
+    /// state and get silently dropped. The strand preserves arrival order
+    /// while still letting the pool parallelise other work.
+    std::optional<asio::strand<asio::any_io_executor>> inbound_strand_;
 
     /// High-level Tox API.
     std::unique_ptr<tox::ToxAdapter> tox_adapter_;

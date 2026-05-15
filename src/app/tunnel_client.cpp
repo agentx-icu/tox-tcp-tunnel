@@ -47,6 +47,14 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     // Create IoContext
     io_ctx_ = std::make_unique<core::IoContext>();
 
+    // Build the inbound-dispatch strand on the IO pool's executor so all
+    // inbound lossless-packet handlers run serialized, preserving the
+    // on-the-wire order toxcore already guarantees. Without it, an ACK
+    // and a DATA frame arriving back-to-back can be picked up by different
+    // worker threads and processed out of order — the DATA lands while the
+    // tunnel is still Connecting and gets silently dropped.
+    inbound_strand_.emplace(asio::make_strand(io_ctx_->get_io_context().get_executor()));
+
     // Create ToxAdapter and configure it
     tox_adapter_ = std::make_unique<tox::ToxAdapter>();
 
@@ -268,7 +276,7 @@ void TunnelClient::setup_tox_callbacks() {
         }
 
         std::vector<uint8_t> packet(data, data + length);
-        asio::post(io_ctx_->get_io_context(), [this, packet = std::move(packet)]() {
+        asio::post(*inbound_strand_, [this, packet = std::move(packet)]() {
             // Skip byte 0 (lossless packet prefix byte), deserialize from byte 1.
             auto frame_data = std::span<const uint8_t>(packet.data() + 1, packet.size() - 1);
             auto frame_result = tunnel::ProtocolFrame::deserialize(frame_data);
