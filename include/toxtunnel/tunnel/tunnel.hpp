@@ -141,6 +141,13 @@ class TunnelImpl : public Tunnel {
     /// Called when data should be written to the TCP connection.
     using SendToTcpCallback = std::function<void(std::span<const uint8_t> data)>;
 
+    /// Zero-copy variant: called when an owned (shared_ptr-backed) buffer
+    /// should be written to the TCP connection. The callee can hand the
+    /// view straight to `TcpConnection::write(OwnedBufferView)` without
+    /// any payload copy. When this callback is set on a tunnel, it takes
+    /// precedence over `SendToTcpCallback` for inbound TUNNEL_DATA frames.
+    using SendToTcpOwnedCallback = std::function<void(core::OwnedBufferView buf)>;
+
     /// Called when the tunnel state changes.
     using StateChangedCallback = std::function<void(State new_state)>;
 
@@ -350,6 +357,11 @@ class TunnelImpl : public Tunnel {
     /// Set callback for sending data to TCP.
     void set_on_data_for_tcp(SendToTcpCallback cb);
 
+    /// Set the zero-copy callback for owned buffers. When both this and the
+    /// span-based callback are set, the owned callback wins for TUNNEL_DATA
+    /// frames; non-DATA paths fall back to the span-based callback.
+    void set_on_data_for_tcp_owned(SendToTcpOwnedCallback cb);
+
     /// Set callback for state changes.
     void set_on_state_change(StateChangedCallback cb);
 
@@ -463,6 +475,7 @@ class TunnelImpl : public Tunnel {
     // Callbacks (accessed under mutex)
     SendToToxCallback on_send_to_tox_;
     SendToTcpCallback on_data_for_tcp_;
+    SendToTcpOwnedCallback on_data_for_tcp_owned_;
     StateChangedCallback on_state_change_;
     ErrorCallback on_error_;
     CloseCallback on_close_;

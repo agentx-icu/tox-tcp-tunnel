@@ -279,15 +279,23 @@ void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
     bytes_received_since_ack_.fetch_add(data_size, std::memory_order_relaxed);
     util::MetricsRegistry::instance().add_bytes_in(data_size);
 
-    // Forward data to TCP connection
-    SendToTcpCallback cb;
+    // Forward data to TCP connection. Prefer the zero-copy owned-buffer
+    // callback when both are set; that path hands the payload to
+    // `TcpConnection::write(OwnedBufferView)` without any payload copy
+    // (the buffer was allocated by `ProtocolFrame::deserialize` and stays
+    // alive until the async TCP write completes via shared_ptr refcount).
+    SendToTcpOwnedCallback owned_cb;
+    SendToTcpCallback span_cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        cb = on_data_for_tcp_;
+        owned_cb = on_data_for_tcp_owned_;
+        span_cb = on_data_for_tcp_;
     }
 
-    if (cb) {
-        cb(data);
+    if (owned_cb) {
+        owned_cb(frame.as_tunnel_data_owned());
+    } else if (span_cb) {
+        span_cb(data);
     }
 
     // Check if we should send ACK
@@ -513,6 +521,11 @@ void TunnelImpl::set_on_send_to_tox(SendToToxCallback cb) {
 void TunnelImpl::set_on_data_for_tcp(SendToTcpCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     on_data_for_tcp_ = std::move(cb);
+}
+
+void TunnelImpl::set_on_data_for_tcp_owned(SendToTcpOwnedCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    on_data_for_tcp_owned_ = std::move(cb);
 }
 
 void TunnelImpl::set_on_state_change(StateChangedCallback cb) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -8,6 +9,7 @@
 #include <system_error>
 #include <vector>
 
+#include "toxtunnel/core/owned_buffer.hpp"
 #include "toxtunnel/util/expected.hpp"
 
 namespace toxtunnel::tunnel {
@@ -219,11 +221,16 @@ class ProtocolFrame {
     [[nodiscard]] uint16_t tunnel_id() const noexcept { return tunnel_id_; }
 
     /// Return a read-only view of the raw payload bytes.
-    [[nodiscard]] std::span<const uint8_t> payload() const noexcept { return payload_; }
+    [[nodiscard]] std::span<const uint8_t> payload() const noexcept {
+        if (payload_shared_) {
+            return std::span<const uint8_t>(payload_shared_->data(), payload_shared_->size());
+        }
+        return payload_;
+    }
 
     /// Return the total serialized size (header + payload).
     [[nodiscard]] std::size_t serialized_size() const noexcept {
-        return kFrameHeaderSize + payload_.size();
+        return kFrameHeaderSize + payload_size();
     }
 
     // -----------------------------------------------------------------
@@ -242,6 +249,19 @@ class ProtocolFrame {
     ///         is not a TUNNEL_DATA frame.
     [[nodiscard]] std::span<const uint8_t> as_tunnel_data() const;
 
+    /// Zero-copy view onto the TUNNEL_DATA payload backed by a `shared_ptr`.
+    ///
+    /// For frames produced by `deserialize()`, this returns the same buffer
+    /// that holds the payload — handing the view onwards (e.g. to
+    /// `TcpConnection::write(OwnedBufferView)`) avoids any additional payload
+    /// copy. For frames built via factory methods such as `make_tunnel_data`,
+    /// the payload was synthesized into an owned `vector<uint8_t>` and the
+    /// returned view aliases it (one `shared_ptr` is allocated on demand).
+    ///
+    /// @return An owned view over the payload bytes, or an empty view if
+    ///         this is not a TUNNEL_DATA frame.
+    [[nodiscard]] core::OwnedBufferView as_tunnel_data_owned() const;
+
     /// Parse the payload as a TUNNEL_ACK message.
     ///
     /// @return The parsed payload, or `std::nullopt` if this is not a
@@ -255,9 +275,20 @@ class ProtocolFrame {
     [[nodiscard]] std::optional<TunnelErrorPayload> as_tunnel_error() const;
 
    private:
+    [[nodiscard]] std::size_t payload_size() const noexcept {
+        return payload_shared_ ? payload_shared_->size() : payload_.size();
+    }
+
     FrameType type_;
     uint16_t tunnel_id_;
     std::vector<uint8_t> payload_;
+
+    /// Optional shared-ownership wrapper around `payload_`, populated lazily
+    /// (and only) by `deserialize()`. When present, `as_tunnel_data_owned()`
+    /// returns a view directly onto this buffer — no additional payload copy
+    /// is ever made on the inbound TUNNEL_DATA path. Outbound factory
+    /// methods leave this null and fall back to `payload_`.
+    std::shared_ptr<const std::vector<uint8_t>> payload_shared_;
 };
 
 }  // namespace toxtunnel::tunnel

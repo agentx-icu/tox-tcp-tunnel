@@ -180,8 +180,18 @@ std::string_view ProtocolFrame::as_info_reply_yaml() const {
 // ===========================================================================
 
 std::vector<uint8_t> ProtocolFrame::serialize() const {
-    auto payload_len =
-        static_cast<uint16_t>(std::min<std::size_t>(payload_.size(), kMaxPayloadSize));
+    // Resolve the payload bytes regardless of which slot holds them.
+    const uint8_t* payload_ptr = nullptr;
+    std::size_t payload_total = 0;
+    if (payload_shared_) {
+        payload_ptr = payload_shared_->data();
+        payload_total = payload_shared_->size();
+    } else {
+        payload_ptr = payload_.data();
+        payload_total = payload_.size();
+    }
+
+    auto payload_len = static_cast<uint16_t>(std::min<std::size_t>(payload_total, kMaxPayloadSize));
 
     // One allocation + direct writes; previously a string of push_back/insert
     // calls re-walked the size guards each time. Hot path on every outbound
@@ -191,7 +201,7 @@ std::vector<uint8_t> ProtocolFrame::serialize() const {
     write_u16_be(&result[1], tunnel_id_);
     write_u16_be(&result[3], payload_len);
     if (payload_len > 0) {
-        std::memcpy(&result[kFrameHeaderSize], payload_.data(), payload_len);
+        std::memcpy(&result[kFrameHeaderSize], payload_ptr, payload_len);
     }
     return result;
 }
@@ -223,8 +233,19 @@ util::Expected<ProtocolFrame, std::error_code> ProtocolFrame::deserialize(
 
     ProtocolFrame frame(type, tunnel_id);
     if (payload_len > 0) {
-        frame.payload_.assign(data.begin() + kFrameHeaderSize,
-                              data.begin() + kFrameHeaderSize + payload_len);
+        // For TUNNEL_DATA, allocate the payload into a shared buffer so it
+        // can be handed onwards to `TcpConnection::write(OwnedBufferView)`
+        // with zero further copies. For all other frame types we own a
+        // plain `vector<uint8_t>` — those payloads are tiny (host+port,
+        // 4-byte ACK counter, short error string) and the existing typed
+        // accessors expect a contiguous `payload_` vector.
+        if (type == FrameType::TUNNEL_DATA) {
+            frame.payload_shared_ = std::make_shared<std::vector<uint8_t>>(
+                data.begin() + kFrameHeaderSize, data.begin() + kFrameHeaderSize + payload_len);
+        } else {
+            frame.payload_.assign(data.begin() + kFrameHeaderSize,
+                                  data.begin() + kFrameHeaderSize + payload_len);
+        }
     }
 
     return frame;
@@ -257,7 +278,29 @@ std::span<const uint8_t> ProtocolFrame::as_tunnel_data() const {
     if (type_ != FrameType::TUNNEL_DATA) {
         return {};
     }
+    // Deserialized frames keep their payload in `payload_shared_`; factory-
+    // built frames store it in `payload_`. Either way, return a span over
+    // the live bytes.
+    if (payload_shared_) {
+        return std::span<const uint8_t>(payload_shared_->data(), payload_shared_->size());
+    }
     return payload_;
+}
+
+core::OwnedBufferView ProtocolFrame::as_tunnel_data_owned() const {
+    if (type_ != FrameType::TUNNEL_DATA) {
+        return {};
+    }
+    if (payload_shared_) {
+        // Zero-copy: just share the existing buffer with the caller.
+        return core::OwnedBufferView(payload_shared_);
+    }
+    // Factory-built path: allocate a shared buffer on demand so the caller
+    // still gets the lifetime guarantees of an owned view. This is the
+    // outbound / synthesized branch; the hot inbound TUNNEL_DATA path never
+    // reaches this copy.
+    auto shared = std::make_shared<std::vector<uint8_t>>(payload_);
+    return core::OwnedBufferView(std::move(shared));
 }
 
 std::optional<TunnelAckPayload> ProtocolFrame::as_tunnel_ack() const {

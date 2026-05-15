@@ -250,6 +250,42 @@ bool TcpConnection::write(std::vector<uint8_t> data) {
     return true;
 }
 
+bool TcpConnection::write(OwnedBufferView buf) {
+    ConnectionState s = state_.load(std::memory_order_acquire);
+    if (s != ConnectionState::Connected && s != ConnectionState::Disconnecting) {
+        util::Logger::warn("TcpConnection::write(view) called in state {}", to_string(s));
+        return false;
+    }
+    if (buf.empty()) {
+        return true;
+    }
+    const std::size_t length = buf.size();
+    if (write_buffer_bytes_.load(std::memory_order_relaxed) + length > max_write_buffer_size_) {
+        util::Logger::debug("TcpConnection: zero-copy write rejected, buffer full");
+        return false;
+    }
+
+    auto self = shared_from_this();
+    asio::post(strand_, [this, self, buf = std::move(buf)]() mutable {
+        ConnectionState inner_s = state_.load(std::memory_order_acquire);
+        if (inner_s != ConnectionState::Connected && inner_s != ConnectionState::Disconnecting) {
+            return;
+        }
+        const std::size_t len = buf.size();
+        if (write_buffer_bytes_.load(std::memory_order_relaxed) + len > max_write_buffer_size_) {
+            return;
+        }
+        WriteBuffer wb;
+        wb.view = std::move(buf);
+        write_buffer_bytes_.fetch_add(len, std::memory_order_relaxed);
+        write_queue_.push_back(std::move(wb));
+        if (!write_in_progress_) {
+            do_write();
+        }
+    });
+    return true;
+}
+
 void TcpConnection::close() {
     auto self = shared_from_this();
     asio::post(strand_, [this, self]() {
@@ -382,28 +418,30 @@ void TcpConnection::do_write() {
 
     auto self = shared_from_this();
     asio::async_write(
-        socket_, asio::buffer(front.data),
-        asio::bind_executor(
-            strand_, [this, self](const std::error_code& ec, std::size_t bytes_transferred) {
-                if (ec) {
-                    util::Logger::debug("TcpConnection: write error: {}", ec.message());
-                    write_in_progress_ = false;
-                    notify_error(ec);
-                    if (state_.load(std::memory_order_acquire) == ConnectionState::Connected) {
-                        set_state(ConnectionState::Disconnecting);
-                    }
-                    do_close(ec);
-                    return;
+        socket_, asio::buffer(front.bytes(), front.size()),
+        asio::bind_executor(strand_, [this, self](const std::error_code& ec,
+                                                  std::size_t bytes_transferred) {
+            if (ec) {
+                util::Logger::debug("TcpConnection: write error: {}", ec.message());
+                write_in_progress_ = false;
+                notify_error(ec);
+                if (state_.load(std::memory_order_acquire) == ConnectionState::Connected) {
+                    set_state(ConnectionState::Disconnecting);
                 }
+                do_close(ec);
+                return;
+            }
 
-                assert(!write_queue_.empty());
-                write_buffer_bytes_.fetch_sub(write_queue_.front().data.size(),
-                                              std::memory_order_relaxed);
-                write_queue_.pop_front();
+            assert(!write_queue_.empty());
+            write_buffer_bytes_.fetch_sub(write_queue_.front().size(), std::memory_order_relaxed);
+            // Pop releases either the owned `vector` or the shared buffer
+            // ref held by the `OwnedBufferView`. Either way the bytes are
+            // freed exactly when their async_write completes — RAII.
+            write_queue_.pop_front();
 
-                (void)bytes_transferred;
-                do_write();
-            }));
+            (void)bytes_transferred;
+            do_write();
+        }));
 }
 
 void TcpConnection::do_close(const std::error_code& ec) {

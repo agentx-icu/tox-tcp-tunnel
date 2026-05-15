@@ -653,6 +653,15 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     });
 
     // Tox data -> TCP: set up the callback so tunnel data is written to TCP.
+    //
+    // Wire the owned-buffer callback for zero-copy hand-off: the shared
+    // payload allocated by `ProtocolFrame::deserialize` is passed straight
+    // through to `TcpConnection::write(OwnedBufferView)` without any further
+    // copy. The buffer's lifetime is held by the shared_ptr until the
+    // async TCP write completes. The span-based callback is kept as a
+    // safety net for any code path that bypasses the owned-buffer route.
+    tunnel_impl->set_on_data_for_tcp_owned(
+        [tcp_conn](core::OwnedBufferView buf) { tcp_conn->write(std::move(buf)); });
     tunnel_impl->set_on_data_for_tcp(
         [tcp_conn](std::span<const uint8_t> data) { tcp_conn->write(data.data(), data.size()); });
 

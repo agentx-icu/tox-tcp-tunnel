@@ -11,6 +11,8 @@
 #include <string_view>
 #include <vector>
 
+#include "toxtunnel/core/owned_buffer.hpp"
+
 namespace toxtunnel::core {
 
 /// Connection lifecycle states.
@@ -157,6 +159,18 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// Convenience overload accepting a vector.
     bool write(std::vector<uint8_t> data);
 
+    /// Zero-copy overload: enqueue a view onto an already-allocated buffer
+    /// whose lifetime is managed by a `shared_ptr`. The buffer is held alive
+    /// until `asio::async_write` completes; no payload copy occurs at this
+    /// boundary. This is the entry point for the inbound TUNNEL_DATA path:
+    /// bytes deserialized on the strand are forwarded straight through to
+    /// the TCP socket without an intermediate `vector<uint8_t>` copy.
+    ///
+    /// @return `true` if the buffer was accepted; `false` if the connection
+    ///         is not writable or the write buffer would exceed the
+    ///         backpressure limit.
+    bool write(OwnedBufferView buf);
+
     /// Initiate a graceful shutdown.  Any data already queued for writing
     /// will be flushed before the socket is closed.  The on_disconnect
     /// callback fires once the shutdown is complete.
@@ -233,8 +247,23 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     std::vector<uint8_t> read_buffer_;
 
     // Write state — touched only inside the strand.
+    //
+    // Each queued buffer can carry either an owned `vector<uint8_t>` (the
+    // legacy path used by outbound TCP writes and write-coalesced frames)
+    // OR an `OwnedBufferView` referring to an externally-allocated buffer
+    // (the zero-copy inbound TUNNEL_DATA path). At most one of `data` or
+    // `view` is meaningful per entry: when `view` is non-empty, it wins.
     struct WriteBuffer {
         std::vector<uint8_t> data;
+        OwnedBufferView view;
+
+        [[nodiscard]] std::size_t size() const noexcept {
+            return !view.empty() ? view.size() : data.size();
+        }
+
+        [[nodiscard]] const uint8_t* bytes() const noexcept {
+            return !view.empty() ? view.data().data() : data.data();
+        }
     };
     std::deque<WriteBuffer> write_queue_;
     /// Atomic so write() can do a fast pre-check before posting onto the

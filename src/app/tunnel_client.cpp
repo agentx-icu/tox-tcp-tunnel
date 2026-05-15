@@ -550,9 +550,9 @@ void TunnelClient::start_pipe_mode() {
 #endif
 
     const uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
-    auto tunnel = std::make_unique<tunnel::TunnelImpl>(
-        io_ctx_->get_io_context(), tunnel_id,
-        server_friend_number_.load(std::memory_order_acquire));
+    auto tunnel =
+        std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
+                                             server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
     auto* tunnel_raw = tunnel.get();
@@ -647,9 +647,9 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     util::Logger::debug("New TCP connection on port {}, creating tunnel {} -> {}:{}",
                         rule.local_port, tunnel_id, rule.remote_host, rule.remote_port);
 
-    auto tunnel = std::make_unique<tunnel::TunnelImpl>(
-        io_ctx_->get_io_context(), tunnel_id,
-        server_friend_number_.load(std::memory_order_acquire));
+    auto tunnel =
+        std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
+                                             server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
 
@@ -669,7 +669,12 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
             server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
-    // Wire callback: when data arrives from Tox for this tunnel, write to TCP
+    // Wire callback: when data arrives from Tox for this tunnel, write to TCP.
+    // Prefer the zero-copy owned-buffer route so the payload buffer
+    // allocated during `ProtocolFrame::deserialize` is handed straight to
+    // the TCP write queue without an intermediate `vector<uint8_t>` copy.
+    tunnel->set_on_data_for_tcp_owned(
+        [conn](core::OwnedBufferView buf) { conn->write(std::move(buf)); });
     tunnel->set_on_data_for_tcp(
         [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
 
