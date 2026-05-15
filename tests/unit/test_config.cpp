@@ -1087,7 +1087,7 @@ client:
     enabled: true
     listen: ")";
 
-    for (const std::string& listen :
+    for (const char* const listen :
          {"127.0.0.1:1080", "127.42.13.7:9999", "[::1]:1080", "localhost:1080", "LocalHost:8080"}) {
         const std::string yaml = std::string(yaml_template) + listen + "\"";
         auto result = Config::from_string(yaml);
