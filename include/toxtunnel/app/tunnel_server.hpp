@@ -1,9 +1,11 @@
 #pragma once
 
+#include <asio.hpp>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -127,6 +129,15 @@ class TunnelServer {
 
     /// Async I/O thread pool.
     std::unique_ptr<core::IoContext> io_context_;
+
+    /// Serializes inbound lossless-packet dispatch on top of io_context_'s
+    /// pool. Without this, frames a friend sends back-to-back (e.g. ACK
+    /// then DATA, or several DATA chunks) can be picked up by different
+    /// worker threads and processed out of order — DATA arriving before
+    /// the receiver has transitioned the tunnel into Connected is silently
+    /// dropped. The strand preserves arrival order while keeping the rest
+    /// of the IO pool parallel.
+    std::optional<asio::strand<asio::any_io_executor>> inbound_strand_;
 
     /// Tox network adapter.
     std::unique_ptr<tox::ToxAdapter> tox_adapter_;

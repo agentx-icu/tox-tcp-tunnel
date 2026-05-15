@@ -55,6 +55,12 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     // Create IoContext.
     io_context_ = std::make_unique<core::IoContext>();
 
+    // Build the inbound-dispatch strand on the IO pool so each friend's
+    // lossless-packet handlers run in arrival order, preserving the order
+    // toxcore already guarantees on the wire. See header comment for the
+    // out-of-order bug this prevents.
+    inbound_strand_.emplace(asio::make_strand(io_context_->get_io_context().get_executor()));
+
     // Configure ToxAdapter.
     tox::ToxAdapterConfig tox_config;
     tox_config.data_dir = config_.data_dir;
@@ -101,7 +107,7 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
             // win is keeping the Tox thread free to push outbound packets at
             // the next 50ms tick rather than waiting for our processing.
             std::vector<uint8_t> packet(data, data + length);
-            asio::post(io_context_->get_io_context(),
+            asio::post(*inbound_strand_,
                        [this, friend_number, packet = std::move(packet)]() {
                            on_lossless_packet(friend_number, packet.data(), packet.size());
                        });
