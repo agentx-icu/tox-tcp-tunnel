@@ -47,7 +47,10 @@ namespace {
 
 using namespace std::chrono_literals;
 
-constexpr auto kTimeout = 5s;
+// 15s is generous enough for slow CI runners (macos-aarch64 has been observed
+// to take >5s for the 4th accept callback with a 2-thread io_context); the
+// successful-path cost is unchanged.
+constexpr auto kTimeout = 15s;
 
 // -----------------------------------------------------------------------------
 // Lifetime sentinel: a vector<uint8_t> subclass whose destructor decrements
