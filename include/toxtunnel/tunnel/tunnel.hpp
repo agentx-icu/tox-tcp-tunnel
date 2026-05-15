@@ -160,6 +160,15 @@ class TunnelImpl : public Tunnel {
     /// Default ACK threshold (16 KiB).
     static constexpr std::size_t kDefaultAckThreshold = 16 * 1024;
 
+    /// Default coalescing flush delay (microseconds). Mirrors the
+    /// `TunnelConfig.coalesce_max_delay_us` schema default.
+    static constexpr std::uint32_t kDefaultCoalesceMaxDelayUs = 200;
+
+    /// Default per-frame coalescing payload cap. Mirrors the
+    /// `TunnelConfig.coalesce_max_bytes` schema default and stays below the
+    /// 1367-byte ceiling imposed by Tox lossless framing.
+    static constexpr std::uint32_t kDefaultCoalesceMaxBytes = 1362;
+
     // -----------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------
@@ -276,6 +285,23 @@ class TunnelImpl : public Tunnel {
     [[nodiscard]] bool send_data_to_tox(const std::vector<uint8_t>& data);
 
     // -----------------------------------------------------------------
+    // Write-side coalescing
+    // -----------------------------------------------------------------
+
+    /// Configure the per-tunnel write coalescer.
+    ///
+    /// @param max_delay_us  Maximum time a byte is held before being flushed.
+    ///                      Zero disables coalescing (every write emits its
+    ///                      own TUNNEL_DATA frames immediately).
+    /// @param max_bytes     Maximum payload size per emitted TUNNEL_DATA
+    ///                      frame. Hard-capped to the Tox-MTU ceiling.
+    void configure_coalesce(std::uint32_t max_delay_us, std::uint32_t max_bytes);
+
+    /// Flush any buffered coalesced bytes immediately as one frame.
+    /// Used by close() / force_close() and exposed for tests.
+    void flush_pending_writes();
+
+    // -----------------------------------------------------------------
     // Error handling
     // -----------------------------------------------------------------
 
@@ -353,6 +379,19 @@ class TunnelImpl : public Tunnel {
     /// Send a frame to the Tox peer via the callback.
     void send_frame_to_tox(const ProtocolFrame& frame);
 
+    /// Append `data` to the coalesce buffer, draining full-MTU frames as it
+    /// fills. The caller must hold `coalesce_mutex_`.
+    void coalesce_append_locked(std::span<const uint8_t> data);
+
+    /// Emit a single TUNNEL_DATA frame carrying the front of the coalesce
+    /// buffer (up to `coalesce_max_bytes_` bytes). The caller must hold
+    /// `coalesce_mutex_`.
+    void coalesce_emit_front_locked(std::size_t bytes);
+
+    /// (Re)arm the flush timer if the buffer is non-empty and no timer is
+    /// pending. The caller must hold `coalesce_mutex_`.
+    void coalesce_arm_timer_locked();
+
     /// Bump the last-activity timestamp to "now". Called only on TUNNEL_DATA
     /// in either direction; keep-alive and control frames do NOT bump.
     void BumpActivity() noexcept;
@@ -406,6 +445,17 @@ class TunnelImpl : public Tunnel {
     /// Last activity timestamp as nanoseconds since steady_clock epoch.
     /// Atomic so the reaper thread can sample without taking the tunnel mutex.
     std::atomic<int64_t> last_activity_ns_;
+
+    // ---- Write coalescing state ------------------------------------------
+    // Separate mutex from `mutex_` so a flush that crosses to the Tox thread
+    // never races with state/callback edits (which also call into us).
+    mutable std::mutex coalesce_mutex_;
+    std::vector<std::uint8_t> coalesce_buf_;
+    asio::steady_timer coalesce_timer_;
+    std::uint32_t coalesce_max_delay_us_{kDefaultCoalesceMaxDelayUs};
+    std::uint32_t coalesce_max_bytes_{kDefaultCoalesceMaxBytes};
+    bool coalesce_timer_armed_{false};
+    std::uint64_t coalesce_timer_epoch_{0};
 
     /// Protects non-atomic members.
     mutable std::mutex mutex_;

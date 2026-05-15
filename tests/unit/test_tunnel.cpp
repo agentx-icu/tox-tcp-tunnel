@@ -271,6 +271,10 @@ TEST_F(TunnelTest, SendData_SplitsFramesToFitToxCustomPacketLimit) {
     constexpr std::size_t kMaxTcpPayloadPerFrame = 1367;
 
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    // Coalescing-off path exercises the raw fragmentation behaviour this
+    // test was originally written for; the coalescing path is covered in
+    // tunnel_coalesce_test.cpp.
+    tunnel.configure_coalesce(0, kMaxTcpPayloadPerFrame);
     tunnel.set_state(Tunnel::State::Connected);
 
     std::vector<ProtocolFrame> sent_frames;
@@ -425,6 +429,9 @@ TEST_F(TunnelTest, TcpConnection_CanBeSet) {
 
 TEST_F(TunnelTest, TcpConnection_DataFromTcpSendsToTox) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    // Disable coalescing so the small TCP write emits synchronously; the
+    // coalescing path is covered by tunnel_coalesce_test.cpp.
+    tunnel.configure_coalesce(0, 1362);
     tunnel.set_state(Tunnel::State::Connected);
 
     bool data_sent_to_tox = false;

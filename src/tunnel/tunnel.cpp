@@ -47,12 +47,15 @@ TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t fr
     : Tunnel(tunnel_id, io_ctx),
       friend_number_(friend_number),
       send_window_size_(send_window),
-      last_activity_ns_(std::chrono::steady_clock::now().time_since_epoch().count()) {
+      last_activity_ns_(std::chrono::steady_clock::now().time_since_epoch().count()),
+      coalesce_timer_(io_ctx) {
     util::Logger::debug("Tunnel created: id={}, friend={}, window={}", tunnel_id_, friend_number_,
                         send_window_size_);
 }
 
 TunnelImpl::~TunnelImpl() {
+    // Cancel without firing the handler — the timer holds a raw `this`.
+    coalesce_timer_.cancel();
     util::Logger::debug("Tunnel destroyed: id={}", tunnel_id_);
 }
 
@@ -158,6 +161,10 @@ void TunnelImpl::close() {
         return;
     }
 
+    // Drain any pending coalesced data before signalling close so receivers
+    // observe every byte we accepted from the IO pool.
+    flush_pending_writes();
+
     // Send TUNNEL_CLOSE frame
     auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
     send_frame_to_tox(frame);
@@ -173,6 +180,8 @@ void TunnelImpl::force_close() {
     if (current == State::Closed) {
         return;
     }
+
+    flush_pending_writes();
 
     // Close TCP connection if any
     {
@@ -408,12 +417,22 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
     // Update statistics
     total_bytes_sent_.fetch_add(data_size, std::memory_order_relaxed);
 
-    for (std::size_t offset = 0; offset < data.size(); offset += kMaxTcpPayloadPerToxFrame) {
-        const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
-        auto frame = ProtocolFrame::make_tunnel_data(tunnel_id_, data.subspan(offset, chunk_size));
-        send_frame_to_tox(frame);
+    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+
+    // Coalescing disabled — preserve the legacy "emit each call, fragment to
+    // Tox MTU" behaviour byte-for-byte.
+    if (coalesce_max_delay_us_ == 0) {
+        for (std::size_t offset = 0; offset < data.size(); offset += kMaxTcpPayloadPerToxFrame) {
+            const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
+            auto frame =
+                ProtocolFrame::make_tunnel_data(tunnel_id_, data.subspan(offset, chunk_size));
+            send_frame_to_tox(frame);
+        }
+        return true;
     }
 
+    coalesce_append_locked(data);
+    coalesce_arm_timer_locked();
     return true;
 }
 
@@ -523,6 +542,80 @@ void TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
 void TunnelImpl::BumpActivity() noexcept {
     last_activity_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                             std::memory_order_relaxed);
+}
+
+// ===========================================================================
+// Write-side coalescing
+// ===========================================================================
+
+void TunnelImpl::configure_coalesce(std::uint32_t max_delay_us, std::uint32_t max_bytes) {
+    // Clamp to the Tox-MTU ceiling so a single emitted frame always fits one
+    // lossless custom packet.
+    std::uint32_t clamped = max_bytes;
+    if (clamped == 0 || clamped > kMaxTcpPayloadPerToxFrame) {
+        clamped = static_cast<std::uint32_t>(kMaxTcpPayloadPerToxFrame);
+    }
+
+    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+    coalesce_max_delay_us_ = max_delay_us;
+    coalesce_max_bytes_ = clamped;
+    // If coalescing was just disabled, drain whatever's queued so order is
+    // preserved relative to subsequent direct writes.
+    if (coalesce_max_delay_us_ == 0 && !coalesce_buf_.empty()) {
+        coalesce_emit_front_locked(coalesce_buf_.size());
+    }
+}
+
+void TunnelImpl::flush_pending_writes() {
+    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+    if (coalesce_buf_.empty()) {
+        return;
+    }
+    coalesce_emit_front_locked(coalesce_buf_.size());
+    coalesce_timer_.cancel();
+    coalesce_timer_armed_ = false;
+}
+
+void TunnelImpl::coalesce_append_locked(std::span<const uint8_t> data) {
+    coalesce_buf_.insert(coalesce_buf_.end(), data.begin(), data.end());
+    while (coalesce_buf_.size() >= coalesce_max_bytes_) {
+        coalesce_emit_front_locked(coalesce_max_bytes_);
+    }
+}
+
+void TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
+    if (bytes == 0 || coalesce_buf_.empty()) {
+        return;
+    }
+    bytes = std::min(bytes, coalesce_buf_.size());
+    auto frame = ProtocolFrame::make_tunnel_data(
+        tunnel_id_, std::span<const uint8_t>(coalesce_buf_.data(), bytes));
+    send_frame_to_tox(frame);
+    coalesce_buf_.erase(coalesce_buf_.begin(),
+                        coalesce_buf_.begin() + static_cast<std::ptrdiff_t>(bytes));
+}
+
+void TunnelImpl::coalesce_arm_timer_locked() {
+    if (coalesce_buf_.empty() || coalesce_timer_armed_) {
+        return;
+    }
+    coalesce_timer_armed_ = true;
+    const auto epoch = ++coalesce_timer_epoch_;
+    coalesce_timer_.expires_after(std::chrono::microseconds(coalesce_max_delay_us_));
+    coalesce_timer_.async_wait([this, epoch](const std::error_code& ec) {
+        if (ec) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        // Reject stale firings (cancel-and-reset races).
+        if (epoch != coalesce_timer_epoch_) {
+            return;
+        }
+        coalesce_timer_armed_ = false;
+        if (!coalesce_buf_.empty()) {
+            coalesce_emit_front_locked(coalesce_buf_.size());
+        }
+    });
 }
 
 }  // namespace toxtunnel::tunnel

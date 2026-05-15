@@ -484,6 +484,8 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
 
     auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(io_context_->get_io_context(),
                                                               tunnel_id, friend_number);
+    server_tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
+                                      config_.tunnel.coalesce_max_bytes);
     // Already-serialized frame from TunnelImpl: prepend the lossless prefix
     // byte and send directly. Going via manager_ptr->send_frame would force a
     // deserialize + re-serialize round trip plus a redundant byte copy.

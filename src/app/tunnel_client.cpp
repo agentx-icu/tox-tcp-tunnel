@@ -454,6 +454,8 @@ void TunnelClient::start_pipe_mode() {
     const uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
     auto tunnel = std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
                                                        server_friend_number_);
+    tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
+                               config_.tunnel.coalesce_max_bytes);
     auto* tunnel_raw = tunnel.get();
 
     tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
@@ -548,6 +550,8 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
 
     auto tunnel = std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
                                                        server_friend_number_);
+    tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
+                               config_.tunnel.coalesce_max_bytes);
 
     // Set the TCP connection on the tunnel
     tunnel->set_tcp_connection(conn);
