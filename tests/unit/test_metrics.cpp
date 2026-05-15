@@ -179,8 +179,10 @@ TEST_F(MetricsTest, RenderEscapesBuildInfoLabels) {
     const std::string text = m.render();
     // The literal `\"`, `\\`, and `\n` (two characters: backslash + n) must
     // appear inside the version label value.
-    EXPECT_NE(text.find(R"(version="v\"1\\0\nbeta")"), std::string::npos) << text;
-    EXPECT_NE(text.find(R"(git_sha="abc123")"), std::string::npos) << text;
+    // MSVC's preprocessor mis-parses default-delimited raw strings that contain
+    // unescaped `"` characters; use a custom delimiter to stay portable.
+    EXPECT_NE(text.find(R"~(version="v\"1\\0\nbeta")~"), std::string::npos) << text;
+    EXPECT_NE(text.find(R"~(git_sha="abc123")~"), std::string::npos) << text;
 }
 
 TEST_F(MetricsTest, RenderEndsWithNewline) {

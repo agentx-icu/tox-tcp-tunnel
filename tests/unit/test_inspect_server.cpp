@@ -78,7 +78,9 @@ std::string send_request(const std::filesystem::path& sock_path, const std::stri
         ::close(fd);
         return {};
     }
-    static_cast<void>(::write(fd, line.data(), line.size()));
+    // GCC's -Wunused-result is intentionally not suppressed by (void) /
+    // static_cast<void> — assign to a [[maybe_unused]] sink instead.
+    [[maybe_unused]] auto write_rc = ::write(fd, line.data(), line.size());
     std::string out;
     char buf[1024];
     ssize_t n = 0;
