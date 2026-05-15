@@ -617,6 +617,45 @@ kubectl config set-cluster remote-k8s \
 
 ---
 
+## SOCKS5 / HTTP CONNECT Proxy
+
+Run the client as a SOCKS5 v5 + HTTP CONNECT listener so a browser (or any
+proxy-aware tool) can dial arbitrary destinations through the tunnel without
+the operator pre-registering each target in `forwards:`. Authorisation stays
+on the server via `rules.yaml`.
+
+```yaml
+# socks5_client.yaml
+mode: client
+data_dir: ~/.config/toxtunnel
+
+client:
+  server_id: "PASTE_REMOTE_SERVER_TOX_ADDRESS"
+  socks5:
+    enabled: true
+    listen: "127.0.0.1:1080"
+```
+
+```bash
+./build/toxtunnel -c socks5_client.yaml
+# or, equivalently:
+./build/toxtunnel -m client --server-id <id-or-alias> --socks5 127.0.0.1:1080
+
+# Browse anything the server's rules allow:
+curl --socks5 127.0.0.1:1080 https://internal.example.com/
+firefox --new-instance --no-remote # then set SOCKS5 host=127.0.0.1 port=1080
+
+# Same listener accepts plain HTTP CONNECT:
+curl --proxy http://127.0.0.1:1080 https://internal.example.com/
+```
+
+The server's `rules.yaml` is the single source of truth for which destinations
+the SOCKS5 client may reach. The listener supports `CONNECT` only —
+`BIND` and `UDP ASSOCIATE` requests are rejected with SOCKS5 reply code `0x07`,
+and unauthenticated proxy auth is the only mode (bind to loopback).
+
+---
+
 ## Multi-hop Tunneling
 
 Chain multiple ToxTunnel instances for complex network setups.

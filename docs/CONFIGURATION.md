@@ -103,6 +103,32 @@ via local `TUNNEL_CLOSE`; TCP listeners rebuild tunnels through the new
 active server on the next accepted connection. The single-string `server_id`
 form remains fully supported and behaves exactly as before.
 
+### Dynamic Destinations (SOCKS5 / HTTP CONNECT)
+
+Instead of enumerating every `forwards:` mapping ahead of time, the client can
+expose a SOCKS5 v5 (RFC 1928) and HTTP CONNECT (RFC 7231 §4.3.6) listener.
+Browsers, `curl --socks5`, `nc -X 5`, and any other proxy-aware tool can then
+ask for arbitrary destinations at runtime — the server still enforces what is
+allowed via `rules.yaml`, so enabling this on the client does not change the
+trust boundary.
+
+```yaml
+client:
+  server_id: "AABBCCDD..."
+  socks5:
+    enabled: false                  # default: off (backwards-compatible)
+    listen: "127.0.0.1:1080"        # local bind for both SOCKS5 and HTTP CONNECT
+```
+
+The listener auto-detects protocol by sniffing the first byte of each accepted
+connection: `0x05` is SOCKS5, anything else is parsed as HTTP CONNECT.
+Authentication is intentionally not implemented in v1 — bind to loopback only
+(`127.0.0.1` / `::1`) and rely on the server-side rules engine for access
+control. Only the CONNECT command is supported; SOCKS5 BIND and UDP ASSOCIATE
+are rejected with reply code `0x07` (command not supported). The CLI form
+`--socks5 host:port` is equivalent to setting `socks5.enabled: true` plus
+`socks5.listen`.
+
 ## Service Policy (`service:`)
 
 Controls whether `toxtunnel --service` (run under systemd / launchd / Windows SCM)

@@ -172,6 +172,19 @@ struct ServerConfig {
     }
 };
 
+/// Dynamic-destination SOCKS5 (and HTTP CONNECT) listener on the client.
+///
+/// Off by default — operators opt in. The server still enforces access via
+/// `rules.yaml`, so enabling this on the client does not change the server's
+/// trust boundary; it only lets the client dial arbitrary destinations
+/// without enumerating them in `forwards`.
+struct Socks5Config {
+    bool enabled = false;
+    std::string listen = "127.0.0.1:1080";
+
+    bool operator==(const Socks5Config& other) const = default;
+};
+
 /// Failover policy for multi-server clients.
 ///
 /// When `client.server_id` resolves to more than one Tox ID, the client adds
@@ -202,6 +215,7 @@ struct ClientConfig {
     std::vector<ForwardRule> forwards;      ///< Port forwarding rules
     std::optional<PipeTarget> pipe_target;  ///< Optional stdio pipe target
     FailoverConfig failover;                ///< Multi-server failover policy
+    Socks5Config socks5;                    ///< Optional dynamic-destination listener
 
     /// Return the ordered list of all server IDs (primary first, then fallbacks).
     /// Skips empty entries.
@@ -222,7 +236,7 @@ struct ClientConfig {
     bool operator==(const ClientConfig& other) const {
         return server_id == other.server_id && fallback_server_ids == other.fallback_server_ids &&
                forwards == other.forwards && pipe_target == other.pipe_target &&
-               failover == other.failover;
+               failover == other.failover && socks5 == other.socks5;
     }
 };
 
@@ -427,6 +441,12 @@ template <>
 struct convert<toxtunnel::ServerConfig> {
     static Node encode(const toxtunnel::ServerConfig& rhs);
     static bool decode(const Node& node, toxtunnel::ServerConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::Socks5Config> {
+    static Node encode(const toxtunnel::Socks5Config& rhs);
+    static bool decode(const Node& node, toxtunnel::Socks5Config& rhs);
 };
 
 template <>

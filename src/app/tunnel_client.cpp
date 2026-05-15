@@ -237,6 +237,29 @@ void TunnelClient::start() {
     schedule_info_refresh();
     schedule_failover_tick();
 
+    if (config_.client.has_value() && config_.client->socks5.enabled) {
+        std::string s5_host;
+        uint16_t s5_port = 0;
+        if (util::parse_listen_spec(config_.client->socks5.listen, s5_host, s5_port)) {
+            socks5_listener_ = std::make_unique<Socks5Listener>();
+            auto err = socks5_listener_->start(
+                io_ctx_->get_io_context(), s5_host, s5_port,
+                [this](std::shared_ptr<core::TcpConnection> conn, std::string host, uint16_t port,
+                       std::function<void(bool)> reply_cb) {
+                    open_socks5_tunnel(std::move(conn), std::move(host), port, std::move(reply_cb));
+                });
+            if (!err.empty()) {
+                util::Logger::warn("SOCKS5 listener disabled: {}", err);
+                socks5_listener_.reset();
+            } else {
+                util::Logger::info("SOCKS5 / HTTP CONNECT listener on {}:{}", s5_host, s5_port);
+            }
+        } else {
+            util::Logger::warn("SOCKS5 listener disabled: invalid listen spec '{}'",
+                               config_.client->socks5.listen);
+        }
+    }
+
     if (is_pipe_mode()) {
         util::Logger::info("Client running in stdio pipe mode");
         if (server_online_) {
@@ -280,6 +303,11 @@ void TunnelClient::stop() {
     if (failover_timer_) {
         failover_timer_->cancel();
         failover_timer_.reset();
+    }
+
+    if (socks5_listener_) {
+        socks5_listener_->stop();
+        socks5_listener_.reset();
     }
 
     // Stop all TCP listeners
@@ -736,6 +764,96 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
 
     util::Logger::debug("Tunnel {} created and TUNNEL_OPEN sent to {}:{}", tunnel_id,
                         rule.remote_host, rule.remote_port);
+}
+
+void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
+                                      uint16_t port, std::function<void(bool)> on_tunnel_state) {
+    if (!server_online_) {
+        util::Logger::warn("SOCKS5 destination {}:{} requested but server is offline", host, port);
+        on_tunnel_state(false);
+        conn->close();
+        return;
+    }
+
+    const uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
+    util::Logger::debug("SOCKS5 destination {}:{} -> tunnel {}", host, port, tunnel_id);
+
+    auto tunnel =
+        std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
+                                             server_friend_number_.load(std::memory_order_acquire));
+    tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
+                               config_.tunnel.coalesce_max_bytes);
+    tunnel->set_tcp_connection(conn);
+
+    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+        std::vector<uint8_t> packet;
+        packet.reserve(1 + data.size());
+        packet.push_back(tunnel::kLosslessPacketByte);
+        packet.insert(packet.end(), data.begin(), data.end());
+        (void)tox_adapter_->send_lossless_packet(
+            server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
+    });
+
+    tunnel->set_on_data_for_tcp(
+        [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
+
+    // The reply gate latch ensures the listener's reply callback is invoked
+    // exactly once across all possible state transitions of this tunnel.
+    auto reply_sent = std::make_shared<std::atomic_flag>();
+    auto open_counted = std::make_shared<std::atomic_flag>();
+    auto active_dec_latch = std::make_shared<std::atomic_flag>();
+    auto reply_cb = std::make_shared<std::function<void(bool)>>(std::move(on_tunnel_state));
+    tunnel->set_on_state_change([conn, tunnel_id, reply_sent, open_counted, active_dec_latch,
+                                 reply_cb](tunnel::Tunnel::State new_state) {
+        if (new_state == tunnel::Tunnel::State::Connected) {
+            if (!reply_sent->test_and_set()) {
+                (*reply_cb)(true);
+            }
+            util::Logger::debug("SOCKS5 tunnel {} connected, starting TCP read", tunnel_id);
+            conn->start_read();
+            if (!open_counted->test_and_set()) {
+                util::MetricsRegistry::instance().inc_tunnels_opened(
+                    util::MetricsRegistry::OpenResult::Ok);
+                util::MetricsRegistry::instance().inc_tunnels_active(
+                    util::MetricsRegistry::Role::Client);
+            }
+        } else if (new_state == tunnel::Tunnel::State::Closed ||
+                   new_state == tunnel::Tunnel::State::Error) {
+            if (!reply_sent->test_and_set()) {
+                (*reply_cb)(false);
+            }
+            util::Logger::debug("SOCKS5 tunnel {} state: {}", tunnel_id, to_string(new_state));
+            conn->close();
+            if (open_counted->test(std::memory_order_acquire) &&
+                !active_dec_latch->test_and_set()) {
+                util::MetricsRegistry::instance().dec_tunnels_active(
+                    util::MetricsRegistry::Role::Client);
+            }
+        }
+    });
+
+    auto* tunnel_mgr_ptr = tunnel_mgr_.get();
+    tunnel->set_on_close([tunnel_mgr_ptr, tunnel_id]() {
+        util::Logger::debug("SOCKS5 tunnel {} on_close, removing from manager", tunnel_id);
+        tunnel_mgr_ptr->remove_tunnel(tunnel_id);
+    });
+
+    auto* tunnel_raw = tunnel.get();
+    conn->set_on_data([tunnel_raw](const uint8_t* data, std::size_t length) {
+        tunnel_raw->on_tcp_data_received(data, length);
+    });
+    conn->set_on_disconnect([tunnel_raw](const std::error_code& /*ec*/) { tunnel_raw->close(); });
+
+    bool opened = tunnel->open(host, port);
+    if (!opened) {
+        util::Logger::error("Failed to open SOCKS5 tunnel {} to {}:{}", tunnel_id, host, port);
+        if (!reply_sent->test_and_set()) {
+            (*reply_cb)(false);
+        }
+        conn->close();
+        return;
+    }
+    tunnel_mgr_->add_tunnel(tunnel_id, std::move(tunnel));
 }
 
 // ---------------------------------------------------------------------------

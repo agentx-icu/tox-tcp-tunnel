@@ -13,6 +13,7 @@
 
 #include "toxtunnel/app/inspect_server.hpp"
 #include "toxtunnel/app/known_servers.hpp"
+#include "toxtunnel/app/socks5_listener.hpp"
 #include "toxtunnel/app/stdio_pipe_bridge.hpp"
 #include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/core/tcp_listener.hpp"
@@ -300,6 +301,15 @@ class TunnelClient {
     /// lifetime is tied to the io_context — the inspect server posts onto
     /// the IO pool, so it must shut down before io_ctx_ does.
     std::unique_ptr<InspectServer> inspect_server_;
+
+    /// Optional SOCKS5 / HTTP CONNECT listener for dynamic destinations.
+    std::unique_ptr<Socks5Listener> socks5_listener_;
+
+    /// Open a brand-new tunnel for a SOCKS5-supplied destination. Wires up
+    /// the same TCP-to-tunnel plumbing as `on_tcp_connection_accepted`, but
+    /// defers the success reply to the listener via `on_tunnel_state`.
+    void open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
+                            uint16_t port, std::function<void(bool)> on_tunnel_state);
 };
 
 }  // namespace toxtunnel::app

@@ -96,6 +96,9 @@ Expected<void, std::string> check_reloadable(const Config& current, const Config
         if (a.pipe_target != b.pipe_target) {
             return make_unexpected(field_rejection("client.pipe_target"));
         }
+        if (!(a.socks5 == b.socks5)) {
+            return make_unexpected(field_rejection("client.socks5"));
+        }
         // forwards is the reloadable bit.
     }
 

@@ -971,6 +971,9 @@ int main(int argc, char* argv[]) {
                    "tried in order if the primary stays offline.")
         ->take_all();
     app.add_option("--pipe", pipe_target, "Pipe mode target host:port (client mode)");
+    std::string socks5_listen;
+    app.add_option("--socks5", socks5_listen,
+                   "Enable SOCKS5 / HTTP CONNECT listener at host:port (client mode)");
     app.add_flag("--service", run_as_service, "Run as background service");
 
     app.set_version_flag("-v,--version", kVersion);
@@ -1180,6 +1183,15 @@ int main(int argc, char* argv[]) {
             overrides.client = ClientConfig{};
         }
         overrides.client->pipe_target = pipe_result.value();
+        has_overrides = true;
+    }
+
+    if (!socks5_listen.empty()) {
+        if (!overrides.client) {
+            overrides.client = ClientConfig{};
+        }
+        overrides.client->socks5.enabled = true;
+        overrides.client->socks5.listen = socks5_listen;
         has_overrides = true;
     }
 

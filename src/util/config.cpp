@@ -419,6 +419,19 @@ util::Expected<void, std::string> Config::validate() const {
                 return util::make_unexpected(std::string("Pipe target remote_port cannot be 0"));
             }
         }
+
+        if (client->socks5.enabled) {
+            std::string host;
+            uint16_t s5_port = 0;
+            if (!util::parse_listen_spec(client->socks5.listen, host, s5_port)) {
+                return util::make_unexpected(std::string("Invalid client.socks5.listen value: ") +
+                                             client->socks5.listen);
+            }
+            if (client->pipe_target.has_value()) {
+                return util::make_unexpected(
+                    std::string("client.socks5.enabled and client.pipe cannot be used together"));
+            }
+        }
     }
 
     return {};
@@ -506,6 +519,9 @@ void Config::merge_cli_overrides(const Config& overrides) {
         }
         if (overrides.client->pipe_target.has_value()) {
             client->pipe_target = overrides.client->pipe_target;
+        }
+        if (!(overrides.client->socks5 == Socks5Config{})) {
+            client->socks5 = overrides.client->socks5;
         }
     }
 
@@ -653,6 +669,12 @@ std::string Config::to_yaml() const {
             }
             out << YAML::EndSeq;
         }
+        if (!(client->socks5 == Socks5Config{})) {
+            out << YAML::Key << "socks5" << YAML::Value << YAML::BeginMap;
+            out << YAML::Key << "enabled" << YAML::Value << client->socks5.enabled;
+            out << YAML::Key << "listen" << YAML::Value << client->socks5.listen;
+            out << YAML::EndMap;
+        }
         out << YAML::EndMap;
     }
 
@@ -712,11 +734,12 @@ using toxtunnel::ClientConfig;
 using toxtunnel::Config;
 using toxtunnel::ForwardRule;
 using toxtunnel::LoggingConfig;
+using toxtunnel::MetricsConfig;
 using toxtunnel::Mode;
 using toxtunnel::PipeTarget;
-using toxtunnel::MetricsConfig;
 using toxtunnel::ServerConfig;
 using toxtunnel::ServiceConfig;
+using toxtunnel::Socks5Config;
 using toxtunnel::ToxConfig;
 using toxtunnel::tox::BootstrapMode;
 using toxtunnel::tox::kPublicKeyHexLen;
@@ -1135,6 +1158,38 @@ bool convert<ServerConfig>::decode(const Node& node, ServerConfig& rhs) {
 }
 
 // ---------------------------------------------------------------------------
+// Socks5Config
+// ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::Socks5Config>::encode(const toxtunnel::Socks5Config& rhs) {
+    Node node;
+    node["enabled"] = rhs.enabled;
+    node["listen"] = rhs.listen;
+    return node;
+}
+
+bool convert<toxtunnel::Socks5Config>::decode(const Node& node, toxtunnel::Socks5Config& rhs) {
+    if (node.IsScalar()) {
+        try {
+            rhs.enabled = node.as<bool>();
+            return true;
+        } catch (const YAML::Exception&) {
+            return false;
+        }
+    }
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["enabled"]) {
+        rhs.enabled = node["enabled"].as<bool>();
+    }
+    if (node["listen"]) {
+        rhs.listen = node["listen"].as<std::string>();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // ClientConfig
 // ---------------------------------------------------------------------------
 
@@ -1165,6 +1220,9 @@ Node convert<ClientConfig>::encode(const ClientConfig& rhs) {
         fo["timeout_seconds"] = rhs.failover.timeout_seconds;
         fo["prefer_primary_grace_seconds"] = rhs.failover.prefer_primary_grace_seconds;
         node["failover"] = fo;
+    }
+    if (!(rhs.socks5 == toxtunnel::Socks5Config{})) {
+        node["socks5"] = rhs.socks5;
     }
     return node;
 }
@@ -1210,6 +1268,10 @@ bool convert<ClientConfig>::decode(const Node& node, ClientConfig& rhs) {
             rhs.failover.prefer_primary_grace_seconds =
                 fo["prefer_primary_grace_seconds"].as<uint32_t>();
         }
+    }
+
+    if (node["socks5"]) {
+        rhs.socks5 = node["socks5"].as<toxtunnel::Socks5Config>();
     }
 
     return true;
@@ -1348,6 +1410,9 @@ Node convert<Config>::encode(const Config& rhs) {
         if (!rhs.client->forwards.empty()) {
             client_node["forwards"] = rhs.client->forwards;
         }
+        if (!(rhs.client->socks5 == toxtunnel::Socks5Config{})) {
+            client_node["socks5"] = rhs.client->socks5;
+        }
         node["client"] = std::move(client_node);
     }
 
@@ -1468,6 +1533,10 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
                 rhs.client->failover.prefer_primary_grace_seconds =
                     fo["prefer_primary_grace_seconds"].as<uint32_t>();
             }
+        }
+
+        if (client_node["socks5"]) {
+            rhs.client->socks5 = client_node["socks5"].as<toxtunnel::Socks5Config>();
         }
     }
 
