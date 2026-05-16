@@ -80,17 +80,28 @@ than expanding this section.
 
 | Layer | Components |
 |-------|------------|
-| Application | `TunnelServer`, `TunnelClient`, `RulesEngine` |
-| TCP I/O | `IoContext`, `TcpConnection`, `TcpListener` |
+| Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener` |
+| TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
 | Tox | `ToxAdapter`, `ToxConnection`, `ToxThread` |
 | Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame` |
-| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `Logger` |
+| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger` |
+
+`TunnelClient` owns a `FailoverConfig`-driven state machine that promotes/demotes
+between primary and fallback Tox IDs. `InspectServer` accepts local IPC
+(Unix socket at `<data_dir>/toxtunnel.sock`; Windows named pipe
+`\\.\pipe\toxtunnel-inspect-<pid>`) and serves JSON snapshots gathered via the
+`InspectProviders` struct. `config_reload` computes the reloadable diff
+(rules, forwards, log level) between an on-disk YAML and the live config.
 
 ### Threading Model
 
-- **I/O thread pool** — async TCP via asio
+- **I/O thread pool** — async TCP via asio; `MetricsServer`, `InspectServer`,
+  and `Socks5Listener` all run on this same `IoContext` (no new threads)
 - **Dedicated Tox thread** — all toxcore API calls funnel through one thread; **toxcore is not thread-safe**, so cross-thread calls must marshal through `ToxThread`
-- **Main thread** — signal handling and orchestration
+- **Main thread** — signal handling (`SIGHUP` triggers `config_reload`) and orchestration
+- **Windows reload pipe thread** — Windows lacks `SIGHUP`; a small dedicated
+  thread serves `\\.\pipe\toxtunnel-reload-<pid>` and posts reload onto the
+  signal `io_context`
 
 ### Protocol
 
@@ -117,15 +128,43 @@ After `toxtunnel servers add <alias> <tox_id>`, both `--server-id` and
 ```
 include/toxtunnel/   # Headers organized by layer: core/, tox/, tunnel/, app/, util/
 src/                 # Implementations mirroring include/
-cli/main.cpp         # CLI entry (subcommands: print-id, servers, install-windows-service; --service flag)
-tests/unit/          # Unit tests (~265 tests)
-tests/integration/   # Integration tests (~41 tests)
+cli/main.cpp         # CLI entry (subcommands: print-id, servers, inspect, reload,
+                     #            install-windows-service; --service / --socks5 /
+                     #            --server-id-fallback flags)
+tests/unit/          # Unit tests
+tests/integration/   # Integration tests
 tests/packaging/     # Package-layout tests (run via ctest)
+                     # Total test count: ~436 across all suites.
 third_party/c-toxcore/   # Git submodule — required for build
 cmake/Packaging.cmake    # CPack configuration
 packaging/{linux,macos,windows}/   # Service units, installer scripts, MSI/WIX fragments
 docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario guides
 ```
+
+## v0.3.0 Default Behavior (read before changing config defaults)
+
+- **Inspect IPC** — `inspect.enabled: true` by default. Listener is local-only
+  (Unix socket / Windows named pipe, never TCP). Disable per-host by setting
+  `inspect.enabled: false`.
+- **Metrics** — `metrics.enabled: false` by default (opt-in). When enabled,
+  binds `127.0.0.1:9100` and serves `GET /metrics` only; other paths 404.
+- **SOCKS5 / HTTP CONNECT** — `client.socks5.enabled: false` by default.
+  When enabled, **loopback binds only** are accepted (the listener rejects
+  non-loopback listen addresses at startup).
+- **Idle tunnel reaper** — `tunnel.idle_timeout_seconds: 0` means disabled by
+  default. Setting any positive value enables the reaper, which ticks every
+  `tunnel.reaper_tick_seconds` (default 10).
+- **Write coalescing** — on by default with safe values:
+  `tunnel.coalesce_max_delay_us = 200`, `tunnel.coalesce_max_bytes = 1362`
+  (one Tox-MTU worth). Set delay to 0 to disable.
+- **Multi-server failover** — engaged whenever `client.server_id` resolves to
+  more than one ID (`server_id` may itself be a YAML list, plus optional
+  `client.fallback_server_ids`). `FailoverConfig` controls timing.
+  The client prefers the primary (index 0) once it has been continuously
+  online for `prefer_primary_grace_seconds`.
+- **Hot-reload scope** — `SIGHUP` (POSIX) / `toxtunnel reload` (Windows
+  named-pipe IPC) reloads only: `server.rules_file` contents,
+  `client.forwards`, and `logging.level`. Everything else requires a restart.
 
 ## Dependencies
 

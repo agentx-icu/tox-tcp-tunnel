@@ -41,6 +41,29 @@ Forward any TCP port through Tox with end-to-end encryption, no central server, 
 
 - **Open Source** - Full transparency, auditable code, GPLv3 licensed.
 
+### v0.3.0 Capabilities at a Glance
+
+- **Dynamic destinations** — Run the client as a SOCKS5 / HTTP CONNECT proxy
+  (`--socks5 127.0.0.1:1080`) and point a browser, `curl`, or any
+  proxy-aware tool at it. No need to enumerate every port in `forwards:`.
+  Loopback-only by design.
+- **Prometheus metrics** — Opt-in `/metrics` HTTP endpoint exporting
+  tunnel/byte/error counters. Scrape it from Prometheus / VictoriaMetrics
+  with zero extra infra.
+- **Runtime inspect** — `toxtunnel inspect tunnels` / `inspect status`
+  talks to the live daemon over a local Unix socket (Windows named pipe)
+  and prints tunnel state without touching `/proc` or restarting.
+- **Hot reload** — `kill -HUP <pid>` (POSIX) or `toxtunnel reload`
+  (Windows) re-reads the YAML and applies rules, forwards, and log level
+  without dropping existing tunnels.
+- **Multi-server failover** — Give the client a list of server Tox IDs.
+  It connects to all of them, runs the active session against one, and
+  fails over automatically if the active server goes offline. Returns to
+  the primary once it stays online for the configured grace window.
+- **Idle tunnel reaper** + **write coalescing** — Server-side knobs that
+  keep long-lived deployments lean (closes idle tunnels) and small-write
+  workloads efficient (batches up to one Tox-MTU per packet).
+
 ---
 
 ## How It Works
@@ -518,23 +541,27 @@ the frame; the client falls back to local-only metadata for that entry.
 toxtunnel [OPTIONS]
 toxtunnel print-id [OPTIONS]
 toxtunnel servers {list|show|add|remove} [OPTIONS]
+toxtunnel inspect [tunnels|status] [OPTIONS]
+toxtunnel reload [OPTIONS]
 toxtunnel install-windows-service [OPTIONS]      # Windows only
 toxtunnel uninstall-windows-service              # Windows only
 ```
 
 ### Main Command
 
-| Flag                    | Description                                  |
-| ----------------------- | -------------------------------------------- |
-| `-c, --config FILE`     | YAML config file                             |
-| `-m, --mode MODE`       | `server` or `client`                         |
-| `-d, --data-dir DIR`    | Override data directory (`/var/lib/toxtunnel` for server, `$HOME/.config/toxtunnel` for client) |
-| `-l, --log-level LEVEL` | `trace`, `debug`, `info`, `warn`, `error`    |
-| `-p, --port PORT`       | TCP relay port override (server mode)        |
-| `--server-id ID`        | Server's 76-char Tox address OR an alias from `known_servers.yaml` (client mode) |
-| `--pipe HOST:PORT`      | Pipe mode: connect stdin/stdout to tunnel    |
-| `--service`             | Run as system service (systemd/SCM/launchd)  |
-| `-v, --version`         | Show version                                 |
+| Flag                          | Description                                  |
+| ----------------------------- | -------------------------------------------- |
+| `-c, --config FILE`           | YAML config file                             |
+| `-m, --mode MODE`             | `server` or `client`                         |
+| `-d, --data-dir DIR`          | Override data directory (`/var/lib/toxtunnel` for server, `$HOME/.config/toxtunnel` for client) |
+| `-l, --log-level LEVEL`       | `trace`, `debug`, `info`, `warn`, `error`    |
+| `-p, --port PORT`             | TCP relay port override (server mode)        |
+| `--server-id ID`              | Primary server's 76-char Tox address OR an alias from `known_servers.yaml` (client mode) |
+| `--server-id-fallback ID`     | Fallback server Tox ID or alias (client mode). Repeatable; tried in order if the primary stays offline. |
+| `--pipe HOST:PORT`            | Pipe mode: connect stdin/stdout to tunnel    |
+| `--socks5 HOST:PORT`          | Enable SOCKS5 / HTTP CONNECT listener (client mode; loopback only) |
+| `--service`                   | Run as system service (systemd/SCM/launchd)  |
+| `-v, --version`               | Show version                                 |
 
 ### servers Subcommand
 
@@ -554,6 +581,155 @@ Once an alias is added, `--server-id` and `client.server_id` will accept it.
 | `-d, --data-dir DIR` | Data directory for loading/creating local Tox identity (default: `$HOME/.config/toxtunnel`) |
 | `--qr`               | Render Tox ID as terminal QR code               |
 | `--color`             | Use ANSI colors in QR output (requires `--qr`)  |
+
+### inspect Subcommand
+
+Talks to a running daemon over local IPC (Unix socket
+`<data_dir>/toxtunnel.sock` or Windows named pipe
+`\\.\pipe\toxtunnel-inspect-<pid>`) and prints a snapshot of active tunnels or
+the daemon's connection status. Read-only; nothing on the wire leaves the host.
+
+| Form                                      | Description                                  |
+| ----------------------------------------- | -------------------------------------------- |
+| `toxtunnel inspect tunnels [--json]`      | List open tunnels (id, peer, idle, bytes)    |
+| `toxtunnel inspect status [--json]`       | Daemon status (mode, friends online, uptime) |
+| `-d, --data-dir DIR` / `-c, --config F`   | Where to find the IPC socket / pid file      |
+
+The IPC endpoint is enabled by default (`inspect.enabled: true`). Set it to
+`false` in the YAML to disable per-host.
+
+### reload Subcommand
+
+Triggers a hot reload of the running daemon. Reloads only `server.rules_file`
+contents, `client.forwards`, and `logging.level` — anything else (Tox
+identity, bootstrap nodes, metrics binding) requires a restart.
+
+| Form                                      | Description                                  |
+| ----------------------------------------- | -------------------------------------------- |
+| `kill -HUP <pid>`                         | POSIX: same effect, no CLI involvement       |
+| `toxtunnel reload`                        | Windows: writes to `\\.\pipe\toxtunnel-reload-<pid>` |
+| `-d, --data-dir DIR` / `-c, --config F`   | Locate the daemon's pid file                 |
+
+---
+
+## SOCKS5 / HTTP CONNECT (dynamic destinations)
+
+Instead of declaring every `local_port -> remote_host:remote_port` in
+`forwards:`, run the client as a local SOCKS5 (and HTTP CONNECT) proxy and let
+applications choose the destination. The server still enforces `rules.yaml`,
+so this changes nothing about the server's trust boundary.
+
+```yaml
+client:
+  server_id: "SERVER_TOX_ADDRESS"
+  socks5:
+    enabled: true
+    listen: 127.0.0.1:1080     # loopback-only (non-loopback rejected at startup)
+```
+
+Or one-shot from the command line:
+
+```bash
+toxtunnel -m client --server-id SERVER_TOX_ADDRESS --socks5 127.0.0.1:1080
+```
+
+Then point a browser, `curl`, or any proxy-aware tool at it:
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 http://10.0.0.5:8080/health
+curl --proxy 127.0.0.1:1080 https://internal.example.org    # HTTP CONNECT
+```
+
+---
+
+## Prometheus /metrics endpoint
+
+Opt-in HTTP endpoint exporting counters for tunnels opened/closed, bytes in/out,
+errors, and friend connection state.
+
+```yaml
+metrics:
+  enabled: true
+  listen: 127.0.0.1:9100
+  path: /metrics
+```
+
+Prometheus scrape config:
+
+```yaml
+- job_name: toxtunnel
+  static_configs:
+    - targets: ['127.0.0.1:9100']
+```
+
+The endpoint serves `GET <path>` only; every other request returns 404. Runs on
+the existing I/O thread pool — no extra threads.
+
+---
+
+## Multi-server failover
+
+Give the client more than one server Tox ID. It adds every server as a Tox
+friend at startup, runs the active session against the first online candidate,
+and fails over if the active server stays offline past
+`failover.timeout_seconds`. Once the primary (index 0) is back online and stays
+online for `prefer_primary_grace_seconds`, the client switches back.
+
+```yaml
+client:
+  # First entry is the primary; the rest are fallbacks, tried in order.
+  server_id:
+    - "PRIMARY_TOX_ADDRESS"
+    - "FALLBACK_A_TOX_ADDRESS"
+    - homelab-backup                # known-servers alias also works
+  failover:
+    timeout_seconds: 60
+    prefer_primary_grace_seconds: 30
+  forwards:
+    - { local_port: 2222, remote_host: 127.0.0.1, remote_port: 22 }
+```
+
+CLI equivalent (repeatable `--server-id-fallback`):
+
+```bash
+toxtunnel -m client \
+    --server-id PRIMARY_TOX_ADDRESS \
+    --server-id-fallback FALLBACK_A_TOX_ADDRESS \
+    --server-id-fallback homelab-backup \
+    --pipe 127.0.0.1:22
+```
+
+---
+
+## Hot reload (SIGHUP / `toxtunnel reload`)
+
+Edit the YAML and reapply rules, forwards, and log level on the live daemon
+without dropping existing connections.
+
+```bash
+# POSIX (Linux / macOS):
+kill -HUP "$(cat /var/run/toxtunnel.pid)"
+
+# Windows (uses a per-pid named pipe under the hood):
+toxtunnel reload -c C:\ProgramData\ToxTunnel\config.yaml
+```
+
+Anything outside that subset (Tox identity, bootstrap nodes, `metrics.listen`,
+`socks5.listen`, `inspect.enabled`) requires a full restart.
+
+---
+
+## Runtime inspect
+
+Peek at a running daemon over local IPC — no remote ports exposed.
+
+```bash
+toxtunnel inspect tunnels
+toxtunnel inspect status --json
+```
+
+Disable the endpoint with `inspect: { enabled: false }` if you don't want even
+local processes to see tunnel state.
 
 ---
 
@@ -598,7 +774,8 @@ For detailed guides on various use cases, see:
 ## Documentation
 
 - [Building Guide](docs/BUILDING.md) - Windows, Docker, detailed instructions
-- [Configuration](docs/CONFIGURATION.md) - Access control, bootstrap nodes, advanced options
+- [Configuration](docs/CONFIGURATION.md) - Full YAML schema (access control,
+  bootstrap nodes, `metrics`, `inspect`, `tunnel`, `socks5`, `failover` blocks)
 - [Architecture](docs/ARCHITECTURE.md) - Protocol, threading model, internals
 - [HTTP Tunneling](docs/HTTP_TUNNELING.md) - Web server access, HTTP proxy scenarios
 - [Database Tunneling](docs/DATABASE_TUNNELING.md) - Database access (PostgreSQL, MySQL, Redis, etc.)
