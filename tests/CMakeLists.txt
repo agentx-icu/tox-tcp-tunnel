@@ -41,6 +41,8 @@ add_executable(unit_tests
     unit/write_coalescer_test.cpp
     unit/rate_limiter_test.cpp
     unit/tox_watchdog_test.cpp
+    unit/atomic_file_test.cpp
+    unit/tunnel_id_allocator_test.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     toxtunnel_lib
@@ -113,4 +115,46 @@ endif()
 gtest_discover_tests(integration_tests
     DISCOVERY_TIMEOUT 60
     PROPERTIES LABELS "integration"
+)
+
+# Soak tests (long-running). Default `ctest` excludes them via labels;
+# release-branch CI runs them via `ctest -L soak`.
+add_executable(soak_tests
+    soak/soak_smoke_test.cpp
+)
+target_link_libraries(soak_tests PRIVATE
+    toxtunnel_lib
+    GTest::gtest_main
+    GTest::gmock
+)
+if(NOT MSVC)
+    target_compile_options(soak_tests PRIVATE -Wall -Wextra -Wpedantic)
+    if(TOXTUNNEL_WARNINGS_AS_ERRORS)
+        target_compile_options(soak_tests PRIVATE -Werror)
+    endif()
+endif()
+gtest_discover_tests(soak_tests
+    DISCOVERY_TIMEOUT 60
+    PROPERTIES LABELS "soak"
+)
+
+# Chaos tests. Default `ctest` excludes them via labels; nightly CI runs
+# them via `ctest -L chaos`.
+add_executable(chaos_tests
+    chaos/chaos_smoke_test.cpp
+)
+target_link_libraries(chaos_tests PRIVATE
+    toxtunnel_lib
+    GTest::gtest_main
+    GTest::gmock
+)
+if(NOT MSVC)
+    target_compile_options(chaos_tests PRIVATE -Wall -Wextra -Wpedantic)
+    if(TOXTUNNEL_WARNINGS_AS_ERRORS)
+        target_compile_options(chaos_tests PRIVATE -Werror)
+    endif()
+endif()
+gtest_discover_tests(chaos_tests
+    DISCOVERY_TIMEOUT 60
+    PROPERTIES LABELS "chaos"
 )

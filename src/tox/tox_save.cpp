@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fstream>
 
+#include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tox {
@@ -71,43 +72,17 @@ util::Expected<Success, std::string> save_tox_data(const Tox* tox,
     std::vector<uint8_t> data(size);
     tox_get_savedata(tox, data.data());
 
-    // Write to a temporary file first, then rename for atomicity.
-    // This prevents a crash mid-write from corrupting the save file.
-    std::filesystem::path tmp_path = filepath;
-    tmp_path += ".tmp";
-
-    // Ensure the parent directory exists.
-    std::error_code fs_ec;
-    if (filepath.has_parent_path()) {
-        std::filesystem::create_directories(filepath.parent_path(), fs_ec);
-        if (fs_ec) {
-            return util::unexpected(std::string("failed to create directory '") +
-                                    filepath.parent_path().string() + "': " + fs_ec.message());
-        }
-    }
-
-    // Write bytes to the temp file.
-    {
-        std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!ofs) {
-            return util::unexpected(std::string("failed to open '") + tmp_path.string() +
-                                    "' for writing: " + std::strerror(errno));
-        }
-        ofs.write(reinterpret_cast<const char*>(data.data()),
-                  static_cast<std::streamsize>(data.size()));
-        if (!ofs) {
-            return util::unexpected(std::string("failed to write save data to '") +
-                                    tmp_path.string() + "'");
-        }
-    }  // ofs is closed here
-
-    // Atomic rename.
-    std::filesystem::rename(tmp_path, filepath, fs_ec);
-    if (fs_ec) {
-        // Best-effort cleanup of the temp file.
-        std::filesystem::remove(tmp_path);
-        return util::unexpected(std::string("failed to rename temp file to '") + filepath.string() +
-                                "': " + fs_ec.message());
+    // Hand off to the shared atomic-write helper. Defaults durably fsync
+    // both the temp file and the parent directory — `tox_save.dat` carries
+    // the identity private key and is the single most important file to
+    // protect from torn writes.
+    util::AtomicFileOptions opts;
+    opts.fsync_parent_dir = true;
+    opts.use_full_fsync_macos = true;
+    auto write_result = util::atomic_write_file(
+        filepath, std::span<const std::uint8_t>(data.data(), data.size()), opts);
+    if (!write_result) {
+        return util::unexpected(write_result.error());
     }
 
     util::Logger::debug("saved Tox state ({} bytes) to '{}'", size, filepath.string());

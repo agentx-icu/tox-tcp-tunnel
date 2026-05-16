@@ -10,6 +10,7 @@
 #include <sstream>
 #include <system_error>
 
+#include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::app {
@@ -246,25 +247,14 @@ util::Expected<void, std::string> KnownServersStore::save() const {
     out << YAML::EndSeq;
     out << YAML::EndMap;
 
-    // Atomic write: temp file + rename.
-    auto tmp_path = path_;
-    tmp_path += ".tmp";
-    {
-        std::ofstream ofs(tmp_path);
-        if (!ofs) {
-            return util::make_unexpected(std::string("Failed to open ") + tmp_path.string() +
-                                         " for writing");
-        }
-        ofs << out.c_str();
-        ofs << '\n';
-        if (!ofs.good()) {
-            return util::make_unexpected(std::string("Failed to write ") + tmp_path.string());
-        }
-    }
-    std::filesystem::rename(tmp_path, path_, ec);
-    if (ec) {
-        return util::make_unexpected(std::string("Failed to rename ") + tmp_path.string() + " -> " +
-                                     path_.string() + ": " + ec.message());
+    // Shared atomic-write helper: temp + fsync + rename + parent-dir fsync.
+    std::string yaml(out.c_str());
+    yaml += '\n';
+    util::AtomicFileOptions opts;
+    opts.fsync_parent_dir = true;
+    auto write_result = util::atomic_write_file(path_, yaml, opts);
+    if (!write_result) {
+        return util::make_unexpected(write_result.error());
     }
     return {};
 }
