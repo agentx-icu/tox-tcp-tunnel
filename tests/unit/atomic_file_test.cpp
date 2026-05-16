@@ -47,6 +47,7 @@ TEST(AtomicWriteFileTest, RoundTripBinary) {
 
 TEST(AtomicWriteFileTest, OverwriteExisting) {
     auto path = std::filesystem::temp_directory_path() / "toxtunnel_atomic_test2.bin";
+    std::filesystem::remove(path);
     {
         std::ofstream out(path);
         out << "stale contents";
@@ -54,10 +55,14 @@ TEST(AtomicWriteFileTest, OverwriteExisting) {
     std::string fresh = "fresh contents";
     auto r = util::atomic_write_file(path, fresh);
     ASSERT_TRUE(r) << r.error();
-    std::ifstream in(path);
-    std::string actual((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string actual;
+    {
+        std::ifstream in(path);
+        actual.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
     EXPECT_EQ(actual, fresh);
-    std::filesystem::remove(path);
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
 }
 
 TEST(AtomicWriteFileTest, CreatesParentDirectory) {

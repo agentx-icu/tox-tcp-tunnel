@@ -46,7 +46,7 @@ struct FriendRule {
     std::vector<TargetSpec> deny;   ///< Targets this friend is denied from accessing
     /// Per-friend rate-limit override. Empty / default means "use the
     /// top-level `rate_limit_defaults`" or no limit at all.
-    RateLimitSpec rate_limit;
+    RateLimitSpec rate_limit{};
 
     bool operator==(const FriendRule& other) const {
         return friend_pk == other.friend_pk && allow == other.allow && deny == other.deny &&
