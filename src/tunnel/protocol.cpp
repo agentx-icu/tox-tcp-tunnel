@@ -50,12 +50,29 @@ void write_u32_be(uint8_t* out, uint32_t value) noexcept {
         case FrameType::TUNNEL_ERROR:
         case FrameType::INFO_REQUEST:
         case FrameType::INFO_REPLY:
+        case FrameType::TUNNEL_RESUME_REQUEST:
+        case FrameType::TUNNEL_RESUME_ACK:
         case FrameType::PING:
         case FrameType::PONG:
             return true;
         default:
             return false;
     }
+}
+
+/// Write a uint64_t in big-endian (network) order.
+void write_u64_be(uint8_t* out, uint64_t value) noexcept {
+    for (int i = 0; i < 8; ++i) {
+        out[i] = static_cast<uint8_t>((value >> (56 - 8 * i)) & 0xFF);
+    }
+}
+
+[[nodiscard]] uint64_t read_u64_be(const uint8_t* src) noexcept {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value = (value << 8) | static_cast<uint64_t>(src[i]);
+    }
+    return value;
 }
 
 }  // anonymous namespace
@@ -80,6 +97,10 @@ std::string_view to_string(FrameType type) noexcept {
             return "INFO_REQUEST";
         case FrameType::INFO_REPLY:
             return "INFO_REPLY";
+        case FrameType::TUNNEL_RESUME_REQUEST:
+            return "TUNNEL_RESUME_REQUEST";
+        case FrameType::TUNNEL_RESUME_ACK:
+            return "TUNNEL_RESUME_ACK";
         case FrameType::PING:
             return "PING";
         case FrameType::PONG:
@@ -161,6 +182,79 @@ ProtocolFrame ProtocolFrame::make_pong() {
 
 ProtocolFrame ProtocolFrame::make_info_request() {
     return ProtocolFrame(FrameType::INFO_REQUEST, 0);
+}
+
+ProtocolFrame ProtocolFrame::make_tunnel_resume_request(const TunnelResumeRequestPayload& payload) {
+    // Wire layout (binary, big-endian):
+    //   [version:1=0x01][prior_id:2][recv:8][send:8][host_len:1][host:N][port:2]
+    ProtocolFrame frame(FrameType::TUNNEL_RESUME_REQUEST, payload.prior_tunnel_id);
+    const auto host_len = static_cast<uint8_t>(std::min<std::size_t>(payload.host.size(), 255));
+    frame.payload_.resize(1 + 2 + 8 + 8 + 1 + host_len + 2);
+    auto* p = frame.payload_.data();
+    p[0] = 0x01;  // schema version
+    write_u16_be(&p[1], payload.prior_tunnel_id);
+    write_u64_be(&p[3], payload.last_local_recv_offset);
+    write_u64_be(&p[11], payload.last_local_send_offset);
+    p[19] = host_len;
+    std::memcpy(&p[20], payload.host.data(), host_len);
+    write_u16_be(&p[20 + host_len], payload.target_port);
+    return frame;
+}
+
+ProtocolFrame ProtocolFrame::make_tunnel_resume_ack(const TunnelResumeAckPayload& payload) {
+    // Wire layout: [version:1=0x01][new_id:2][server_recv:8][server_send:8][status:1]
+    ProtocolFrame frame(FrameType::TUNNEL_RESUME_ACK, payload.new_tunnel_id);
+    frame.payload_.resize(1 + 2 + 8 + 8 + 1);
+    auto* p = frame.payload_.data();
+    p[0] = 0x01;
+    write_u16_be(&p[1], payload.new_tunnel_id);
+    write_u64_be(&p[3], payload.server_recv_offset);
+    write_u64_be(&p[11], payload.server_send_offset);
+    p[19] = static_cast<uint8_t>(payload.status);
+    return frame;
+}
+
+std::optional<TunnelResumeRequestPayload> ProtocolFrame::as_tunnel_resume_request() const {
+    if (type_ != FrameType::TUNNEL_RESUME_REQUEST) {
+        return std::nullopt;
+    }
+    if (payload_.size() < 22) {
+        return std::nullopt;
+    }
+    if (payload_[0] != 0x01) {
+        return std::nullopt;
+    }
+    TunnelResumeRequestPayload out;
+    out.prior_tunnel_id = read_u16_be(&payload_[1]);
+    out.last_local_recv_offset = read_u64_be(&payload_[3]);
+    out.last_local_send_offset = read_u64_be(&payload_[11]);
+    const uint8_t host_len = payload_[19];
+    if (payload_.size() < static_cast<std::size_t>(20 + host_len + 2)) {
+        return std::nullopt;
+    }
+    out.host.assign(reinterpret_cast<const char*>(&payload_[20]), host_len);
+    out.target_port = read_u16_be(&payload_[20 + host_len]);
+    return out;
+}
+
+std::optional<TunnelResumeAckPayload> ProtocolFrame::as_tunnel_resume_ack() const {
+    if (type_ != FrameType::TUNNEL_RESUME_ACK || payload_.size() < 20) {
+        return std::nullopt;
+    }
+    if (payload_[0] != 0x01) {
+        return std::nullopt;
+    }
+    TunnelResumeAckPayload out;
+    out.new_tunnel_id = read_u16_be(&payload_[1]);
+    out.server_recv_offset = read_u64_be(&payload_[3]);
+    out.server_send_offset = read_u64_be(&payload_[11]);
+    const auto raw = payload_[19];
+    if (raw > static_cast<uint8_t>(TunnelResumeStatus::Unknown)) {
+        out.status = TunnelResumeStatus::Unknown;
+    } else {
+        out.status = static_cast<TunnelResumeStatus>(raw);
+    }
+    return out;
 }
 
 ProtocolFrame ProtocolFrame::make_info_reply(std::string_view yaml_payload) {

@@ -43,6 +43,7 @@ add_executable(unit_tests
     unit/tox_watchdog_test.cpp
     unit/atomic_file_test.cpp
     unit/tunnel_id_allocator_test.cpp
+    unit/tunnel_resume_test.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     toxtunnel_lib

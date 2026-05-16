@@ -101,6 +101,17 @@ struct InspectConfig {
     bool operator==(const InspectConfig& other) const = default;
 };
 
+/// Tunnel-resume sub-block. Default off; opcodes 0x08/0x09 are wire-
+/// inactive when `enabled: false` and v0.3.0 peers see no change.
+struct TunnelResumeConfig {
+    bool enabled = false;
+    std::string state_path;              ///< default: <data_dir>/tunnel_resume_state.yaml
+    uint32_t max_age_seconds = 300;      ///< entries older than this are dropped on load
+    std::string on_gap = "passthrough";  ///< passthrough | close
+
+    bool operator==(const TunnelResumeConfig& other) const = default;
+};
+
 /// Per-tunnel data-path tunables (write coalescing + idle reaper).
 struct TunnelConfig {
     uint32_t coalesce_max_delay_us = 200;
@@ -111,6 +122,7 @@ struct TunnelConfig {
     std::string coalesce_mode = "fixed";
     uint32_t idle_timeout_seconds = 0;
     uint32_t reaper_tick_seconds = 10;
+    TunnelResumeConfig resume;
 
     [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }
 
@@ -454,6 +466,12 @@ template <>
 struct convert<toxtunnel::InspectConfig> {
     static Node encode(const toxtunnel::InspectConfig& rhs);
     static bool decode(const Node& node, toxtunnel::InspectConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::TunnelResumeConfig> {
+    static Node encode(const toxtunnel::TunnelResumeConfig& rhs);
+    static bool decode(const Node& node, toxtunnel::TunnelResumeConfig& rhs);
 };
 
 template <>

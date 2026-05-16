@@ -1057,6 +1057,33 @@ bool convert<toxtunnel::InspectConfig>::decode(const Node& node, toxtunnel::Insp
 // TunnelConfig
 // ---------------------------------------------------------------------------
 
+Node convert<toxtunnel::TunnelResumeConfig>::encode(const toxtunnel::TunnelResumeConfig& rhs) {
+    Node node;
+    node["enabled"] = rhs.enabled;
+    if (!rhs.state_path.empty()) {
+        node["state_path"] = rhs.state_path;
+    }
+    node["max_age_seconds"] = rhs.max_age_seconds;
+    node["on_gap"] = rhs.on_gap;
+    return node;
+}
+
+bool convert<toxtunnel::TunnelResumeConfig>::decode(const Node& node,
+                                                    toxtunnel::TunnelResumeConfig& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["enabled"])
+        rhs.enabled = node["enabled"].as<bool>();
+    if (node["state_path"])
+        rhs.state_path = node["state_path"].as<std::string>();
+    if (node["max_age_seconds"])
+        rhs.max_age_seconds = node["max_age_seconds"].as<uint32_t>();
+    if (node["on_gap"])
+        rhs.on_gap = node["on_gap"].as<std::string>();
+    return true;
+}
+
 Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs) {
     Node node;
     node["coalesce_max_delay_us"] = rhs.coalesce_max_delay_us;
@@ -1064,6 +1091,9 @@ Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs
     node["coalesce_mode"] = rhs.coalesce_mode;
     node["idle_timeout_seconds"] = rhs.idle_timeout_seconds;
     node["reaper_tick_seconds"] = rhs.reaper_tick_seconds;
+    if (!(rhs.resume == toxtunnel::TunnelResumeConfig{})) {
+        node["resume"] = rhs.resume;
+    }
     return node;
 }
 
@@ -1085,6 +1115,9 @@ bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::Tunne
     }
     if (node["reaper_tick_seconds"]) {
         rhs.reaper_tick_seconds = node["reaper_tick_seconds"].as<uint32_t>();
+    }
+    if (node["resume"]) {
+        rhs.resume = node["resume"].as<toxtunnel::TunnelResumeConfig>();
     }
     return true;
 }

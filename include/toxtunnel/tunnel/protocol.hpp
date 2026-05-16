@@ -49,8 +49,47 @@ enum class FrameType : uint8_t {
     /// payload is a small UTF-8 YAML map. An empty payload (`length == 0`)
     /// is valid and means "policy is to disclose nothing".
     INFO_REPLY = 0x07,
+    /// Client → Server: request to fast-reattach a prior tunnel after a
+    /// server restart. Carries the prior tunnel_id, target host:port, and
+    /// the client-observed offsets. Feature-flag-gated by
+    /// `tunnel.resume.enabled`; old servers ignore unknown opcodes and the
+    /// client times out the resume attempt and falls back to TUNNEL_OPEN.
+    TUNNEL_RESUME_REQUEST = 0x08,
+    /// Server → Client response to TUNNEL_RESUME_REQUEST. Carries the new
+    /// (or recycled) tunnel_id, server-side offsets, and a status byte.
+    TUNNEL_RESUME_ACK = 0x09,
     PING = 0x10,  ///< Keep-alive request.
     PONG = 0x11,  ///< Keep-alive response.
+};
+
+// ---------------------------------------------------------------------------
+// Tunnel-resume payload structs
+// ---------------------------------------------------------------------------
+
+/// Status codes for `TUNNEL_RESUME_ACK`.
+enum class TunnelResumeStatus : std::uint8_t {
+    Ok = 0,
+    TargetUnreachable = 1,
+    RulesDenied = 2,
+    TooOld = 3,
+    Unknown = 4,
+};
+
+/// Parsed payload for a TUNNEL_RESUME_REQUEST frame.
+struct TunnelResumeRequestPayload {
+    std::uint16_t prior_tunnel_id{0};
+    std::uint64_t last_local_recv_offset{0};
+    std::uint64_t last_local_send_offset{0};
+    std::string host;
+    std::uint16_t target_port{0};
+};
+
+/// Parsed payload for a TUNNEL_RESUME_ACK frame.
+struct TunnelResumeAckPayload {
+    std::uint16_t new_tunnel_id{0};
+    std::uint64_t server_recv_offset{0};
+    std::uint64_t server_send_offset{0};
+    TunnelResumeStatus status{TunnelResumeStatus::Unknown};
 };
 
 /// Return a human-readable label for a frame type, or "UNKNOWN" if the
@@ -182,6 +221,23 @@ class ProtocolFrame {
 
     /// Create an INFO_REQUEST frame (tunnel_id is 0, empty payload).
     [[nodiscard]] static ProtocolFrame make_info_request();
+
+    /// Create a TUNNEL_RESUME_REQUEST frame. The payload is binary
+    /// (big-endian):
+    ///   `[version:1=0x01][prior_id:2][recv:8][send:8][host_len:1][host:N][port:2]`
+    [[nodiscard]] static ProtocolFrame make_tunnel_resume_request(
+        const TunnelResumeRequestPayload& payload);
+
+    /// Create a TUNNEL_RESUME_ACK frame.
+    ///   `[version:1=0x01][new_id:2][server_recv:8][server_send:8][status:1]`
+    [[nodiscard]] static ProtocolFrame make_tunnel_resume_ack(
+        const TunnelResumeAckPayload& payload);
+
+    /// Parse a TUNNEL_RESUME_REQUEST payload.
+    [[nodiscard]] std::optional<TunnelResumeRequestPayload> as_tunnel_resume_request() const;
+
+    /// Parse a TUNNEL_RESUME_ACK payload.
+    [[nodiscard]] std::optional<TunnelResumeAckPayload> as_tunnel_resume_ack() const;
 
     /// Create an INFO_REPLY frame carrying a UTF-8 YAML payload (tunnel_id is 0).
     /// `yaml_payload` may be empty, signalling "no fields disclosed".

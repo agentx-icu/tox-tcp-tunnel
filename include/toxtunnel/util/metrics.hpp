@@ -163,6 +163,21 @@ class MetricsRegistry {
     [[nodiscard]] std::uint64_t watchdog_aborts() const;
 
     // -----------------------------------------------------------------
+    // Tunnel resume protocol
+    // -----------------------------------------------------------------
+
+    /// Client-side: increment on every TUNNEL_RESUME_REQUEST emitted.
+    void inc_resume_attempts();
+    /// Client-side: increment on every status=Ok TUNNEL_RESUME_ACK received.
+    void inc_resume_successes();
+    /// Client-side: increment on every status != Ok TUNNEL_RESUME_ACK.
+    void inc_resume_failures();
+
+    [[nodiscard]] std::uint64_t resume_attempts() const;
+    [[nodiscard]] std::uint64_t resume_successes() const;
+    [[nodiscard]] std::uint64_t resume_failures() const;
+
+    // -----------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------
 
@@ -225,6 +240,11 @@ class MetricsRegistry {
     // Tox-thread watchdog.
     std::atomic<std::int64_t> tox_iterate_lag_ms_{0};
     std::atomic<std::uint64_t> watchdog_aborts_{0};
+
+    // Tunnel resume protocol.
+    std::atomic<std::uint64_t> resume_attempts_{0};
+    std::atomic<std::uint64_t> resume_successes_{0};
+    std::atomic<std::uint64_t> resume_failures_{0};
 
     mutable std::mutex labels_mutex_;
     std::string build_version_;

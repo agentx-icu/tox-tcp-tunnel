@@ -118,6 +118,9 @@ void MetricsRegistry::reset() {
     rate_limit_bytes_throttled_.store(0, std::memory_order_relaxed);
     tox_iterate_lag_ms_.store(0, std::memory_order_relaxed);
     watchdog_aborts_.store(0, std::memory_order_relaxed);
+    resume_attempts_.store(0, std::memory_order_relaxed);
+    resume_successes_.store(0, std::memory_order_relaxed);
+    resume_failures_.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(labels_mutex_);
     build_version_.clear();
     build_git_sha_.clear();
@@ -278,6 +281,25 @@ void MetricsRegistry::inc_watchdog_aborts() {
 
 std::uint64_t MetricsRegistry::watchdog_aborts() const {
     return watchdog_aborts_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_resume_attempts() {
+    resume_attempts_.fetch_add(1, std::memory_order_relaxed);
+}
+void MetricsRegistry::inc_resume_successes() {
+    resume_successes_.fetch_add(1, std::memory_order_relaxed);
+}
+void MetricsRegistry::inc_resume_failures() {
+    resume_failures_.fetch_add(1, std::memory_order_relaxed);
+}
+std::uint64_t MetricsRegistry::resume_attempts() const {
+    return resume_attempts_.load(std::memory_order_relaxed);
+}
+std::uint64_t MetricsRegistry::resume_successes() const {
+    return resume_successes_.load(std::memory_order_relaxed);
+}
+std::uint64_t MetricsRegistry::resume_failures() const {
+    return resume_failures_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t MetricsRegistry::tunnels_active(Role role) const {
@@ -452,6 +474,20 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_watchdog_aborts_total counter\n"
            "toxtunnel_watchdog_aborts_total "
         << watchdog_aborts() << "\n";
+
+    out << "# HELP toxtunnel_resume_attempts_total TUNNEL_RESUME_REQUEST frames emitted by "
+           "this client.\n"
+           "# TYPE toxtunnel_resume_attempts_total counter\n"
+           "toxtunnel_resume_attempts_total "
+        << resume_attempts() << "\n";
+    out << "# HELP toxtunnel_resume_successes_total status=Ok ACKs received.\n"
+           "# TYPE toxtunnel_resume_successes_total counter\n"
+           "toxtunnel_resume_successes_total "
+        << resume_successes() << "\n";
+    out << "# HELP toxtunnel_resume_failures_total non-Ok ACKs received.\n"
+           "# TYPE toxtunnel_resume_failures_total counter\n"
+           "toxtunnel_resume_failures_total "
+        << resume_failures() << "\n";
 
     return out.str();
 }
