@@ -21,6 +21,8 @@
 
 namespace toxtunnel::tox {
 
+class ToxWatchdog;  // forward declaration
+
 // ---------------------------------------------------------------------------
 // Tox instance RAII deleter
 // ---------------------------------------------------------------------------
@@ -211,6 +213,12 @@ class ToxAdapter {
     ///
     /// Blocks until the thread has joined.  Safe to call if not running.
     void stop();
+
+    /// Attach a Tox-thread watchdog. Heartbeat is bumped after every
+    /// successful return from `tox_iterate`. Pass nullptr to detach.
+    void set_watchdog(class toxtunnel::tox::ToxWatchdog* watchdog) {
+        watchdog_.store(watchdog, std::memory_order_release);
+    }
 
     /// Return true if the iteration thread is running.
     [[nodiscard]] bool is_running() const noexcept;
@@ -446,6 +454,11 @@ class ToxAdapter {
 
     /// Flag signalling the iterate thread to stop.
     std::atomic<bool> running_{false};
+
+    /// Optional watchdog observer. Not owned. When set, the iterate loop
+    /// bumps the watchdog's heartbeat after every successful tox_iterate
+    /// return so the main-thread observer can detect a wedge.
+    std::atomic<class toxtunnel::tox::ToxWatchdog*> watchdog_{nullptr};
 
     /// Wakeup primitive that lets the iterate loop sleep for up to
     /// tox_iteration_interval() ms but exit early when there is new data to

@@ -202,6 +202,11 @@ class ToxThread {
     void set_friend_message_handler(FriendMessageHandler handler);
     void set_data_received_handler(DataReceivedHandler handler);
 
+    /// Plug the watchdog observer in. When set, the Tox thread bumps the
+    /// watchdog's heartbeat on every return from `tox_iterate`. Safe to set
+    /// before or after start(); ownership remains with the caller.
+    void set_watchdog(class ToxWatchdog* watchdog);
+
    private:
     // -----------------------------------------------------------------
     // Internal methods (all run on the Tox thread unless noted)
@@ -266,6 +271,10 @@ class ToxThread {
     std::queue<Command> command_queue_;
     std::mutex command_mutex_;
     std::condition_variable command_cv_;
+
+    /// Optional Tox-thread watchdog. Not owned; nulled-out by default and
+    /// only set on production servers / clients via `set_watchdog`.
+    std::atomic<class ToxWatchdog*> watchdog_{nullptr};
 
     /// Registered event handlers.
     FriendRequestHandler friend_request_handler_;

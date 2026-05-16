@@ -1127,6 +1127,31 @@ bool convert<toxtunnel::FlowControlConfig>::decode(const Node& node,
 }
 
 // ---------------------------------------------------------------------------
+// WatchdogConfig
+// ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::WatchdogConfig>::encode(const toxtunnel::WatchdogConfig& rhs) {
+    Node node;
+    node["enabled"] = rhs.enabled;
+    node["deadline_seconds"] = rhs.deadline_seconds;
+    node["systemd_notify"] = rhs.systemd_notify;
+    return node;
+}
+
+bool convert<toxtunnel::WatchdogConfig>::decode(const Node& node, toxtunnel::WatchdogConfig& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["enabled"])
+        rhs.enabled = node["enabled"].as<bool>();
+    if (node["deadline_seconds"])
+        rhs.deadline_seconds = node["deadline_seconds"].as<uint32_t>();
+    if (node["systemd_notify"])
+        rhs.systemd_notify = node["systemd_notify"].as<bool>();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // ServerInfoDisclose
 // ---------------------------------------------------------------------------
 
@@ -1450,6 +1475,9 @@ Node convert<Config>::encode(const Config& rhs) {
     if (!(rhs.flow_control == toxtunnel::FlowControlConfig{})) {
         node["flow_control"] = rhs.flow_control;
     }
+    if (!(rhs.watchdog == toxtunnel::WatchdogConfig{})) {
+        node["watchdog"] = rhs.watchdog;
+    }
 
     if (rhs.server) {
         Node server_node;
@@ -1538,6 +1566,10 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
     if (node["flow_control"]) {
         rhs.flow_control = node["flow_control"].as<toxtunnel::FlowControlConfig>();
+    }
+
+    if (node["watchdog"]) {
+        rhs.watchdog = node["watchdog"].as<toxtunnel::WatchdogConfig>();
     }
 
     // Mode-specific config

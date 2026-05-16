@@ -116,6 +116,8 @@ void MetricsRegistry::reset() {
     tunnel_bandwidth_max_bps_.store(0, std::memory_order_relaxed);
     rate_limit_open_rejected_.store(0, std::memory_order_relaxed);
     rate_limit_bytes_throttled_.store(0, std::memory_order_relaxed);
+    tox_iterate_lag_ms_.store(0, std::memory_order_relaxed);
+    watchdog_aborts_.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(labels_mutex_);
     build_version_.clear();
     build_git_sha_.clear();
@@ -260,6 +262,22 @@ std::uint64_t MetricsRegistry::rate_limit_open_rejected() const {
 
 std::uint64_t MetricsRegistry::rate_limit_bytes_throttled() const {
     return rate_limit_bytes_throttled_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::set_tox_iterate_lag_ms(std::int64_t ms) {
+    tox_iterate_lag_ms_.store(ms, std::memory_order_relaxed);
+}
+
+std::int64_t MetricsRegistry::tox_iterate_lag_ms() const {
+    return tox_iterate_lag_ms_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_watchdog_aborts() {
+    watchdog_aborts_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::watchdog_aborts() const {
+    return watchdog_aborts_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t MetricsRegistry::tunnels_active(Role role) const {
@@ -423,6 +441,17 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_rate_limit_bytes_throttled_total counter\n"
            "toxtunnel_rate_limit_bytes_throttled_total "
         << rate_limit_bytes_throttled() << "\n";
+
+    out << "# HELP toxtunnel_tox_iterate_lag_ms Milliseconds since the last successful "
+           "tox_iterate() return.\n"
+           "# TYPE toxtunnel_tox_iterate_lag_ms gauge\n"
+           "toxtunnel_tox_iterate_lag_ms "
+        << tox_iterate_lag_ms() << "\n";
+    out << "# HELP toxtunnel_watchdog_aborts_total Cumulative tox-thread wedge aborts since "
+           "process start.\n"
+           "# TYPE toxtunnel_watchdog_aborts_total counter\n"
+           "toxtunnel_watchdog_aborts_total "
+        << watchdog_aborts() << "\n";
 
     return out.str();
 }

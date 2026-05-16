@@ -146,6 +146,19 @@ void TunnelServer::start() {
         }
     }
 
+    // Start the Tox-thread watchdog *before* the iterate loop so the
+    // first heartbeat lands on a primed observer.
+    if (config_.watchdog.enabled) {
+        watchdog_ = std::make_unique<tox::ToxWatchdog>();
+        watchdog_->configure(std::chrono::seconds(config_.watchdog.deadline_seconds),
+                             config_.watchdog.enabled);
+        watchdog_->set_data_dir(config_.data_dir);
+        tox_adapter_->set_watchdog(watchdog_.get());
+        watchdog_->start(io_context_->get_io_context());
+        util::Logger::info("Tox-thread watchdog enabled (deadline={}s)",
+                           config_.watchdog.deadline_seconds);
+    }
+
     // Start ToxAdapter iteration thread.
     tox_adapter_->start();
 
@@ -237,6 +250,11 @@ void TunnelServer::stop() {
     }
 
     // Stop ToxAdapter.
+    if (watchdog_) {
+        tox_adapter_->set_watchdog(nullptr);
+        watchdog_->stop();
+        watchdog_.reset();
+    }
     tox_adapter_->stop();
 
     // Stop IoContext.

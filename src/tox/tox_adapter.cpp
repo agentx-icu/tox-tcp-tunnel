@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
+#include "toxtunnel/tox/tox_watchdog.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tox {
@@ -746,6 +747,11 @@ void ToxAdapter::run_loop() {
         {
             std::lock_guard<std::mutex> lock(tox_mutex_);
             tox_iterate(tox_.get(), this);
+            // Watchdog heartbeat: bumped immediately on return so a hang
+            // inside `tox_iterate` is detected by the main-thread observer.
+            if (auto* wd = watchdog_.load(std::memory_order_acquire)) {
+                wd->heartbeat();
+            }
             interval = tox_iteration_interval(tox_.get());
         }
 

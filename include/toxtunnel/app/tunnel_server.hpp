@@ -15,6 +15,7 @@
 #include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tox/tox_adapter.hpp"
+#include "toxtunnel/tox/tox_watchdog.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
 #include "toxtunnel/util/config.hpp"
 #include "toxtunnel/util/metrics.hpp"
@@ -168,6 +169,10 @@ class TunnelServer {
 
     /// Tox network adapter.
     std::unique_ptr<tox::ToxAdapter> tox_adapter_;
+
+    /// Tox-thread watchdog. Optional; constructed at start() when
+    /// `config_.watchdog.enabled` is true.
+    std::unique_ptr<tox::ToxWatchdog> watchdog_;
 
     /// Access control engine. Reads (`evaluate()`) take a shared lock,
     /// SIGHUP reload (`reload()`) takes a unique lock to swap the engine in

@@ -132,6 +132,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/tox/tox_thread.cpp
     src/tox/tox_connection.cpp
     src/tox/tox_adapter.cpp
+    src/tox/tox_watchdog.cpp
     src/app/inspect_server.cpp
     src/app/known_servers.cpp
     src/app/rate_limiter.cpp

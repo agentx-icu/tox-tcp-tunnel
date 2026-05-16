@@ -146,6 +146,23 @@ class MetricsRegistry {
     [[nodiscard]] std::uint64_t rate_limit_bytes_throttled() const;
 
     // -----------------------------------------------------------------
+    // Tox-thread watchdog
+    // -----------------------------------------------------------------
+
+    /// Set the current `tox_iterate` lag gauge (milliseconds). Reported on
+    /// every watchdog tick so dashboards can alert on "rising lag" before
+    /// "hard wedge".
+    void set_tox_iterate_lag_ms(std::int64_t ms);
+    [[nodiscard]] std::int64_t tox_iterate_lag_ms() const;
+
+    /// Increment the cumulative abort counter. The watchdog also persists a
+    /// monotonic count in `<data_dir>/abort_count` so the value survives
+    /// restarts; this counter resets at process start (it is the in-process
+    /// view).
+    void inc_watchdog_aborts();
+    [[nodiscard]] std::uint64_t watchdog_aborts() const;
+
+    // -----------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------
 
@@ -204,6 +221,10 @@ class MetricsRegistry {
     // Per-friend rate limiting.
     std::atomic<std::uint64_t> rate_limit_open_rejected_{0};
     std::atomic<std::uint64_t> rate_limit_bytes_throttled_{0};
+
+    // Tox-thread watchdog.
+    std::atomic<std::int64_t> tox_iterate_lag_ms_{0};
+    std::atomic<std::uint64_t> watchdog_aborts_{0};
 
     mutable std::mutex labels_mutex_;
     std::string build_version_;

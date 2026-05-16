@@ -40,6 +40,7 @@ add_executable(unit_tests
     unit/outbound_zero_copy_test.cpp
     unit/write_coalescer_test.cpp
     unit/rate_limiter_test.cpp
+    unit/tox_watchdog_test.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     toxtunnel_lib

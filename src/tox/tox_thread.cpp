@@ -4,6 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "toxtunnel/tox/tox_watchdog.hpp"
 #include "toxtunnel/util/logger.hpp"
 #include "toxtunnel/util/metrics.hpp"
 
@@ -156,6 +157,13 @@ void ToxThread::run_loop() {
         //    callback trampolines can reach the ToxThread instance.
         const auto iterate_start = std::chrono::steady_clock::now();
         tox_iterate(tox_.get(), this);
+        // The watchdog heartbeat is the *first* line after the iterate
+        // returns so a hang inside `tox_iterate` is detected by the
+        // main-thread observer; a stall before this line will trip the
+        // configured deadline.
+        if (auto* wd = watchdog_.load(std::memory_order_acquire)) {
+            wd->heartbeat();
+        }
         const auto iterate_end = std::chrono::steady_clock::now();
         util::MetricsRegistry::instance().observe_iterate_lag_ms(
             std::chrono::duration<double, std::milli>(iterate_end - iterate_start).count());
@@ -394,6 +402,10 @@ void ToxThread::set_friend_message_handler(FriendMessageHandler handler) {
 
 void ToxThread::set_data_received_handler(DataReceivedHandler handler) {
     data_received_handler_ = std::move(handler);
+}
+
+void ToxThread::set_watchdog(class ToxWatchdog* watchdog) {
+    watchdog_.store(watchdog, std::memory_order_release);
 }
 
 // ===========================================================================

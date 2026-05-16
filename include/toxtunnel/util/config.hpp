@@ -117,6 +117,17 @@ struct TunnelConfig {
     bool operator==(const TunnelConfig& other) const = default;
 };
 
+/// Tox-thread watchdog. On by default — the in-process detector calls
+/// `std::abort()` after `deadline_seconds` of no heartbeat from the Tox
+/// thread. systemd / launchd handles the restart.
+struct WatchdogConfig {
+    bool enabled = true;
+    uint32_t deadline_seconds = 30;  ///< minimum enforced 5 by the implementation
+    bool systemd_notify = true;      ///< no-op on non-Linux platforms
+
+    bool operator==(const WatchdogConfig& other) const = default;
+};
+
 /// BDP-aware flow control configuration. `mode: fixed` (default) preserves
 /// the v0.3.0 256 KiB / 16 KiB window; `mode: bdp` lets the per-tunnel
 /// `BdpFlowControl` resize the window from RTT × bandwidth estimates.
@@ -282,6 +293,7 @@ struct Config {
     InspectConfig inspect;
     TunnelConfig tunnel;
     FlowControlConfig flow_control;
+    WatchdogConfig watchdog;
 
     // Mode-specific options
     std::optional<ServerConfig> server;
@@ -352,8 +364,8 @@ struct Config {
         return mode == other.mode && data_dir == other.data_dir && logging == other.logging &&
                service == other.service && effective_tox_config() == other.effective_tox_config() &&
                metrics == other.metrics && inspect == other.inspect && tunnel == other.tunnel &&
-               flow_control == other.flow_control && server == other.server &&
-               client == other.client;
+               flow_control == other.flow_control && watchdog == other.watchdog &&
+               server == other.server && client == other.client;
     }
 };
 
@@ -454,6 +466,12 @@ template <>
 struct convert<toxtunnel::FlowControlConfig> {
     static Node encode(const toxtunnel::FlowControlConfig& rhs);
     static bool decode(const Node& node, toxtunnel::FlowControlConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::WatchdogConfig> {
+    static Node encode(const toxtunnel::WatchdogConfig& rhs);
+    static bool decode(const Node& node, toxtunnel::WatchdogConfig& rhs);
 };
 
 template <>
