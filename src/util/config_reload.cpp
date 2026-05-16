@@ -48,6 +48,9 @@ Expected<void, std::string> check_reloadable(const Config& current, const Config
     if (!(current.tunnel == next.tunnel)) {
         return make_unexpected(field_rejection("tunnel"));
     }
+    if (!(current.flow_control == next.flow_control)) {
+        return make_unexpected(field_rejection("flow_control"));
+    }
 
     // Server-side: only `rules_file` is reloadable (path can change; the
     // referenced content is re-read). disclose/tcp_port/udp_enabled/bootstrap

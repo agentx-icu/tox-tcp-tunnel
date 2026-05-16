@@ -398,6 +398,21 @@ void TunnelServer::on_self_connection(bool connected) {
     }
 }
 
+void TunnelServer::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
+    tunnel::CoalesceMode coalesce_mode = tunnel::CoalesceMode::Fixed;
+    (void)tunnel::parse_coalesce_mode(config_.tunnel.coalesce_mode, coalesce_mode);
+    tunnel.set_coalesce_mode(coalesce_mode);
+
+    tunnel::BdpFlowControl::Config fc;
+    fc.mode = tunnel::FlowControlMode::Fixed;
+    (void)tunnel::parse_flow_control_mode(config_.flow_control.mode, fc.mode);
+    fc.min_window_bytes = static_cast<std::int64_t>(config_.flow_control.send_window_min_bytes);
+    fc.max_window_bytes = static_cast<std::int64_t>(config_.flow_control.send_window_max_bytes);
+    fc.safety_factor_x100 = static_cast<std::int64_t>(config_.flow_control.safety_factor_x100);
+    fc.fixed_window_bytes = static_cast<std::int64_t>(config_.flow_control.fixed_window_bytes);
+    tunnel.configure_flow_control(fc);
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -512,6 +527,7 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                                                               tunnel_id, friend_number);
     server_tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                       config_.tunnel.coalesce_max_bytes);
+    apply_coalesce_and_flow_control(*server_tunnel);
     // Already-serialized frame from TunnelImpl: prepend the lossless prefix
     // byte and send directly. Going via manager_ptr->send_frame would force a
     // deserialize + re-serialize round trip plus a redundant byte copy.

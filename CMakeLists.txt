@@ -124,6 +124,8 @@ target_sources(toxtunnel_lib PRIVATE
     src/tunnel/protocol.cpp
     src/tunnel/tunnel.cpp
     src/tunnel/tunnel_manager.cpp
+    src/tunnel/write_coalescer.cpp
+    src/tunnel/bdp_flow_control.cpp
     src/tox/bootstrap_source.cpp
     src/tox/types.cpp
     src/tox/tox_save.cpp

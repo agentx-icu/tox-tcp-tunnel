@@ -12,8 +12,10 @@
 #include <string>
 
 #include "toxtunnel/core/tcp_connection.hpp"
+#include "toxtunnel/tunnel/bdp_flow_control.hpp"
 #include "toxtunnel/tunnel/owned_frame_buffer.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
+#include "toxtunnel/tunnel/write_coalescer.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tunnel {
@@ -317,6 +319,40 @@ class TunnelImpl : public Tunnel {
     ///                      frame. Hard-capped to the Tox-MTU ceiling.
     void configure_coalesce(std::uint32_t max_delay_us, std::uint32_t max_bytes);
 
+    /// Set the operator-selected coalesce mode. The state machine in the
+    /// per-tunnel `WriteCoalescer` runs on every `send_data_to_tox` and
+    /// picks the active `CoalescePolicy` (Bypass/Drain/Batch). Default is
+    /// `Fixed` which always uses `Batch`.
+    void set_coalesce_mode(CoalesceMode mode);
+
+    /// Read-only access to the active coalescer (metrics, inspect).
+    [[nodiscard]] const WriteCoalescer& write_coalescer() const noexcept { return coalescer_; }
+
+    /// Configure the BDP-aware flow-control window. Replaces the constructor
+    /// fixed-window argument. When `mode: bdp` is selected, RTT and bandwidth
+    /// observations from `observe_rtt_us`/`observe_bandwidth_bps` (driven by
+    /// the existing PING/PONG and ACK paths) resize the window in place.
+    void configure_flow_control(const BdpFlowControl::Config& cfg);
+
+    /// Observation hooks for the BDP estimator. Wired from the PING/PONG and
+    /// TUNNEL_ACK paths. Calling these has no effect when flow control is in
+    /// fixed mode (the EWMA is still updated for telemetry).
+    void observe_rtt_us(std::int64_t rtt_us);
+    void observe_bandwidth_bps(std::int64_t bps);
+
+    /// Current target window — exposed for metrics + inspect.
+    [[nodiscard]] std::int64_t target_window_bytes() const noexcept {
+        return flow_control_.target_window_bytes();
+    }
+
+    /// Current EWMA RTT in microseconds.
+    [[nodiscard]] std::int64_t rtt_us() const noexcept { return flow_control_.rtt_us(); }
+
+    /// Current EWMA bandwidth estimate (bytes/sec).
+    [[nodiscard]] std::int64_t bandwidth_bps() const noexcept {
+        return flow_control_.bandwidth_bps();
+    }
+
     /// Flush any buffered coalesced bytes immediately as one frame.
     /// Used by close() / force_close() and exposed for tests.
     void flush_pending_writes();
@@ -494,6 +530,16 @@ class TunnelImpl : public Tunnel {
     std::uint32_t coalesce_max_bytes_{kDefaultCoalesceMaxBytes};
     bool coalesce_timer_armed_{false};
     std::uint64_t coalesce_timer_epoch_{0};
+
+    // Adaptive coalescer + BDP flow control. Updated on the data path.
+    WriteCoalescer coalescer_;
+    BdpFlowControl flow_control_;
+    /// Set to true once `configure_flow_control` has been called. When false
+    /// the legacy `send_window_size_` (constructor argument) drives admission
+    /// control byte-for-byte, preserving v0.3.0 semantics for tests and
+    /// existing call sites that never opt in.
+    std::atomic<bool> flow_control_configured_{false};
+    std::atomic<std::int64_t> last_push_ns_{0};
 
     /// Protects non-atomic members.
     mutable std::mutex mutex_;

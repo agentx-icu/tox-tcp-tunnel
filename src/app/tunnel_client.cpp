@@ -558,6 +558,21 @@ bool TunnelClient::is_pipe_mode() const noexcept {
     return config_.client.has_value() && config_.client->pipe_target.has_value();
 }
 
+void TunnelClient::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
+    tunnel::CoalesceMode coalesce_mode = tunnel::CoalesceMode::Fixed;
+    (void)tunnel::parse_coalesce_mode(config_.tunnel.coalesce_mode, coalesce_mode);
+    tunnel.set_coalesce_mode(coalesce_mode);
+
+    tunnel::BdpFlowControl::Config fc;
+    fc.mode = tunnel::FlowControlMode::Fixed;
+    (void)tunnel::parse_flow_control_mode(config_.flow_control.mode, fc.mode);
+    fc.min_window_bytes = static_cast<std::int64_t>(config_.flow_control.send_window_min_bytes);
+    fc.max_window_bytes = static_cast<std::int64_t>(config_.flow_control.send_window_max_bytes);
+    fc.safety_factor_x100 = static_cast<std::int64_t>(config_.flow_control.safety_factor_x100);
+    fc.fixed_window_bytes = static_cast<std::int64_t>(config_.flow_control.fixed_window_bytes);
+    tunnel.configure_flow_control(fc);
+}
+
 void TunnelClient::start_pipe_mode() {
     if (!is_pipe_mode() || !server_online_) {
         return;
@@ -584,6 +599,7 @@ void TunnelClient::start_pipe_mode() {
                                              server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
+    apply_coalesce_and_flow_control(*tunnel);
     auto* tunnel_raw = tunnel.get();
 
     tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
@@ -690,6 +706,7 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
                                              server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
+    apply_coalesce_and_flow_control(*tunnel);
 
     // Set the TCP connection on the tunnel
     tunnel->set_tcp_connection(conn);
@@ -801,6 +818,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
                                              server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
+    apply_coalesce_and_flow_control(*tunnel);
     tunnel->set_tcp_connection(conn);
 
     tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {

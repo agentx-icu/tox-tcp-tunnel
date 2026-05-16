@@ -415,12 +415,21 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         return false;
     }
 
-    // Check window
-    std::size_t data_size = data.size();
+    // Check window. When `configure_flow_control` has been called, prefer
+    // the BDP-driven target over the constructor-time `send_window_size_`:
+    // in `fixed` mode they match, in `bdp` mode the estimator resizes the
+    // window in place. Otherwise stick with the legacy v0.3.0 behaviour so
+    // existing tests and pre-v0.4 callers see unchanged semantics.
+    const std::size_t data_size = data.size();
+    std::size_t effective_window = send_window_size_;
+    if (flow_control_configured_.load(std::memory_order_acquire)) {
+        effective_window = std::max<std::size_t>(
+            send_window_size_, static_cast<std::size_t>(flow_control_.target_window_bytes()));
+    }
     std::size_t current = send_window_used_.load(std::memory_order_relaxed);
-    if (current + data_size > send_window_size_) {
+    if (current + data_size > effective_window) {
         util::Logger::debug("Tunnel {} send window full ({} + {} > {})", tunnel_id_, current,
-                            data_size, send_window_size_);
+                            data_size, effective_window);
         return false;
     }
 
@@ -433,6 +442,20 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
     total_bytes_sent_.fetch_add(data_size, std::memory_order_relaxed);
     util::MetricsRegistry::instance().add_bytes_out(data_size);
 
+    // ---- Adaptive coalescer decision ------------------------------------
+    // Update EWMA + select the active policy. The decision applies to this
+    // push only; the policy may change on every call.
+    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto prev_ns = last_push_ns_.exchange(now_ns, std::memory_order_relaxed);
+    const std::int64_t gap_us = prev_ns == 0 ? 0 : (now_ns - prev_ns) / 1000;
+    coalescer_.observe(data_size, gap_us);
+    const auto decision = coalescer_.decide();
+    if (decision.transitioned) {
+        util::MetricsRegistry::instance().inc_coalesce_policy_transitions();
+        util::Logger::debug("Tunnel {} coalesce policy {} -> {}", tunnel_id_,
+                            to_string(decision.previous), to_string(decision.policy));
+    }
+
     // Determine which outbound path is active. We snapshot the owned-callback
     // presence before grabbing the coalesce mutex so the data path runs
     // lock-free against callback edits.
@@ -444,11 +467,13 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
 
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
 
-    // Coalescing disabled — preserve the legacy "emit each call, fragment to
-    // Tox MTU" behaviour byte-for-byte. With zero-copy enabled, each chunk is
-    // shipped through an `OwnedFrameBuffer` so we still skip the intermediate
-    // vector allocation in the on_send_to_tox callback.
-    if (coalesce_max_delay_us_ == 0) {
+    // `Bypass` policy and the legacy `max_delay_us == 0` path both emit each
+    // chunk immediately with no coalesce buffer involvement. The two paths
+    // are bit-identical on the wire; bypass is what the adaptive state
+    // machine settles on for bulk transfers with MTU-sized writes.
+    const bool emit_immediate =
+        coalesce_max_delay_us_ == 0 || decision.policy == CoalescePolicy::Bypass;
+    if (emit_immediate) {
         for (std::size_t offset = 0; offset < data.size(); offset += kMaxTcpPayloadPerToxFrame) {
             const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
             if (zero_copy) {
@@ -465,8 +490,13 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         return true;
     }
 
+    // `Drain` policy: write into the coalesce buffer, but never arm the timer
+    // — emission only happens on full-MTU overflow. Falls back to `Batch`
+    // behaviour for sub-MTU residuals so we don't leak unflushed bytes.
     coalesce_append_locked(data);
-    coalesce_arm_timer_locked();
+    if (decision.policy != CoalescePolicy::Drain) {
+        coalesce_arm_timer_locked();
+    }
     return true;
 }
 
@@ -629,11 +659,34 @@ void TunnelImpl::configure_coalesce(std::uint32_t max_delay_us, std::uint32_t ma
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
     coalesce_max_delay_us_ = max_delay_us;
     coalesce_max_bytes_ = clamped;
+    coalescer_.configure(clamped, max_delay_us);
     // If coalescing was just disabled, drain whatever's queued so order is
     // preserved relative to subsequent direct writes.
     if (coalesce_max_delay_us_ == 0 && !coalesce_buf_.empty()) {
         coalesce_emit_front_locked(coalesce_buf_.size());
     }
+}
+
+void TunnelImpl::set_coalesce_mode(CoalesceMode mode) {
+    coalescer_.set_mode(mode);
+}
+
+void TunnelImpl::configure_flow_control(const BdpFlowControl::Config& cfg) {
+    flow_control_.configure(cfg);
+    flow_control_configured_.store(true, std::memory_order_release);
+    // Seed the per-tunnel window from the configured fixed value so the very
+    // first push has a sensible budget regardless of mode.
+    if (cfg.fixed_window_bytes > 0) {
+        send_window_size_ = static_cast<std::size_t>(cfg.fixed_window_bytes);
+    }
+}
+
+void TunnelImpl::observe_rtt_us(std::int64_t rtt_us) {
+    flow_control_.observe_rtt_us(rtt_us);
+}
+
+void TunnelImpl::observe_bandwidth_bps(std::int64_t bps) {
+    flow_control_.observe_bandwidth_bps(bps);
 }
 
 void TunnelImpl::flush_pending_writes() {

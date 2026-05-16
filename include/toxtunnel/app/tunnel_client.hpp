@@ -156,6 +156,11 @@ class TunnelClient {
     /// Return true if the client is configured for stdio pipe mode.
     [[nodiscard]] bool is_pipe_mode() const noexcept;
 
+    /// Apply the v0.4 adaptive coalescer mode + BDP flow control config to a
+    /// freshly-built tunnel. Centralised so all three tunnel-open paths
+    /// (forward rule, pipe mode, SOCKS5) stay in sync.
+    void apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel);
+
     /// Open the single stdio-backed tunnel used by pipe mode.
     void start_pipe_mode();
 

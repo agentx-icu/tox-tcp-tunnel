@@ -105,12 +105,29 @@ struct InspectConfig {
 struct TunnelConfig {
     uint32_t coalesce_max_delay_us = 200;
     uint32_t coalesce_max_bytes = 1362;
+    /// Coalesce mode: "fixed" (v0.3.0 behaviour, current default), "adaptive"
+    /// (state-machine policy selection), "bypass" (always emit), "drain"
+    /// (no hold timer).
+    std::string coalesce_mode = "fixed";
     uint32_t idle_timeout_seconds = 0;
     uint32_t reaper_tick_seconds = 10;
 
     [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }
 
     bool operator==(const TunnelConfig& other) const = default;
+};
+
+/// BDP-aware flow control configuration. `mode: fixed` (default) preserves
+/// the v0.3.0 256 KiB / 16 KiB window; `mode: bdp` lets the per-tunnel
+/// `BdpFlowControl` resize the window from RTT × bandwidth estimates.
+struct FlowControlConfig {
+    std::string mode = "fixed";                        ///< "fixed" or "bdp"
+    uint32_t send_window_min_bytes = 65536;            ///< 64 KiB clamp floor
+    uint32_t send_window_max_bytes = 4 * 1024 * 1024;  ///< 4 MiB clamp ceiling
+    uint32_t safety_factor_x100 = 150;                 ///< 1.5× BDP headroom
+    uint32_t fixed_window_bytes = 262144;              ///< 256 KiB — used in fixed mode
+
+    bool operator==(const FlowControlConfig& other) const = default;
 };
 
 /// Service / daemon policy for packaged installs (`--service`).
@@ -264,6 +281,7 @@ struct Config {
     MetricsConfig metrics;
     InspectConfig inspect;
     TunnelConfig tunnel;
+    FlowControlConfig flow_control;
 
     // Mode-specific options
     std::optional<ServerConfig> server;
@@ -334,7 +352,8 @@ struct Config {
         return mode == other.mode && data_dir == other.data_dir && logging == other.logging &&
                service == other.service && effective_tox_config() == other.effective_tox_config() &&
                metrics == other.metrics && inspect == other.inspect && tunnel == other.tunnel &&
-               server == other.server && client == other.client;
+               flow_control == other.flow_control && server == other.server &&
+               client == other.client;
     }
 };
 
@@ -429,6 +448,12 @@ template <>
 struct convert<toxtunnel::TunnelConfig> {
     static Node encode(const toxtunnel::TunnelConfig& rhs);
     static bool decode(const Node& node, toxtunnel::TunnelConfig& rhs);
+};
+
+template <>
+struct convert<toxtunnel::FlowControlConfig> {
+    static Node encode(const toxtunnel::FlowControlConfig& rhs);
+    static bool decode(const Node& node, toxtunnel::FlowControlConfig& rhs);
 };
 
 template <>

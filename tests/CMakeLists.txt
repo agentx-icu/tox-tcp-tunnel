@@ -38,6 +38,7 @@ add_executable(unit_tests
     unit/zero_copy_read_test.cpp
     unit/socks5_listener_test.cpp
     unit/outbound_zero_copy_test.cpp
+    unit/write_coalescer_test.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     toxtunnel_lib

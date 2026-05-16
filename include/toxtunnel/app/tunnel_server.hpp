@@ -117,6 +117,10 @@ class TunnelServer {
     /// Handle self connection status changes (DHT connectivity).
     void on_self_connection(bool connected);
 
+    /// Apply the v0.4 adaptive coalescer mode + BDP flow control config to a
+    /// freshly-built server-side tunnel.
+    void apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel);
+
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------

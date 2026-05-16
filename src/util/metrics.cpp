@@ -104,6 +104,16 @@ void MetricsRegistry::reset() {
     outbound_buffer_allocs_.store(0, std::memory_order_relaxed);
     outbound_buffer_reuse_.store(0, std::memory_order_relaxed);
     outbound_buffer_overflow_.store(0, std::memory_order_relaxed);
+    coalesce_policy_transitions_.store(0, std::memory_order_relaxed);
+    tunnel_rtt_count_.store(0, std::memory_order_relaxed);
+    tunnel_rtt_sum_us_.store(0, std::memory_order_relaxed);
+    tunnel_rtt_max_us_.store(0, std::memory_order_relaxed);
+    tunnel_send_window_count_.store(0, std::memory_order_relaxed);
+    tunnel_send_window_sum_bytes_.store(0, std::memory_order_relaxed);
+    tunnel_send_window_max_bytes_.store(0, std::memory_order_relaxed);
+    tunnel_bandwidth_count_.store(0, std::memory_order_relaxed);
+    tunnel_bandwidth_sum_bps_.store(0, std::memory_order_relaxed);
+    tunnel_bandwidth_max_bps_.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(labels_mutex_);
     build_version_.clear();
     build_git_sha_.clear();
@@ -181,6 +191,57 @@ std::uint64_t MetricsRegistry::outbound_buffer_reuse() const {
 
 std::uint64_t MetricsRegistry::outbound_buffer_overflow() const {
     return outbound_buffer_overflow_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_coalesce_policy_transitions() {
+    coalesce_policy_transitions_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::coalesce_policy_transitions() const {
+    return coalesce_policy_transitions_.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+void atomic_add_i64(std::atomic<std::int64_t>& target, std::int64_t delta) {
+    target.fetch_add(delta, std::memory_order_relaxed);
+}
+
+void atomic_max_i64(std::atomic<std::int64_t>& target, std::int64_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (value > current &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
+        // current refreshed by CAS on failure.
+    }
+}
+
+}  // namespace
+
+void MetricsRegistry::observe_tunnel_rtt_us(std::int64_t rtt_us) {
+    if (rtt_us <= 0) {
+        return;
+    }
+    tunnel_rtt_count_.fetch_add(1, std::memory_order_relaxed);
+    atomic_add_i64(tunnel_rtt_sum_us_, rtt_us);
+    atomic_max_i64(tunnel_rtt_max_us_, rtt_us);
+}
+
+void MetricsRegistry::observe_tunnel_send_window_bytes(std::int64_t bytes) {
+    if (bytes <= 0) {
+        return;
+    }
+    tunnel_send_window_count_.fetch_add(1, std::memory_order_relaxed);
+    atomic_add_i64(tunnel_send_window_sum_bytes_, bytes);
+    atomic_max_i64(tunnel_send_window_max_bytes_, bytes);
+}
+
+void MetricsRegistry::observe_tunnel_bandwidth_bps(std::int64_t bps) {
+    if (bps <= 0) {
+        return;
+    }
+    tunnel_bandwidth_count_.fetch_add(1, std::memory_order_relaxed);
+    atomic_add_i64(tunnel_bandwidth_sum_bps_, bps);
+    atomic_max_i64(tunnel_bandwidth_max_bps_, bps);
 }
 
 std::uint64_t MetricsRegistry::tunnels_active(Role role) const {
@@ -294,6 +355,45 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_outbound_buffer_overflow_total counter\n"
            "toxtunnel_outbound_buffer_overflow_total "
         << outbound_buffer_overflow() << "\n";
+
+    // Adaptive coalescer telemetry.
+    out << "# HELP toxtunnel_coalesce_policy_transitions_total Adaptive coalesce policy "
+           "state-machine transitions.\n"
+           "# TYPE toxtunnel_coalesce_policy_transitions_total counter\n"
+           "toxtunnel_coalesce_policy_transitions_total "
+        << coalesce_policy_transitions() << "\n";
+
+    // Per-tunnel summaries: render as count+sum+max so dashboards can derive
+    // mean and tail without the cost of full quantile estimation.
+    const auto rtt_count = tunnel_rtt_count_.load(std::memory_order_relaxed);
+    const auto rtt_sum = tunnel_rtt_sum_us_.load(std::memory_order_relaxed);
+    const auto rtt_max = tunnel_rtt_max_us_.load(std::memory_order_relaxed);
+    out << "# HELP toxtunnel_tunnel_rtt_microseconds Per-tunnel RTT EWMA samples.\n"
+           "# TYPE toxtunnel_tunnel_rtt_microseconds summary\n"
+           "toxtunnel_tunnel_rtt_microseconds_count "
+        << rtt_count << "\n"
+        << "toxtunnel_tunnel_rtt_microseconds_sum " << rtt_sum << "\n"
+        << "toxtunnel_tunnel_rtt_microseconds_max " << rtt_max << "\n";
+
+    const auto win_count = tunnel_send_window_count_.load(std::memory_order_relaxed);
+    const auto win_sum = tunnel_send_window_sum_bytes_.load(std::memory_order_relaxed);
+    const auto win_max = tunnel_send_window_max_bytes_.load(std::memory_order_relaxed);
+    out << "# HELP toxtunnel_tunnel_send_window_bytes Per-tunnel target send-window samples.\n"
+           "# TYPE toxtunnel_tunnel_send_window_bytes summary\n"
+           "toxtunnel_tunnel_send_window_bytes_count "
+        << win_count << "\n"
+        << "toxtunnel_tunnel_send_window_bytes_sum " << win_sum << "\n"
+        << "toxtunnel_tunnel_send_window_bytes_max " << win_max << "\n";
+
+    const auto bw_count = tunnel_bandwidth_count_.load(std::memory_order_relaxed);
+    const auto bw_sum = tunnel_bandwidth_sum_bps_.load(std::memory_order_relaxed);
+    const auto bw_max = tunnel_bandwidth_max_bps_.load(std::memory_order_relaxed);
+    out << "# HELP toxtunnel_tunnel_bandwidth_bytes_per_second Per-tunnel bandwidth EWMA samples.\n"
+           "# TYPE toxtunnel_tunnel_bandwidth_bytes_per_second summary\n"
+           "toxtunnel_tunnel_bandwidth_bytes_per_second_count "
+        << bw_count << "\n"
+        << "toxtunnel_tunnel_bandwidth_bytes_per_second_sum " << bw_sum << "\n"
+        << "toxtunnel_tunnel_bandwidth_bytes_per_second_max " << bw_max << "\n";
 
     return out.str();
 }

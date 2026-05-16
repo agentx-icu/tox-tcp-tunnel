@@ -1061,6 +1061,7 @@ Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs
     Node node;
     node["coalesce_max_delay_us"] = rhs.coalesce_max_delay_us;
     node["coalesce_max_bytes"] = rhs.coalesce_max_bytes;
+    node["coalesce_mode"] = rhs.coalesce_mode;
     node["idle_timeout_seconds"] = rhs.idle_timeout_seconds;
     node["reaper_tick_seconds"] = rhs.reaper_tick_seconds;
     return node;
@@ -1076,11 +1077,51 @@ bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::Tunne
     if (node["coalesce_max_bytes"]) {
         rhs.coalesce_max_bytes = node["coalesce_max_bytes"].as<uint32_t>();
     }
+    if (node["coalesce_mode"]) {
+        rhs.coalesce_mode = node["coalesce_mode"].as<std::string>();
+    }
     if (node["idle_timeout_seconds"]) {
         rhs.idle_timeout_seconds = node["idle_timeout_seconds"].as<uint32_t>();
     }
     if (node["reaper_tick_seconds"]) {
         rhs.reaper_tick_seconds = node["reaper_tick_seconds"].as<uint32_t>();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// FlowControlConfig
+// ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::FlowControlConfig>::encode(const toxtunnel::FlowControlConfig& rhs) {
+    Node node;
+    node["mode"] = rhs.mode;
+    node["send_window_min_bytes"] = rhs.send_window_min_bytes;
+    node["send_window_max_bytes"] = rhs.send_window_max_bytes;
+    node["safety_factor_x100"] = rhs.safety_factor_x100;
+    node["fixed_window_bytes"] = rhs.fixed_window_bytes;
+    return node;
+}
+
+bool convert<toxtunnel::FlowControlConfig>::decode(const Node& node,
+                                                   toxtunnel::FlowControlConfig& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["mode"]) {
+        rhs.mode = node["mode"].as<std::string>();
+    }
+    if (node["send_window_min_bytes"]) {
+        rhs.send_window_min_bytes = node["send_window_min_bytes"].as<uint32_t>();
+    }
+    if (node["send_window_max_bytes"]) {
+        rhs.send_window_max_bytes = node["send_window_max_bytes"].as<uint32_t>();
+    }
+    if (node["safety_factor_x100"]) {
+        rhs.safety_factor_x100 = node["safety_factor_x100"].as<uint32_t>();
+    }
+    if (node["fixed_window_bytes"]) {
+        rhs.fixed_window_bytes = node["fixed_window_bytes"].as<uint32_t>();
     }
     return true;
 }
@@ -1403,6 +1444,12 @@ Node convert<Config>::encode(const Config& rhs) {
         rhs.metrics.path != MetricsConfig{}.path) {
         node["metrics"] = rhs.metrics;
     }
+    if (!(rhs.tunnel == toxtunnel::TunnelConfig{})) {
+        node["tunnel"] = rhs.tunnel;
+    }
+    if (!(rhs.flow_control == toxtunnel::FlowControlConfig{})) {
+        node["flow_control"] = rhs.flow_control;
+    }
 
     if (rhs.server) {
         Node server_node;
@@ -1483,6 +1530,14 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
     if (node["metrics"]) {
         rhs.metrics = node["metrics"].as<MetricsConfig>();
+    }
+
+    if (node["tunnel"]) {
+        rhs.tunnel = node["tunnel"].as<toxtunnel::TunnelConfig>();
+    }
+
+    if (node["flow_control"]) {
+        rhs.flow_control = node["flow_control"].as<toxtunnel::FlowControlConfig>();
     }
 
     // Mode-specific config

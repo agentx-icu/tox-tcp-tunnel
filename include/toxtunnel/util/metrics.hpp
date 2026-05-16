@@ -107,6 +107,28 @@ class MetricsRegistry {
     [[nodiscard]] std::uint64_t outbound_buffer_overflow() const;
 
     // -----------------------------------------------------------------
+    // Adaptive coalescer / BDP flow control telemetry (v0.4)
+    // -----------------------------------------------------------------
+
+    /// Increment the cumulative count of adaptive policy transitions. A
+    /// transition is committed whenever a tunnel moves from one
+    /// CoalescePolicy to another (e.g. Batch -> Bypass).
+    void inc_coalesce_policy_transitions();
+
+    /// Record an RTT observation (microseconds) used for the per-tunnel BDP
+    /// estimator. Exposed as a summary so operators can chart median/tail.
+    void observe_tunnel_rtt_us(std::int64_t rtt_us);
+
+    /// Record the current target send window (bytes) for a tunnel. Sampled
+    /// when an RTT/bandwidth update recomputes the window.
+    void observe_tunnel_send_window_bytes(std::int64_t bytes);
+
+    /// Record the current EWMA bandwidth estimate (bytes/sec).
+    void observe_tunnel_bandwidth_bps(std::int64_t bps);
+
+    [[nodiscard]] std::uint64_t coalesce_policy_transitions() const;
+
+    // -----------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------
 
@@ -149,6 +171,18 @@ class MetricsRegistry {
     std::atomic<std::uint64_t> outbound_buffer_allocs_{0};
     std::atomic<std::uint64_t> outbound_buffer_reuse_{0};
     std::atomic<std::uint64_t> outbound_buffer_overflow_{0};
+
+    // Adaptive coalescer + BDP summaries.
+    std::atomic<std::uint64_t> coalesce_policy_transitions_{0};
+    std::atomic<std::uint64_t> tunnel_rtt_count_{0};
+    std::atomic<std::int64_t> tunnel_rtt_sum_us_{0};
+    std::atomic<std::int64_t> tunnel_rtt_max_us_{0};
+    std::atomic<std::uint64_t> tunnel_send_window_count_{0};
+    std::atomic<std::int64_t> tunnel_send_window_sum_bytes_{0};
+    std::atomic<std::int64_t> tunnel_send_window_max_bytes_{0};
+    std::atomic<std::uint64_t> tunnel_bandwidth_count_{0};
+    std::atomic<std::int64_t> tunnel_bandwidth_sum_bps_{0};
+    std::atomic<std::int64_t> tunnel_bandwidth_max_bps_{0};
 
     mutable std::mutex labels_mutex_;
     std::string build_version_;
