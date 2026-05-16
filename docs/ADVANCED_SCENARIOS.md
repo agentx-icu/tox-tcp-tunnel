@@ -8,9 +8,14 @@ This guide covers advanced use cases for ToxTunnel including remote desktop, fil
 2. [Remote Desktop (RDP/VNC)](#remote-desktop-rdpvnc)
 3. [NAS Access](#nas-access)
 4. [Custom Services](#custom-services)
-5. [Multi-hop Tunneling](#multi-hop-tunneling)
-6. [High Availability](#high-availability)
-7. [Service Integration](#service-integration)
+5. [SOCKS5 / HTTP CONNECT Proxy](#socks5--http-connect-proxy)
+6. [Scraping Prometheus Metrics](#scraping-prometheus-metrics)
+7. [Live Tunnel Inspection During Incidents](#live-tunnel-inspection-during-incidents)
+8. [Hot-Reloading rules.yaml Without Dropping Connections](#hot-reloading-rulesyaml-without-dropping-connections)
+9. [Multi-Server Failover](#multi-server-failover)
+10. [Multi-hop Tunneling](#multi-hop-tunneling)
+11. [High Availability](#high-availability)
+12. [Service Integration](#service-integration)
 
 ---
 
@@ -653,6 +658,313 @@ The server's `rules.yaml` is the single source of truth for which destinations
 the SOCKS5 client may reach. The listener supports `CONNECT` only —
 `BIND` and `UDP ASSOCIATE` requests are rejected with SOCKS5 reply code `0x07`,
 and unauthenticated proxy auth is the only mode (bind to loopback).
+
+---
+
+## Scraping Prometheus Metrics
+
+Wire ToxTunnel's `/metrics` endpoint into the rest of your observability
+stack. See [`docs/CONFIGURATION.md`](CONFIGURATION.md) ("Prometheus Metrics
+(`metrics:`)") for the config block and
+[`docs/ARCHITECTURE.md`](ARCHITECTURE.md) ("Operational Endpoints →
+`/metrics` HTTP") for the full series catalogue.
+
+### Server (or client) config
+
+```yaml
+metrics:
+  enabled: true
+  listen: "127.0.0.1:9105"   # loopback-only — fronted by node_exporter / reverse proxy
+```
+
+Reload semantics: `metrics.*` is **not** SIGHUP-reloadable. A restart is
+required to flip the listener on or change its bind.
+
+### Quick sanity check
+
+```bash
+curl -s http://127.0.0.1:9105/metrics | head
+# # HELP toxtunnel_tunnels_open Tunnels currently in OPEN state
+# # TYPE toxtunnel_tunnels_open gauge
+# toxtunnel_tunnels_open 4
+# # HELP toxtunnel_bytes_in_total Bytes received per direction
+# ...
+```
+
+### Prometheus scrape job
+
+```yaml
+# /etc/prometheus/prometheus.yml
+scrape_configs:
+  - job_name: toxtunnel
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - homelab.internal:9105
+          - dmz.internal:9105
+        labels:
+          service: toxtunnel
+```
+
+Run Prometheus itself behind ToxTunnel if the daemon's `metrics.listen` is
+loopback-only — add a `forwards:` mapping on the scraper host pointing at
+`127.0.0.1:9105` on each target.
+
+### Alertmanager rule examples
+
+```yaml
+# alerts.yml
+groups:
+  - name: toxtunnel
+    rules:
+      - alert: ToxTunnelNoFriendsOnline
+        expr: toxtunnel_active_friends == 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "ToxTunnel has zero peers online for 5m"
+
+      - alert: ToxTunnelReloadsRejected
+        expr: increase(toxtunnel_reloads_total{result="rejected"}[15m]) > 0
+        labels: { severity: warn }
+        annotations:
+          summary: "A SIGHUP / reload attempt was rejected — non-reloadable field changed"
+
+      - alert: ToxTunnelFailoverStorm
+        expr: increase(toxtunnel_failover_switchovers_total[10m]) > 3
+        labels: { severity: page }
+        annotations:
+          summary: "Active-server switchovers exceeded 3 in 10m — primary is flapping"
+```
+
+### Grafana
+
+Import a panel keyed off the series above. A minimal dashboard usually
+includes: tunnels open (gauge), bytes_in / bytes_out (rate), tunnels_closed by
+reason (stacked counter), reloads (annotation), and `tox_self_connection_status`
+(state-timeline).
+
+---
+
+## Live Tunnel Inspection During Incidents
+
+`toxtunnel inspect` talks to the local-only `InspectServer` IPC (default-on,
+no remote attack surface — see [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+"Operational Endpoints → `toxtunnel inspect` IPC"). Use it when something is
+wrong on a running daemon and you need ground truth without restarting.
+
+### Interactive triage
+
+```bash
+# Who am I and how long have I been up?
+toxtunnel inspect status
+
+# What tunnels are alive right now?
+toxtunnel inspect tunnels
+
+# Which friends does the daemon see online?
+toxtunnel inspect friends
+
+# Snapshot of every metrics counter (same numbers /metrics serves,
+# even when metrics.enabled = false).
+toxtunnel inspect metrics
+```
+
+The CLI pretty-prints by default. Pass `--json` for raw IPC output suitable
+for `jq` / scripts:
+
+```bash
+toxtunnel inspect tunnels --json \
+  | jq '.tunnels[] | select(.idle_seconds > 60)'
+```
+
+### Scripted health probes
+
+Because every reply is one JSON line on a Unix-domain socket, you can shell
+out from anywhere on the same host without depending on the metrics endpoint:
+
+```bash
+# Fail the systemd unit's ExecStartPost if no peers are online after boot.
+SOCK=/var/lib/toxtunnel/inspect.sock
+status=$(printf '{"cmd":"status"}\n' \
+  | socat - UNIX-CONNECT:$SOCK \
+  | jq -r '.tunnels_open')
+[ "${status:-0}" -gt 0 ] || exit 1
+```
+
+### When inspect is your only option
+
+- The daemon is running but `/metrics` is disabled.
+- You suspect a thread is stuck — `toxtunnel inspect status` will still answer
+  because the IPC accept loop runs on the I/O pool, not the Tox thread.
+- You need a snapshot at the exact moment a tunnel hangs, before SIGHUP /
+  restart loses the state.
+
+If `toxtunnel inspect` itself hangs, the I/O pool is wedged; capture a core
+dump (`gcore` / minidump) before restarting.
+
+---
+
+## Hot-Reloading rules.yaml Without Dropping Connections
+
+The reloadable subset is intentionally tiny — see
+[`docs/CONFIGURATION.md`](CONFIGURATION.md) ("Hot Reload (`SIGHUP` / reload
+pipe)"). For `rules.yaml` specifically: edit the file, signal the daemon, and
+existing tunnels that are still allowed by the new rules **stay open**. Only
+tunnels that the new rules now deny are closed.
+
+### Workflow (POSIX)
+
+```bash
+# 1. Edit the rules file in place.
+sudoedit /etc/toxtunnel/rules.yaml
+
+# 2. Signal the running server.
+sudo systemctl reload toxtunnel        # preferred — wraps SIGHUP
+# or:
+sudo kill -HUP $(pidof toxtunnel)
+
+# 3. Confirm in the logs.
+sudo journalctl -u toxtunnel -n 5 --no-pager | grep -i reload
+# Reload applied: rules_file=/etc/toxtunnel/rules.yaml (3 allow, 1 deny)
+
+# 4. Confirm via the metrics counter (if metrics.enabled).
+curl -s http://127.0.0.1:9105/metrics | grep toxtunnel_reloads_total
+# toxtunnel_reloads_total{result="success"} 7
+# toxtunnel_reloads_total{result="rejected"} 0
+```
+
+If you accidentally edit a non-reloadable field — say you bump `tox.tcp_port`
+in the same checkpoint — the reload is rejected as a whole:
+
+```
+Reload rejected: field tox.tcp_port is not reloadable
+```
+
+The running daemon's config is untouched; revert the offending change, signal
+again, and you're back in business.
+
+### Workflow (Windows)
+
+```powershell
+# 1. Edit the rules file.
+notepad C:\ProgramData\toxtunnel\rules.yaml
+
+# 2. Trigger the reload over the named pipe.
+toxtunnel reload                       # talks to \\.\pipe\toxtunnel-reload-<pid>
+
+# 3. Inspect the running state.
+toxtunnel inspect status
+```
+
+### What the daemon does internally
+
+`ConfigReload::apply()` parses the new file, diffs against the live `Config`,
+and either swaps just the reloadable subset under each consumer's strand or
+rejects the whole reload. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+("Operational Endpoints → SIGHUP / reload pipe") for the full flow.
+
+### Recommended workflow for sensitive rule changes
+
+```bash
+# Stage the new file alongside, validate it without applying.
+sudo cp /etc/toxtunnel/rules.yaml /etc/toxtunnel/rules.yaml.next
+sudoedit /etc/toxtunnel/rules.yaml.next
+toxtunnel config check --rules /etc/toxtunnel/rules.yaml.next
+
+# Atomically move it into place, then signal.
+sudo mv /etc/toxtunnel/rules.yaml.next /etc/toxtunnel/rules.yaml
+sudo systemctl reload toxtunnel
+```
+
+---
+
+## Multi-Server Failover
+
+Production redundancy without an external load balancer. The client maintains
+a list of servers, prefers the primary, and falls over automatically. See
+[`docs/CONFIGURATION.md`](CONFIGURATION.md) ("Multi-Server Failover") for the
+full field reference.
+
+### Pattern: primary + one hot spare
+
+```yaml
+# /etc/toxtunnel/client.yaml
+mode: client
+data_dir: /var/lib/toxtunnel
+
+client:
+  server_id:
+    - homelab-primary        # alias from `toxtunnel servers add`
+    - homelab-spare
+
+  failover:
+    timeout_seconds: 60                # how long the active server may be
+                                        # offline before we promote a fallback
+    prefer_primary_grace_seconds: 30   # how long the primary must be back
+                                        # online before we switch back
+
+  forwards:
+    - local_port: 2222
+      remote_host: 127.0.0.1
+      remote_port: 22
+```
+
+Both servers must export the same set of allowed destinations in their
+respective `rules.yaml` — failover doesn't synchronise rules, it only changes
+which Tox peer carries the traffic.
+
+### Pattern: primary + two geographic spares
+
+```yaml
+client:
+  server_id:
+    - prod-iad               # us-east-1
+    - prod-fra               # eu-central-1 (spare)
+    - prod-sin               # ap-southeast-1 (spare-of-spare)
+  failover:
+    timeout_seconds: 30                 # tighter — multi-region demands fast
+                                         # detection
+    prefer_primary_grace_seconds: 120   # avoid flapping while iad recovers
+```
+
+The client tries `prod-iad` first. If it stays offline for 30s, the client
+promotes the lowest-index online fallback (`prod-fra` if it's up, otherwise
+`prod-sin`). When `prod-iad` is back online for 120s straight, the client
+switches back.
+
+### Verifying failover behaviour
+
+```bash
+# Pre-flight: confirm all servers are registered as friends and at least one
+# is online.
+toxtunnel inspect friends --json | jq '.friends[] | {alias, online}'
+
+# Simulate a primary outage by shutting it down — watch the log line:
+sudo systemctl stop toxtunnel@prod-iad   # on the server host
+
+# On the client:
+sudo journalctl -u toxtunnel -f | grep -i failover
+# Failover: primary 'prod-iad' offline > 30s; promoting 'prod-fra'
+
+# Bring the primary back:
+sudo systemctl start toxtunnel@prod-iad
+# Failover: primary 'prod-iad' back online for 120s; switching back
+```
+
+`toxtunnel_failover_switchovers_total` (counter, exported via `/metrics`)
+should increment by 2 across that demo. Wire an Alertmanager rule on
+`increase(...)>N over 10m` to detect flapping primaries — see "Scraping
+Prometheus Metrics" above.
+
+### Switchover semantics (what your TCP clients see)
+
+When the client promotes a new active server it tears down every tunnel
+currently routed through the old endpoint with a local `TUNNEL_CLOSE`. The
+TCP listeners stay bound — the next accepted TCP connection rebuilds a fresh
+tunnel through the new active server. Existing TCP connections through old
+tunnels are closed by the local listener; long-lived protocols (SSH, psql)
+need a reconnect, which is the same behaviour as any L4 failover.
 
 ---
 

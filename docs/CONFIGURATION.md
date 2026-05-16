@@ -346,6 +346,126 @@ client times out silently and persists only locally-observable metadata
 > only way the server publishes runtime metadata, and the operator opts in
 > per field.
 
+## Tunnel-level Tuning (`tunnel:`)
+
+Per-tunnel buffering and lifecycle knobs. All defaults are safe — only touch
+these if a profile or operational requirement justifies it. The wire format is
+unchanged regardless of values.
+
+```yaml
+tunnel:
+  idle_timeout_seconds: 0          # 0 = disabled (default). >0 closes tunnels
+                                    # that have been idle (no TUNNEL_DATA in
+                                    # either direction) for this long.
+  reaper_tick_seconds: 30          # how often the reaper scans; only matters
+                                    # if idle_timeout_seconds > 0.
+
+  coalesce_max_delay_us: 200       # 0 disables coalescing. Otherwise the
+                                    # per-tunnel WriteQueue holds small writes
+                                    # for up to this many microseconds before
+                                    # emitting one TUNNEL_DATA frame.
+  coalesce_max_bytes: 1362         # flush early if the buffered payload hits
+                                    # this many bytes. Default matches the
+                                    # TUNNEL_DATA payload MTU.
+```
+
+| Field | Default | Reloadable? | Effect |
+|---|---|---|---|
+| `idle_timeout_seconds` | `0` (off) | restart | Idle reaper threshold. When >0 the reaper closes tunnels with no TUNNEL_DATA in either direction for the given duration. |
+| `reaper_tick_seconds` | `30` | restart | Reaper scan period. Lower = faster reclaim, higher = less wake-up overhead. |
+| `coalesce_max_delay_us` | `200` | restart | Max time a small write is buffered before being emitted. `0` disables coalescing — every write becomes its own TUNNEL_DATA frame, matching pre-v0.3.0 behaviour. |
+| `coalesce_max_bytes` | `1362` | restart | Buffer-size flush threshold. Should be ≤ TUNNEL_DATA payload MTU; higher values are clamped. |
+
+The reaper and coalescer live in `TunnelManager` and run on the existing I/O
+pool — they do not start new threads. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+("Operational Endpoints" and the WriteQueue/idle-reaper rows in "Components")
+for the dataflow.
+
+## Prometheus Metrics (`metrics:`)
+
+`MetricsServer` exposes a `GET /metrics` endpoint in Prometheus text format.
+**Default-off**; flip on per-server / per-client as desired.
+
+```yaml
+metrics:
+  enabled: false                       # default: off
+  listen: "127.0.0.1:9105"             # bind address — loopback recommended
+  # path: /metrics                     # optional; default /metrics
+```
+
+| Field | Default | Reloadable? | Effect |
+|---|---|---|---|
+| `metrics.enabled` | `false` | restart | Master switch. Setting to `true` starts `MetricsServer` at boot. |
+| `metrics.listen` | `127.0.0.1:9105` | restart | HTTP bind. Use a non-loopback bind only if you front-proxy with TLS + auth. |
+| `metrics.path` | `/metrics` | restart | URL path. Other paths return `404`. |
+
+The full list of exported series is in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+under "Operational Endpoints → /metrics HTTP". For Grafana / Alertmanager
+wiring examples, see [`docs/ADVANCED_SCENARIOS.md`](ADVANCED_SCENARIOS.md)
+("Scraping Prometheus metrics").
+
+## Local Inspection IPC (`inspect:`)
+
+`InspectServer` powers the `toxtunnel inspect` CLI. It is **default-on**
+because the listener is a local Unix-domain socket (POSIX) or named pipe
+(Windows), so the OS permission bits gate access — there is no TCP attack
+surface.
+
+```yaml
+inspect:
+  enabled: true                        # default: on
+  socket_path: ""                      # empty = <data_dir>/inspect.sock
+                                        # (POSIX) or
+                                        # \\.\pipe\toxtunnel-inspect-<pid> (Windows)
+  socket_mode: 0600                    # POSIX-only; chmod on the socket file
+```
+
+| Field | Default | Reloadable? | Effect |
+|---|---|---|---|
+| `inspect.enabled` | `true` | restart | Master switch. Set to `false` to disable the IPC listener entirely. |
+| `inspect.socket_path` | `<data_dir>/inspect.sock` | restart | Where to bind. Override only if `data_dir` lives on a filesystem that does not support sockets. |
+| `inspect.socket_mode` | `0600` | restart | POSIX file mode on the socket inode. `0660` is appropriate if you run the daemon as a system user and want a group to peek. |
+
+The IPC wire format (single-line JSON request → single-line JSON reply) and
+the catalogue of `cmd` values live in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+("Operational Endpoints → toxtunnel inspect IPC").
+
+## Hot Reload (`SIGHUP` / reload pipe)
+
+A running daemon will reload a tightly scoped subset of its configuration in
+place, without dropping existing tunnels, when it receives:
+
+- POSIX: `SIGHUP` (e.g. `kill -HUP <pid>` or `systemctl reload toxtunnel`).
+- Windows: a single byte written to the reload named pipe (default
+  `\\.\pipe\toxtunnel-reload-<pid>`). The CLI helper is `toxtunnel reload`.
+
+### Reloadable fields
+
+| Field | Effect on reload |
+|---|---|
+| `logging.level` | Swapped atomically — next log line uses the new level. |
+| `client.forwards` | New listeners are bound, removed listeners are closed, unchanged listeners keep their open tunnels. |
+| `server.rules_file` | File is re-read and the parsed `RulesEngine` is swapped in. Tunnels disallowed by the new rules are closed; everything else continues. |
+
+### Non-reloadable fields (reload is rejected, running config untouched)
+
+`mode`, `data_dir`, the entire `tox.*` block, `server.disclose.*`,
+`client.server_id`, `client.failover.*`, `client.socks5.*`, the entire
+`metrics.*` block, the entire `inspect.*` block, and the `tunnel.*` block.
+
+Changing any of those requires a full restart. A reload that touches one of
+them is rejected as a whole — no partial application — and logged at WARN:
+
+```
+Reload rejected: field client.server_id is not reloadable
+```
+
+A successful reload is logged at INFO and increments
+`toxtunnel_reloads_total{result="success"}`.
+
+For a worked example, see [`docs/ADVANCED_SCENARIOS.md`](ADVANCED_SCENARIOS.md)
+("Hot-reloading rules.yaml without dropping connections").
+
 ## Logging
 
 ```yaml
@@ -353,6 +473,10 @@ logging:
   level: info              # trace, debug, info, warn, error
   file: /var/log/toxtunnel.log   # optional, defaults to stderr
 ```
+
+`logging.level` is one of the few fields that is hot-reloadable — see "Hot
+Reload" above. `logging.file` is **not** reloadable (it is opened at startup);
+rotate it via `logrotate` + `copytruncate` or your platform equivalent.
 
 ## Multiple Port Forwards
 

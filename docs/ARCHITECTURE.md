@@ -33,6 +33,14 @@
 | `SystemInfo`        | Server-side platform probes gated by `ServerInfoDisclose` policy (hostname / os / arch / uptime / version). Used to build `INFO_REPLY` payloads. |
 | `IoContext`         | Async I/O thread pool wrapping asio                              |
 | `Config`            | YAML configuration loading, validation, and CLI override merging |
+| `ConfigReload`      | Atomically swaps the reloadable subset (rules, forwards, log level) of `Config` on SIGHUP / reload-pipe; rejects changes to non-reloadable fields. See [Operational Endpoints](#operational-endpoints). |
+| `FailoverConfig`    | Per-client failover policy (`timeout_seconds`, `prefer_primary_grace_seconds`); consumed by `TunnelClient`'s per-endpoint state machine. |
+| `MetricsRegistry`   | Lock-free registry of atomic counters / gauges / summaries; updated from any thread. |
+| `MetricsServer`     | Asio HTTP/1.1 listener that renders `MetricsRegistry` as Prometheus text format on `GET /metrics`. Default-off; see [Operational Endpoints](#operational-endpoints). |
+| `InspectServer`     | Local IPC server (Unix-domain socket on POSIX, named pipe on Windows) for the `toxtunnel inspect` CLI. Default-on, loopback-only by construction — no remote attack surface. |
+| `Socks5Listener`    | Client-side TCP listener that auto-detects SOCKS5 v5 vs HTTP CONNECT by sniffing the first byte; binds loopback-only (enforced at config validation). Pipelined CONNECT payloads are preserved across the handshake. |
+| `OwnedBufferView`   | `shared_ptr<vector<uint8_t>>` slice handed from the Tox callback down to `TcpConnection::write`. Eliminates one copy on the inbound path (see [Inbound Copy Path](#inbound-copy-path)). |
+| `WriteQueue`        | Per-tunnel write coalescer in `TunnelManager`. Accumulates small writes for up to `tunnel.coalesce_max_delay_us` (200µs default) or `tunnel.coalesce_max_bytes` (1362 = TUNNEL_DATA MTU) before flushing one TUNNEL_DATA frame. Wire-format unchanged. |
 
 ## Configuration Model
 
@@ -102,6 +110,18 @@ Offset  Size  Field
 - **Tox thread**: Single dedicated thread for all toxcore API calls (toxcore is not thread-safe)
 - **I/O pool**: Async TCP operations via asio (default: 10 threads)
 
+v0.3.0 introduced four new I/O participants — `MetricsServer`, `InspectServer`,
+`Socks5Listener`, and the SIGHUP reload watcher — **none of which add new
+threads**. All four live entirely on the existing asio I/O pool:
+
+- `MetricsServer` and `InspectServer` are plain asio acceptors with per-connection strands.
+- `Socks5Listener` shares the pool with the regular forward listeners.
+- SIGHUP is wired through `asio::signal_set` bound to the main `IoContext` on POSIX. On
+  Windows there is no SIGHUP — `ConfigReload` watches a named pipe (configurable via
+  `service.reload_pipe`) on the same pool.
+- `MetricsRegistry` is updated lock-free (atomic increments) from any thread, including
+  the Tox thread, without marshalling.
+
 ## Data Flow
 
 ### Client -> Server (Outbound Tunnel)
@@ -130,6 +150,119 @@ Offset  Size  Field
             |------- TUNNEL_CLOSE --------->|  (or <-)
             |                               |
 ```
+
+## Operational Endpoints
+
+ToxTunnel v0.3.0 exposes three out-of-band channels that operators use to
+observe, inspect, and reload a running daemon. None of them carry tunnel data
+and none of them open additional threads.
+
+### `/metrics` HTTP (Prometheus)
+
+`MetricsServer` is a small asio HTTP/1.1 listener that renders `MetricsRegistry`
+in Prometheus text exposition format. **Default-off**; enable per
+`docs/CONFIGURATION.md` → "metrics".
+
+Exposed series (subject to growth — names are stable once shipped):
+
+| Metric | Type | Description |
+|---|---|---|
+| `toxtunnel_tunnels_open` | gauge | Tunnels currently in OPEN state |
+| `toxtunnel_tunnels_opened_total` | counter | Cumulative tunnels opened |
+| `toxtunnel_tunnels_closed_total{reason}` | counter | Closures, labelled by reason |
+| `toxtunnel_bytes_in_total{direction}` | counter | Bytes received on each direction |
+| `toxtunnel_bytes_out_total{direction}` | counter | Bytes sent on each direction |
+| `toxtunnel_frames_total{type}` | counter | Frames seen, labelled by frame type |
+| `toxtunnel_active_friends` | gauge | Friends currently online |
+| `toxtunnel_reaper_closed_total` | counter | Tunnels closed by the idle reaper |
+| `toxtunnel_reloads_total{result}` | counter | SIGHUP / reload-pipe reloads (success / rejected) |
+| `toxtunnel_failover_switchovers_total` | counter | Active-server changes on the client |
+| `toxtunnel_tox_self_connection_status` | gauge | Toxcore self-connection enum (0=none, 1=TCP, 2=UDP) |
+
+Bind to loopback if you do not want public scraping; reverse-proxy with TLS +
+auth if you do.
+
+### `toxtunnel inspect` IPC
+
+`InspectServer` accepts connections on a local Unix-domain socket (POSIX) or
+named pipe (Windows). Default path follows `data_dir/inspect.sock` /
+`\\.\pipe\toxtunnel-inspect-<pid>`. **Default-on, loopback-only by
+construction** — there is no TCP listener and no auth layer because the OS
+permission bits on the socket file are the access control.
+
+Wire format is intentionally trivial:
+
+1. Client opens the socket, writes one JSON request line terminated by `\n`.
+2. Server replies with one JSON reply line terminated by `\n`, then closes.
+
+```
+> {"cmd": "tunnels"}
+< {"ok": true, "tunnels": [{"id": 17, "peer": "AA…", "state": "OPEN", "bytes_in": 4096, "bytes_out": 8192, "idle_seconds": 3.2}]}
+
+> {"cmd": "status"}
+< {"ok": true, "mode": "client", "self_tox_id": "…", "uptime_seconds": 1294, "active_server": "primary", "tunnels_open": 4}
+```
+
+The CLI subcommands (`toxtunnel inspect tunnels|status|friends|metrics`) are
+thin wrappers that compose the JSON request, write it, and pretty-print the
+reply. Tooling that wants structured output should call the IPC socket
+directly.
+
+### SIGHUP / reload pipe
+
+POSIX: `kill -HUP <pid>` (or `systemctl reload toxtunnel`) is delivered to an
+`asio::signal_set` on the main `IoContext`. Windows has no SIGHUP, so the
+equivalent path is a named pipe — write a single byte to it, or run
+`toxtunnel reload --pipe <path>`.
+
+Either trigger calls `ConfigReload::apply()`, which:
+
+1. Re-reads the original config file.
+2. Diffs the parsed result against the live `Config`.
+3. **Rejects** the reload (no changes applied) if any non-reloadable field
+   changed: `mode`, `data_dir`, `tox.*`, `server.disclose.*`, `client.server_id`,
+   `client.failover.*`, `metrics.*`, `inspect.*`, `client.socks5.*`.
+4. Otherwise atomically swaps the reloadable subset — `rules_file` contents,
+   `client.forwards`, and `logging.level` — under the strand that owns each
+   consumer. Existing tunnels are **not** torn down on a successful reload
+   unless their friend or destination is no longer allowed by the new rules.
+
+A `Reload applied: …` line is emitted at INFO. A rejected reload emits a
+`Reload rejected: field <name> is not reloadable` line at WARN and leaves the
+running config untouched.
+
+## Inbound Copy Path
+
+Pre-v0.3.0 the inbound path (Tox → local TCP) made three copies: toxcore's
+internal buffer → ToxTunnel framing buffer → per-tunnel queue → kernel via
+`asio::async_write`. The Wave A zero-copy rework collapses the middle two into
+a single shared owner.
+
+```
+toxcore packet callback (Tox thread)
+   │  std::vector<uint8_t>  ← framed payload, one allocation
+   ▼
+make_shared<vector<uint8_t>>   ← OwnedBufferView
+   │  post() to TunnelManager strand on the I/O pool
+   ▼
+TunnelManager::route(OwnedBufferView)
+   │  slice → asio::buffer pointing into the same vector
+   ▼
+TcpConnection::write(buffer, keep_alive = OwnedBufferView)
+   │  asio::async_write — buffer stays valid until completion
+   ▼
+kernel writev()
+```
+
+Key properties:
+
+- One heap allocation per inbound Tox frame, regardless of fan-out.
+- `OwnedBufferView` keeps the backing vector alive across the async write; the
+  shared_ptr is captured by the completion handler.
+- Strand discipline is unchanged — the buffer is only **read** off-strand by
+  asio's writer, never mutated.
+- The outbound path (TCP → Tox) was not changed in v0.3.0; the write
+  coalescer (`WriteQueue`) reuses the existing `TUNNEL_DATA` framing buffer.
 
 ## Dependencies
 
