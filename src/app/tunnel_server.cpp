@@ -4,6 +4,7 @@
 #include <shared_mutex>
 #include <span>
 
+#include "toxtunnel/app/rate_limiter.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
@@ -54,6 +55,9 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     } else {
         util::Logger::info("No rules file configured; using permissive defaults");
     }
+    // Propagate the rate-limit configuration from the rules engine into the
+    // process-wide singleton. Idempotent — safe to call again on reload.
+    sync_rate_limiter();
 
     // Create IoContext.
     io_context_ = std::make_unique<core::IoContext>();
@@ -265,6 +269,7 @@ util::Expected<void, std::string> TunnelServer::reload(const Config& new_config)
         std::unique_lock rules_lock(rules_mutex_);
         rules_engine_ = RulesEngine{};
     }
+    sync_rate_limiter();
 
     if (config_.logging.level != new_config.logging.level) {
         util::Logger::set_level(new_config.logging.level);
@@ -398,6 +403,17 @@ void TunnelServer::on_self_connection(bool connected) {
     }
 }
 
+void TunnelServer::sync_rate_limiter() {
+    auto& limiter = rate_limiter_instance();
+    std::shared_lock rules_lock(rules_mutex_);
+    limiter.set_default_spec(rules_engine_.rate_limit_defaults());
+    for (const auto& rule : rules_engine_.rules()) {
+        if (!rule.rate_limit.empty()) {
+            limiter.set_friend_spec(rule.friend_pk, rule.rate_limit);
+        }
+    }
+}
+
 void TunnelServer::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
     tunnel::CoalesceMode coalesce_mode = tunnel::CoalesceMode::Fixed;
     (void)tunnel::parse_coalesce_mode(config_.tunnel.coalesce_mode, coalesce_mode);
@@ -470,8 +486,26 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     util::Logger::info("TUNNEL_OPEN from friend {}: tunnel_id={} target={}:{}", friend_number,
                        tunnel_id, target_host, target_port);
 
-    // Check access rules.
+    // Anti-DoS rate limit (runs *before* RulesEngine — a rejected friend
+    // burns no rules-engine CPU). Mode == Off / Report short-circuits inside
+    // the limiter and always returns true.
     auto pk_hex = get_friend_pk_hex(friend_number);
+    if (!rate_limiter_instance().try_consume_open(pk_hex)) {
+        util::Logger::warn("Rate-limit OPEN reject for friend {} (tunnel_id={})", pk_hex,
+                           tunnel_id);
+        util::MetricsRegistry::instance().inc_tunnels_opened(
+            util::MetricsRegistry::OpenResult::Denied);
+        std::lock_guard lock(managers_mutex_);
+        auto it = managers_.find(friend_number);
+        if (it != managers_.end()) {
+            auto error_frame =
+                tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 3, "Rate limit exceeded");
+            it->second->send_frame(error_frame);
+        }
+        return;
+    }
+
+    // Check access rules.
     AccessRequest access_req;
     access_req.friend_pk = pk_hex;
     access_req.target_host = target_host;

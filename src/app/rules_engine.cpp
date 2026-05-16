@@ -83,7 +83,17 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_vi
             rules_node.push_back(node);
         } else {
             // Empty or unrecognized format - return empty engine
+            // (but still surface rate_limit_defaults if present)
+            if (node.IsMap() && node["rate_limit_defaults"]) {
+                engine.rate_limit_defaults_ = node["rate_limit_defaults"].as<RateLimitSpec>();
+            }
             return engine;
+        }
+
+        // Top-level rate_limit_defaults — only meaningful when the document
+        // is a map (sequence-rooted documents don't carry sibling fields).
+        if (node.IsMap() && node["rate_limit_defaults"]) {
+            engine.rate_limit_defaults_ = node["rate_limit_defaults"].as<RateLimitSpec>();
         }
 
         for (const auto& rule_node : rules_node) {
@@ -526,6 +536,59 @@ bool convert<FriendRule>::decode(const Node& node, FriendRule& rhs) {
         rhs.deny = node["deny"].as<std::vector<TargetSpec>>();
     }
 
+    if (node["rate_limit"]) {
+        rhs.rate_limit = node["rate_limit"].as<toxtunnel::RateLimitSpec>();
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// RateLimitSpec
+// ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::RateLimitSpec>::encode(const toxtunnel::RateLimitSpec& rhs) {
+    Node node;
+    node["mode"] = std::string(toxtunnel::to_string(rhs.mode));
+    if (rhs.open_per_sec)
+        node["open_per_sec"] = rhs.open_per_sec;
+    if (rhs.open_burst)
+        node["open_burst"] = rhs.open_burst;
+    if (rhs.bytes_per_sec)
+        node["bytes_per_sec"] = rhs.bytes_per_sec;
+    if (rhs.bytes_burst)
+        node["bytes_burst"] = rhs.bytes_burst;
+    if (rhs.max_concurrent_tunnels)
+        node["max_concurrent_tunnels"] = rhs.max_concurrent_tunnels;
+    return node;
+}
+
+bool convert<toxtunnel::RateLimitSpec>::decode(const Node& node, toxtunnel::RateLimitSpec& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    if (node["mode"]) {
+        const auto s = node["mode"].as<std::string>();
+        if (!toxtunnel::parse_rate_limit_mode(s, rhs.mode)) {
+            return false;
+        }
+    } else {
+        // Mode defaults to enforce if any limit values are present and no
+        // explicit mode is set; this matches the design doc default of
+        // "tighten by default once configured".
+        rhs.mode = toxtunnel::RateLimitMode::Enforce;
+    }
+    if (node["open_per_sec"])
+        rhs.open_per_sec = node["open_per_sec"].as<std::uint32_t>();
+    if (node["open_burst"])
+        rhs.open_burst = node["open_burst"].as<std::uint32_t>();
+    if (node["bytes_per_sec"])
+        rhs.bytes_per_sec = node["bytes_per_sec"].as<std::uint64_t>();
+    if (node["bytes_burst"])
+        rhs.bytes_burst = node["bytes_burst"].as<std::uint64_t>();
+    if (node["max_concurrent_tunnels"]) {
+        rhs.max_concurrent_tunnels = node["max_concurrent_tunnels"].as<std::uint32_t>();
+    }
     return true;
 }
 

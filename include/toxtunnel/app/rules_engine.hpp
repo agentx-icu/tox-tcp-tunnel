@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "toxtunnel/app/rate_limiter.hpp"
 #include "toxtunnel/tox/types.hpp"
 #include "toxtunnel/util/expected.hpp"
 #include "toxtunnel/util/logger.hpp"
@@ -43,9 +44,13 @@ struct FriendRule {
     std::string friend_pk;          ///< Friend's hex-encoded public key (64 chars)
     std::vector<TargetSpec> allow;  ///< Targets this friend is allowed to access
     std::vector<TargetSpec> deny;   ///< Targets this friend is denied from accessing
+    /// Per-friend rate-limit override. Empty / default means "use the
+    /// top-level `rate_limit_defaults`" or no limit at all.
+    RateLimitSpec rate_limit;
 
     bool operator==(const FriendRule& other) const {
-        return friend_pk == other.friend_pk && allow == other.allow && deny == other.deny;
+        return friend_pk == other.friend_pk && allow == other.allow && deny == other.deny &&
+               rate_limit == other.rate_limit;
     }
 };
 
@@ -126,6 +131,13 @@ class RulesEngine {
     /// Get all friend rules.
     [[nodiscard]] const std::vector<FriendRule>& rules() const noexcept { return rules_; }
 
+    /// Top-level `rate_limit_defaults:` block parsed from the rules file.
+    /// Used by the `RateLimiter` when a friend has no explicit override.
+    [[nodiscard]] const RateLimitSpec& rate_limit_defaults() const noexcept {
+        return rate_limit_defaults_;
+    }
+    void set_rate_limit_defaults(const RateLimitSpec& spec) { rate_limit_defaults_ = spec; }
+
     /// Serialize rules to YAML.
     [[nodiscard]] std::string to_yaml() const;
 
@@ -155,6 +167,7 @@ class RulesEngine {
 
    private:
     std::vector<FriendRule> rules_;
+    RateLimitSpec rate_limit_defaults_;
 
     /// Find rules for a specific friend.
     [[nodiscard]] const FriendRule* find_friend_rule(const std::string& friend_pk) const;
@@ -213,6 +226,12 @@ template <>
 struct convert<toxtunnel::FriendRule> {
     static Node encode(const toxtunnel::FriendRule& rhs);
     static bool decode(const Node& node, toxtunnel::FriendRule& rhs);
+};
+
+template <>
+struct convert<toxtunnel::RateLimitSpec> {
+    static Node encode(const toxtunnel::RateLimitSpec& rhs);
+    static bool decode(const Node& node, toxtunnel::RateLimitSpec& rhs);
 };
 
 }  // namespace YAML

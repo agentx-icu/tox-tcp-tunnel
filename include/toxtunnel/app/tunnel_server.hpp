@@ -121,6 +121,11 @@ class TunnelServer {
     /// freshly-built server-side tunnel.
     void apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel);
 
+    /// Push the rules engine's rate-limit configuration (defaults + per-
+    /// friend specs) into the process-wide RateLimiter. Idempotent; called
+    /// after every rules load / reload.
+    void sync_rate_limiter();
+
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------

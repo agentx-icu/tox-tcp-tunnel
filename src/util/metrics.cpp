@@ -114,6 +114,8 @@ void MetricsRegistry::reset() {
     tunnel_bandwidth_count_.store(0, std::memory_order_relaxed);
     tunnel_bandwidth_sum_bps_.store(0, std::memory_order_relaxed);
     tunnel_bandwidth_max_bps_.store(0, std::memory_order_relaxed);
+    rate_limit_open_rejected_.store(0, std::memory_order_relaxed);
+    rate_limit_bytes_throttled_.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(labels_mutex_);
     build_version_.clear();
     build_git_sha_.clear();
@@ -242,6 +244,22 @@ void MetricsRegistry::observe_tunnel_bandwidth_bps(std::int64_t bps) {
     tunnel_bandwidth_count_.fetch_add(1, std::memory_order_relaxed);
     atomic_add_i64(tunnel_bandwidth_sum_bps_, bps);
     atomic_max_i64(tunnel_bandwidth_max_bps_, bps);
+}
+
+void MetricsRegistry::inc_rate_limit_open_rejected() {
+    rate_limit_open_rejected_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_rate_limit_bytes_throttled() {
+    rate_limit_bytes_throttled_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::rate_limit_open_rejected() const {
+    return rate_limit_open_rejected_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::rate_limit_bytes_throttled() const {
+    return rate_limit_bytes_throttled_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t MetricsRegistry::tunnels_active(Role role) const {
@@ -394,6 +412,17 @@ std::string MetricsRegistry::render() const {
         << bw_count << "\n"
         << "toxtunnel_tunnel_bandwidth_bytes_per_second_sum " << bw_sum << "\n"
         << "toxtunnel_tunnel_bandwidth_bytes_per_second_max " << bw_max << "\n";
+
+    out << "# HELP toxtunnel_rate_limit_open_rejected_total TUNNEL_OPENs rejected by the "
+           "per-friend rate limiter.\n"
+           "# TYPE toxtunnel_rate_limit_open_rejected_total counter\n"
+           "toxtunnel_rate_limit_open_rejected_total "
+        << rate_limit_open_rejected() << "\n";
+    out << "# HELP toxtunnel_rate_limit_bytes_throttled_total Times the per-friend bytes "
+           "bucket went into deny.\n"
+           "# TYPE toxtunnel_rate_limit_bytes_throttled_total counter\n"
+           "toxtunnel_rate_limit_bytes_throttled_total "
+        << rate_limit_bytes_throttled() << "\n";
 
     return out.str();
 }

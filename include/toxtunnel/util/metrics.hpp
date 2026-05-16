@@ -129,6 +129,23 @@ class MetricsRegistry {
     [[nodiscard]] std::uint64_t coalesce_policy_transitions() const;
 
     // -----------------------------------------------------------------
+    // Per-friend rate limiting (anti-DoS)
+    // -----------------------------------------------------------------
+
+    /// Increment the cumulative number of TUNNEL_OPEN frames rejected by
+    /// the per-friend rate limiter. We do not surface per-friend labels —
+    /// the friend public key has unbounded cardinality so the global counter
+    /// is the safe Prometheus-exportable view. Per-friend detail is
+    /// available via the inspect IPC.
+    void inc_rate_limit_open_rejected();
+
+    /// Increment the count of TUNNEL_DATA bytes-bucket exhaustion events.
+    void inc_rate_limit_bytes_throttled();
+
+    [[nodiscard]] std::uint64_t rate_limit_open_rejected() const;
+    [[nodiscard]] std::uint64_t rate_limit_bytes_throttled() const;
+
+    // -----------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------
 
@@ -183,6 +200,10 @@ class MetricsRegistry {
     std::atomic<std::uint64_t> tunnel_bandwidth_count_{0};
     std::atomic<std::int64_t> tunnel_bandwidth_sum_bps_{0};
     std::atomic<std::int64_t> tunnel_bandwidth_max_bps_{0};
+
+    // Per-friend rate limiting.
+    std::atomic<std::uint64_t> rate_limit_open_rejected_{0};
+    std::atomic<std::uint64_t> rate_limit_bytes_throttled_{0};
 
     mutable std::mutex labels_mutex_;
     std::string build_version_;

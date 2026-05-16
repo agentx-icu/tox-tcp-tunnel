@@ -134,6 +134,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/tox/tox_adapter.cpp
     src/app/inspect_server.cpp
     src/app/known_servers.cpp
+    src/app/rate_limiter.cpp
     src/app/rules_engine.cpp
     src/app/socks5_listener.cpp
     src/app/stdio_pipe_bridge.cpp
