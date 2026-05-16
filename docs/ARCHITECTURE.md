@@ -41,6 +41,14 @@
 | `Socks5Listener`    | Client-side TCP listener that auto-detects SOCKS5 v5 vs HTTP CONNECT by sniffing the first byte; binds loopback-only (enforced at config validation). Pipelined CONNECT payloads are preserved across the handshake. |
 | `OwnedBufferView`   | `shared_ptr<vector<uint8_t>>` slice handed from the Tox callback down to `TcpConnection::write`. Eliminates one copy on the inbound path (see [Inbound Copy Path](#inbound-copy-path)). |
 | `WriteQueue`        | Per-tunnel write coalescer in `TunnelManager`. Accumulates small writes for up to `tunnel.coalesce_max_delay_us` (200µs default) or `tunnel.coalesce_max_bytes` (1362 = TUNNEL_DATA MTU) before flushing one TUNNEL_DATA frame. Wire-format unchanged. |
+| `OwnedFrameBuffer`  | Outbound zero-copy buffer (Wave B). Reserves 6 bytes of prefix (`0xA0` lossless byte + 5-byte tunnel frame header) inside a single `shared_ptr<vector<uint8_t>>` allocation; the TCP read path writes directly into the payload region and `ProtocolFrame::serialize_tunnel_data_in_place()` fills in the header before toxcore is called. See [Outbound Copy Path](#outbound-copy-path). |
+| `WriteCoalescer`    | Per-tunnel EWMA + policy state machine. Selects between `Bypass`, `Drain`, and `Batch` policies based on `avg_write_size` vs MTU and `avg_write_gap` vs `4 × max_delay_us`. α = 1/8, 4-tick hysteresis. Operator pins mode via `tunnel.coalesce_mode`. |
+| `BdpFlowControl`    | Per-tunnel send-window state. Tracks RTT (PING/PONG round-trip) and bandwidth (cumulative-ACK delta) as EWMAs; recomputes the target window as `bdp × safety_factor` clamped to `[min, max]`. In `mode: fixed` the window is pinned to the v0.3.0 value; `mode: bdp` opts in to dynamic sizing. |
+| `RateLimiter`       | Per-friend token-bucket layer that runs before `RulesEngine` on TUNNEL_OPEN and (optionally) alongside the data path. Modes: `off | report | enforce`. Hot-reloadable via the rules file. Defaults to `off` (no v0.3.0 behaviour change). |
+| `ToxWatchdog`       | Heartbeat-based detector for a stalled `tox_iterate`. The Tox thread bumps the counter on every return; a 1 Hz observer on the main IO context calls `std::abort()` if the deadline is exceeded. Persistent abort count lives at `<data_dir>/abort_count`. |
+| `TunnelIdAllocator` | Bitset-backed 1..65535 allocator with a roving cursor and an explicit `reserve(id)` API for the tunnel-resume path. |
+| `TunnelResumeStore` | Client-side `<data_dir>/tunnel_resume_state.yaml` persistence (schema-versioned, age-pruned). Wipes itself when the active server's Tox ID changes. Persisted via `util::atomic_write_file`. |
+| `atomic_write_file` | Shared helper: write to `<path>.tmp.<pid>`, fsync, rename, optional parent-dir fsync (`F_FULLFSYNC` on macOS). Used by `ToxSave::persist`, `KnownServersStore::save`, and `TunnelResumeStore::save`. |
 
 ## Configuration Model
 
@@ -79,6 +87,8 @@ Offset  Size  Field
 | `TUNNEL_ERROR`  | 0x05  | Error (connect failed, etc.)                      |
 | `INFO_REQUEST`  | 0x06  | Client → Server: ask peer for system info (`tunnel_id` = 0, empty payload). Sent once when the friend transitions to online. |
 | `INFO_REPLY`    | 0x07  | Server → Client response (`tunnel_id` = 0, UTF-8 YAML map filtered by `server.disclose.*`). Empty payload = "policy is to disclose nothing"; client persists the result to `known_servers.yaml`. Old servers ignore `INFO_REQUEST` — client falls back to locally-observable metadata only. |
+| `TUNNEL_RESUME_REQUEST` | 0x08 | Client → Server: fast-reattach a prior tunnel after a server restart. Binary payload: `[version:1=0x01][prior_id:2][recv:8][send:8][host_len:1][host:N][port:2]`. Wire-inactive when `tunnel.resume.enabled: false` (the v0.4.0 default). Old servers ignore unknown opcodes; client times out the resume attempt and falls back to `TUNNEL_OPEN`. |
+| `TUNNEL_RESUME_ACK`     | 0x09 | Server → Client: result of the resume attempt. Binary payload: `[version:1=0x01][new_id:2][server_recv:8][server_send:8][status:1]` where `status ∈ {0=Ok, 1=TargetUnreachable, 2=RulesDenied, 3=TooOld, 4=Unknown}`. |
 | `PING`          | 0x10  | Keep-alive ping                                   |
 | `PONG`          | 0x11  | Keep-alive response                               |
 
@@ -263,6 +273,66 @@ Key properties:
   asio's writer, never mutated.
 - The outbound path (TCP → Tox) was not changed in v0.3.0; the write
   coalescer (`WriteQueue`) reuses the existing `TUNNEL_DATA` framing buffer.
+
+## Outbound Copy Path
+
+The v0.4.0 Wave B work makes the symmetric outbound path
+(local TCP → Tox) single-copy. The TCP read writes directly into an
+`OwnedFrameBuffer`'s payload region, which reserves 6 header bytes in
+front of the payload inside the same allocation. `serialize_in_place()`
+fills in the header before the buffer is handed to
+`ToxAdapter::send_lossless_packet`, so toxcore sees one contiguous wire
+view per frame.
+
+```
+TcpConnection::async_read_some  (I/O pool worker thread)
+   │  reads N bytes into the OwnedFrameBuffer payload region
+   │  (allocation = [0xA0][type:1][tunnel_id:2][length:2][payload:N])
+   ▼
+TunnelImpl::send_data_to_tox
+   │  consults the adaptive coalescer; on bypass/drain → emit directly
+   │  on batch → buffer for up to coalesce_max_delay_us
+   ▼
+ProtocolFrame::serialize_tunnel_data_in_place(OwnedFrameBuffer&, id)
+   │  writes the 6 prefix bytes into the reserved header room
+   ▼
+ToxAdapter::send_lossless_packet(friend, wire_view.data(), size)
+   │  toxcore copies into its own buffer (single unavoidable copy)
+   ▼
+encrypted UDP / TCP relay
+```
+
+Key properties:
+
+- One heap allocation per outbound TUNNEL_DATA frame; no separate
+  framing buffer.
+- `OwnedFrameBuffer` shares ownership through `shared_ptr`; the
+  async-send completion handler keeps the allocation alive until
+  toxcore returns.
+- The adaptive `WriteCoalescer` selects `Bypass` for bulk transfers
+  with MTU-sized writes (zero hold latency), `Drain` for bursty
+  sub-MTU writes (emit on overflow only), and `Batch` for trickle
+  workloads (the v0.3.0 default behaviour, with a 200 µs hold timer).
+- The `BdpFlowControl` window resizes between `min_window_bytes` and
+  `max_window_bytes` when `flow_control.mode: bdp`; in `fixed` mode
+  the v0.3.0 256 KiB / 16 KiB cadence is preserved.
+
+## Operational Endpoints (v0.4 additions)
+
+- `toxtunnel_outbound_buffer_allocs_total` — outbound `OwnedFrameBuffer`
+  allocations.
+- `toxtunnel_coalesce_policy_transitions_total` — state-machine moves
+  between adaptive policies.
+- `toxtunnel_tunnel_rtt_microseconds`, `_send_window_bytes`, and
+  `_bandwidth_bytes_per_second` — summaries from `BdpFlowControl`.
+- `toxtunnel_rate_limit_open_rejected_total`,
+  `toxtunnel_rate_limit_bytes_throttled_total` — per-friend rate limiter.
+- `toxtunnel_tox_iterate_lag_ms` — gauge from `ToxWatchdog`; updated on
+  every 1 Hz observer tick.
+- `toxtunnel_watchdog_aborts_total` — cumulative aborts since process
+  start; persistent count in `<data_dir>/abort_count`.
+- `toxtunnel_resume_attempts_total`, `_successes_total`, `_failures_total` —
+  tunnel-resume protocol counters (client-side).
 
 ## Dependencies
 

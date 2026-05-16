@@ -551,3 +551,71 @@ bash scripts/verify.sh <local_port> <service_type>
 ## Verification
 [Test command and expected output]
 ```
+
+## v0.4 Optional Config Blocks
+
+Operators with extra capacity / hardening needs can opt into the new
+v0.4 blocks. Defaults preserve v0.3.0 behaviour byte-for-byte.
+
+### Watchdog (on by default)
+
+```yaml
+watchdog:
+  enabled: true                # default
+  deadline_seconds: 30         # min 5; raise on flaky-network deployments
+  systemd_notify: true         # ignored outside Linux
+```
+
+### Adaptive coalescing (opt-in)
+
+```yaml
+tunnel:
+  coalesce_mode: adaptive      # default fixed (v0.3.0); flip to adaptive
+                                # only after one release of soak
+```
+
+### BDP flow control (opt-in)
+
+```yaml
+flow_control:
+  mode: bdp                    # default fixed; bdp scales window from RTT × bps
+  send_window_min_bytes: 65536
+  send_window_max_bytes: 4194304
+  safety_factor_x100: 150
+  fixed_window_bytes: 262144
+```
+
+### Per-friend rate limiting (opt-in)
+
+In `rules.yaml`:
+
+```yaml
+rate_limit_defaults:
+  mode: report                 # start shadow; flip to enforce once tuned
+  open_per_sec: 10
+  open_burst: 50
+  bytes_per_sec: 10485760
+  bytes_burst: 33554432
+  max_concurrent_tunnels: 100
+
+rules:
+  - friend: "...64hex..."
+    rate_limit:
+      bytes_per_sec: 104857600
+      max_concurrent_tunnels: 200
+    allow:
+      - host: "127.0.0.1"
+        ports: [22]
+```
+
+### Tunnel resume (opt-in, partial in v0.4.0)
+
+```yaml
+tunnel:
+  resume:
+    enabled: false             # opt-in; default off. Wire format ships but the
+                                # live handshake driver lands in v0.4.1.
+    max_age_seconds: 300
+    on_gap: passthrough
+```
+

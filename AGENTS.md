@@ -80,11 +80,11 @@ than expanding this section.
 
 | Layer | Components |
 |-------|------------|
-| Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener` |
+| Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter`, `TunnelResumeStore` |
 | TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
-| Tox | `ToxAdapter`, `ToxConnection`, `ToxThread` |
-| Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame` |
-| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger` |
+| Tox | `ToxAdapter`, `ToxConnection`, `ToxThread`, `ToxWatchdog` |
+| Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame`, `OwnedFrameBuffer`, `WriteCoalescer`, `BdpFlowControl`, `TunnelIdAllocator` |
+| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger`, `atomic_write_file` |
 
 `TunnelClient` owns a `FailoverConfig`-driven state machine that promotes/demotes
 between primary and fallback Tox IDs. `InspectServer` accepts local IPC
@@ -108,7 +108,13 @@ between primary and fallback Tox IDs. `InspectServer` accepts local IPC
 Binary framing over Tox lossless custom packets. Header: `[type:1][tunnel_id:2][length:2]`.
 
 Frame types: `TUNNEL_OPEN`, `TUNNEL_DATA`, `TUNNEL_CLOSE`, `TUNNEL_ACK`, `TUNNEL_ERROR`,
-`PING`, `PONG`, `INFO_REQUEST` (0x06), `INFO_REPLY` (0x07).
+`PING`, `PONG`, `INFO_REQUEST` (0x06), `INFO_REPLY` (0x07),
+`TUNNEL_RESUME_REQUEST` (0x08), `TUNNEL_RESUME_ACK` (0x09).
+
+The resume opcodes are wire-inactive when `tunnel.resume.enabled: false` (the
+v0.4.0 default); v0.3.0 peers see no behavioural change. Wiring the live
+resume handshake into the data flow is tracked separately — see
+`docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
 
 `INFO_REQUEST` / `INFO_REPLY` carry only the metadata the server has explicitly
 opted into via `server.disclose.*` (all fields default to `false`). There is **no**
@@ -134,7 +140,9 @@ cli/main.cpp         # CLI entry (subcommands: print-id, servers, inspect, reloa
 tests/unit/          # Unit tests
 tests/integration/   # Integration tests
 tests/packaging/     # Package-layout tests (run via ctest)
-                     # Total test count: ~436 across all suites.
+tests/soak/          # Long-running soak fixtures (ctest -L soak)
+tests/chaos/         # Chaos / fault-injection fixtures (ctest -L chaos)
+                     # Total test count: ~493 across all suites.
 third_party/c-toxcore/   # Git submodule — required for build
 cmake/Packaging.cmake    # CPack configuration
 packaging/{linux,macos,windows}/   # Service units, installer scripts, MSI/WIX fragments
@@ -165,6 +173,37 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
 - **Hot-reload scope** — `SIGHUP` (POSIX) / `toxtunnel reload` (Windows
   named-pipe IPC) reloads only: `server.rules_file` contents,
   `client.forwards`, and `logging.level`. Everything else requires a restart.
+
+## v0.4.0 Default Behavior (additions on top of v0.3.0)
+
+- **Outbound zero-copy (Wave B)** — `OwnedFrameBuffer` carries the
+  TUNNEL_DATA wire bytes from the TCP read into the toxcore lossless send
+  in a single allocation. Wire format unchanged.
+- **Adaptive coalescing** — `tunnel.coalesce_mode: fixed` is the default
+  (v0.3.0 behaviour). Other options: `adaptive` (EWMA state machine that
+  selects between `bypass`, `drain`, `batch` per tunnel), `bypass` (no
+  hold ever), `drain` (emit on overflow only). Non-reloadable.
+- **BDP-aware flow control** — `flow_control.mode: fixed` (default;
+  256 KiB window / 16 KiB ACK). `flow_control.mode: bdp` opts in to a
+  per-tunnel `BdpFlowControl` that resizes the window from RTT × bandwidth
+  EWMA. Non-reloadable.
+- **Per-friend rate limiting** — absent from `rules.yaml` means no
+  limiting (v0.3.0 behaviour). When `rate_limit_defaults:` or a per-friend
+  `rate_limit:` block is present, `RateLimiter` runs before `RulesEngine`
+  on the TUNNEL_OPEN path. Modes: `off | report | enforce`.
+- **Tox-thread watchdog** — `watchdog.enabled: true` by default. The
+  Tox thread bumps a heartbeat after every `tox_iterate` return; a
+  1 Hz observer on the main `IoContext` calls `std::abort()` if the
+  deadline (default 30 s, min 5 s) is exceeded. systemd / launchd
+  handles the restart. Persisted abort count in
+  `<data_dir>/abort_count`.
+- **Atomic writes** — `tox_save.dat` and `known_servers.yaml` go through
+  `util::atomic_write_file` (tmp + fsync + rename, plus parent-dir
+  fsync; `F_FULLFSYNC` on macOS for the identity file).
+- **Tunnel resume** — `tunnel.resume.enabled: false` by default. New
+  opcodes `0x08 / 0x09` are wire-inactive in that mode. Driver wiring
+  is partial in v0.4.0; see
+  `docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
 
 ## Dependencies
 

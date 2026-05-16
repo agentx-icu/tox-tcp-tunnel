@@ -76,12 +76,17 @@ Binary framing over Tox lossless custom packets:
 
 ### Operational Limits
 
-- Max concurrent tunnels per friend: **100** (hardcoded default)
-- Max tunnel ID: 65535 (0 reserved)
+- Max concurrent tunnels per friend: **100** (hardcoded default; v0.4
+  exposes `rate_limit.max_concurrent_tunnels` to override per friend,
+  clamped at 10 000 process-wide).
+- Max tunnel ID: 65535 (0 reserved for control frames; `TunnelIdAllocator`
+  recycles aggressively).
 - Max payload per Tox frame: 1367 bytes (Tox custom packet limit)
 - Max hostname length in rules: 255 bytes
 - Write buffer per TCP connection: 1 MiB
 - Pipe mode: **POSIX only** (macOS/Linux) — not supported on Windows
+- Watchdog deadline: minimum 5 s (config-validator enforced); default 30 s.
+- Rate-limit defaults: absent block ⇒ no limiting (v0.3.0 behaviour).
 
 ### Configuration Format (YAML)
 
@@ -108,8 +113,25 @@ inspect:
 tunnel:
   coalesce_max_delay_us: 200        # default-on small-write coalescing (perf, benign to leave)
   coalesce_max_bytes: 1362          # flush threshold (≤ Tox 1367-byte frame limit)
+  coalesce_mode: fixed              # v0.4: fixed (default) | adaptive | bypass | drain
   idle_timeout_seconds: 0           # 0 = disabled; e.g. 900 closes tunnels idle for 15 min
   reaper_tick_seconds: 10           # reaper wake-up interval
+  resume:                           # v0.4: tunnel fast-reattach. Opt-in.
+    enabled: false                  # default false; opcodes wire-inactive when off
+    max_age_seconds: 300            # entries older than this dropped on load
+    on_gap: passthrough             # passthrough (default) | close
+
+# v0.4 stability blocks (all defaults preserve v0.3.0 semantics):
+watchdog:
+  enabled: true                     # in-process tox-thread wedge detector
+  deadline_seconds: 30              # std::abort() after this much heartbeat silence; min 5s
+  systemd_notify: true              # sd_notify(WATCHDOG=1) on Linux; ignored elsewhere
+flow_control:
+  mode: fixed                       # fixed (default; v0.3.0) | bdp (BDP-aware sizing)
+  send_window_min_bytes: 65536      # 64 KiB clamp floor (bdp mode)
+  send_window_max_bytes: 4194304    # 4 MiB clamp ceiling (bdp mode)
+  safety_factor_x100: 150           # 1.5× BDP headroom
+  fixed_window_bytes: 262144        # 256 KiB — used in fixed mode
 ```
 
 **Client config:**
@@ -326,6 +348,10 @@ Analyze the user's message and route to the appropriate mode:
 | "Production redundancy", "my homelab dies sometimes", "two servers, prefer primary" | **Multi-server failover** (`server_id` list + `client.failover`) | Primary-preference: client switches back to entry 0 after `prefer_primary_grace_seconds` of stable uptime |
 | "See live tunnel state without log diving", "what's open right now", "how many bytes" | **`toxtunnel inspect`** | Local IPC only; `--json` for machine consumption |
 | "Close zombie tunnels", "free old connections" | **Idle reaper** (`tunnel.idle_timeout_seconds`) | 0 = disabled (default); typical setting: 600–1800 |
+| "A friend is DoSing me with TUNNEL_OPENs", "throttle one friend's bandwidth", "anti-abuse" | **Per-friend rate limit** (`rate_limit_defaults` + per-rule `rate_limit`) | v0.4. Modes: `off | report | enforce`. Hot-reloadable via the rules file. Start with `mode: report` to size limits against real traffic. |
+| "An SSH session shouldn't drop when I restart the server", "fast reattach across maintenance" | **Tunnel resume** (`tunnel.resume.enabled: true`) | v0.4 opt-in. Wire format ships; live driver wiring is partial in v0.4.0 — see `docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`. |
+| "Bulk transfer is slow", "throughput-tune", "high BDP link" | **Adaptive coalescing** (`tunnel.coalesce_mode: adaptive`) + **BDP flow control** (`flow_control.mode: bdp`) | v0.4 opt-in. Both default `fixed` for one release of soak; flip them in tandem on bulk-heavy deployments. |
+| "Daemon went silent without exiting", "tunnels stop but RSS flat", "detect a wedge" | **Watchdog metrics** (`toxtunnel_tox_iterate_lag_ms`, `toxtunnel_watchdog_aborts_total`) | v0.4. The watchdog is on by default; alert when `lag_ms` rises sustained or when the abort counter ticks. |
 
 **Modes flow naturally:** Design → Execute → Diagnose. After design, if user says "execute it", switch to Execute. After execute, if something fails, switch to Diagnose. No explicit mode switching needed.
 

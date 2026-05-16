@@ -22,10 +22,28 @@
 # Place this file alongside server.yaml and reference it with:
 #   server:
 #     rules_file: rules.yaml
+#
+# v0.4: anti-DoS rate-limit defaults (apply to every friend without a
+# per-friend `rate_limit:` block). Uncomment to enable. Start with
+# `mode: report` to size the limits against real traffic, then flip to
+# `mode: enforce`.
+#
+# rate_limit_defaults:
+#   mode: enforce
+#   open_per_sec: 10
+#   open_burst: 50
+#   bytes_per_sec: 10485760     # 10 MiB/s steady-state
+#   bytes_burst: 33554432       # 32 MiB allowed burst
+#   max_concurrent_tunnels: 100
 
 rules:
 {{#RULES}}
   - friend: "{{FRIEND_PK}}"    # {{FRIEND_LABEL}}
+    # v0.4: optional per-friend rate-limit override (additive over defaults).
+    # rate_limit:
+    #   mode: enforce
+    #   bytes_per_sec: 104857600
+    #   max_concurrent_tunnels: 200
     allow:
 {{#ALLOW}}
       - host: "{{HOST}}"

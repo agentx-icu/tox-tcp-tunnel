@@ -64,6 +64,51 @@ Forward any TCP port through Tox with end-to-end encryption, no central server, 
   keep long-lived deployments lean (closes idle tunnels) and small-write
   workloads efficient (batches up to one Tox-MTU per packet).
 
+### v0.4.0 Performance + Stability Additions
+
+- **Outbound zero-copy (Wave B)** — symmetric to the v0.3.0 inbound zero-
+  copy work. The TCP read path writes directly into the `OwnedFrameBuffer`
+  payload region; the 0xA0 Tox prefix + 5-byte tunnel header live in the
+  same allocation, so toxcore sees one contiguous wire view per frame.
+  Wire format is unchanged.
+
+- **Adaptive write coalescing** — per-tunnel EWMA picks one of three
+  strategies (`bypass`, `drain`, `batch`) for every push. Bulk transfers
+  with MTU-sized writes skip the 200 µs hold entirely; trickle workloads
+  keep the v0.3.0 batching default. Selectable via `tunnel.coalesce_mode`;
+  defaults to `fixed` (v0.3.0 behaviour) for one release of soak.
+
+- **BDP-aware flow control** — opt-in via `flow_control.mode: bdp`. The
+  per-tunnel send window is recomputed from RTT × bandwidth EWMA and
+  clamped to `[64 KiB, 4 MiB]`, replacing the v0.3.0 fixed 256 KiB cap on
+  high-RTT × high-bandwidth links. Default stays `fixed`.
+
+- **Per-friend rate limiting** — anti-DoS layer in `rules.yaml`. Per-
+  friend `rate_limit:` blocks and a top-level `rate_limit_defaults:`
+  configure token buckets for `TUNNEL_OPEN` frames/sec and `TUNNEL_DATA`
+  bytes/sec. Modes: `off | report | enforce`. Reloadable with the rules
+  file via `SIGHUP`.
+
+- **Tox-thread watchdog** — `watchdog.enabled: true` by default. The Tox
+  iteration thread bumps a heartbeat on every return from `tox_iterate`;
+  a 1 Hz observer on the main IO context calls `std::abort()` if the
+  heartbeat misses the configured deadline (default 30 s). systemd /
+  launchd / Windows SCM handles the restart; the in-process detector
+  preserves a core dump for postmortem.
+
+- **Stability hardening** — `tox_save.dat`, `known_servers.yaml`, and
+  the new `tunnel_resume_state.yaml` go through a shared atomic-write
+  helper (tmp + fsync + rename + parent-dir fsync; `F_FULLFSYNC` on
+  macOS for the identity file). A new `TunnelIdAllocator` exposes
+  `reserve(id)` for the resume protocol.
+
+- **Tunnel resume (opt-in, partial in v0.4.0)** — new wire opcodes
+  `TUNNEL_RESUME_REQUEST` (0x08) and `TUNNEL_RESUME_ACK` (0x09) plus a
+  client-side persistent state store. Default off
+  (`tunnel.resume.enabled: false`); v0.3.0 peers see no change when the
+  flag is off. Full live handshake wiring is tracked for v0.4.1 — see
+  `docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
+
 ---
 
 ## How It Works

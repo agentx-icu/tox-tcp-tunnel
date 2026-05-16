@@ -172,3 +172,61 @@ bash scripts/diagnose.sh /path/to/config.yaml
 # Verify a specific port
 bash scripts/verify.sh <local_port> [ssh|http|postgres|mysql|redis|mongo|tcp]
 ```
+
+## v0.4 Stability + Performance Diagnostics
+
+### Symptom: daemon went silent without exiting
+
+Tox-thread watchdog fires when `tox_iterate` stalls past
+`watchdog.deadline_seconds`. Check:
+
+1. `journalctl -u toxtunnel | grep tox_thread_wedge` — the FATAL line
+   carries `delta_ms` and `last_heartbeat_counter`.
+2. `cat <data_dir>/abort_count` — persistent count across restarts.
+3. `curl 127.0.0.1:9100/metrics | grep watchdog_aborts` — same value
+   as the abort file once metrics scrape resumes.
+4. `toxtunnel_tox_iterate_lag_ms` gauge rising over time indicates a
+   slow toxcore but not yet a wedge — a useful early warning.
+
+The watchdog calls `std::abort()` precisely because in-process recovery
+of a wedged toxcore is unsafe. systemd / launchd / Windows SCM
+brings the daemon back.
+
+### Symptom: a friend is denied with "Rate limit exceeded"
+
+Rate limiter rejected the TUNNEL_OPEN. Check:
+
+1. `curl 127.0.0.1:9100/metrics | grep rate_limit_open_rejected_total`
+   — global counter.
+2. The structured WARN log line carries the friend public key prefix.
+3. `toxtunnel inspect status --json` shows per-friend bucket levels
+   (when configured).
+
+Loosen `rate_limit_defaults` or add a per-friend override block in
+`rules.yaml` and `kill -HUP` to reload.
+
+### Symptom: adaptive coalescing is making bad decisions
+
+The `toxtunnel_coalesce_policy_transitions_total` counter ticks on
+every state-machine move. If it climbs fast under steady traffic, the
+EWMA is flapping. Workarounds:
+
+1. Pin the mode: `tunnel.coalesce_mode: fixed` (v0.3.0 behaviour).
+2. For bulk-only workloads pin `bypass`; for trickle-only pin `batch`.
+
+### Symptom: high BDP link still capped at 256 KiB
+
+`flow_control.mode` defaults to `fixed`. Set `mode: bdp` and the
+per-tunnel `BdpFlowControl` will scale the window between
+`send_window_min_bytes` and `send_window_max_bytes` based on RTT ×
+bandwidth EWMA. Inspect via the
+`toxtunnel_tunnel_send_window_bytes` summary.
+
+### Symptom: tunnels die across server restart
+
+v0.4 ships the wire format + state store for tunnel-resume but the
+live handshake driver is partial. With `tunnel.resume.enabled: false`
+(the default) restarts behave exactly as in v0.3.0. Track the v0.4.1
+follow-up at
+`docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
+

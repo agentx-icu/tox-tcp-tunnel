@@ -375,11 +375,125 @@ tunnel:
 | `reaper_tick_seconds` | `30` | restart | Reaper scan period. Lower = faster reclaim, higher = less wake-up overhead. |
 | `coalesce_max_delay_us` | `200` | restart | Max time a small write is buffered before being emitted. `0` disables coalescing — every write becomes its own TUNNEL_DATA frame, matching pre-v0.3.0 behaviour. |
 | `coalesce_max_bytes` | `1362` | restart | Buffer-size flush threshold. Should be ≤ TUNNEL_DATA payload MTU; higher values are clamped. |
+| `coalesce_mode` | `fixed` | restart | Coalescer policy. `fixed` (v0.3.0 behaviour), `adaptive` (state machine selects between bypass / drain / batch per push), `bypass` (no hold timer ever), `drain` (emit on overflow only). |
 
-The reaper and coalescer live in `TunnelManager` and run on the existing I/O
-pool — they do not start new threads. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
-("Operational Endpoints" and the WriteQueue/idle-reaper rows in "Components")
-for the dataflow.
+### Adaptive coalescing (`coalesce_mode: adaptive`)
+
+The adaptive coalescer maintains a per-tunnel EWMA of write size and
+inter-arrival gap. On every push it picks one of three behaviours:
+
+- **`bypass`** — `avg_write_size >= MTU`. Every push emits a single
+  frame; no hold timer. Best for bulk transfers.
+- **`drain`** — `avg_write_gap_us > 4 * coalesce_max_delay_us`.
+  Sub-MTU writes that arrive faster than the hold window: emit on
+  overflow only, never armed by a timer.
+- **`batch`** — otherwise. The v0.3.0 default: hold for up to
+  `coalesce_max_delay_us` (200 µs) or `coalesce_max_bytes` (1362 B),
+  whichever comes first.
+
+A 4-tick hysteresis prevents the state machine from flapping on a
+brief burst. Transitions log at DEBUG and increment
+`toxtunnel_coalesce_policy_transitions_total`.
+
+### BDP-aware flow control (`flow_control:`)
+
+```yaml
+flow_control:
+  mode: fixed                  # fixed (default; v0.3.0) | bdp
+  send_window_min_bytes: 65536           # 64 KiB clamp floor (bdp mode)
+  send_window_max_bytes: 4194304         # 4 MiB clamp ceiling (bdp mode)
+  safety_factor_x100: 150                # 1.5× BDP headroom
+  fixed_window_bytes: 262144             # 256 KiB — used in fixed mode
+```
+
+When `mode: bdp`, the per-tunnel `BdpFlowControl` updates an EWMA of
+RTT (from PING/PONG round-trip) and bandwidth (cumulative-ACK delta)
+and recomputes the target window as `bdp × safety_factor_x100 / 100`
+clamped to `[min, max]`. ACK threshold scales proportionally to keep
+~16 ACKs in flight regardless of window size.
+
+`mode: fixed` preserves the v0.3.0 256 KiB / 16 KiB cadence
+byte-for-byte. Non-reloadable.
+
+### Tunnel-resume protocol (`tunnel.resume:`) — opt-in, v0.4.0 partial
+
+```yaml
+tunnel:
+  resume:
+    enabled: false                  # OPT-IN. Default false in v0.4.0.
+    state_path: ""                  # default: <data_dir>/tunnel_resume_state.yaml
+    max_age_seconds: 300            # entries older than this are dropped on load
+    on_gap: passthrough             # passthrough (default) | close
+```
+
+The wire-format additions (opcodes `0x08` / `0x09`) and the client-side
+persistent state store ship in v0.4.0. The live handshake driver is
+partial — see
+[`docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`](plans/2026-05-15-tunnel-resume-protocol-partial.md)
+for the v0.4.1 follow-up scope. With `enabled: false` the new opcodes
+are wire-inactive and v0.3.0 peers see no change.
+
+The reaper, coalescer, BDP flow control, and resume store all live in
+the existing I/O pool — none start new threads. See
+[`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+("Operational Endpoints" and the rows in "Components") for the dataflow.
+
+## Tox-Thread Watchdog (`watchdog:`)
+
+```yaml
+watchdog:
+  enabled: true              # default on; set false to disable entirely
+  deadline_seconds: 30       # default; minimum enforced 5
+  systemd_notify: true       # default true on Linux; ignored elsewhere
+```
+
+The Tox iteration thread bumps a heartbeat on every return from
+`tox_iterate`. A 1 Hz observer on the main `IoContext` calls
+`std::abort()` if the heartbeat is older than `deadline_seconds`. The
+service manager (systemd, launchd, Windows SCM) handles the restart;
+the in-process detector preserves a core dump for postmortem.
+
+Non-reloadable. `systemd_notify: true` periodically sends
+`sd_notify(WATCHDOG=1)` on the main thread so a stalled main thread is
+caught by `WatchdogSec` if the systemd unit declares one.
+
+## Per-Friend Rate Limiting (`rules.yaml`)
+
+Anti-DoS layer. Default behaviour is "no limiting" (v0.3.0
+semantics). When configured, `RateLimiter` runs before `RulesEngine`
+on the TUNNEL_OPEN path.
+
+```yaml
+# Top-level defaults — apply to every friend that does NOT name its own block.
+rate_limit_defaults:
+  mode: enforce              # off (default) | report | enforce
+  open_per_sec: 10
+  open_burst: 50
+  bytes_per_sec: 10485760    # 10 MiB/s
+  bytes_burst: 33554432      # 32 MiB
+  max_concurrent_tunnels: 100
+
+rules:
+  - friend: "AABB...64hex..."
+    rate_limit:              # per-friend override; additive over defaults
+      bytes_per_sec: 104857600
+      max_concurrent_tunnels: 200
+    allow:
+      - host: "127.0.0.1"
+        ports: [22]
+```
+
+Modes:
+
+- `off` — no limiting, no counters.
+- `report` — counters tick on rejection but the request is allowed
+  through. Shadow mode for tuning the limits against real traffic.
+- `enforce` — over-budget OPENs receive `TUNNEL_ERROR` with reason
+  code 3 (`Rate limit exceeded`).
+
+Hot-reloadable via the rules file (`SIGHUP` / `toxtunnel reload`).
+Loosening takes effect immediately; tightening is observed lazily on
+the next consume + refill cycle.
 
 ## Prometheus Metrics (`metrics:`)
 
