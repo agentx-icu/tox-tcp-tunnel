@@ -595,6 +595,15 @@ void TunnelClient::start_pipe_mode() {
             server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
+    // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
+    // lossless prefix + 5-byte tunnel header in its reserved prefix, so we
+    // hand `wire_view()` straight to toxcore with zero further copies.
+    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) {
+        const auto wire = buf.wire_view();
+        (void)tox_adapter_->send_lossless_packet(
+            server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
+    });
+
     tunnel->set_on_data_for_tcp([this](std::span<const uint8_t> data) {
         if (pipe_bridge_) {
             pipe_bridge_->write_output(data);
@@ -698,6 +707,13 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
             server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
+    // Wave B zero-copy outbound for TUNNEL_DATA frames.
+    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) {
+        const auto wire = buf.wire_view();
+        (void)tox_adapter_->send_lossless_packet(
+            server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
+    });
+
     // Wire callback: when data arrives from Tox for this tunnel, write to TCP.
     // Prefer the zero-copy owned-buffer route so the payload buffer
     // allocated during `ProtocolFrame::deserialize` is handed straight to
@@ -794,6 +810,13 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         packet.insert(packet.end(), data.begin(), data.end());
         (void)tox_adapter_->send_lossless_packet(
             server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
+    });
+
+    // Wave B zero-copy outbound for TUNNEL_DATA frames.
+    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) {
+        const auto wire = buf.wire_view();
+        (void)tox_adapter_->send_lossless_packet(
+            server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
     });
 
     tunnel->set_on_data_for_tcp(

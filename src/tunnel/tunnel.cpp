@@ -433,16 +433,34 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
     total_bytes_sent_.fetch_add(data_size, std::memory_order_relaxed);
     util::MetricsRegistry::instance().add_bytes_out(data_size);
 
+    // Determine which outbound path is active. We snapshot the owned-callback
+    // presence before grabbing the coalesce mutex so the data path runs
+    // lock-free against callback edits.
+    bool zero_copy = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        zero_copy = static_cast<bool>(on_send_to_tox_owned_);
+    }
+
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
 
     // Coalescing disabled — preserve the legacy "emit each call, fragment to
-    // Tox MTU" behaviour byte-for-byte.
+    // Tox MTU" behaviour byte-for-byte. With zero-copy enabled, each chunk is
+    // shipped through an `OwnedFrameBuffer` so we still skip the intermediate
+    // vector allocation in the on_send_to_tox callback.
     if (coalesce_max_delay_us_ == 0) {
         for (std::size_t offset = 0; offset < data.size(); offset += kMaxTcpPayloadPerToxFrame) {
             const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
-            auto frame =
-                ProtocolFrame::make_tunnel_data(tunnel_id_, data.subspan(offset, chunk_size));
-            send_frame_to_tox(frame);
+            if (zero_copy) {
+                auto buf = OwnedFrameBuffer::with_payload(data.subspan(offset, chunk_size));
+                util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
+                ProtocolFrame::serialize_tunnel_data_in_place(buf, tunnel_id_);
+                send_owned_data_to_tox(std::move(buf));
+            } else {
+                auto frame =
+                    ProtocolFrame::make_tunnel_data(tunnel_id_, data.subspan(offset, chunk_size));
+                send_frame_to_tox(frame);
+            }
         }
         return true;
     }
@@ -518,6 +536,11 @@ void TunnelImpl::set_on_send_to_tox(SendToToxCallback cb) {
     on_send_to_tox_ = std::move(cb);
 }
 
+void TunnelImpl::set_on_send_to_tox_owned(SendOwnedToToxCallback cb) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    on_send_to_tox_owned_ = std::move(cb);
+}
+
 void TunnelImpl::set_on_data_for_tcp(SendToTcpCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     on_data_for_tcp_ = std::move(cb);
@@ -557,6 +580,32 @@ void TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
     if (cb) {
         auto wire = frame.serialize();
         cb(std::span<const uint8_t>(wire.data(), wire.size()));
+    }
+}
+
+void TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
+    SendOwnedToToxCallback owned_cb;
+    SendToToxCallback span_cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        owned_cb = on_send_to_tox_owned_;
+        span_cb = on_send_to_tox_;
+    }
+
+    if (owned_cb) {
+        owned_cb(std::move(buf));
+        return;
+    }
+    // Fallback: surface the bytes through the span callback so a partially
+    // configured tunnel (e.g. tests that only wire the legacy callback) still
+    // works. The wire bytes here are header+payload minus the leading 0xA0
+    // lossless prefix — the legacy callback expects exactly that.
+    if (span_cb && !buf.empty()) {
+        const auto wire = buf.wire_view();
+        // Skip the lossless prefix byte that the legacy callback will re-prepend.
+        if (wire.size() > 1) {
+            span_cb(std::span<const std::uint8_t>(wire.data() + 1, wire.size() - 1));
+        }
     }
 }
 
@@ -609,9 +658,30 @@ void TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
         return;
     }
     bytes = std::min(bytes, coalesce_buf_.size());
-    auto frame = ProtocolFrame::make_tunnel_data(
-        tunnel_id_, std::span<const uint8_t>(coalesce_buf_.data(), bytes));
-    send_frame_to_tox(frame);
+    // Prefer the Wave B zero-copy outbound path when the owned callback is
+    // wired. We still need a single payload memcpy here (out of the
+    // coalesce_buf_ deque into a freshly allocated frame buffer) because the
+    // bytes were buffered before we knew the final emission boundary; the win
+    // comes from skipping the secondary lossless-prefix-vector allocation in
+    // the on_send_to_tox callback. Full zero-copy from TCP→Tox happens on the
+    // coalesce-disabled path (max_delay_us == 0) and once the adaptive
+    // bypass/drain policies (item 2) are wired up.
+    bool zero_copy = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        zero_copy = static_cast<bool>(on_send_to_tox_owned_);
+    }
+    if (zero_copy) {
+        auto buf = OwnedFrameBuffer::with_payload(
+            std::span<const std::uint8_t>(coalesce_buf_.data(), bytes));
+        util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
+        ProtocolFrame::serialize_tunnel_data_in_place(buf, tunnel_id_);
+        send_owned_data_to_tox(std::move(buf));
+    } else {
+        auto frame = ProtocolFrame::make_tunnel_data(
+            tunnel_id_, std::span<const uint8_t>(coalesce_buf_.data(), bytes));
+        send_frame_to_tox(frame);
+    }
     coalesce_buf_.erase(coalesce_buf_.begin(),
                         coalesce_buf_.begin() + static_cast<std::ptrdiff_t>(bytes));
 }

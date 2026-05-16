@@ -526,6 +526,17 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                 manager_ptr->record_bytes_sent(data.size());
             }
         });
+    // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
+    // lossless prefix + 5-byte tunnel header in the same allocation.
+    server_tunnel->set_on_send_to_tox_owned(
+        [this, manager_ptr, friend_number](tunnel::OwnedFrameBuffer buf) {
+            const auto wire = buf.wire_view();
+            if (tox_adapter_->send_lossless_packet(friend_number, wire.data(), wire.size())) {
+                manager_ptr->record_frame_sent();
+                // The lossless prefix byte is bookkeeping overhead, not payload.
+                manager_ptr->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);
+            }
+        });
     manager_ptr->add_tunnel(tunnel_id, std::move(server_tunnel));
 
     // Create a TCP connection to the target host:port.

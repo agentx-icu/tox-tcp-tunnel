@@ -87,6 +87,26 @@ class MetricsRegistry {
     void observe_iterate_lag_ms(double ms);
 
     // -----------------------------------------------------------------
+    // Outbound zero-copy counters (Wave B)
+    // -----------------------------------------------------------------
+
+    /// Increment `toxtunnel_outbound_buffer_allocs_total` — counts every
+    /// `OwnedFrameBuffer` allocated for an outbound TUNNEL_DATA frame.
+    void inc_outbound_buffer_allocs();
+    /// Increment `toxtunnel_outbound_buffer_reuse_total` — counts every time
+    /// a write was appended to the active outbound buffer without allocating
+    /// a new one (true in-place coalescing).
+    void inc_outbound_buffer_reuse();
+    /// Increment `toxtunnel_outbound_buffer_overflow_total` — counts every
+    /// time a push would have overflowed the active buffer and forced an
+    /// early flush.
+    void inc_outbound_buffer_overflow();
+
+    [[nodiscard]] std::uint64_t outbound_buffer_allocs() const;
+    [[nodiscard]] std::uint64_t outbound_buffer_reuse() const;
+    [[nodiscard]] std::uint64_t outbound_buffer_overflow() const;
+
+    // -----------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------
 
@@ -124,6 +144,11 @@ class MetricsRegistry {
     std::atomic<std::uint64_t> iterate_lag_count_{0};
     std::atomic<double> iterate_lag_sum_ms_{0.0};
     std::atomic<double> iterate_lag_max_ms_{0.0};
+
+    // Outbound zero-copy counters (Wave B).
+    std::atomic<std::uint64_t> outbound_buffer_allocs_{0};
+    std::atomic<std::uint64_t> outbound_buffer_reuse_{0};
+    std::atomic<std::uint64_t> outbound_buffer_overflow_{0};
 
     mutable std::mutex labels_mutex_;
     std::string build_version_;

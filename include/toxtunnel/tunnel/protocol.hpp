@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "toxtunnel/core/owned_buffer.hpp"
+#include "toxtunnel/tunnel/owned_frame_buffer.hpp"
 #include "toxtunnel/util/expected.hpp"
 
 namespace toxtunnel::tunnel {
@@ -199,6 +200,20 @@ class ProtocolFrame {
     /// The returned buffer includes the 5-byte header followed by the
     /// payload.  All multi-byte integers are in network (big-endian) order.
     [[nodiscard]] std::vector<uint8_t> serialize() const;
+
+    /// Serialise a TUNNEL_DATA frame in place into a pre-allocated
+    /// `OwnedFrameBuffer`.
+    ///
+    /// The buffer must already carry the payload bytes in its payload region
+    /// (the TCP read path writes there directly). This call writes the 0xA0
+    /// lossless byte plus the 5-byte tunnel frame header into the reserved
+    /// prefix and returns a wire-ready view (`OwnedFrameBuffer::wire_view()`).
+    /// The returned buffer's lifetime is governed entirely by the
+    /// `OwnedFrameBuffer`'s shared allocation — once the async-send completion
+    /// handler drops the last reference, the allocation goes away.
+    ///
+    /// Wire format is unchanged from `serialize()`.
+    static void serialize_tunnel_data_in_place(OwnedFrameBuffer& buf, uint16_t tunnel_id) noexcept;
 
     /// Deserialize a frame from a byte buffer.
     ///

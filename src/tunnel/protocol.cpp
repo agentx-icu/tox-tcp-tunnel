@@ -206,6 +206,24 @@ std::vector<uint8_t> ProtocolFrame::serialize() const {
     return result;
 }
 
+void ProtocolFrame::serialize_tunnel_data_in_place(OwnedFrameBuffer& buf,
+                                                   uint16_t tunnel_id) noexcept {
+    if (buf.empty()) {
+        return;
+    }
+    // Reserved prefix layout (Wave B outbound zero-copy):
+    //   [lossless:1 = 0xA0][type:1 = TUNNEL_DATA][tunnel_id:2][length:2]
+    // The 0xA0 byte is the Tox custom-packet header consumed by toxcore; the
+    // remaining 5 bytes match the wire format produced by serialize().
+    uint8_t* hdr = buf.header_data();
+    const auto payload_len =
+        static_cast<uint16_t>(std::min<std::size_t>(buf.payload_used(), kMaxPayloadSize));
+    hdr[0] = 0xA0;
+    hdr[1] = static_cast<uint8_t>(FrameType::TUNNEL_DATA);
+    write_u16_be(&hdr[2], tunnel_id);
+    write_u16_be(&hdr[4], payload_len);
+}
+
 util::Expected<ProtocolFrame, std::error_code> ProtocolFrame::deserialize(
     std::span<const uint8_t> data) {
     // Need at least the 5-byte header.

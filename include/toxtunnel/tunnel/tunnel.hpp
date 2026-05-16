@@ -12,6 +12,7 @@
 #include <string>
 
 #include "toxtunnel/core/tcp_connection.hpp"
+#include "toxtunnel/tunnel/owned_frame_buffer.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/util/logger.hpp"
 
@@ -137,6 +138,18 @@ class TunnelImpl : public Tunnel {
 
     /// Called when a frame should be sent to the Tox peer.
     using SendToToxCallback = std::function<void(std::span<const uint8_t> data)>;
+
+    /// Zero-copy outbound (Wave B): called when a fully-framed TUNNEL_DATA
+    /// frame should be sent to the Tox peer. The supplied `OwnedFrameBuffer`
+    /// already carries the lossless prefix byte plus the 5-byte tunnel header
+    /// in its reserved prefix; the callee only needs to hand `wire_view()` to
+    /// `ToxAdapter::send_lossless_packet` and keep the buffer alive until that
+    /// returns. When this callback is set on a tunnel, it takes precedence
+    /// over `SendToToxCallback` for TUNNEL_DATA frames produced by
+    /// `send_data_to_tox`; non-DATA control frames continue to take the
+    /// span-based callback for simplicity (their payloads are tiny and the
+    /// extra copy is not measurable).
+    using SendOwnedToToxCallback = std::function<void(OwnedFrameBuffer buf)>;
 
     /// Called when data should be written to the TCP connection.
     using SendToTcpCallback = std::function<void(std::span<const uint8_t> data)>;
@@ -354,6 +367,14 @@ class TunnelImpl : public Tunnel {
     /// Set callback for sending data to Tox.
     void set_on_send_to_tox(SendToToxCallback cb);
 
+    /// Set the zero-copy callback for outbound TUNNEL_DATA frames. When set,
+    /// `send_data_to_tox` builds an `OwnedFrameBuffer` (header reserved in
+    /// the same allocation) and hands it to this callback instead of going
+    /// through the span-based callback. Control frames continue to take the
+    /// span path. Setting this to a null callback disables the zero-copy
+    /// outbound path.
+    void set_on_send_to_tox_owned(SendOwnedToToxCallback cb);
+
     /// Set callback for sending data to TCP.
     void set_on_data_for_tcp(SendToTcpCallback cb);
 
@@ -390,6 +411,11 @@ class TunnelImpl : public Tunnel {
 
     /// Send a frame to the Tox peer via the callback.
     void send_frame_to_tox(const ProtocolFrame& frame);
+
+    /// Send a fully-framed TUNNEL_DATA OwnedFrameBuffer to the Tox peer via
+    /// the zero-copy callback if it is set; otherwise fall back to the
+    /// span-based callback.
+    void send_owned_data_to_tox(OwnedFrameBuffer buf);
 
     /// Append `data` to the coalesce buffer, draining full-MTU frames as it
     /// fills. The caller must hold `coalesce_mutex_`.
@@ -474,6 +500,7 @@ class TunnelImpl : public Tunnel {
 
     // Callbacks (accessed under mutex)
     SendToToxCallback on_send_to_tox_;
+    SendOwnedToToxCallback on_send_to_tox_owned_;
     SendToTcpCallback on_data_for_tcp_;
     SendToTcpOwnedCallback on_data_for_tcp_owned_;
     StateChangedCallback on_state_change_;

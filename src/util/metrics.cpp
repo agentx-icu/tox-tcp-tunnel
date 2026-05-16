@@ -101,6 +101,9 @@ void MetricsRegistry::reset() {
     iterate_lag_count_.store(0, std::memory_order_relaxed);
     iterate_lag_sum_ms_.store(0.0, std::memory_order_relaxed);
     iterate_lag_max_ms_.store(0.0, std::memory_order_relaxed);
+    outbound_buffer_allocs_.store(0, std::memory_order_relaxed);
+    outbound_buffer_reuse_.store(0, std::memory_order_relaxed);
+    outbound_buffer_overflow_.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(labels_mutex_);
     build_version_.clear();
     build_git_sha_.clear();
@@ -154,6 +157,30 @@ void MetricsRegistry::observe_iterate_lag_ms(double ms) {
     iterate_lag_count_.fetch_add(1, std::memory_order_relaxed);
     atomic_add_double(iterate_lag_sum_ms_, ms);
     atomic_max_double(iterate_lag_max_ms_, ms);
+}
+
+void MetricsRegistry::inc_outbound_buffer_allocs() {
+    outbound_buffer_allocs_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_outbound_buffer_reuse() {
+    outbound_buffer_reuse_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_outbound_buffer_overflow() {
+    outbound_buffer_overflow_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::outbound_buffer_allocs() const {
+    return outbound_buffer_allocs_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::outbound_buffer_reuse() const {
+    return outbound_buffer_reuse_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::outbound_buffer_overflow() const {
+    return outbound_buffer_overflow_.load(std::memory_order_relaxed);
 }
 
 std::uint64_t MetricsRegistry::tunnels_active(Role role) const {
@@ -250,6 +277,23 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_tox_iterate_lag_milliseconds_max gauge\n"
            "toxtunnel_tox_iterate_lag_milliseconds_max "
         << format_double(max) << "\n";
+
+    // Outbound zero-copy counters (Wave B).
+    out << "# HELP toxtunnel_outbound_buffer_allocs_total OwnedFrameBuffer allocations for "
+           "outbound TUNNEL_DATA frames.\n"
+           "# TYPE toxtunnel_outbound_buffer_allocs_total counter\n"
+           "toxtunnel_outbound_buffer_allocs_total "
+        << outbound_buffer_allocs() << "\n";
+    out << "# HELP toxtunnel_outbound_buffer_reuse_total Outbound writes appended to an "
+           "existing buffer (in-place coalesce).\n"
+           "# TYPE toxtunnel_outbound_buffer_reuse_total counter\n"
+           "toxtunnel_outbound_buffer_reuse_total "
+        << outbound_buffer_reuse() << "\n";
+    out << "# HELP toxtunnel_outbound_buffer_overflow_total Outbound buffer overflows that "
+           "forced an early flush.\n"
+           "# TYPE toxtunnel_outbound_buffer_overflow_total counter\n"
+           "toxtunnel_outbound_buffer_overflow_total "
+        << outbound_buffer_overflow() << "\n";
 
     return out.str();
 }
