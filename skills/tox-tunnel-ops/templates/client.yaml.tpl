@@ -27,6 +27,24 @@ tox:
   udp_enabled: true
   bootstrap_mode: {{BOOTSTRAP_MODE|auto}}
 
+# Prometheus /metrics endpoint (opt-in). Off by default.
+# The client exposes its own metric set (tunnels_active{role="client"},
+# friends_online, bytes_in/out, etc.). KEEP loopback unless scraper is trusted.
+# metrics:
+#   enabled: false
+#   listen: 127.0.0.1:9100
+#   path: /metrics
+
+# Local IPC for `toxtunnel inspect` (read-only, default-on).
+# inspect:
+#   enabled: true
+
+# Tunnel data-path tunables (defaults are fine for most users).
+# tunnel:
+#   coalesce_max_delay_us: 200
+#   coalesce_max_bytes: 1362
+#   idle_timeout_seconds: 0       # 0 = disabled; set non-zero to reap idle tunnels
+
 client:
   # Either paste the server's 76-character Tox ID here, or use an alias that
   # has been registered with `toxtunnel servers add <alias> <tox_id>`. Aliases
@@ -34,6 +52,28 @@ client:
   # You can find a literal Tox ID in the server's startup log output, or via
   # `toxtunnel print-id` on the server side.
   server_id: {{SERVER_ID|<PASTE_SERVER_TOX_ID_HERE>}}
+  # --- OR use a list for multi-server failover ---
+  # The first entry is the preferred primary; remaining entries are tried in
+  # order when the active server stays offline past failover.timeout_seconds.
+  # server_id:
+  #   - primary-homelab
+  #   - hetzner-fallback
+  #   - <full-76-char-tox-id>
+
+  # Multi-server failover policy (only applies when server_id is a list, or
+  # when --server-id-fallback was passed on the CLI).
+  # failover:
+  #   timeout_seconds: 60                  # primary offline this long -> promote next online candidate
+  #   prefer_primary_grace_seconds: 30     # primary must be online this long before we switch back
+
+  # SOCKS5 / HTTP CONNECT listener for dynamic destinations.
+  # Off by default. Listen address MUST be loopback (127.0.0.1, ::1, localhost)
+  # — the config validator rejects non-loopback binds. The server-side
+  # rules.yaml still enforces which destinations are reachable.
+  # Mutually exclusive with `pipe` below.
+  # socks5:
+  #   enabled: false
+  #   listen: 127.0.0.1:1080
 
   # Port forwarding rules: local_port on this machine → remote_host:remote_port on server side
   forwards:
@@ -44,13 +84,14 @@ client:
 {{/FORWARDS}}
 
 {{#PIPE_TARGET}}
-  # Pipe mode (alternative to forwards, used with SSH ProxyCommand)
+  # Pipe mode (alternative to forwards, used with SSH ProxyCommand).
+  # NOTE: pipe and socks5 cannot be enabled at the same time.
   pipe:
     remote_host: {{PIPE_REMOTE_HOST}}
     remote_port: {{PIPE_REMOTE_PORT}}
 {{/PIPE_TARGET}}
 {{^PIPE_TARGET}}
-  # Pipe mode (uncomment for SSH ProxyCommand usage):
+  # Pipe mode (uncomment for SSH ProxyCommand usage; POSIX only):
   # pipe:
   #   remote_host: 127.0.0.1
   #   remote_port: 22

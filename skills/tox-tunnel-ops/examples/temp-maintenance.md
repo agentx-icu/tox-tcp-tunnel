@@ -72,10 +72,16 @@ client:
 When maintenance is complete:
 
 1. **Remove the contractor's rule** from `rules.yaml`
-2. **Restart the server**: `sudo systemctl restart toxtunnel@server`
+2. **Hot-reload the server (no restart needed in v0.3.0+):**
+   - POSIX: `toxtunnel reload` or `kill -HUP $(cat /etc/toxtunnel/toxtunnel.pid)`
+   - Windows (Administrator): `toxtunnel.exe reload -c 'C:\ProgramData\ToxTunnel\config.yaml'`
+   - Verify the reload landed: grep the log for `config reloaded (rules: N rules)`
+   - Existing tunnels keep flowing; new TUNNEL_OPEN frames from the revoked friend are denied immediately
+   - Fallback path if reload isn't available: `sudo systemctl restart toxtunnel@server` (drops all open tunnels)
 3. **Revoke DB access** if applicable: `DROP USER contractor_readonly;`
 4. **Review logs**: `grep "contractor-key-prefix" /var/log/toxtunnel/server.log`
-5. **Optional**: remove the contractor as a Tox friend (requires tox_save.dat editing or fresh identity)
+5. **Confirm via inspect**: `toxtunnel inspect tunnels` — the contractor should no longer appear as a friend with open tunnels
+6. **Optional**: remove the contractor as a Tox friend (requires tox_save.dat editing or fresh identity)
 
 ## Multiple Contractors
 

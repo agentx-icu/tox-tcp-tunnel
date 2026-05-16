@@ -1,6 +1,6 @@
 ---
 name: tox-tunnel-ops
-description: "Design, deploy, and troubleshoot secure TCP tunnels over the Tox P2P network for SSH, RDP/VNC, database access, web service exposure, NAS/homelab access, and arbitrary TCP forwarding. Use when: remote SSH without port forwarding, NAT traversal, intranet penetration, exposing internal services, generating ToxTunnel config files, setting up temporary contractor access, diagnosing toxtunnel connection failures, or tightening rules.yaml access control."
+description: "Design, deploy, and troubleshoot secure TCP tunnels over the Tox P2P network for SSH, RDP/VNC, database access, web service exposure, NAS/homelab access, and arbitrary TCP forwarding. Use when: remote SSH without port forwarding, NAT traversal, intranet penetration, exposing internal services, generating ToxTunnel config files, setting up temporary contractor access, diagnosing toxtunnel connection failures, tightening rules.yaml access control, dynamic SOCKS5 / HTTP CONNECT browsing through a Tox tunnel, scraping Prometheus /metrics into Grafana, hot-reloading rules without restart (SIGHUP / `toxtunnel reload`), inspecting live tunnel state via `toxtunnel inspect`, or wiring multi-server failover for production redundancy."
 metadata:
   openclaw:
     requires:
@@ -27,8 +27,12 @@ This skill helps you create **secure, encrypted TCP tunnels** that work behind N
 - **Web service exposure** — share a local dev server or internal web app with teammates
 - **NAS / homelab remote access** — access Synology, TrueNAS, or any home server from outside the LAN
 - **Intranet penetration** — bypass corporate or carrier-grade NAT without VPN infrastructure
-- **Temporary contractor access** — grant time-scoped, auditable access to specific services
+- **Temporary contractor access** — grant time-scoped, auditable access to specific services, revocable without a restart via hot-reload
 - **Air-gapped / LAN-only networking** — works entirely on local network without internet
+- **Dynamic browsing / debugging proxy** — point a browser, curl, or DB client at a loopback SOCKS5 / HTTP CONNECT listener instead of enumerating every destination in YAML
+- **Production HA** — multi-server failover (one primary, ordered fallbacks) for tunnels that must survive a server outage
+- **Observability** — Prometheus `/metrics` endpoint for scraping into Grafana / Alertmanager
+- **Live introspection** — `toxtunnel inspect` over a local Unix socket / named pipe, no log tailing
 
 **How it compares to alternatives:**
 - vs **VPN**: No central server, no complex setup, per-service access control
@@ -93,6 +97,19 @@ tox:
   bootstrap_mode: auto    # auto | lan
 server:
   rules_file: /path/to/rules.yaml   # optional access control
+
+# v0.3.0 top-level blocks (all opt-in unless noted):
+metrics:
+  enabled: false                    # opt-in; enables Prometheus /metrics endpoint
+  listen: 127.0.0.1:9100            # use 0.0.0.0:9100 only behind a trusted network
+  path: /metrics                    # must start with '/'
+inspect:
+  enabled: true                     # default-on; serves a Unix socket / named pipe for `toxtunnel inspect`
+tunnel:
+  coalesce_max_delay_us: 200        # default-on small-write coalescing (perf, benign to leave)
+  coalesce_max_bytes: 1362          # flush threshold (≤ Tox 1367-byte frame limit)
+  idle_timeout_seconds: 0           # 0 = disabled; e.g. 900 closes tunnels idle for 15 min
+  reaper_tick_seconds: 10           # reaper wake-up interval
 ```
 
 **Client config:**
@@ -105,16 +122,45 @@ tox:
   udp_enabled: true
   bootstrap_mode: auto
 client:
-  server_id: <76-char-tox-id>
+  # Single ID (Tox ID OR known-servers alias):
+  server_id: <76-char-tox-id-or-alias>
+  # ...OR a list for multi-server failover (entry 0 is primary, 1..N are fallbacks):
+  # server_id:
+  #   - primary-homelab
+  #   - hetzner-fallback
+  #   - <full-76-char-tox-id>
   forwards:
     - local_port: 2222
       remote_host: 127.0.0.1
       remote_port: 22
+
+  # Optional: multi-server failover policy (only applies when server_id is a list)
+  failover:
+    timeout_seconds: 60                   # how long primary must stay offline before promotion
+    prefer_primary_grace_seconds: 30      # how long primary must be online before switching back
+
+  # Optional: SOCKS5 / HTTP CONNECT listener for dynamic destinations.
+  # Server-side rules.yaml STILL enforces what targets are reachable.
+  socks5:
+    enabled: false
+    listen: 127.0.0.1:1080                # MUST be a loopback address; config validator rejects others
+
   # Optional pipe mode (SSH ProxyCommand) — POSIX only, not supported on Windows:
   # pipe:
   #   remote_host: 127.0.0.1
   #   remote_port: 22
 ```
+
+**Opt-in vs default-on summary:**
+
+| Block | State | Notes |
+|-------|-------|-------|
+| `metrics.enabled` | **opt-in** (default `false`) | Listener binds wherever `metrics.listen` says; defaults to loopback |
+| `inspect.enabled` | **default-on** | Local IPC only (Unix socket / named pipe), never network-exposed |
+| `tunnel.coalesce_*` | **default-on** | Tiny latency cost (≤200 µs) in exchange for fewer Tox frames; safe to leave alone |
+| `tunnel.idle_timeout_seconds` | **opt-in** (default `0` = disabled) | Set non-zero to reap silently abandoned tunnels |
+| `client.socks5.enabled` | **opt-in** (default `false`) | `listen` MUST be loopback (`127.0.0.1`, `::1`, `localhost`); validator rejects others |
+| `client.failover` | **default values applied only when `server_id` is a list** | Single-ID configs ignore this block |
 
 **Rules config (access control):**
 
@@ -194,12 +240,16 @@ run shell commands on the server, forward port 22 and use SSH.
 ```
 toxtunnel -m server -c server.yaml
 toxtunnel -m client -c client.yaml
+toxtunnel -m client --server-id <ID|alias> --server-id-fallback <ID2> <ID3>  # multi-server failover
 toxtunnel -m client --server-id <ID|alias> --pipe <host:port>   # pipe mode (SSH ProxyCommand)
+toxtunnel -m client --server-id <ID|alias> --socks5 127.0.0.1:1080  # dynamic destinations (loopback only)
 toxtunnel print-id [-d DATA_DIR] [--qr] [--color]               # print/display Tox ID
 toxtunnel servers list [--full] [-d DIR | -c CONFIG]            # list known servers
 toxtunnel servers show <alias_or_id> [-d DIR | -c CONFIG]       # show one server's record
 toxtunnel servers add   <alias> <tox_id> [--notes "..."]        # register alias for a Tox ID
 toxtunnel servers remove <alias_or_id>                          # forget a server
+toxtunnel inspect [tunnels|status] [--json] [-d DIR | -c CONFIG]  # live introspection via local IPC
+toxtunnel reload [-d DIR | -c CONFIG]                           # trigger hot-reload (Windows-friendly SIGHUP)
 ```
 
 Key flags:
@@ -208,8 +258,10 @@ Key flags:
 - `-d, --data-dir`: data directory override
 - `-l, --log-level`: trace | debug | info | warn | error
 - `-p, --port`: TCP port (server mode)
-- `--server-id`: server Tox ID OR alias from known_servers.yaml (client mode)
+- `--server-id`: primary server Tox ID OR alias from known_servers.yaml (client mode)
+- `--server-id-fallback <ID> [<ID2> ...]`: ordered fallback servers (client mode); promoted when primary stays offline past `client.failover.timeout_seconds`
 - `--pipe`: pipe target host:port (client mode, for SSH ProxyCommand, POSIX only)
+- `--socks5`: enable SOCKS5 / HTTP CONNECT listener at host:port (client mode); listen address **must** be loopback
 - `--service`: run as system service (integrates with systemd/Windows SCM/launchd)
 - `-v, --version`: print version and exit
 
@@ -218,6 +270,16 @@ Subcommands:
   - `--qr`: render the Tox ID as a terminal QR code (for scanning with a phone)
   - `--color`: use ANSI colors in QR output (requires `--qr`)
   - `-d, --data-dir`: data directory for loading/creating identity
+- `inspect [tunnels|status]`: connect to a running daemon's local IPC channel and print state
+  - `tunnels` (default): table of currently open tunnels (id, friend, target, bytes, age)
+  - `status`: process / version / friend / metrics snapshot
+  - `--json`: emit raw JSON for piping into `jq` / dashboards
+  - `-d` or `-c` resolves the daemon's `data_dir` (where the Unix socket / pidfile lives)
+- `reload`: trigger a hot-reload of the **reloadable subset** of config on the running daemon
+  - Reloadable: `server.rules_file` contents, `client.forwards`, `logging.level`
+  - **NOT** reloadable: Tox identity, `tox.*`, listen addresses, mode, `data_dir`
+  - POSIX equivalent: `kill -HUP $(cat <data_dir>/toxtunnel.pid)`
+  - Windows equivalent: writes `RELOAD\n` to `\\.\pipe\toxtunnel-reload-<pid>`
 
 ---
 
@@ -231,11 +293,13 @@ Subcommands:
 4. **Minimum privilege on generated rules.** Every generated `rules.yaml` must only allow the exact `host:port` combinations required by the scenario.
 5. **Never write secrets to persistent output.** Do not include Tox IDs, friend public keys, or `tox_save.dat` contents in log summaries, conversation history, or any output that persists beyond the current session.
 6. **No background daemons without explicit request.** Do not auto-enable systemd/launchd/NSSM persistence unless the user explicitly asks for "persistent" or "auto-start" or "run as service".
+7. **SOCKS5 listener is loopback-only.** Never generate `client.socks5.listen` with a non-loopback bind address (e.g. `0.0.0.0`, `::`, a LAN IP). The config validator already rejects these — but if a user asks to bind the SOCKS5 listener on a public or LAN interface, refuse and explain: SOCKS5 has no authentication, so binding off loopback gives every host that can reach the port the same access the local user has, including (via the server's rules.yaml allowlist) targets the operator never intended to expose. The safe pattern is loopback + an SSH local-forward or platform-native tunnel for remote consumers.
+8. **Metrics endpoint defaults to loopback for a reason.** Only bind `metrics.listen` to a non-loopback address when the operator has confirmed the network in front of it is trusted (typical: a private VPC / WireGuard mesh / firewalled monitoring subnet). Prometheus has no auth.
 
 ### Soft Constraints (SHOULD follow)
 
 1. When user asks to "open up the whole internal network", first give a risk assessment, then propose a narrower scope covering only what they actually need.
-2. For contractor/temporary access, always attach a revocation reminder with specific steps.
+2. For contractor/temporary access, always attach a revocation reminder with specific steps. **Prefer hot-reload over restart** for revocation: edit `rules.yaml`, then `toxtunnel reload` (or `kill -HUP <pid>` on POSIX) — open tunnels stay up but new TUNNEL_OPENs from the revoked friend are denied within milliseconds.
 3. For database scenarios, suggest read-only database accounts and time-limited access windows.
 4. For any multi-service exposure, enumerate each service individually in the rules rather than using broad host wildcards.
 5. Remind users to back up `tox_save.dat` — it is their Tox identity and cannot be recovered if lost.
@@ -251,6 +315,17 @@ Analyze the user's message and route to the appropriate mode:
 | Describes a need/scenario, asks "how to" | **Design** | "Expose my NAS remotely", "I need remote SSH access", "Give a contractor temporary database access" |
 | Asks to generate config, start service, write files | **Execute** | "Generate the config", "Start the server", "Write client.yaml" |
 | Describes a failure, asks "why not working" | **Diagnose** | "It won't connect", "The port is unreachable", "The rules blocked it", "Friend is connected but forwarding still fails" |
+
+### Feature-aware intent → capability mapping (v0.3.0)
+
+| User intent | Route to | Notes |
+|-------------|----------|-------|
+| "Browse / curl / hit arbitrary destinations through the tunnel" | **SOCKS5 listener** (`client.socks5` / `--socks5`) | Loopback-only bind; rules.yaml on the server still gates targets |
+| "Watch tunnel health in Grafana", "expose metrics", "scrape into Prometheus" | **Metrics endpoint** (`metrics.enabled: true`) | Default loopback bind; metric names: `toxtunnel_tunnels_active`, `toxtunnel_friends_online`, `toxtunnel_tunnels_opened_total`, `toxtunnel_bytes_in_total`, etc. |
+| "Rotate rules without restart", "revoke a contractor immediately", "add a new forward live" | **Hot-reload** (`kill -HUP` / `toxtunnel reload`) | Reloadable subset only: `server.rules_file`, `client.forwards`, `logging.level` |
+| "Production redundancy", "my homelab dies sometimes", "two servers, prefer primary" | **Multi-server failover** (`server_id` list + `client.failover`) | Primary-preference: client switches back to entry 0 after `prefer_primary_grace_seconds` of stable uptime |
+| "See live tunnel state without log diving", "what's open right now", "how many bytes" | **`toxtunnel inspect`** | Local IPC only; `--json` for machine consumption |
+| "Close zombie tunnels", "free old connections" | **Idle reaper** (`tunnel.idle_timeout_seconds`) | 0 = disabled (default); typical setting: 600–1800 |
 
 **Modes flow naturally:** Design → Execute → Diagnose. After design, if user says "execute it", switch to Execute. After execute, if something fails, switch to Diagnose. No explicit mode switching needed.
 
@@ -337,6 +412,53 @@ Output must include:
 - Bandwidth/latency considerations (Tox relay vs direct UDP)
 - Post-migration cleanup: revoke rule, drop temporary DB user, verify data
 - Rollback steps
+
+### Template: SOCKS5 Dev / Debugging Proxy
+
+**When:** developer wants to hit a moving set of destinations on the server side (ad-hoc internal HTTP, multiple DB hosts, debugging tools) without re-editing `client.forwards` every time.
+
+Pre-filled fields:
+- `client.socks5.enabled: true`
+- `client.socks5.listen: 127.0.0.1:1080` (loopback only — see Hard Constraint 7)
+- Server-side `rules.yaml` carries the real allowlist; the client does not know what's reachable until it asks.
+
+Output must include:
+- A loopback-bound SOCKS5 stanza on the client
+- A server-side `rules.yaml` snippet that enumerates the actual hosts/ports allowed (do NOT collapse to wildcards just because the client is dynamic — the server is the trust boundary)
+- A browser / curl invocation example: `curl --socks5-hostname 127.0.0.1:1080 http://internal.lan/`, `ALL_PROXY=socks5h://127.0.0.1:1080 ...`
+- Reminder that HTTP CONNECT is supported on the same port, so `https_proxy=http://127.0.0.1:1080` also works
+- A warning that `socks5` and `pipe` cannot be enabled simultaneously
+
+### Template: Production HA (Multi-Server Failover)
+
+**When:** a tunnel must survive a single server going offline (home connection flaps, datacenter restart, etc.).
+
+Pre-filled fields:
+- `client.server_id` is a **YAML list**: `[primary-alias, fallback-alias, ...]` (or full Tox IDs)
+- `client.failover.timeout_seconds: 60` (default) — tune up for flaky networks, down for fast cutover
+- `client.failover.prefer_primary_grace_seconds: 30` — how long the primary must stay continuously online before the client switches back from a fallback
+
+Output must include:
+- All N server installs (typically use the same config skeleton with different Tox identities and rules)
+- A client config showing the **list form** of `server_id` (or `--server-id-fallback ID2 ID3` on the CLI)
+- Verification: tail the client log for `Failover: switching active server ... -> ...` lines, or run `toxtunnel inspect status --json | jq .active_server`
+- Caveat: each fallback is a full Tox friend on the client side; the client allow-lists all of them, and ONE will be active at a time
+
+### Template: Observability Setup (Prometheus + Grafana)
+
+**When:** operator wants to monitor ToxTunnel as a real service (alert on offline friends, track tunnel churn, watch tox_iterate lag).
+
+Pre-filled fields:
+- `metrics.enabled: true`
+- `metrics.listen: 127.0.0.1:9100` (default — only widen this if the scraper is on a trusted network)
+- `metrics.path: /metrics`
+
+Output must include:
+- The minimal `metrics:` block in `server.yaml` and/or `client.yaml` (both sides can expose metrics; they serve different label sets)
+- A Prometheus scrape config snippet (`job_name: toxtunnel`, `static_configs: [{ targets: [...] }]`)
+- The key metrics to alert on: `toxtunnel_friends_online` (gauge — alert if 0 unexpectedly), `toxtunnel_tunnels_opened_total{result="denied"}` (counter — spike means rules-engine refusing connections), `toxtunnel_tunnels_opened_total{result="failed"}` (target-side failures), `toxtunnel_tox_iterate_lag_milliseconds_max` (gauge — alert > 100 ms sustained)
+- One-line smoke test: `curl -s localhost:9100/metrics | grep toxtunnel_`
+- Hard Constraint 8 reminder: never bind off loopback without a trusted-network story
 
 ---
 
@@ -440,8 +562,10 @@ Numbered step-by-step:
 
 - `templates/server.yaml.tpl`, `templates/client.yaml.tpl`, `templates/rules.yaml.tpl`
   — base templates for generated configs
-- `examples/*.md` — scenario-specific walk-throughs for SSH, RDP, DB, web, NAS, and
-  temporary access
+- `examples/*.md` — scenario-specific walk-throughs for SSH, RDP, DB, web, NAS,
+  temporary access, SOCKS5 dynamic-destination browsing
+  (`socks5-browser-proxy.md`), and Prometheus / Grafana monitoring
+  (`prometheus-monitoring.md`)
 - `references/execute.md` — detailed install, startup, persistence, lifecycle, and
   verification commands by platform
 - `references/diagnose.md` — deep troubleshooting flow, common errors, and diagnosis
@@ -541,3 +665,6 @@ Read on demand:
 11. **Use `print-id` for Tox ID sharing.** When users need to transfer a Tox ID between machines, suggest `toxtunnel print-id --qr` to generate a QR code that can be scanned with a phone camera.
 12. **Use `--service` for daemon mode.** When setting up persistent services, use the `--service` flag which integrates with systemd (sd_notify) on Linux and Windows SCM on Windows.
 13. **Template rendering.** When generating configs from templates, perform direct string substitution of `{{VARIABLE}}` placeholders. Conditional sections (`{{#SECTION}}...{{/SECTION}}`) are included when the variable is set; inverted sections (`{{^SECTION}}...{{/SECTION}}`) are included when the variable is NOT set.
+14. **Prefer `toxtunnel inspect` over log tailing for live state.** When diagnosing "is this tunnel actually open?" / "how many bytes have flowed?" / "which server is currently active?", reach for `toxtunnel inspect tunnels` and `toxtunnel inspect status` before suggesting `journalctl -f` / `tail -F`. Logs are still authoritative for *historical* events (denied opens, errors, reload acks).
+15. **Hot-reload boundary.** Only `server.rules_file` contents, `client.forwards`, and `logging.level` are reloadable. Tox identity, listen ports, mode, and `data_dir` changes still require a restart. If a user asks "can I change X without restart?", check that list first and say "no" honestly when X is outside it.
+16. **SOCKS5 vs `forwards` choice.** Recommend SOCKS5 when the destination set is *dynamic* (browsing, ad-hoc curl, multi-host debugging). Recommend explicit `forwards` when the destination set is *static* and known (SSH to one host, one DB) — static forwards integrate better with launchers, systemd socket activation, and tools that don't speak SOCKS.

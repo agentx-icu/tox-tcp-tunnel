@@ -12,9 +12,36 @@ mode: server
 # Windows: %APPDATA%\toxtunnel\server
 data_dir: {{DATA_DIR}}
 
+# Service / daemon policy when run under `--service` (systemd, launchd, SCM).
+# Server defaults to "online" — packaged installs come up reachable. Flip
+# auto_start: false to ship a server install that idles until manually enabled.
+# service:
+#   auto_start: true            # server installs default to online
+#   allow_client_daemon: false  # ignored in server mode
+
 logging:
   level: {{LOG_LEVEL|info}}
   # file: /var/log/toxtunnel/server.log   # uncomment for file logging
+
+# Prometheus /metrics endpoint (opt-in). Off by default.
+# KEEP the listen address on loopback unless the scraper is on a trusted
+# network — Prometheus exposition has no built-in auth.
+# metrics:
+#   enabled: false
+#   listen: 127.0.0.1:9100
+#   path: /metrics
+
+# Local IPC for `toxtunnel inspect` (read-only, never network-exposed).
+# Default-on; set enabled: false to disable.
+# inspect:
+#   enabled: true
+
+# Tunnel data-path tunables. Defaults are sane for most users.
+# tunnel:
+#   coalesce_max_delay_us: 200    # default-on small-write coalescing
+#   coalesce_max_bytes: 1362      # ≤ Tox 1367-byte frame limit
+#   idle_timeout_seconds: 0       # 0 = disabled; set e.g. 900 to reap idle tunnels
+#   reaper_tick_seconds: 10       # reaper wake-up interval
 
 tox:
   udp_enabled: true

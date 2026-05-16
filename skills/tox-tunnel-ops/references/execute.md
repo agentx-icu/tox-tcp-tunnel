@@ -311,6 +311,183 @@ tail -f /usr/local/var/log/toxtunnel-server.log
 toxtunnel -m server -c server.yaml -l debug
 ```
 
+## Step 4.4: v0.3.0 Feature Recipes
+
+### Enable Prometheus `/metrics`
+
+Add to **either** `server.yaml` **or** `client.yaml` (or both — they expose
+different label sets):
+
+```yaml
+metrics:
+  enabled: true
+  listen: 127.0.0.1:9100   # KEEP loopback unless the scraper is on a trusted network
+  path: /metrics
+```
+
+Restart the daemon (metrics listen is NOT a hot-reloadable field), then smoke-test:
+
+```bash
+curl -s http://127.0.0.1:9100/metrics | grep '^toxtunnel_' | head -20
+```
+
+Expected metric families:
+`toxtunnel_build_info`, `toxtunnel_tunnels_active{role=...}`,
+`toxtunnel_tunnels_opened_total{result="ok|denied|failed"}`,
+`toxtunnel_tunnels_closed_total{reason="local|remote|timeout|error"}`,
+`toxtunnel_bytes_in_total`, `toxtunnel_bytes_out_total`,
+`toxtunnel_friends_online`, `toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max}`.
+
+Minimal Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: toxtunnel
+    static_configs:
+      - targets: ['127.0.0.1:9100']
+    scrape_interval: 15s
+```
+
+### Enable SOCKS5 / HTTP CONNECT listener (client side)
+
+CLI flag form (no YAML edit, ephemeral):
+
+```bash
+toxtunnel -m client --server-id homelab --socks5 127.0.0.1:1080
+```
+
+YAML form:
+
+```yaml
+client:
+  server_id: homelab
+  socks5:
+    enabled: true
+    listen: 127.0.0.1:1080     # config validator REJECTS non-loopback binds
+```
+
+Use it from a browser / curl / pip:
+
+```bash
+# curl over SOCKS5 (DNS resolved on the server side via socks5-hostname / socks5h)
+curl --socks5-hostname 127.0.0.1:1080 http://internal.example.lan/
+
+# HTTP CONNECT (same listener auto-detects)
+https_proxy=http://127.0.0.1:1080 curl https://internal.example.lan/
+
+# Firefox / Chrome: SOCKS host 127.0.0.1, port 1080, "Proxy DNS when using SOCKS v5"
+```
+
+**The server-side `rules.yaml` still gates which destinations succeed** — a
+SOCKS5 CONNECT to a host/port that isn't in the friend's allow list returns a
+SOCKS5 "connection not allowed by ruleset" reply. SOCKS5 and `client.pipe`
+cannot be enabled at the same time (validator error).
+
+### Multi-server failover (production HA)
+
+YAML list form for `server_id`:
+
+```yaml
+client:
+  server_id:
+    - homelab-primary       # entry 0 = preferred primary
+    - hetzner-fallback
+    - <full-76-char-tox-id> # raw IDs and aliases mix freely
+  failover:
+    timeout_seconds: 60               # primary offline this long -> promote next online candidate
+    prefer_primary_grace_seconds: 30  # primary must be online this long before we switch back
+  forwards:
+    - { local_port: 2222, remote_host: 127.0.0.1, remote_port: 22 }
+```
+
+CLI flag form (one primary + repeated fallback):
+
+```bash
+toxtunnel -m client \
+  --server-id homelab-primary \
+  --server-id-fallback hetzner-fallback aws-fallback \
+  -c client.yaml
+```
+
+Verify failover behavior:
+
+```bash
+# Watch active server transitions in the log
+journalctl -u toxtunnel -f | grep -E 'Failover|active server'
+
+# Or query the running daemon directly
+toxtunnel inspect status --json | jq '.active_server, .friends'
+```
+
+### Live inspection (`toxtunnel inspect`)
+
+The daemon serves a local IPC channel — Unix socket on POSIX
+(`<data_dir>/toxtunnel.sock`), named pipe on Windows
+(`\\.\pipe\toxtunnel-inspect-<pid>`). Inspection is read-only and
+strictly local — never network-exposed.
+
+```bash
+# Table of currently open tunnels (id, role, friend, target, bytes, age)
+toxtunnel inspect tunnels
+
+# Process / version / friend / metrics snapshot
+toxtunnel inspect status
+
+# Pipe JSON into jq for dashboards or scripting
+toxtunnel inspect tunnels --json | jq '.tunnels[] | select(.bytes_in > 1000000)'
+
+# Point at a non-default data_dir (e.g. service install paths)
+toxtunnel inspect status -c /etc/toxtunnel/server.yaml
+toxtunnel inspect tunnels -d /var/lib/toxtunnel
+```
+
+`inspect.enabled` is **default-on**; set `inspect.enabled: false` to disable.
+
+### Hot-reload (no restart)
+
+Reloadable subset only: **`server.rules_file` contents, `client.forwards`,
+`logging.level`**. Tox identity, listen ports, mode, and `data_dir` still
+require a full restart.
+
+```bash
+# POSIX (Linux/macOS): SIGHUP, either form works
+toxtunnel reload                            # cross-platform, finds pid via data_dir
+toxtunnel reload -c /etc/toxtunnel/server.yaml
+kill -HUP $(cat /var/lib/toxtunnel/toxtunnel.pid)
+kill -HUP $(pgrep -f 'toxtunnel.*server')
+```
+
+```powershell
+# Windows: writes RELOAD\n to \\.\pipe\toxtunnel-reload-<pid>
+toxtunnel.exe reload -c 'C:\ProgramData\ToxTunnel\config.yaml'
+```
+
+Confirm the reload landed by tailing the log for one of:
+
+```
+config reloaded (rules: N rules)
+config reloaded (forwards: +A -B)
+```
+
+If the new config has a parse error or validation failure, the daemon
+**rejects the reload, keeps running the old config, and logs**
+`reload failed: <reason>` / `reload rejected: <reason>` — no downtime, no
+partial state.
+
+### Idle tunnel reaper
+
+Set a non-zero `tunnel.idle_timeout_seconds` to close tunnels that have
+seen no data in that many seconds. Default `0` disables it.
+
+```yaml
+tunnel:
+  idle_timeout_seconds: 900   # 15 minutes
+  reaper_tick_seconds: 10     # how often the reaper wakes up
+```
+
+Closed-by-reaper events show up as `toxtunnel_tunnels_closed_total{reason="timeout"}`
+in the metrics endpoint.
+
 ## Step 4.5: Known-Servers Registry (client side)
 
 After a successful client→server connection, the client persists an entry in
