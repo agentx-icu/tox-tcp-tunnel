@@ -541,6 +541,16 @@ class TunnelImpl : public Tunnel {
     std::atomic<bool> flow_control_configured_{false};
     std::atomic<std::int64_t> last_push_ns_{0};
 
+    /// BDP sampling state.
+    /// `burst_start_ns_`: steady_clock ns when send_window_used_ went 0->positive
+    ///   (we use this to time the round-trip from first byte sent → first ACK
+    ///   that brings the window back to zero). Stored as 0 when no burst is
+    ///   in-flight.
+    /// `last_ack_ns_`: steady_clock ns of the previous TUNNEL_ACK arrival,
+    ///   used to compute instantaneous bandwidth = bytes_acked / delta_t.
+    std::atomic<std::int64_t> burst_start_ns_{0};
+    std::atomic<std::int64_t> last_ack_ns_{0};
+
     /// Protects non-atomic members.
     mutable std::mutex mutex_;
 

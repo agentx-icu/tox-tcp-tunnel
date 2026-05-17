@@ -343,19 +343,64 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
         return;
     }
 
-    // Free up send window
+    // Free up send window. Capture pre- and post- values to detect a
+    // window-drain transition (post == 0) that lets us close out an RTT sample.
     std::size_t acked = payload->bytes_acked;
     std::size_t current_window = send_window_used_.load(std::memory_order_relaxed);
+    std::size_t new_window = current_window;
     while (current_window > 0) {
         std::size_t new_val = current_window > acked ? current_window - acked : 0;
         if (send_window_used_.compare_exchange_weak(current_window, new_val,
                                                     std::memory_order_relaxed)) {
+            new_window = new_val;
             break;
         }
     }
 
+    // Feed BDP flow control + metrics histograms. Only meaningful when an
+    // ACK actually moved bytes; the OPEN-ACK path returns earlier above.
+    if (acked > 0 && flow_control_configured_.load(std::memory_order_acquire)) {
+        const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+
+        // Bandwidth = bytes_acked / delta_t since the previous ACK. Skip the
+        // first sample (no prev_ns) and very-small intervals (avoid div-by-zero
+        // and bogus huge spikes from sub-millisecond jitter).
+        const auto prev_ack_ns = last_ack_ns_.exchange(now_ns, std::memory_order_relaxed);
+        if (prev_ack_ns > 0) {
+            const std::int64_t delta_ns = now_ns - prev_ack_ns;
+            if (delta_ns > 1'000'000) {  // > 1 ms
+                const std::int64_t bps =
+                    static_cast<std::int64_t>(acked) * 1'000'000'000 / delta_ns;
+                observe_bandwidth_bps(bps);
+                util::MetricsRegistry::instance().observe_tunnel_bandwidth_bps(bps);
+            }
+        }
+
+        // RTT = (now - burst_start) when this ACK fully drains the window.
+        // burst_start_ns_ was stamped when send_window_used_ went 0 -> positive.
+        // Reset it to 0 on drain so the next burst gets its own sample.
+        if (new_window == 0) {
+            const auto burst_start =
+                burst_start_ns_.exchange(0, std::memory_order_relaxed);
+            if (burst_start > 0) {
+                const std::int64_t rtt_us = (now_ns - burst_start) / 1000;
+                if (rtt_us > 0) {
+                    observe_rtt_us(rtt_us);
+                    util::MetricsRegistry::instance().observe_tunnel_rtt_us(rtt_us);
+                }
+            }
+        }
+
+        // Report current window target to /metrics so operators can watch
+        // it ramp up under load.
+        const auto win = flow_control_.target_window_bytes();
+        if (win > 0) {
+            util::MetricsRegistry::instance().observe_tunnel_send_window_bytes(win);
+        }
+    }
+
     util::Logger::debug("Tunnel {} received ACK for {} bytes (window now {})", tunnel_id_, acked,
-                        send_window_used_.load());
+                        new_window);
 }
 
 void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
@@ -433,8 +478,13 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         return false;
     }
 
-    // Update window
-    send_window_used_.fetch_add(data_size, std::memory_order_relaxed);
+    // Update window. Mark burst-start when we go 0 -> positive so the next
+    // ACK that drains us back to 0 gives us an RTT sample.
+    std::size_t before = send_window_used_.fetch_add(data_size, std::memory_order_relaxed);
+    if (before == 0) {
+        const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        burst_start_ns_.store(now_ns, std::memory_order_relaxed);
+    }
 
     BumpActivity();
 
@@ -555,6 +605,8 @@ void TunnelImpl::reset_statistics() {
     total_bytes_sent_.store(0, std::memory_order_relaxed);
     bytes_received_since_ack_.store(0, std::memory_order_relaxed);
     send_window_used_.store(0, std::memory_order_relaxed);
+    burst_start_ns_.store(0, std::memory_order_relaxed);
+    last_ack_ns_.store(0, std::memory_order_relaxed);
 }
 
 // ===========================================================================
