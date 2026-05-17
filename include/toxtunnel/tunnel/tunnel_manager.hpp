@@ -172,29 +172,39 @@ class TunnelManager {
 
     /// Add a tunnel to the manager.
     ///
-    /// Takes ownership of the tunnel. If a tunnel with the same ID
-    /// already exists, it is replaced.
+    /// Takes shared ownership of the tunnel. If a tunnel with the same ID
+    /// already exists, it is replaced. Callers may keep their own
+    /// `shared_ptr<Tunnel>` after calling this — useful for capturing the
+    /// tunnel into async callbacks where teardown ordering would otherwise
+    /// leave a dangling pointer (TCP strand vs Tox strand).
     ///
     /// @param tunnel_id  The tunnel identifier.
     /// @param tunnel     The tunnel instance to add.
-    void add_tunnel(uint16_t tunnel_id, std::unique_ptr<Tunnel> tunnel);
+    void add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunnel);
 
     /// Remove and destroy a tunnel.
     ///
-    /// Calls close() on the tunnel before removal.
+    /// Calls close() on the tunnel before erasing the manager's shared_ptr
+    /// reference. If any external callbacks still hold a shared_ptr to the
+    /// tunnel (the recommended pattern for TCP-strand callbacks), the
+    /// underlying Tunnel object survives until those callbacks release it.
     ///
     /// @param tunnel_id  The tunnel to remove.
     void remove_tunnel(uint16_t tunnel_id);
 
-    /// Get a pointer to a tunnel by ID.
+    /// Get a shared_ptr to a tunnel by ID.
     ///
-    /// @return Pointer to the tunnel, or nullptr if not found.
-    [[nodiscard]] Tunnel* get_tunnel(uint16_t tunnel_id);
+    /// Returning a shared_ptr (rather than a raw pointer) lets the caller
+    /// safely keep the tunnel alive across a strand boundary even if
+    /// remove_tunnel() races with the caller's use of the returned handle.
+    ///
+    /// @return shared_ptr to the tunnel, or nullptr if not found.
+    [[nodiscard]] std::shared_ptr<Tunnel> get_tunnel(uint16_t tunnel_id);
 
-    /// Get a const pointer to a tunnel by ID.
+    /// Get a const shared_ptr to a tunnel by ID.
     ///
-    /// @return Pointer to the tunnel, or nullptr if not found.
-    [[nodiscard]] const Tunnel* get_tunnel(uint16_t tunnel_id) const;
+    /// @return shared_ptr to the tunnel, or nullptr if not found.
+    [[nodiscard]] std::shared_ptr<const Tunnel> get_tunnel(uint16_t tunnel_id) const;
 
     /// Check if a tunnel with the given ID exists.
     [[nodiscard]] bool has_tunnel(uint16_t tunnel_id) const;
@@ -341,7 +351,9 @@ class TunnelManager {
     asio::io_context& io_ctx_;
 
     /// Map of tunnel_id -> Tunnel.
-    std::map<uint16_t, std::unique_ptr<Tunnel>> tunnels_;
+    /// Stored as shared_ptr so that external callbacks (TCP strand etc.)
+    /// can keep the tunnel alive past `remove_tunnel`. See add_tunnel().
+    std::map<uint16_t, std::shared_ptr<Tunnel>> tunnels_;
 
     /// Set of IDs currently in use (for fast lookup during allocation).
     std::vector<bool> used_ids_;

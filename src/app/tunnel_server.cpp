@@ -575,7 +575,7 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
         return;
     }
 
-    auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(io_context_->get_io_context(),
+    auto server_tunnel = std::make_shared<tunnel::TunnelImpl>(io_context_->get_io_context(),
                                                               tunnel_id, friend_number);
     server_tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                       config_.tunnel.coalesce_max_bytes);
@@ -668,7 +668,10 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
 
 void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id,
                                       std::shared_ptr<core::TcpConnection> tcp_conn) {
-    tunnel::TunnelImpl* tunnel_impl = nullptr;
+    // Hold a shared_ptr to the TunnelImpl so its lifetime extends across the
+    // TCP strand's async callbacks, even if remove_tunnel() fires from the Tox
+    // strand mid-flight.
+    std::shared_ptr<tunnel::TunnelImpl> tunnel_impl;
     tunnel::TunnelManager* manager_ptr = nullptr;
 
     // Look up manager and tunnel under the lock, then release immediately.
@@ -683,8 +686,8 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
         }
         manager_ptr = it->second.get();
 
-        auto* tunnel = manager_ptr->get_tunnel(tunnel_id);
-        if (tunnel == nullptr) {
+        auto tunnel = manager_ptr->get_tunnel(tunnel_id);
+        if (!tunnel) {
             util::Logger::warn("Cannot wire: tunnel {} not found for friend {}", tunnel_id,
                                friend_number);
             tcp_conn->close();
@@ -692,8 +695,8 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
         }
 
         // Downcast to TunnelImpl for the extended API.
-        tunnel_impl = dynamic_cast<tunnel::TunnelImpl*>(tunnel);
-        if (tunnel_impl == nullptr) {
+        tunnel_impl = std::dynamic_pointer_cast<tunnel::TunnelImpl>(tunnel);
+        if (!tunnel_impl) {
             util::Logger::error("Tunnel {} is not a TunnelImpl", tunnel_id);
             tcp_conn->close();
             return;
@@ -701,8 +704,9 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     }
 
     // All wiring below happens WITHOUT holding managers_mutex_.
-    // The manager/tunnel pointers remain valid because teardown only happens
-    // on the Tox thread (friend disconnect), not on I/O threads.
+    // Capturing tunnel_impl by value into each callback keeps the underlying
+    // Tunnel alive past remove_tunnel(); the last shared_ptr to release the
+    // tunnel is the TcpConnection's callback slot when the TCP socket dies.
 
     // Associate the TCP connection with the tunnel.
     tunnel_impl->set_tcp_connection(tcp_conn);

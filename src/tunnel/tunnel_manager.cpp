@@ -196,7 +196,7 @@ void TunnelManager::set_next_tunnel_id(uint16_t next_id) {
 // Tunnel lifecycle
 // ===========================================================================
 
-void TunnelManager::add_tunnel(uint16_t tunnel_id, std::unique_ptr<Tunnel> tunnel) {
+void TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunnel) {
     if (!tunnel) {
         util::Logger::warn("TunnelManager::add_tunnel: null tunnel for id {}", tunnel_id);
         return;
@@ -271,16 +271,16 @@ void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
     }
 }
 
-Tunnel* TunnelManager::get_tunnel(uint16_t tunnel_id) {
+std::shared_ptr<Tunnel> TunnelManager::get_tunnel(uint16_t tunnel_id) {
     std::shared_lock lock(mutex_);
     auto it = tunnels_.find(tunnel_id);
-    return (it != tunnels_.end()) ? it->second.get() : nullptr;
+    return (it != tunnels_.end()) ? it->second : nullptr;
 }
 
-const Tunnel* TunnelManager::get_tunnel(uint16_t tunnel_id) const {
+std::shared_ptr<const Tunnel> TunnelManager::get_tunnel(uint16_t tunnel_id) const {
     std::shared_lock lock(mutex_);
     auto it = tunnels_.find(tunnel_id);
-    return (it != tunnels_.end()) ? it->second.get() : nullptr;
+    return (it != tunnels_.end()) ? it->second : nullptr;
 }
 
 bool TunnelManager::has_tunnel(uint16_t tunnel_id) const {
@@ -329,7 +329,7 @@ uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
 }
 
 void TunnelManager::close_all() {
-    std::map<uint16_t, std::unique_ptr<Tunnel>> tunnels_to_close;
+    std::map<uint16_t, std::shared_ptr<Tunnel>> tunnels_to_close;
     TunnelClosedCallback closed_cb;
 
     {

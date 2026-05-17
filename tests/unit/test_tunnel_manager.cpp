@@ -79,8 +79,8 @@ class TunnelManagerTest : public ::testing::Test {
     void TearDown() override { manager.reset(); }
 
     // Helper to create a TestTunnel
-    std::unique_ptr<TestTunnel> create_test_tunnel(uint16_t tunnel_id) {
-        return std::make_unique<TestTunnel>(tunnel_id, io_ctx);
+    std::shared_ptr<TestTunnel> create_test_tunnel(uint16_t tunnel_id) {
+        return std::make_shared<TestTunnel>(tunnel_id, io_ctx);
     }
 };
 
@@ -196,14 +196,14 @@ TEST_F(TunnelManagerTest, TunnelLifecycle_RemoveNonExistentTunnel) {
 TEST_F(TunnelManagerTest, TunnelLifecycle_GetTunnel) {
     auto tunnel = create_test_tunnel(1);
     auto* raw_ptr = tunnel.get();
-    manager->add_tunnel(1, std::move(tunnel));
+    manager->add_tunnel(1, tunnel);
 
-    auto* retrieved = manager->get_tunnel(1);
-    EXPECT_EQ(retrieved, raw_ptr);
+    auto retrieved = manager->get_tunnel(1);
+    EXPECT_EQ(retrieved.get(), raw_ptr);
 }
 
 TEST_F(TunnelManagerTest, TunnelLifecycle_GetNonExistentTunnel) {
-    auto* retrieved = manager->get_tunnel(999);
+    auto retrieved = manager->get_tunnel(999);
     EXPECT_EQ(retrieved, nullptr);
 }
 

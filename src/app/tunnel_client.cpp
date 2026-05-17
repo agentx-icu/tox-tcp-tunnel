@@ -595,12 +595,11 @@ void TunnelClient::start_pipe_mode() {
 
     const uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
     auto tunnel =
-        std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
+        std::make_shared<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
                                              server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
     apply_coalesce_and_flow_control(*tunnel);
-    auto* tunnel_raw = tunnel.get();
 
     tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
         std::vector<uint8_t> packet;
@@ -626,17 +625,17 @@ void TunnelClient::start_pipe_mode() {
         }
     });
 
-    tunnel->set_on_state_change([this, tunnel_raw, tunnel_id](tunnel::Tunnel::State new_state) {
+    tunnel->set_on_state_change([this, tunnel, tunnel_id](tunnel::Tunnel::State new_state) {
         if (new_state == tunnel::Tunnel::State::Connected) {
             auto start_result = pipe_bridge_->start(
-                [tunnel_raw](std::span<const uint8_t> data) {
-                    tunnel_raw->on_tcp_data_received(data.data(), data.size());
+                [tunnel](std::span<const uint8_t> data) {
+                    tunnel->on_tcp_data_received(data.data(), data.size());
                 },
-                [tunnel_raw]() { tunnel_raw->close(); });
+                [tunnel]() { tunnel->close(); });
             if (!start_result) {
                 util::Logger::error("Failed to start stdio pipe bridge for tunnel {}: {}",
                                     tunnel_id, start_result.error());
-                tunnel_raw->close();
+                tunnel->close();
                 request_stop();
             }
         } else if (new_state == tunnel::Tunnel::State::Error) {
@@ -658,9 +657,9 @@ void TunnelClient::start_pipe_mode() {
         request_stop();
     });
 
-    tunnel_mgr_->add_tunnel(tunnel_id, std::move(tunnel));
+    tunnel_mgr_->add_tunnel(tunnel_id, tunnel);
 
-    if (!tunnel_raw->open(target.remote_host, target.remote_port)) {
+    if (!tunnel->open(target.remote_host, target.remote_port)) {
         util::Logger::error("Failed to open pipe-mode tunnel {} to {}:{}", tunnel_id,
                             target.remote_host, target.remote_port);
         tunnel_mgr_->remove_tunnel(tunnel_id);
@@ -702,7 +701,7 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
                         rule.local_port, tunnel_id, rule.remote_host, rule.remote_port);
 
     auto tunnel =
-        std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
+        std::make_shared<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
                                              server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
@@ -775,14 +774,13 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
         tunnel_mgr_ptr->remove_tunnel(tunnel_id);
     });
 
-    // Wire TCP data callback: forward received TCP data to tunnel
-    auto* tunnel_raw = tunnel.get();
-    conn->set_on_data([tunnel_raw](const uint8_t* data, std::size_t length) {
-        tunnel_raw->on_tcp_data_received(data, length);
+    // Wire TCP data + disconnect callbacks. Capturing the tunnel shared_ptr by
+    // value keeps the tunnel alive past `remove_tunnel()`; the TcpConnection's
+    // callback slots are the last refs to drop when the socket is destroyed.
+    conn->set_on_data([tunnel](const uint8_t* data, std::size_t length) {
+        tunnel->on_tcp_data_received(data, length);
     });
-
-    // Wire TCP disconnect: close the tunnel
-    conn->set_on_disconnect([tunnel_raw](const std::error_code& /*ec*/) { tunnel_raw->close(); });
+    conn->set_on_disconnect([tunnel](const std::error_code& /*ec*/) { tunnel->close(); });
 
     // Initiate tunnel opening: sends TUNNEL_OPEN frame to server
     bool opened = tunnel->open(rule.remote_host, rule.remote_port);
@@ -793,8 +791,10 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
         return;
     }
 
-    // Add tunnel to manager (transfers ownership)
-    tunnel_mgr_->add_tunnel(tunnel_id, std::move(tunnel));
+    // Add tunnel to manager. The manager takes a strong ref; the local
+    // `tunnel` shared_ptr (and the conn callback captures above) keep it alive
+    // independently.
+    tunnel_mgr_->add_tunnel(tunnel_id, tunnel);
 
     util::Logger::debug("Tunnel {} created and TUNNEL_OPEN sent to {}:{}", tunnel_id,
                         rule.remote_host, rule.remote_port);
@@ -814,7 +814,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     util::Logger::debug("SOCKS5 destination {}:{} -> tunnel {}", host, port, tunnel_id);
 
     auto tunnel =
-        std::make_unique<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
+        std::make_shared<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
                                              server_friend_number_.load(std::memory_order_acquire));
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
@@ -840,8 +840,6 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     tunnel->set_on_data_for_tcp(
         [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
 
-    auto* tunnel_raw = tunnel.get();
-
     // The reply gate latch ensures the listener's reply callback is invoked
     // exactly once across all possible state transitions of this tunnel.
     auto reply_sent = std::make_shared<std::atomic<bool>>(false);
@@ -853,7 +851,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     // upstream BEFORE we start_read so the tunnel sees them in original order.
     auto initial_payload_holder =
         std::make_shared<std::vector<uint8_t>>(std::move(initial_payload));
-    tunnel->set_on_state_change([conn, tunnel_id, tunnel_raw, reply_sent, open_counted,
+    tunnel->set_on_state_change([conn, tunnel_id, tunnel, reply_sent, open_counted,
                                  active_dec_latch, reply_cb,
                                  initial_payload_holder](tunnel::Tunnel::State new_state) {
         if (new_state == tunnel::Tunnel::State::Connected) {
@@ -861,8 +859,8 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
                 (*reply_cb)(true);
             }
             if (!initial_payload_holder->empty()) {
-                tunnel_raw->on_tcp_data_received(initial_payload_holder->data(),
-                                                 initial_payload_holder->size());
+                tunnel->on_tcp_data_received(initial_payload_holder->data(),
+                                             initial_payload_holder->size());
                 initial_payload_holder->clear();
             }
             util::Logger::debug("SOCKS5 tunnel {} connected, starting TCP read", tunnel_id);
@@ -893,10 +891,10 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         util::Logger::debug("SOCKS5 tunnel {} on_close, removing from manager", tunnel_id);
         tunnel_mgr_ptr->remove_tunnel(tunnel_id);
     });
-    conn->set_on_data([tunnel_raw](const uint8_t* data, std::size_t length) {
-        tunnel_raw->on_tcp_data_received(data, length);
+    conn->set_on_data([tunnel](const uint8_t* data, std::size_t length) {
+        tunnel->on_tcp_data_received(data, length);
     });
-    conn->set_on_disconnect([tunnel_raw](const std::error_code& /*ec*/) { tunnel_raw->close(); });
+    conn->set_on_disconnect([tunnel](const std::error_code& /*ec*/) { tunnel->close(); });
 
     bool opened = tunnel->open(host, port);
     if (!opened) {
@@ -907,7 +905,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         conn->close();
         return;
     }
-    tunnel_mgr_->add_tunnel(tunnel_id, std::move(tunnel));
+    tunnel_mgr_->add_tunnel(tunnel_id, tunnel);
 }
 
 // ---------------------------------------------------------------------------
