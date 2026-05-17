@@ -66,8 +66,16 @@ void BdpFlowControl::recompute_window_locked() noexcept {
     // Worked in int64_t to avoid overflow on a 10 Gbps × 100 ms link.
     const std::int64_t bdp = (bps * rtt) / 1'000'000;
     const std::int64_t target = (bdp * cfg_.safety_factor_x100) / 100;
+    // Never shrink below the configured seed (fixed_window_bytes). On a
+    // high-RTT / low-throughput path (e.g. Tox public TCP relay), the BDP
+    // estimate is small — but a single SSH/scp write can be larger than the
+    // BDP, and shrinking below the seed would starve those writes at the
+    // admission gate even though the link can actually carry that much
+    // in-flight. Treat the seed as a floor; only grow from it.
+    const std::int64_t floor_bytes = std::max<std::int64_t>(cfg_.min_window_bytes,
+                                                            cfg_.fixed_window_bytes);
     const std::int64_t clamped =
-        std::clamp<std::int64_t>(target, cfg_.min_window_bytes, cfg_.max_window_bytes);
+        std::clamp<std::int64_t>(target, floor_bytes, cfg_.max_window_bytes);
     target_window_bytes_.store(clamped, std::memory_order_relaxed);
     ack_threshold_bytes_.store(std::max<std::int64_t>(clamped / 16, 1024),
                                std::memory_order_relaxed);
