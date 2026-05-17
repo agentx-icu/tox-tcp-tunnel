@@ -140,15 +140,16 @@ struct WatchdogConfig {
     bool operator==(const WatchdogConfig& other) const = default;
 };
 
-/// BDP-aware flow control configuration. `mode: fixed` (default) preserves
-/// the v0.3.0 256 KiB / 16 KiB window; `mode: bdp` lets the per-tunnel
-/// `BdpFlowControl` resize the window from RTT × bandwidth estimates.
+/// BDP-aware flow control configuration. `mode: bdp` (default since v0.4.1)
+/// lets the per-tunnel `BdpFlowControl` resize the window from RTT × bandwidth
+/// estimates fed by `handle_tunnel_ack_frame`. Use `mode: fixed` to lock to
+/// the legacy v0.3.0 256 KiB / 16 KiB window (e.g. for soak-test reproducibility).
 struct FlowControlConfig {
-    std::string mode = "fixed";                        ///< "fixed" or "bdp"
+    std::string mode = "bdp";                          ///< "bdp" or "fixed"
     uint32_t send_window_min_bytes = 65536;            ///< 64 KiB clamp floor
     uint32_t send_window_max_bytes = 4 * 1024 * 1024;  ///< 4 MiB clamp ceiling
     uint32_t safety_factor_x100 = 150;                 ///< 1.5× BDP headroom
-    uint32_t fixed_window_bytes = 262144;              ///< 256 KiB — used in fixed mode
+    uint32_t fixed_window_bytes = 262144;              ///< 256 KiB — used in fixed mode and as the initial BDP window before any RTT samples are observed.
 
     bool operator==(const FlowControlConfig& other) const = default;
 };

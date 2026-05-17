@@ -183,10 +183,12 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   (v0.3.0 behaviour). Other options: `adaptive` (EWMA state machine that
   selects between `bypass`, `drain`, `batch` per tunnel), `bypass` (no
   hold ever), `drain` (emit on overflow only). Non-reloadable.
-- **BDP-aware flow control** — `flow_control.mode: fixed` (default;
-  256 KiB window / 16 KiB ACK). `flow_control.mode: bdp` opts in to a
-  per-tunnel `BdpFlowControl` that resizes the window from RTT × bandwidth
-  EWMA. Non-reloadable.
+- **BDP-aware flow control** — `flow_control.mode: bdp` is the default
+  since v0.4.1. The per-tunnel `BdpFlowControl` starts at the fixed
+  256 KiB seed window and dynamically resizes it (between 64 KiB and 4 MiB)
+  from RTT × bandwidth EWMA samples fed by `handle_tunnel_ack_frame`.
+  Set `flow_control.mode: fixed` to lock to the legacy v0.3.0 behaviour.
+  Non-reloadable.
 - **Per-friend rate limiting** — absent from `rules.yaml` means no
   limiting (v0.3.0 behaviour). When `rate_limit_defaults:` or a per-friend
   `rate_limit:` block is present, `RateLimiter` runs before `RulesEngine`
