@@ -72,8 +72,8 @@ void BdpFlowControl::recompute_window_locked() noexcept {
     // BDP, and shrinking below the seed would starve those writes at the
     // admission gate even though the link can actually carry that much
     // in-flight. Treat the seed as a floor; only grow from it.
-    const std::int64_t floor_bytes = std::max<std::int64_t>(cfg_.min_window_bytes,
-                                                            cfg_.fixed_window_bytes);
+    const std::int64_t floor_bytes =
+        std::max<std::int64_t>(cfg_.min_window_bytes, cfg_.fixed_window_bytes);
     const std::int64_t clamped =
         std::clamp<std::int64_t>(target, floor_bytes, cfg_.max_window_bytes);
     target_window_bytes_.store(clamped, std::memory_order_relaxed);

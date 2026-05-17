@@ -149,7 +149,8 @@ struct FlowControlConfig {
     uint32_t send_window_min_bytes = 65536;            ///< 64 KiB clamp floor
     uint32_t send_window_max_bytes = 4 * 1024 * 1024;  ///< 4 MiB clamp ceiling
     uint32_t safety_factor_x100 = 150;                 ///< 1.5× BDP headroom
-    uint32_t fixed_window_bytes = 262144;              ///< 256 KiB — used in fixed mode and as the initial BDP window before any RTT samples are observed.
+    uint32_t fixed_window_bytes = 262144;  ///< 256 KiB — used in fixed mode and as the initial BDP
+                                           ///< window before any RTT samples are observed.
 
     bool operator==(const FlowControlConfig& other) const = default;
 };

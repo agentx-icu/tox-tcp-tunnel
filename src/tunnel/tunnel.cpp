@@ -380,8 +380,7 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
         // burst_start_ns_ was stamped when send_window_used_ went 0 -> positive.
         // Reset it to 0 on drain so the next burst gets its own sample.
         if (new_window == 0) {
-            const auto burst_start =
-                burst_start_ns_.exchange(0, std::memory_order_relaxed);
+            const auto burst_start = burst_start_ns_.exchange(0, std::memory_order_relaxed);
             if (burst_start > 0) {
                 const std::int64_t rtt_us = (now_ns - burst_start) / 1000;
                 if (rtt_us > 0) {
