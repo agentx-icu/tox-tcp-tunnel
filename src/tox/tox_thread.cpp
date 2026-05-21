@@ -69,6 +69,29 @@ void ToxThread::stop() {
         thread_.join();
     }
 
+    // S24 / H-14 (2026-05-20 review): the loop can exit with commands
+    // still sitting in the queue — e.g. a caller posted SendData and
+    // was waiting on its future when stop() flipped running_ to false
+    // and the loop bailed out before draining. Leaving those promises
+    // unfulfilled deadlocks any caller blocked on future::get(). Fail
+    // them explicitly with empty result vectors so callers unwind
+    // cleanly. Empty result matches the existing "operation failed"
+    // convention used elsewhere in process_commands (see e.g. the
+    // short-data guards in AddFriend / SendData).
+    std::queue<Command> leftover;
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        std::swap(leftover, command_queue_);
+    }
+    while (!leftover.empty()) {
+        try {
+            leftover.front().result.set_value({});
+        } catch (const std::future_error&) {
+            // Promise already satisfied or abandoned; nothing to do.
+        }
+        leftover.pop();
+    }
+
     save_state();
 }
 
