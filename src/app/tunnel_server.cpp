@@ -624,8 +624,15 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                            tunnel_id, friend_number);
         return;
     }
+    // H-S-3 (2026-05-20 fix-storm review): hold a shared_ptr to the
+    // manager, not a raw pointer. The async tail (add_tunnel +
+    // async_resolve + connect) can outrun a friend-offline teardown
+    // that removes the manager from the server's managers_ map; the
+    // shared_ptr keeps the manager alive long enough for the guard's
+    // destructor to actually do its job, instead of dereferencing a
+    // freed object or no-op'ing a release that should have happened.
     struct TunnelIdGuard {
-        tunnel::TunnelManager* mgr;
+        std::shared_ptr<tunnel::TunnelManager> mgr;
         uint16_t id;
         bool committed = false;
         ~TunnelIdGuard() {
@@ -634,7 +641,7 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
             }
         }
     };
-    TunnelIdGuard id_guard{manager_ptr.get(), tunnel_id, false};
+    TunnelIdGuard id_guard{manager_ptr, tunnel_id, false};
 
     auto server_tunnel = std::make_shared<tunnel::TunnelImpl>(io_context_->get_io_context(),
                                                               tunnel_id, friend_number);
