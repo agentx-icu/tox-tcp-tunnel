@@ -400,6 +400,14 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
 
     util::Logger::debug("Tunnel {} received ACK for {} bytes (window now {})", tunnel_id_, acked,
                         new_window);
+
+    // C-18 follow-up: if on_tcp_data_received paused the TCP read because
+    // the send window was full, resume it now that there is room again.
+    // resume_read is idempotent + thread-safe, so it's cheap to call
+    // unconditionally; the no-op fast path returns early.
+    if (new_window < current_window && tcp_conn_) {
+        tcp_conn_->resume_read();
+    }
 }
 
 void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
@@ -446,8 +454,16 @@ void TunnelImpl::on_tcp_data_received(const uint8_t* data, std::size_t length) {
         return;
     }
 
-    // Forward to Tox (ignore return value - backpressure is handled by TcpConnection)
-    (void)send_data_to_tox(std::span<const uint8_t>(data, length));
+    // Forward to Tox; if the send window is full, propagate the backpressure
+    // upstream by pausing TCP reads — otherwise the data would be silently
+    // dropped (C-18 in the 2026-05-20 review). handle_tunnel_ack_frame
+    // calls resume_read once the window drains.
+    const bool accepted = send_data_to_tox(std::span<const uint8_t>(data, length));
+    if (!accepted) {
+        if (tcp_conn_) {
+            tcp_conn_->pause_read();
+        }
+    }
 }
 
 // ===========================================================================

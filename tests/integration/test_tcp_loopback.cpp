@@ -462,5 +462,81 @@ TEST_F(TcpLoopbackTest, LargeDataTransfer) {
     listener->stop();
 }
 
+// ===========================================================================
+// 6. PauseReadHaltsDataDelivery (C-18 — T5 backpressure)
+// ===========================================================================
+
+// C-18 / 2026-05-20 finding: TunnelImpl now calls TcpConnection::pause_read
+// when its send window is full, and resume_read when an ACK drains it.
+//
+// pause_read is *soft* backpressure — it stops posting new
+// async_read_some calls. An in-flight read completes and delivers
+// whatever it already had, then the loop stops. The kernel receive
+// buffer then fills, the TCP receive window collapses, and the remote
+// peer is throttled at the protocol level. This test exercises the
+// end-to-end shape: pause + bombard with bulk data + expect the
+// receiver to stop well short of the sent volume, then resume and
+// expect the rest.
+TEST_F(TcpLoopbackTest, PauseReadHaltsBulkDeliveryUntilResume) {
+    auto listener = make_listener();
+    const auto port = listener->port();
+
+    std::promise<std::shared_ptr<core::TcpConnection>> server_conn_promise;
+    auto server_conn_future = server_conn_promise.get_future();
+    listener->start_accept([&server_conn_promise](std::shared_ptr<core::TcpConnection> conn) {
+        server_conn_promise.set_value(std::move(conn));
+    });
+
+    auto client = std::make_shared<core::TcpConnection>(io());
+    client->set_max_write_buffer_size(8 * 1024 * 1024);  // permissive client side
+
+    std::promise<void> connected_promise;
+    auto connected_future = connected_promise.get_future();
+    client->async_connect(loopback(port), [&connected_promise](const std::error_code& ec) {
+        ASSERT_FALSE(ec) << ec.message();
+        connected_promise.set_value();
+    });
+    ASSERT_EQ(connected_future.wait_for(kTimeout), std::future_status::ready);
+    connected_future.get();
+    ASSERT_EQ(server_conn_future.wait_for(kTimeout), std::future_status::ready);
+    auto server = server_conn_future.get();
+
+    std::atomic<std::size_t> received_bytes{0};
+    server->set_on_data(
+        [&received_bytes](const uint8_t* /*data*/, std::size_t len) { received_bytes += len; });
+
+    // Pause BEFORE start_read so no read is in flight at the moment we
+    // pause — guarantees nothing surfaces before the resume.
+    server->pause_read();
+    EXPECT_TRUE(server->is_read_paused());
+    server->start_read();
+
+    constexpr std::size_t kBulkSize = 4 * 1024 * 1024;  // 4 MiB
+    std::vector<uint8_t> payload(kBulkSize, 0xAB);
+    EXPECT_TRUE(client->write(payload.data(), payload.size()));
+
+    // Give the kernel time to drain whatever it can into its receive
+    // buffer; with no reader, that bounds at the SO_RCVBUF size
+    // (typically 256 KiB-2 MiB on Linux/macOS — comfortably below 4 MiB).
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto leaked = received_bytes.load();
+    EXPECT_LT(leaked, kBulkSize)
+        << "all bulk data delivered while paused — pause_read had no effect";
+
+    // Resume → the rest must surface.
+    server->resume_read();
+    EXPECT_FALSE(server->is_read_paused());
+
+    const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+    while (received_bytes.load() < kBulkSize && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(received_bytes.load(), kBulkSize);
+
+    client->close();
+    server->close();
+    listener->stop();
+}
+
 }  // namespace
 }  // namespace toxtunnel::integration

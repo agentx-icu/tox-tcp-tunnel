@@ -149,6 +149,22 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// @pre state() == Connected
     void start_read();
 
+    /// Pause / resume the async read loop without closing the socket.
+    /// Used by the tunnel layer to propagate downstream backpressure
+    /// (when the Tox send window is full) back to the TCP peer: pausing
+    /// stops posting new `async_read_some` calls, which lets the kernel
+    /// receive buffer fill up and the TCP receive window collapse — the
+    /// remote peer then naturally throttles. `resume_read` re-posts the
+    /// read once downstream has drained. Both are safe to call from any
+    /// thread and idempotent. T5/C-18 in the 2026-05-20 review.
+    void pause_read();
+    void resume_read();
+
+    /// True if the read loop is currently paused (paused_read_ flag).
+    [[nodiscard]] bool is_read_paused() const noexcept {
+        return read_paused_.load(std::memory_order_acquire);
+    }
+
     /// Queue data for asynchronous writing.
     ///
     /// @return `true` if the data was accepted; `false` if the write buffer
@@ -270,6 +286,11 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// strand. Updated only from inside the strand.
     std::atomic<std::size_t> write_buffer_bytes_{0};
     bool write_in_progress_ = false;
+
+    /// Read-loop pause flag. When true, `do_read()` returns early without
+    /// posting another async_read_some. Flipped by `pause_read` /
+    /// `resume_read` from arbitrary threads (atomic).
+    std::atomic<bool> read_paused_{false};
 
     // Limits
     std::size_t max_write_buffer_size_ = kDefaultMaxWriteBufferSize;

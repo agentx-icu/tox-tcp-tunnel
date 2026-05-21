@@ -383,8 +383,29 @@ asio::any_io_executor TcpConnection::get_executor() noexcept {
 // Internal helpers — all run inside strand_
 // ===========================================================================
 
+void TcpConnection::pause_read() {
+    read_paused_.store(true, std::memory_order_release);
+}
+
+void TcpConnection::resume_read() {
+    bool was_paused = read_paused_.exchange(false, std::memory_order_acq_rel);
+    if (!was_paused) {
+        return;
+    }
+    // Re-post a read on the strand. The current state may have changed
+    // (closed, disconnecting) — do_read itself short-circuits in those
+    // cases, so just dispatch.
+    auto self = shared_from_this();
+    asio::post(strand_, [this, self]() { do_read(); });
+}
+
 void TcpConnection::do_read() {
     if (state_.load(std::memory_order_acquire) != ConnectionState::Connected) {
+        return;
+    }
+    if (read_paused_.load(std::memory_order_acquire)) {
+        // Backpressure: skip posting a new read. resume_read() will
+        // re-arm the loop when downstream drains.
         return;
     }
 
