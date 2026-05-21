@@ -46,7 +46,11 @@ struct CapturedFrames {
 class TunnelCoalesceTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        tunnel_ = std::make_unique<TunnelImpl>(io_ctx_, 1, 0);
+        // shared_ptr (not unique_ptr): Tunnel inherits enable_shared_from_this
+        // so its timer handlers can capture weak_from_this(). Constructing
+        // via make_unique would leave weak_from_this returning an expired
+        // weak_ptr and the timer callbacks would silently no-op.
+        tunnel_ = std::make_shared<TunnelImpl>(io_ctx_, 1, 0);
         tunnel_->set_on_send_to_tox(
             [this](std::span<const uint8_t> wire) { captured_.record(wire); });
         tunnel_->set_state(Tunnel::State::Connecting);
@@ -60,7 +64,7 @@ class TunnelCoalesceTest : public ::testing::Test {
     }
 
     asio::io_context io_ctx_;
-    std::unique_ptr<TunnelImpl> tunnel_;
+    std::shared_ptr<TunnelImpl> tunnel_;
     CapturedFrames captured_;
 };
 

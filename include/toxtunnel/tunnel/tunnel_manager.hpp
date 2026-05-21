@@ -79,7 +79,12 @@ using TunnelClosedCallback = std::function<void(uint16_t tunnel_id)>;
 ///   // Create a local-initiated tunnel
 ///   auto id = manager.create_tunnel("internal.local", 8080);
 /// @endcode
-class TunnelManager {
+/// Owned via shared_ptr (TunnelServer.managers_ stores
+/// shared_ptr<TunnelManager>). `enable_shared_from_this` lets the
+/// reaper timer's async_wait handler capture a weak_ptr instead of
+/// `this`, so a teardown that races a not-yet-dispatched timer firing
+/// doesn't UAF the manager (S17 in the 2026-05-20 follow-up).
+class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
    public:
     // -----------------------------------------------------------------
     // Construction

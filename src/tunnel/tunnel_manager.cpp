@@ -82,22 +82,30 @@ void TunnelManager::disable_reaper() {
 void TunnelManager::schedule_reaper_tick() {
     reaper_active_.store(true, std::memory_order_release);
     reaper_timer_.expires_after(reaper_tick_);
-    reaper_timer_.async_wait([this](const asio::error_code& ec) {
+    // S17 / 2026-05-20 follow-up: weak_ptr capture so the handler
+    // gracefully bails out if the manager was destroyed between
+    // `cancel()` (non-blocking) and dispatch.
+    std::weak_ptr<TunnelManager> weak = weak_from_this();
+    reaper_timer_.async_wait([weak](const asio::error_code& ec) {
         if (ec == asio::error::operation_aborted) {
             return;
         }
+        auto self = weak.lock();
+        if (!self) {
+            return;  // Manager was destroyed before the timer fired.
+        }
         // Stash & re-read the timeout: disable_reaper() may have raced in.
-        if (reaper_idle_timeout_ns_.load(std::memory_order_relaxed) == 0) {
-            reaper_active_.store(false, std::memory_order_release);
+        if (self->reaper_idle_timeout_ns_.load(std::memory_order_relaxed) == 0) {
+            self->reaper_active_.store(false, std::memory_order_release);
             return;
         }
 
-        reap_idle_tunnels_once();
+        self->reap_idle_tunnels_once();
 
-        if (reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0) {
-            schedule_reaper_tick();
+        if (self->reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0) {
+            self->schedule_reaper_tick();
         } else {
-            reaper_active_.store(false, std::memory_order_release);
+            self->reaper_active_.store(false, std::memory_order_release);
         }
     });
 }

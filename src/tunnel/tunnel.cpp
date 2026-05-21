@@ -813,18 +813,28 @@ void TunnelImpl::coalesce_arm_timer_locked() {
     coalesce_timer_armed_ = true;
     const auto epoch = ++coalesce_timer_epoch_;
     coalesce_timer_.expires_after(std::chrono::microseconds(coalesce_max_delay_us_));
-    coalesce_timer_.async_wait([this, epoch](const std::error_code& ec) {
+    // S17 / 2026-05-20 follow-up: capture weak_ptr instead of bare `this`.
+    // steady_timer::cancel() is non-blocking; a handler already dispatched
+    // to the io_context's worker queue will still run after this Tunnel
+    // is destroyed unless the lambda holds a shared_ptr keeping it alive,
+    // or (as here) gracefully bails out via `weak.lock()`.
+    std::weak_ptr<Tunnel> weak = weak_from_this();
+    coalesce_timer_.async_wait([weak, epoch](const std::error_code& ec) {
         if (ec) {
             return;
         }
-        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        auto self = std::static_pointer_cast<TunnelImpl>(weak.lock());
+        if (!self) {
+            return;  // Tunnel was destroyed before the timer fired.
+        }
+        std::lock_guard<std::mutex> lock(self->coalesce_mutex_);
         // Reject stale firings (cancel-and-reset races).
-        if (epoch != coalesce_timer_epoch_) {
+        if (epoch != self->coalesce_timer_epoch_) {
             return;
         }
-        coalesce_timer_armed_ = false;
-        if (!coalesce_buf_.empty()) {
-            coalesce_emit_front_locked(coalesce_buf_.size());
+        self->coalesce_timer_armed_ = false;
+        if (!self->coalesce_buf_.empty()) {
+            self->coalesce_emit_front_locked(self->coalesce_buf_.size());
         }
     });
 }

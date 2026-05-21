@@ -37,7 +37,14 @@ class ProtocolFrame;
 /// owns and orchestrates multiple Tunnel instances.
 ///
 /// Concrete implementations handle the specific connection logic and state machine.
-class Tunnel {
+///
+/// Tunnels are always held via shared_ptr (the manager stores
+/// shared_ptr<Tunnel>; TCP/Tox callbacks capture them by value).
+/// `enable_shared_from_this` lets timer handlers (coalesce / future
+/// per-tunnel timers) capture a weak_ptr instead of `this`, so a
+/// destructor that races a not-yet-dispatched timer firing doesn't
+/// UAF (S17 in the 2026-05-20 follow-up).
+class Tunnel : public std::enable_shared_from_this<Tunnel> {
    public:
     // -----------------------------------------------------------------
     // State enum

@@ -146,10 +146,14 @@ TEST_F(IdleTunnelTest, AckDoesNotResetIdleTimer) {
 class ReaperTest : public ::testing::Test {
    protected:
     asio::io_context io_ctx;
-    std::unique_ptr<TunnelManager> manager;
+    // shared_ptr (not unique_ptr): TunnelManager inherits
+    // enable_shared_from_this so the reaper timer callback can capture
+    // weak_from_this(). A unique_ptr-owned instance would leave
+    // weak_from_this empty and the reaper would silently no-op.
+    std::shared_ptr<TunnelManager> manager;
 
     void SetUp() override {
-        manager = std::make_unique<TunnelManager>(io_ctx);
+        manager = std::make_shared<TunnelManager>(io_ctx);
         manager->set_send_handler([](const std::vector<uint8_t>&) { return true; });
     }
 
@@ -242,16 +246,17 @@ TEST_F(ReaperTest, TimerFiresPeriodically) {
 
     // Pump the io_context until the timer fires and removes the tunnel,
     // or we time out.
-    const bool reaped = RunUntil(io_ctx, [&] { return !manager->has_tunnel(500); }, 5000ms);
+    const bool reaped = RunUntil(
+        io_ctx, [&] { return !manager->has_tunnel(500); }, 5000ms);
     EXPECT_TRUE(reaped);
 }
 
 TEST_F(ReaperTest, DestructorCancelsCleanly) {
     auto local_io = std::make_unique<asio::io_context>();
-    auto mgr = std::make_unique<TunnelManager>(*local_io);
+    auto mgr = std::make_shared<TunnelManager>(*local_io);
     mgr->set_send_handler([](const std::vector<uint8_t>&) { return true; });
 
-    auto t = std::make_unique<TunnelImpl>(*local_io, /*tunnel_id=*/600, /*friend_number=*/1);
+    auto t = std::make_shared<TunnelImpl>(*local_io, /*tunnel_id=*/600, /*friend_number=*/1);
     t->set_state(Tunnel::State::Connected);
     mgr->add_tunnel(600, std::move(t));
 
