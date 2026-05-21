@@ -75,10 +75,17 @@ void TcpListener::on_connection_closed() {
 
     // If the accept loop was paused because we hit the connection limit,
     // resume it now that there is room for a new connection.
+    // M-S-2 (2026-05-20 fix-storm review): on_connection_closed can be
+    // invoked from any thread (TcpConnection's disconnect callback may
+    // fire from an I/O worker that isn't the acceptor's executor). asio
+    // acceptors are not thread-safe, so calling do_accept() directly
+    // would race async_accept on the acceptor. post the resume onto
+    // the acceptor's executor so it always runs on the right thread.
     if (accepting_.load(std::memory_order_relaxed) &&
         connection_count_.load(std::memory_order_relaxed) <
             max_connections_.load(std::memory_order_relaxed)) {
-        do_accept();
+        auto self = shared_from_this();
+        asio::post(acceptor_.get_executor(), [self]() { self->do_accept(); });
     }
 }
 
@@ -87,10 +94,12 @@ void TcpListener::set_max_connections(std::size_t max) {
 
     util::Logger::debug("TcpListener: max connections set to {}", max);
 
-    // If we now have room, resume accepting.
+    // If we now have room, resume accepting. Same strand-correctness
+    // note as on_connection_closed above (M-S-2).
     if (accepting_.load(std::memory_order_relaxed) &&
         connection_count_.load(std::memory_order_relaxed) < max) {
-        do_accept();
+        auto self = shared_from_this();
+        asio::post(acceptor_.get_executor(), [self]() { self->do_accept(); });
     }
 }
 
