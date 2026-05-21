@@ -538,5 +538,93 @@ TEST_F(TcpLoopbackTest, PauseReadHaltsBulkDeliveryUntilResume) {
     listener->stop();
 }
 
+// ===========================================================================
+// 7. PauseResumeWithInflightRead (S16 — inflight guard)
+// ===========================================================================
+
+// S16 / 2026-05-20 follow-up: resume_read used to unconditionally post
+// do_read onto the strand. If a read was already in flight when
+// pause_read fired, the in-flight completion would call do_read again
+// AND the resume_read post would also call do_read — two concurrent
+// async_read_some on the same socket, overlapping into the same
+// read_buffer_. This test exercises that interleaving with start_read
+// already active (the prior test paused BEFORE start_read, so this
+// path was never covered) and asserts the data still arrives intact.
+TEST_F(TcpLoopbackTest, PauseResumeAfterStartReadDoesNotCorruptData) {
+    auto listener = make_listener();
+    const auto port = listener->port();
+
+    std::promise<std::shared_ptr<core::TcpConnection>> server_conn_promise;
+    auto server_conn_future = server_conn_promise.get_future();
+    listener->start_accept([&server_conn_promise](std::shared_ptr<core::TcpConnection> conn) {
+        server_conn_promise.set_value(std::move(conn));
+    });
+
+    auto client = std::make_shared<core::TcpConnection>(io());
+    std::promise<void> connected_promise;
+    auto connected_future = connected_promise.get_future();
+    client->async_connect(loopback(port), [&connected_promise](const std::error_code& ec) {
+        ASSERT_FALSE(ec) << ec.message();
+        connected_promise.set_value();
+    });
+    ASSERT_EQ(connected_future.wait_for(kTimeout), std::future_status::ready);
+    connected_future.get();
+    ASSERT_EQ(server_conn_future.wait_for(kTimeout), std::future_status::ready);
+    auto server = server_conn_future.get();
+
+    // Use a recognisable pattern; if two concurrent reads overlap the
+    // single read_buffer_, the second read's bytes would clobber the
+    // first read's bytes and the assembled stream would not match.
+    constexpr std::size_t kPayloadSize = 256 * 1024;  // 256 KiB
+    std::vector<uint8_t> payload(kPayloadSize);
+    std::iota(payload.begin(), payload.end(), uint8_t{0});
+
+    auto received = std::make_shared<std::vector<uint8_t>>();
+    received->reserve(kPayloadSize);
+    auto mu = std::make_shared<std::mutex>();
+    std::promise<void> done_promise;
+    auto done_future = done_promise.get_future();
+    auto done_ptr = std::make_shared<std::promise<void>>(std::move(done_promise));
+    auto fired = std::make_shared<bool>(false);
+    server->set_on_data([received, mu, done_ptr, fired](const uint8_t* data, std::size_t len) {
+        std::lock_guard lock(*mu);
+        received->insert(received->end(), data, data + len);
+        if (received->size() >= kPayloadSize && !*fired) {
+            *fired = true;
+            done_ptr->set_value();
+        }
+    });
+
+    // start_read first → there is now an async_read_some in flight.
+    server->start_read();
+
+    // Hammer pause/resume from this test thread while bytes are flowing.
+    // With the old code, several of these resumes would post duplicate
+    // do_read calls and a second async_read_some would land on the
+    // socket alongside the first.
+    std::thread toggler([&] {
+        for (int i = 0; i < 200; ++i) {
+            server->pause_read();
+            server->resume_read();
+        }
+    });
+
+    EXPECT_TRUE(client->write(payload.data(), payload.size()));
+
+    toggler.join();
+    // Make sure we end un-paused so the kernel buffer drains.
+    server->resume_read();
+
+    ASSERT_EQ(done_future.wait_for(kTimeout), std::future_status::ready);
+    std::lock_guard lock(*mu);
+    ASSERT_EQ(received->size(), kPayloadSize);
+    EXPECT_TRUE(std::equal(payload.begin(), payload.end(), received->begin()))
+        << "stream corrupted under pause/resume cycling — likely overlapping reads";
+
+    client->close();
+    server->close();
+    listener->stop();
+}
+
 }  // namespace
 }  // namespace toxtunnel::integration

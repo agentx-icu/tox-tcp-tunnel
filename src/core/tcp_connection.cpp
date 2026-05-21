@@ -392,9 +392,13 @@ void TcpConnection::resume_read() {
     if (!was_paused) {
         return;
     }
-    // Re-post a read on the strand. The current state may have changed
-    // (closed, disconnecting) — do_read itself short-circuits in those
-    // cases, so just dispatch.
+    // Dispatch onto the strand and let do_read decide whether to actually
+    // start a new async_read_some. Just posting do_read directly would
+    // race with an in-flight read: if pause_read fired *after* do_read
+    // had already submitted async_read_some, the completion would later
+    // re-enter do_read and we'd end up with two concurrent reads on the
+    // same socket (S16 in the 2026-05-20 follow-up). The `read_in_flight_`
+    // guard inside do_read suppresses the second submission.
     auto self = shared_from_this();
     asio::post(strand_, [this, self]() { do_read(); });
 }
@@ -408,12 +412,20 @@ void TcpConnection::do_read() {
         // re-arm the loop when downstream drains.
         return;
     }
+    if (read_in_flight_) {
+        // A previous async_read_some is still outstanding. Its completion
+        // handler will call do_read() again — no need to submit a second
+        // read on the same socket.
+        return;
+    }
 
+    read_in_flight_ = true;
     auto self = shared_from_this();
     socket_.async_read_some(
         asio::buffer(read_buffer_),
         asio::bind_executor(
             strand_, [this, self](const std::error_code& ec, std::size_t bytes_transferred) {
+                read_in_flight_ = false;
                 if (ec) {
                     if (ec == asio::error::eof || ec == asio::error::connection_reset ||
                         ec == asio::error::operation_aborted) {

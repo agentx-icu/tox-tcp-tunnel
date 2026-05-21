@@ -292,6 +292,12 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// `resume_read` from arbitrary threads (atomic).
     std::atomic<bool> read_paused_{false};
 
+    /// True between async_read_some submission and its completion. Plain
+    /// bool because all reads/writes happen on `strand_`. Guards against
+    /// `resume_read` posting a second concurrent read while the previous
+    /// one is still in flight (S16 in the 2026-05-20 follow-up).
+    bool read_in_flight_{false};
+
     // Limits
     std::size_t max_write_buffer_size_ = kDefaultMaxWriteBufferSize;
 
