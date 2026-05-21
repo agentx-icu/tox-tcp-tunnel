@@ -4,6 +4,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "toxtunnel/util/atomic_file.hpp"
+
 namespace toxtunnel {
 
 // ---------------------------------------------------------------------------
@@ -412,12 +414,17 @@ std::string RulesEngine::to_yaml() const {
 
 util::Expected<void, std::string> RulesEngine::save(const std::filesystem::path& filepath) const {
     try {
-        std::ofstream ofs(filepath);
-        if (!ofs) {
-            return util::make_unexpected(std::string("Failed to open file for writing: ") +
-                                         filepath.string());
+        // Atomic write so a crash mid-save can't leave a truncated rules.yaml
+        // (which would then fail to parse on the next SIGHUP reload — the
+        // rules file is the *core* reloadable artefact, so corrupting it
+        // during a routine save is a high-impact bug).
+        const std::string serialised = to_yaml();
+        util::AtomicFileOptions opts{};
+        opts.fsync_parent_dir = true;
+        auto written = util::atomic_write_file(filepath, serialised, opts);
+        if (!written) {
+            return util::make_unexpected(std::string("Failed to write rules: ") + written.error());
         }
-        ofs << to_yaml();
         return {};
     } catch (const std::exception& e) {
         return util::make_unexpected(std::string("Failed to save rules: ") + e.what());

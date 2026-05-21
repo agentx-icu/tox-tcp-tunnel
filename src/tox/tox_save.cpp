@@ -75,10 +75,13 @@ util::Expected<Success, std::string> save_tox_data(const Tox* tox,
     // Hand off to the shared atomic-write helper. Defaults durably fsync
     // both the temp file and the parent directory — `tox_save.dat` carries
     // the identity private key and is the single most important file to
-    // protect from torn writes.
+    // protect from torn writes. Also lock the file mode to owner-only:
+    // the default 0644 from AtomicFileOptions would expose the private
+    // key to every local user. (S18 in the 2026-05-20 follow-up.)
     util::AtomicFileOptions opts;
     opts.fsync_parent_dir = true;
     opts.use_full_fsync_macos = true;
+    opts.mode = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
     auto write_result = util::atomic_write_file(
         filepath, std::span<const std::uint8_t>(data.data(), data.size()), opts);
     if (!write_result) {

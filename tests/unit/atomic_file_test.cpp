@@ -117,5 +117,40 @@ TEST(AtomicWriteFileTest, ConcurrentWritersDoNotCorrupt) {
     std::filesystem::remove(path);
 }
 
+// S18 / 2026-05-20 follow-up: tox_save.dat carries the Tox identity
+// private key and must NOT be world-readable. Verify atomic_write_file
+// honours opts.mode = owner-only (0600) on POSIX. Skipped on Windows
+// where AtomicFileOptions::mode is documented as ignored.
+TEST(AtomicWriteFileTest, RespectsOwnerOnlyMode) {
+#if !defined(_WIN32)
+    auto path = std::filesystem::temp_directory_path() / "toxtunnel_atomic_owner_only.bin";
+    std::filesystem::remove(path);
+
+    util::AtomicFileOptions opts;
+    opts.mode = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+
+    const std::vector<std::uint8_t> payload(64, 0x55);
+    auto r = util::atomic_write_file(
+        path, std::span<const std::uint8_t>(payload.data(), payload.size()), opts);
+    ASSERT_TRUE(r) << r.error();
+    ASSERT_TRUE(std::filesystem::exists(path));
+
+    auto actual = std::filesystem::status(path).permissions();
+    // Group / others bits must be unset; owner read+write must be set.
+    constexpr auto kForbidden =
+        std::filesystem::perms::group_read | std::filesystem::perms::group_write |
+        std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+        std::filesystem::perms::others_write | std::filesystem::perms::others_exec;
+    EXPECT_EQ(actual & kForbidden, std::filesystem::perms::none)
+        << "tox_save.dat-class files must not be readable/writable by group or others";
+    EXPECT_NE(actual & std::filesystem::perms::owner_read, std::filesystem::perms::none);
+    EXPECT_NE(actual & std::filesystem::perms::owner_write, std::filesystem::perms::none);
+
+    std::filesystem::remove(path);
+#else
+    GTEST_SKIP() << "AtomicFileOptions::mode is ignored on Windows";
+#endif
+}
+
 }  // namespace
 }  // namespace toxtunnel::test

@@ -901,11 +901,17 @@ bool ToxAdapter::write_save_data() const {
     tox_get_savedata(tox_.get(), data.data());
 
     // The Tox identity is the most security-critical file we own; loss of it
-    // breaks every existing tunnel forever. Use the strongest durability
-    // setting: parent-dir fsync + F_FULLFSYNC on macOS.
+    // breaks every existing tunnel forever, and a read by another local
+    // user is an identity theft. Use the strongest durability setting
+    // (parent-dir fsync + F_FULLFSYNC on macOS) AND tighten the file mode
+    // to owner-only — the default 0644 from AtomicFileOptions is fine for
+    // bootstrap caches but unacceptable for a private key. The inspect
+    // socket is chmod 0600 for the same reason; the identity file ought to
+    // be at least as restrictive.
     util::AtomicFileOptions opts{};
     opts.fsync_parent_dir = true;
     opts.use_full_fsync_macos = true;
+    opts.mode = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
 
     auto written = util::atomic_write_file(path, std::span<const std::uint8_t>(data), opts);
     if (!written) {
