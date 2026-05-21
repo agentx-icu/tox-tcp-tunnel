@@ -6,7 +6,11 @@
 #include <string>
 
 #if defined(_WIN32)
+#include <aclapi.h>
+#include <sddl.h>
 #include <windows.h>
+
+#include <vector>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -134,9 +138,86 @@ Expected<void, std::string> posix_write(const std::filesystem::path& path,
 #endif
 
 #if defined(_WIN32)
+
+// M-S-1 (2026-05-20 fix-storm review): on POSIX the `opts.mode` field
+// is applied via open(2)'s mode argument so callers like tox_save.dat
+// land at 0600. The Windows path used to ignore opts entirely, so the
+// Tox private-key file inherited the parent directory's DACL — on a
+// multi-user box that meant other users could read the identity.
+// Build an owner-only SECURITY_ATTRIBUTES when the caller asks for
+// restricted perms (any POSIX-style mode that excludes group/world);
+// otherwise fall back to inherited ACLs (matches the 0644 default).
+namespace {
+
+// A POSIX mode of 0600/0400 has the group + world bits all zero.
+bool is_owner_only_mode(unsigned mode) {
+    constexpr unsigned kGroupOrWorldRW = 077;  // S_IRWXG | S_IRWXO equivalent
+    return (mode & kGroupOrWorldRW) == 0;
+}
+
+struct OwnerOnlySa {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    SECURITY_ATTRIBUTES sa{};
+    ~OwnerOnlySa() {
+        if (sd) {
+            ::LocalFree(sd);
+        }
+    }
+};
+
+// Build an SD that grants the current user GENERIC_ALL and excludes
+// everyone else via a protected DACL. Returns false on any Win32
+// failure (caller falls back to the inherited ACL — same as before).
+bool build_owner_only_sa(OwnerOnlySa& out) {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return false;
+    }
+    DWORD needed = 0;
+    ::GetTokenInformation(token, TokenUser, nullptr, 0, &needed);
+    if (needed == 0) {
+        ::CloseHandle(token);
+        return false;
+    }
+    std::vector<std::uint8_t> buf(needed);
+    if (!::GetTokenInformation(token, TokenUser, buf.data(), needed, &needed)) {
+        ::CloseHandle(token);
+        return false;
+    }
+    ::CloseHandle(token);
+
+    PSID user_sid = reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid;
+    LPSTR sid_str = nullptr;
+    if (!::ConvertSidToStringSidA(user_sid, &sid_str)) {
+        return false;
+    }
+    // SDDL: owner = user, group = user, protected DACL with one ACE
+    // granting GENERIC_ALL ("GA") to the user SID. "P" prevents
+    // inheritance of less-restrictive parent ACEs.
+    std::string sddl = "O:";
+    sddl += sid_str;
+    sddl += "G:";
+    sddl += sid_str;
+    sddl += "D:P(A;;GA;;;";
+    sddl += sid_str;
+    sddl += ")";
+    ::LocalFree(sid_str);
+
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl.c_str(), SDDL_REVISION_1,
+                                                                &out.sd, nullptr)) {
+        return false;
+    }
+    out.sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    out.sa.lpSecurityDescriptor = out.sd;
+    out.sa.bInheritHandle = FALSE;
+    return true;
+}
+
+}  // namespace
+
 Expected<void, std::string> windows_write(const std::filesystem::path& path,
                                           std::span<const std::uint8_t> contents,
-                                          const AtomicFileOptions& /*opts*/) {
+                                          const AtomicFileOptions& opts) {
     // Match the POSIX path: tmp file name carries the PID so two processes
     // writing the same target don't truncate each other's tmp (C-25 in the
     // 2026-05-20 review). The PID alone is sufficient because all callers
@@ -144,7 +225,12 @@ Expected<void, std::string> windows_write(const std::filesystem::path& path,
     auto tmp = path;
     tmp += L".tmp." + std::to_wstring(::GetCurrentProcessId());
 
-    HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+    OwnerOnlySa owner_only;
+    SECURITY_ATTRIBUTES* sa_ptr = nullptr;
+    if (is_owner_only_mode(opts.mode) && build_owner_only_sa(owner_only)) {
+        sa_ptr = &owner_only.sa;
+    }
+    HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, sa_ptr, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         return make_unexpected(std::string("CreateFileW tmp failed: ") +
