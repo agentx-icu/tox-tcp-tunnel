@@ -369,8 +369,20 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
         if (prev_ack_ns > 0) {
             const std::int64_t delta_ns = now_ns - prev_ack_ns;
             if (delta_ns > 1'000'000) {  // > 1 ms
+                // C-S-2 (2026-05-20 fix-storm review): S21 protected
+                // `bps * rtt` in BdpFlowControl with __int128 but left
+                // the upstream `bps` producer at plain int64. `acked`
+                // is uint32_t, so `acked * 1e9` reaches ~4.3e18 — inside
+                // int64 today, but a single bytes_acked widening to
+                // uint64 in the future, or a coalesced ACK carrying
+                // more than 4 GiB, would silently wrap. Compute in
+                // __int128 and clamp to a sane 100 Gbps ceiling before
+                // feeding the EWMA so a hostile peer can't pump the
+                // estimator with bogus values.
+                constexpr std::int64_t kMaxBpsCap = 12'500'000'000LL;  // 100 Gbps
+                const __int128 bps128 = (static_cast<__int128>(acked) * 1'000'000'000) / delta_ns;
                 const std::int64_t bps =
-                    static_cast<std::int64_t>(acked) * 1'000'000'000 / delta_ns;
+                    static_cast<std::int64_t>(std::min<__int128>(bps128, kMaxBpsCap));
                 observe_bandwidth_bps(bps);
                 util::MetricsRegistry::instance().observe_tunnel_bandwidth_bps(bps);
             }
