@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "toxtunnel/util/logger.hpp"
+
 namespace toxtunnel::tunnel {
 
 // ===========================================================================
@@ -126,6 +128,20 @@ ProtocolFrame ProtocolFrame::make_tunnel_open(uint16_t tunnel_id, const std::str
     ProtocolFrame frame(FrameType::TUNNEL_OPEN, tunnel_id);
 
     // Payload: [host_len:1][host:host_len][port:2]
+    // The wire host_len is u8 (max 255) — DNS names are bounded at 253 per
+    // RFC 1035 so this only bites on user-error inputs (a malformed rules
+    // file entry, a SOCKS5 client sending junk). The previous silent
+    // truncation would connect to a *prefix* of the configured target,
+    // i.e. quietly dial the wrong host. Log a warning so the operator
+    // sees the truncation in the daemon log instead of debugging a
+    // "wrong host" mystery downstream. (S26 / H-22 in the 2026-05-20
+    // review.)
+    if (host.size() > 255) {
+        util::Logger::warn(
+            "TUNNEL_OPEN host length {} exceeds wire cap (255); truncating — "
+            "this almost certainly indicates a malformed forward target",
+            host.size());
+    }
     auto host_len = static_cast<uint8_t>(std::min<std::size_t>(host.size(), 255));
     frame.payload_.reserve(1 + host_len + 2);
 
