@@ -13,8 +13,15 @@ namespace toxtunnel::app {
 
 namespace {
 
+// system_clock (not steady_clock) is mandatory here: the saved value is
+// persisted to YAML and compared against `now_ns()` on the *next* process
+// run, possibly after a reboot. steady_clock's epoch is arbitrary and
+// resets per boot, so the old `saved_at_ns - cutoff` comparison was
+// essentially random across restarts (C-9 in the 2026-05-20 review).
 [[nodiscard]] std::int64_t now_ns() {
-    return std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 }  // namespace
@@ -125,13 +132,19 @@ util::Expected<void, std::string> TunnelResumeStore::save() const {
 
 void TunnelResumeStore::upsert(const TunnelResumeEntry& entry) {
     std::lock_guard<std::mutex> lock(mu_);
+    // Always stamp with wall time so the staleness comparison on the next
+    // process run is meaningful (see C-9 note on now_ns). Callers don't
+    // need to populate saved_at_ns; if they do, we overwrite to keep the
+    // invariant local to this store.
+    TunnelResumeEntry stamped = entry;
+    stamped.saved_at_ns = now_ns();
     auto it = std::find_if(entries_.begin(), entries_.end(), [&](const TunnelResumeEntry& e) {
-        return e.tunnel_id == entry.tunnel_id;
+        return e.tunnel_id == stamped.tunnel_id;
     });
     if (it == entries_.end()) {
-        entries_.push_back(entry);
+        entries_.push_back(stamped);
     } else {
-        *it = entry;
+        *it = stamped;
     }
 }
 

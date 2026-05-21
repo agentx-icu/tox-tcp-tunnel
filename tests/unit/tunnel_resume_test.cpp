@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 
 #include "toxtunnel/app/tunnel_resume_store.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
@@ -134,20 +135,60 @@ TEST(TunnelResumeStoreTest, RoundTripPersist) {
     std::filesystem::remove_all(dir);
 }
 
+// C-9 / 2026-05-20 finding: saved_at_ns must come from system_clock,
+// not steady_clock, because the value is persisted to YAML and compared
+// against now_ns() on the next process run (possibly after a reboot).
+// steady_clock's epoch is arbitrary and per-boot.
+TEST(TunnelResumeStoreTest, SavedTimestampIsWallClock) {
+    using namespace std::chrono;
+
+    app::TunnelResumeStore store;
+    app::TunnelResumeEntry e;
+    e.tunnel_id = 1;
+    e.target_host = "127.0.0.1";
+    e.target_port = 80;
+    store.upsert(e);
+
+    // After upsert, the stored saved_at_ns must be a recent wall-clock
+    // value. Test bounds: 2026-01-01 (~1.767e18 ns) lower, two years
+    // ahead upper. Steady-clock typical values are << 1e18 (it starts
+    // from process boot, so under 10^15 ns even after a year of uptime).
+    auto entries = store.entries();
+    ASSERT_EQ(entries.size(), 1u);
+    const auto saved = entries[0].saved_at_ns;
+
+    const auto now_wall =
+        duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
+    EXPECT_GT(saved, static_cast<std::int64_t>(1'700'000'000) * 1'000'000'000)
+        << "saved_at_ns looks like a steady_clock value, not wall clock";
+    EXPECT_LE(saved, now_wall);
+    // And the stamp lands within a tight window of "now" (clock skew aside).
+    EXPECT_LT(now_wall - saved, static_cast<std::int64_t>(60) * 1'000'000'000)
+        << "saved_at_ns drifted from system_clock::now()";
+}
+
 TEST(TunnelResumeStoreTest, DropsEntriesOlderThanMaxAge) {
     auto dir = std::filesystem::temp_directory_path() / "toxtunnel_resume_store_age";
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     auto path = dir / "tunnel_resume_state.yaml";
 
+    // Hand-craft the YAML rather than going through upsert(): upsert
+    // always stamps `saved_at_ns = now_ns()` so the entry is by
+    // construction fresh, which is the right runtime behaviour but not
+    // what we want to test here. We want the load-side filter to drop
+    // an ancient entry that was written by a previous process.
     {
-        app::TunnelResumeStore store;
-        store.set_path(path);
-        app::TunnelResumeEntry stale;
-        stale.tunnel_id = 5;
-        stale.saved_at_ns = 1;  // ancient
-        store.upsert(stale);
-        ASSERT_TRUE(store.save());
+        std::ofstream out(path);
+        out << "version: 1\n";
+        out << "tunnels:\n";
+        out << "  - tunnel_id: 5\n";
+        out << "    target_host: 127.0.0.1\n";
+        out << "    target_port: 22\n";
+        out << "    last_local_recv_offset: 0\n";
+        out << "    last_local_send_offset: 0\n";
+        out << "    local_listener_port: 0\n";
+        out << "    saved_at_ns: 1\n";  // ancient (Unix epoch + 1ns)
     }
 
     app::TunnelResumeStore loaded;
