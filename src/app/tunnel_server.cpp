@@ -320,7 +320,28 @@ void TunnelServer::on_friend_request(const tox::PublicKeyArray& public_key,
     auto pk_hex = tox::bytes_to_hex(public_key.data(), public_key.size());
     util::Logger::info("Friend request from {} (message: {})", pk_hex, message);
 
-    // Auto-accept friend requests.
+    // S28 / H-2 (2026-05-20 review): use the rules engine as an
+    // implicit allowlist. Previously every incoming friend request was
+    // auto-accepted, so anyone holding the server's Tox ID could spam
+    // requests and grow the friend list without bound (toxcore enforces
+    // an internal cap, but well before that the daemon's memory and the
+    // rules engine's per-friend lookup both degrade). A friend that
+    // appears nowhere in rules.yaml can never open a tunnel anyway
+    // (default-deny — see S14), so refusing the friend request itself
+    // is strictly safer.
+    bool allowed;
+    {
+        std::shared_lock rules_lock(rules_mutex_);
+        allowed = rules_engine_.has_rules_for_friend(pk_hex);
+    }
+    if (!allowed) {
+        util::Logger::warn(
+            "Refused friend request from {}: no rule entry for this Tox ID — "
+            "add the public key to rules.yaml to allow this peer",
+            pk_hex);
+        return;
+    }
+
     auto result = tox_adapter_->add_friend_norequest(public_key);
     if (result) {
         util::Logger::info("Accepted friend request from {}, friend_number={}", pk_hex,
