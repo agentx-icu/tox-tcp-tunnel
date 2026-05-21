@@ -125,21 +125,49 @@ util::Expected<void, std::string> validate_bootstrap_nodes(
 
 // SOCKS5 has no authentication in v1, so the listener must bind to a loopback
 // address. Accepts: "localhost" (case-insensitive), any 127.0.0.0/8 address,
-// or "::1". Anything else exposes an unauthenticated proxy on the LAN and is
-// rejected at config-validation time.
+// or "::1" (with or without brackets). Anything else — most importantly the
+// INADDR_ANY forms ("0.0.0.0", "::") and IPv4-mapped loopback
+// "::ffff:127.x.x.x" — is rejected at config-validation time.
+// H-S-8 (2026-05-20 fix-storm review): the runtime Socks5Listener guard
+// also enforces this on the resolved asio::ip::address (S6), but the
+// two layers must agree so reload paths and direct API callers don't
+// see divergent verdicts.
 bool is_loopback_host(const std::string& host) {
     if (host.empty()) {
         return false;
     }
-    if (host == "::1") {
+
+    // Strip optional surrounding brackets ("[::1]" form).
+    std::string_view h(host);
+    if (h.size() >= 2 && h.front() == '[' && h.back() == ']') {
+        h.remove_prefix(1);
+        h.remove_suffix(1);
+    }
+
+    // Explicit reject: INADDR_ANY / in6addr_any forms. Without this they'd
+    // fall through and be misclassified as "not loopback" with a confusing
+    // generic error; calling them out keeps the verdict and the message
+    // honest.
+    if (h == "0.0.0.0" || h == "::") {
+        return false;
+    }
+
+    if (h == "::1") {
         return true;
     }
-    if (host.size() >= 4 && host.compare(0, 4, "127.") == 0) {
+    // IPv4-mapped loopback like ::ffff:127.0.0.1
+    if ((h.size() > 7) && (h.substr(0, 7) == "::ffff:" || h.substr(0, 7) == "::FFFF:")) {
+        const auto rest = h.substr(7);
+        if (rest.size() >= 4 && rest.compare(0, 4, "127.") == 0) {
+            return true;
+        }
+    }
+    if (h.size() >= 4 && h.compare(0, 4, "127.") == 0) {
         return true;
     }
     std::string lower;
-    lower.reserve(host.size());
-    for (char c : host) {
+    lower.reserve(h.size());
+    for (char c : h) {
         lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
     }
     return lower == "localhost";
