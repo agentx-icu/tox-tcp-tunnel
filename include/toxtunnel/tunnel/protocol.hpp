@@ -28,6 +28,25 @@ inline constexpr std::size_t kMaxPayloadSize = 65535;
 /// First byte prepended to every ProtocolFrame when sent as a toxcore lossless
 /// custom packet. Toxcore reserves the 0xA0..0xFF range for application-defined
 /// lossless packets; we use 0xA0 across client and server.
+///
+/// Wire-format convention (matters for any code touching the serialise/
+/// deserialise pair — see C-16 in the 2026-05-20 review):
+///
+/// * `serialize()` returns the **5-byte tunnel header + payload**, WITHOUT
+///   the 0xA0 lossless byte. Callers (TunnelServer / TunnelClient
+///   `set_on_send_to_tox`) prepend `kLosslessPacketByte` before handing the
+///   packet to `ToxAdapter::send_lossless_packet`.
+///
+/// * `serialize_tunnel_data_in_place()` writes the **0xA0 + 5-byte header**
+///   directly into the OwnedFrameBuffer's reserved prefix so the zero-copy
+///   outbound path can feed `wire_view()` straight to toxcore without an
+///   extra allocation. This is the only function that emits 6 prefix bytes;
+///   any other zero-copy call site must follow the same convention.
+///
+/// * `deserialize()` consumes the **5-byte tunnel header + payload**, with
+///   no 0xA0 byte. Inbound callers (lossless-packet handlers in
+///   TunnelServer / TunnelClient) skip `data[0]` (the lossless byte from
+///   toxcore) before invoking deserialize.
 inline constexpr uint8_t kLosslessPacketByte = 0xA0;
 
 // ---------------------------------------------------------------------------
@@ -268,12 +287,18 @@ class ProtocolFrame {
     /// `OwnedFrameBuffer`'s shared allocation — once the async-send completion
     /// handler drops the last reference, the allocation goes away.
     ///
-    /// Wire format is unchanged from `serialize()`.
+    /// **Wire-prefix convention** — see also `kLosslessPacketByte` doc. This
+    /// function writes 6 bytes (0xA0 + 5-byte header); `serialize()` writes 5
+    /// (no 0xA0). They are NOT round-trippable through `deserialize()`
+    /// directly: zero-copy emitted bytes are consumed by toxcore, never by
+    /// our own deserialize.
     static void serialize_tunnel_data_in_place(OwnedFrameBuffer& buf, uint16_t tunnel_id) noexcept;
 
     /// Deserialize a frame from a byte buffer.
     ///
-    /// @param data  Buffer that must contain at least the 5-byte header.
+    /// @param data  Buffer that must contain at least the 5-byte tunnel
+    ///              header, **with the 0xA0 lossless byte already
+    ///              stripped** (inbound callers slice `data + 1`).
     ///              Extra trailing bytes after the frame are ignored.
     ///
     /// @return The parsed frame on success, or a `std::error_code` on
