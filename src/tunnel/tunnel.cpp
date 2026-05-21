@@ -559,7 +559,19 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
                 // function so the send window doesn't leak forever; without
                 // the refund a few consecutive drops would saturate
                 // send_window_used_ and pause TCP read indefinitely.
-                send_window_used_.fetch_sub(chunk_size, std::memory_order_relaxed);
+                // S29 (2026-05-20 follow-up): refund via a CAS loop that
+                // saturates at zero — a plain fetch_sub can underflow an
+                // unsigned counter if a racing TUNNEL_ACK already reduced
+                // it below `chunk_size` (size_t wraps to ~SIZE_MAX, which
+                // would then trip backpressure permanently).
+                std::size_t cur = send_window_used_.load(std::memory_order_relaxed);
+                while (true) {
+                    const std::size_t next = cur >= chunk_size ? cur - chunk_size : 0;
+                    if (send_window_used_.compare_exchange_weak(cur, next,
+                                                                std::memory_order_relaxed)) {
+                        break;
+                    }
+                }
                 util::Logger::debug(
                     "Tunnel {} dropped {} bytes (Tox send rejected); refunded send window",
                     tunnel_id_, chunk_size);
@@ -822,8 +834,15 @@ void TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
         // immediate emit path. send_data_to_tox charged `bytes` to
         // send_window_used_ when the data entered the coalesce buffer;
         // if Tox now refuses the wire frame the budget has to come back
-        // or the tunnel will pause TCP read forever.
-        send_window_used_.fetch_sub(bytes, std::memory_order_relaxed);
+        // or the tunnel will pause TCP read forever. S29: saturating
+        // CAS — see the matching note in send_data_to_tox.
+        std::size_t cur = send_window_used_.load(std::memory_order_relaxed);
+        while (true) {
+            const std::size_t next = cur >= bytes ? cur - bytes : 0;
+            if (send_window_used_.compare_exchange_weak(cur, next, std::memory_order_relaxed)) {
+                break;
+            }
+        }
         util::Logger::debug(
             "Tunnel {} dropped {} coalesced bytes (Tox send rejected); refunded send window",
             tunnel_id_, bytes);
