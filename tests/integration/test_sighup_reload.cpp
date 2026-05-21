@@ -100,12 +100,12 @@ TEST(SighupReloadTest, SigtermUnblocksRunWithReArmingSighupHandler) {
     });
 
     // Same re-arming pattern as cli/main.cpp's reload handler.
-    std::function<void(const asio::error_code&, int)> on_reload =
-        [&](const asio::error_code& ec, int /*sig*/) {
-            if (ec)
-                return;
-            reload_signals.async_wait(on_reload);
-        };
+    std::function<void(const asio::error_code&, int)> on_reload = [&](const asio::error_code& ec,
+                                                                      int /*sig*/) {
+        if (ec)
+            return;
+        reload_signals.async_wait(on_reload);
+    };
     reload_signals.async_wait(on_reload);
 
     std::thread killer([] {
