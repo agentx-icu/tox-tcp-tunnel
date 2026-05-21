@@ -105,6 +105,14 @@ class RateLimiter {
     /// override.
     void set_friend_spec(std::string_view friend_pk, const RateLimitSpec& spec);
 
+    /// Drop every per-friend override and reset all bucket counters. Used
+    /// on rules-reload to avoid leaving stale token state for a friend
+    /// that has been removed from the new rules (or whose previous
+    /// override has been removed). After this call, all friends fall
+    /// back to the default spec; the caller is expected to re-install
+    /// any per-friend specs from the new rules.
+    void clear_all_friend_specs();
+
     /// Look up the effective spec for the given friend public key. Returns
     /// the per-friend override if installed, otherwise the default.
     [[nodiscard]] RateLimitSpec effective_spec(std::string_view friend_pk) const;

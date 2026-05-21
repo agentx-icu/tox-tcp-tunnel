@@ -99,6 +99,19 @@ Expected<void, std::string> check_reloadable(const Config& current, const Config
         if (a.server_id != b.server_id) {
             return make_unexpected(field_rejection("client.server_id"));
         }
+        // The fallback list directly drives the set of Tox friends the client
+        // keeps online and the failover state machine's candidate set. We
+        // don't currently re-add/re-remove friends on reload, so a change
+        // here would silently fail to take effect. Reject explicitly.
+        if (a.fallback_server_ids != b.fallback_server_ids) {
+            return make_unexpected(field_rejection("client.fallback_server_ids"));
+        }
+        // Timeouts driving the failover state machine — changing them at
+        // runtime would re-arm timers in a way that the running state
+        // machine isn't prepared for.
+        if (!(a.failover == b.failover)) {
+            return make_unexpected(field_rejection("client.failover"));
+        }
         if (a.pipe_target != b.pipe_target) {
             return make_unexpected(field_rejection("client.pipe_target"));
         }

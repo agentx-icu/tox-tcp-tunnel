@@ -424,6 +424,12 @@ void TunnelServer::on_self_connection(bool connected) {
 void TunnelServer::sync_rate_limiter() {
     auto& limiter = rate_limiter_instance();
     std::shared_lock rules_lock(rules_mutex_);
+    // Wipe all prior per-friend specs and bucket state. Without this, a
+    // friend that was present in the old rules but removed from the new
+    // ones would silently retain its old token bucket and continue to be
+    // limited (or unlimited) per the stale spec. Re-applying defaults +
+    // per-friend overrides below rebuilds the table from scratch.
+    limiter.clear_all_friend_specs();
     limiter.set_default_spec(rules_engine_.rate_limit_defaults());
     for (const auto& rule : rules_engine_.rules()) {
         if (!rule.rate_limit.empty()) {

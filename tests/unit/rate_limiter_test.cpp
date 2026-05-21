@@ -139,6 +139,43 @@ TEST(RateLimiterTest, BytesBucketDeniesWhenExhausted) {
 // 6. parse_rate_limit_mode round-trips known values.
 // =============================================================================
 
+// H-3 / 2026-05-20 finding: rules reload calls clear_all_friend_specs()
+// to drop stale per-friend buckets. Without this, a friend removed from
+// the new rules would silently retain its old (possibly tightening) spec
+// and continue to be limited under stale parameters.
+TEST(RateLimiterTest, ClearAllFriendSpecsDropsOverridesAndBuckets) {
+    RateLimiter rl;
+
+    // Tight default; loose per-friend override exhausts friend1's bucket.
+    RateLimitSpec defaults;
+    defaults.mode = RateLimitMode::Enforce;
+    defaults.open_per_sec = 1;
+    defaults.open_burst = 1;
+    rl.set_default_spec(defaults);
+
+    RateLimitSpec loose;
+    loose.mode = RateLimitMode::Enforce;
+    loose.open_per_sec = 100;
+    loose.open_burst = 100;
+    rl.set_friend_spec(kFriend1, loose);
+
+    // Drain the loose bucket so its open_tokens are near 0.
+    for (int i = 0; i < 100; ++i) {
+        (void)rl.try_consume_open(kFriend1);
+    }
+
+    // Reload: clear and re-install only the default. friend1 should now
+    // be governed by the (tight) default spec, not its old loose state.
+    rl.clear_all_friend_specs();
+    rl.set_default_spec(defaults);
+
+    EXPECT_EQ(rl.effective_spec(kFriend1).mode, defaults.mode);
+    EXPECT_EQ(rl.effective_spec(kFriend1).open_burst, defaults.open_burst);
+    // Burst of 1 -> first open allowed, second denied.
+    EXPECT_TRUE(rl.try_consume_open(kFriend1));
+    EXPECT_FALSE(rl.try_consume_open(kFriend1));
+}
+
 TEST(RateLimiterTest, ParseModeRoundTrip) {
     RateLimitMode m = RateLimitMode::Off;
     EXPECT_TRUE(parse_rate_limit_mode("enforce", m));

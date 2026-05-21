@@ -183,6 +183,28 @@ TEST(CheckReloadableTest, RejectsClientServerIdChange) {
     EXPECT_NE(res.error().find("client.server_id"), std::string::npos) << res.error();
 }
 
+// C-23 / 2026-05-20 finding: adding or changing a fallback id must be
+// rejected at reload — the running client doesn't re-friend on reload.
+TEST(CheckReloadableTest, RejectsClientFallbackServerIdsChange) {
+    auto a = make_client_config();
+    auto b = a;
+    b.client->fallback_server_ids.push_back(std::string(76, 'C'));
+    auto res = check_reloadable(a, b);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_NE(res.error().find("client.fallback_server_ids"), std::string::npos) << res.error();
+}
+
+// C-24 / 2026-05-20 finding: failover timing knobs control a live state
+// machine; reload would re-arm timers the running machine isn't ready for.
+TEST(CheckReloadableTest, RejectsClientFailoverChange) {
+    auto a = make_client_config();
+    auto b = a;
+    b.client->failover.timeout_seconds = a.client->failover.timeout_seconds + 1;
+    auto res = check_reloadable(a, b);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_NE(res.error().find("client.failover"), std::string::npos) << res.error();
+}
+
 TEST(CheckReloadableTest, RejectsMetricsChange) {
     auto a = make_server_config();
     auto b = a;

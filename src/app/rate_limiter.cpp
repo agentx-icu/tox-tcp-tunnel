@@ -35,6 +35,11 @@ void RateLimiter::set_default_spec(const RateLimitSpec& spec) {
     default_spec_ = spec;
 }
 
+void RateLimiter::clear_all_friend_specs() {
+    std::lock_guard<std::mutex> lock(mu_);
+    buckets_.clear();
+}
+
 void RateLimiter::set_friend_spec(std::string_view friend_pk, const RateLimitSpec& spec) {
     const auto key = normalise_key(friend_pk);
     std::lock_guard<std::mutex> lock(mu_);
