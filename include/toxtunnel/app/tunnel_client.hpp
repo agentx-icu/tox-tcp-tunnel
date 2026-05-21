@@ -186,7 +186,15 @@ class TunnelClient {
     std::unique_ptr<tox::ToxAdapter> tox_adapter_;
 
     /// Manages active tunnels for the server friend.
-    std::unique_ptr<tunnel::TunnelManager> tunnel_mgr_;
+    // shared_ptr (not unique_ptr): on_close lambdas registered by pipe-
+    // mode and SOCKS5 tunnels need to call tunnel_mgr_->remove_tunnel
+    // *after* the tunnel's lifetime crossed an async boundary. The
+    // previous bare `tunnel_mgr_.get()` capture (H-S-2/H-S-4 in the
+    // fix-storm review) would UAF if request_stop() destroyed the
+    // owning TunnelClient before the lambda fired. shared_ptr capture
+    // in the lambda keeps the manager alive for as long as the lambda
+    // needs it.
+    std::shared_ptr<tunnel::TunnelManager> tunnel_mgr_;
 
     /// One TCP listener per forwarding rule.
     // shared_ptr (not unique_ptr): TcpListener now inherits

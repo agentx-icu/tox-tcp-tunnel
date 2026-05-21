@@ -160,7 +160,7 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     }
 
     // Create TunnelManager
-    tunnel_mgr_ = std::make_unique<tunnel::TunnelManager>(io_ctx_->get_io_context());
+    tunnel_mgr_ = std::make_shared<tunnel::TunnelManager>(io_ctx_->get_io_context());
 
     // Set up callbacks and handlers
     setup_tox_callbacks();
@@ -671,14 +671,17 @@ void TunnelClient::start_pipe_mode() {
         }
     });
 
-    auto* tunnel_mgr_ptr = tunnel_mgr_.get();
-    tunnel->set_on_close([this, tunnel_mgr_ptr, tunnel_id]() {
+    // H-S-2 (2026-05-20 fix-storm review): capture shared_ptr to the
+    // manager, not a raw pointer. request_stop() can race the on_close
+    // lambda; without this the lambda could deref a destroyed manager.
+    auto mgr = tunnel_mgr_;
+    tunnel->set_on_close([this, mgr, tunnel_id]() {
         if (pipe_bridge_) {
             pipe_bridge_->stop();
             pipe_bridge_.reset();
         }
         pipe_mode_started_ = false;
-        tunnel_mgr_ptr->remove_tunnel(tunnel_id);
+        mgr->remove_tunnel(tunnel_id);
         request_stop();
     });
 
@@ -792,11 +795,13 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
             }
         });
 
-    // Wire tunnel close callback
-    auto* tunnel_mgr_ptr = tunnel_mgr_.get();
-    tunnel->set_on_close([tunnel_mgr_ptr, tunnel_id]() {
+    // Wire tunnel close callback. H-S-4 (2026-05-20 fix-storm review):
+    // capture shared_ptr — see the matching note on the pipe-mode
+    // on_close above.
+    auto mgr = tunnel_mgr_;
+    tunnel->set_on_close([mgr, tunnel_id]() {
         util::Logger::debug("Tunnel {} on_close, removing from manager", tunnel_id);
-        tunnel_mgr_ptr->remove_tunnel(tunnel_id);
+        mgr->remove_tunnel(tunnel_id);
     });
 
     // Wire TCP data + disconnect callbacks. Capturing the tunnel shared_ptr by
