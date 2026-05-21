@@ -46,8 +46,12 @@ class TcpLoopbackTest : public ::testing::Test {
 
     /// Create a TcpListener on an OS-assigned port (port 0) and return it.
     /// The actual port is available via listener->port() after construction.
-    std::unique_ptr<core::TcpListener> make_listener() {
-        return std::make_unique<core::TcpListener>(io(), std::uint16_t{0});
+    // shared_ptr: TcpListener inherits enable_shared_from_this so its
+    // async_accept callback can keep the listener alive across
+    // in-flight reads. A unique_ptr-owned instance would leave
+    // shared_from_this() throwing on the accept path.
+    std::shared_ptr<core::TcpListener> make_listener() {
+        return std::make_shared<core::TcpListener>(io(), std::uint16_t{0});
     }
 
     /// Build a loopback endpoint targeting the given port.

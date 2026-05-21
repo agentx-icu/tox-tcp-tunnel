@@ -37,7 +37,14 @@ namespace toxtunnel::core {
 ///   });
 ///   io.run();
 /// @endcode
-class TcpListener {
+/// Always held via shared_ptr: TunnelClient/TunnelServer stash
+/// listeners in containers and reload paths swap them in/out while
+/// async_accept callbacks may still be in flight on io_context worker
+/// threads. enable_shared_from_this lets the accept callback capture
+/// a shared_ptr keep-alive, so a listener whose unique slot was just
+/// erased can finish its current callback without UAF (S19 in the
+/// 2026-05-20 follow-up).
+class TcpListener : public std::enable_shared_from_this<TcpListener> {
    public:
     /// Callback invoked for each accepted connection.
     using AcceptHandler = std::function<void(std::shared_ptr<TcpConnection>)>;

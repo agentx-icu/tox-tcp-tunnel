@@ -189,7 +189,12 @@ class TunnelClient {
     std::unique_ptr<tunnel::TunnelManager> tunnel_mgr_;
 
     /// One TCP listener per forwarding rule.
-    std::vector<std::unique_ptr<core::TcpListener>> listeners_;
+    // shared_ptr (not unique_ptr): TcpListener now inherits
+    // enable_shared_from_this so its async_accept callback can keep
+    // itself alive across the in-flight read even if reload() removes
+    // the listener from this vector. The vector + reload mutations
+    // themselves are serialised onto io_ctx_ (see TunnelClient::reload).
+    std::vector<std::shared_ptr<core::TcpListener>> listeners_;
 
     /// Optional stdio bridge used in pipe mode.
     std::unique_ptr<StdioPipeBridge> pipe_bridge_;

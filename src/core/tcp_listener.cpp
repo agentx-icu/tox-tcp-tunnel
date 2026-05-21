@@ -136,7 +136,14 @@ void TcpListener::do_accept() {
         return;
     }
 
-    acceptor_.async_accept([this](const asio::error_code& ec, asio::ip::tcp::socket peer_socket) {
+    // Keep the listener alive across the in-flight async_accept (S19 in
+    // the 2026-05-20 follow-up). The caller might erase its owning
+    // shared_ptr (e.g. TunnelClient::reload removing a forward rule)
+    // between submission and dispatch; the lambda's keep-alive copy
+    // lets the current callback finish cleanly instead of UAF-ing.
+    auto self = shared_from_this();
+    acceptor_.async_accept([this, self](const asio::error_code& ec,
+                                        asio::ip::tcp::socket peer_socket) {
         if (ec) {
             if (ec == asio::error::operation_aborted) {
                 // Acceptor was closed (stop() was called); do not continue.

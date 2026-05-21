@@ -385,7 +385,7 @@ util::Expected<void, std::string> TunnelClient::reload(const Config& new_config)
 
         for (const auto& added : diff.added) {
             auto listener =
-                std::make_unique<core::TcpListener>(io_ctx_->get_io_context(), added.local_port);
+                std::make_shared<core::TcpListener>(io_ctx_->get_io_context(), added.local_port);
             const auto rule = added;
             listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
                 on_tcp_connection_accepted(std::move(conn), rule);
@@ -571,7 +571,7 @@ void TunnelClient::create_listeners(const std::vector<ForwardRule>& forwards) {
 
     for (const auto& rule : forwards) {
         auto listener =
-            std::make_unique<core::TcpListener>(io_ctx_->get_io_context(), rule.local_port);
+            std::make_shared<core::TcpListener>(io_ctx_->get_io_context(), rule.local_port);
         listeners_.push_back(std::move(listener));
     }
 }

@@ -120,7 +120,10 @@ class ZeroCopyReadTest : public ::testing::Test {
 
 TEST_F(ZeroCopyReadTest, TunneledBytesArriveIntactAndInOrder) {
     // --- Loopback listener + connected pair ------------------------------
-    core::TcpListener listener(io_ctx(), uint16_t{0});
+    // shared_ptr (not stack): TcpListener uses enable_shared_from_this in
+    // its accept callback now (S19).
+    auto listener_ptr = std::make_shared<core::TcpListener>(io_ctx(), uint16_t{0});
+    auto& listener = *listener_ptr;
     const auto port = listener.port();
     ASSERT_NE(port, 0);
 
@@ -202,7 +205,10 @@ TEST_F(ZeroCopyReadTest, TunneledBytesArriveIntactAndInOrder) {
 // =============================================================================
 
 TEST_F(ZeroCopyReadTest, OwnedBufferOutlivesAsyncWrite) {
-    core::TcpListener listener(io_ctx(), uint16_t{0});
+    // shared_ptr (not stack): TcpListener uses enable_shared_from_this in
+    // its accept callback now (S19).
+    auto listener_ptr = std::make_shared<core::TcpListener>(io_ctx(), uint16_t{0});
+    auto& listener = *listener_ptr;
     const auto port = listener.port();
 
     std::promise<std::shared_ptr<core::TcpConnection>> server_promise;
@@ -309,7 +315,10 @@ TEST_F(ZeroCopyReadTest, ConcurrentTunnelsDoNotCrossContaminate) {
     std::vector<std::unique_ptr<PerTunnel>> tunnels;
     tunnels.reserve(kTunnelCount);
 
-    core::TcpListener listener(io_ctx(), uint16_t{0});
+    // shared_ptr (not stack): TcpListener uses enable_shared_from_this in
+    // its accept callback now (S19).
+    auto listener_ptr = std::make_shared<core::TcpListener>(io_ctx(), uint16_t{0});
+    auto& listener = *listener_ptr;
     const auto port = listener.port();
     ASSERT_NE(port, 0);
 
