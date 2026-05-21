@@ -651,9 +651,26 @@ void MetricsServer::do_accept() {
         // Read the request line. We don't care about headers — for a
         // /metrics endpoint we only need the first line ("GET /path HTTP/1.x").
         auto buffer = std::make_shared<asio::streambuf>(kMaxRequestBytes);
+
+        // S23 / H-33 (2026-05-20 review): a slowloris-style client that
+        // opens the socket and dribbles bytes (or sends nothing at all)
+        // would pin this `async_read_until` forever, holding the file
+        // descriptor and a 4 KiB streambuf. Even though the listener is
+        // loopback by default, a runaway scraper or a local DoS would
+        // gradually exhaust fds. Arm a deadline timer that cancels the
+        // socket if the request hasn't completed within 5 seconds.
+        auto deadline = std::make_shared<asio::steady_timer>(io_ctx_);
+        deadline->expires_after(std::chrono::seconds(5));
+        deadline->async_wait([socket](const asio::error_code& ec) {
+            if (ec)
+                return;  // cancelled because the read completed first
+            asio::error_code ignore;
+            socket->cancel(ignore);
+        });
         asio::async_read_until(
             *socket, *buffer, "\r\n\r\n",
-            [this, socket, buffer](const asio::error_code& read_ec, std::size_t) {
+            [this, socket, buffer, deadline](const asio::error_code& read_ec, std::size_t) {
+                deadline->cancel();
                 // Even on EOF we may have a usable first line in the buffer.
                 std::string request_line;
                 if (buffer->size() > 0) {
