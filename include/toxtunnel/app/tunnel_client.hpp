@@ -301,13 +301,18 @@ class TunnelClient {
     static constexpr std::chrono::hours kInfoRefreshInterval{1};
 
     /// Persist the latest connection metadata (last_connected_at, transport)
-    /// for this server into the known_servers registry. Called when the
-    /// friend transitions to online.
-    void record_server_connection();
+    /// for the given `tox_id` (uppercase 76-hex) into the known_servers
+    /// registry. `friend_number` identifies which peer's transport state
+    /// to record. Callers MUST pass the tox_id captured atomically with
+    /// the friend_number at the moment the event was observed, so a
+    /// concurrent failover cannot misattribute the record to the new
+    /// active server (S15 in the 2026-05-20 review).
+    void record_server_connection(std::string_view tox_id, std::uint32_t friend_number);
 
-    /// Update the server's disclosed system info from an INFO_REPLY payload
-    /// (UTF-8 YAML bytes) and persist.
-    void record_server_info(std::string_view yaml_payload);
+    /// Update `tox_id`'s disclosed system info from an INFO_REPLY payload
+    /// (UTF-8 YAML bytes) and persist. Same atomicity requirement as
+    /// `record_server_connection`.
+    void record_server_info(std::string_view tox_id, std::string_view yaml_payload);
 
     /// Local IPC server backing `toxtunnel inspect`. Owned here so its
     /// lifetime is tied to the io_context — the inspect server posts onto

@@ -426,6 +426,10 @@ void TunnelClient::setup_tox_callbacks() {
         const auto now = std::chrono::steady_clock::now();
         std::size_t hit_index = endpoints_.size();
         bool is_active = false;
+        // S15 / 2026-05-20 follow-up: capture the endpoint's tox_id while
+        // holding endpoints_mutex_, so a concurrent switch_active_endpoint
+        // cannot misattribute the connection event to the new server.
+        std::string sender_tox_id;
         {
             std::lock_guard<std::mutex> lock(endpoints_mutex_);
             for (std::size_t i = 0; i < endpoints_.size(); ++i) {
@@ -445,6 +449,7 @@ void TunnelClient::setup_tox_callbacks() {
                 ep.offline_since = now;
             }
             ep.online = connected;
+            sender_tox_id = ep.tox_id_hex;
             is_active = (hit_index == active_index_);
             if (is_active) {
                 server_online_.store(connected, std::memory_order_release);
@@ -455,7 +460,7 @@ void TunnelClient::setup_tox_callbacks() {
         if (is_active) {
             if (connected) {
                 util::Logger::info("Server friend {} is now online", friend_number);
-                record_server_connection();
+                record_server_connection(sender_tox_id, friend_number);
                 send_info_request();
                 if (is_pipe_mode() && running_) {
                     io_ctx_->post([this] { start_pipe_mode(); });
@@ -483,42 +488,55 @@ void TunnelClient::setup_tox_callbacks() {
     // waiting on our frame handlers (whose tail eventually calls
     // TcpConnection::write — itself another post). Costs one extra vector
     // copy of the inbound packet.
-    tox_adapter_->set_on_lossless_packet([this](uint32_t friend_number, const uint8_t* data,
-                                                std::size_t length) {
-        if (friend_number != server_friend_number_.load(std::memory_order_acquire)) {
-            // Could be a stale packet from a freshly-demoted fallback, or
-            // genuinely an unexpected friend. Either way, ignore.
-            util::Logger::debug("Received lossless packet from non-active friend {} (active is {})",
-                                friend_number,
-                                server_friend_number_.load(std::memory_order_acquire));
-            return;
-        }
-        if (length < 2) {
-            util::Logger::warn("Lossless packet too short ({} bytes)", length);
-            return;
-        }
-
-        std::vector<uint8_t> packet(data, data + length);
-        asio::post(*inbound_strand_, [this, packet = std::move(packet)]() {
-            // Skip byte 0 (lossless packet prefix byte), deserialize from byte 1.
-            auto frame_data = std::span<const uint8_t>(packet.data() + 1, packet.size() - 1);
-            auto frame_result = tunnel::ProtocolFrame::deserialize(frame_data);
-            if (!frame_result) {
-                util::Logger::error("Failed to deserialize ProtocolFrame from lossless packet");
+    tox_adapter_->set_on_lossless_packet(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) {
+            // S15 / 2026-05-20 follow-up: filter + capture sender identity
+            // atomically under endpoints_mutex_. A simple "is this the
+            // current active friend_number" check, followed by a later
+            // server_tox_id_snapshot(), would race with switch_active_endpoint
+            // and misattribute the inbound INFO_REPLY to the freshly-promoted
+            // server's record.
+            std::string sender_tox_id;
+            {
+                std::lock_guard<std::mutex> lock(endpoints_mutex_);
+                if (active_index_ >= endpoints_.size() ||
+                    endpoints_[active_index_].friend_number != friend_number) {
+                    // Stale packet from a freshly-demoted fallback, or an
+                    // unexpected friend. Either way, ignore.
+                    util::Logger::debug(
+                        "Received lossless packet from non-active friend {} (active idx {})",
+                        friend_number, active_index_);
+                    return;
+                }
+                sender_tox_id = endpoints_[active_index_].tox_id_hex;
+            }
+            if (length < 2) {
+                util::Logger::warn("Lossless packet too short ({} bytes)", length);
                 return;
             }
 
-            // INFO_REPLY is a per-friend control frame outside the per-tunnel
-            // routing. Intercept it before route_frame so TunnelManager
-            // doesn't log a "no tunnel for id 0" warning.
-            if (frame_result.value().type() == tunnel::FrameType::INFO_REPLY) {
-                record_server_info(frame_result.value().as_info_reply_yaml());
-                return;
-            }
+            std::vector<uint8_t> packet(data, data + length);
+            asio::post(*inbound_strand_, [this, packet = std::move(packet),
+                                          sender_tox_id = std::move(sender_tox_id)]() {
+                // Skip byte 0 (lossless packet prefix byte), deserialize from byte 1.
+                auto frame_data = std::span<const uint8_t>(packet.data() + 1, packet.size() - 1);
+                auto frame_result = tunnel::ProtocolFrame::deserialize(frame_data);
+                if (!frame_result) {
+                    util::Logger::error("Failed to deserialize ProtocolFrame from lossless packet");
+                    return;
+                }
 
-            tunnel_mgr_->route_frame(frame_result.value());
+                // INFO_REPLY is a per-friend control frame outside the per-tunnel
+                // routing. Intercept it before route_frame so TunnelManager
+                // doesn't log a "no tunnel for id 0" warning.
+                if (frame_result.value().type() == tunnel::FrameType::INFO_REPLY) {
+                    record_server_info(sender_tox_id, frame_result.value().as_info_reply_yaml());
+                    return;
+                }
+
+                tunnel_mgr_->route_frame(frame_result.value());
+            });
         });
-    });
 
     // Self connection status (DHT connectivity)
     tox_adapter_->set_on_self_connection([](bool connected) {
@@ -987,14 +1005,12 @@ std::string TunnelClient::server_tox_id_snapshot() const {
     return server_tox_id_hex_;
 }
 
-void TunnelClient::record_server_connection() {
-    const auto tox_id = server_tox_id_snapshot();
+void TunnelClient::record_server_connection(std::string_view tox_id, std::uint32_t friend_number) {
     if (!known_servers_ || tox_id.empty())
         return;
-    const auto state = tox_adapter_->get_friend_connection_status(
-        server_friend_number_.load(std::memory_order_acquire));
+    const auto state = tox_adapter_->get_friend_connection_status(friend_number);
     const auto type = to_known_connection_type(state);
-    if (!known_servers_->record_connection(tox_id, type)) {
+    if (!known_servers_->record_connection(std::string(tox_id), type)) {
         util::Logger::warn("known_servers: record_connection rejected tox_id");
         return;
     }
@@ -1003,8 +1019,7 @@ void TunnelClient::record_server_connection() {
     }
 }
 
-void TunnelClient::record_server_info(std::string_view yaml_payload) {
-    const auto tox_id = server_tox_id_snapshot();
+void TunnelClient::record_server_info(std::string_view tox_id, std::string_view yaml_payload) {
     if (!known_servers_ || tox_id.empty())
         return;
 
@@ -1024,7 +1039,7 @@ void TunnelClient::record_server_info(std::string_view yaml_payload) {
         info.os.value_or("(undisclosed)"), info.arch.value_or("(undisclosed)"),
         info.toxtunnel_version.value_or("(undisclosed)"));
 
-    if (!known_servers_->record_info(tox_id, info)) {
+    if (!known_servers_->record_info(std::string(tox_id), info)) {
         util::Logger::warn("known_servers: record_info rejected tox_id");
         return;
     }
@@ -1101,6 +1116,7 @@ std::optional<std::size_t> TunnelClient::pick_next_online_locked() const {
 void TunnelClient::switch_active_endpoint(std::size_t new_index) {
     std::string old_id_prefix;
     std::string new_id_prefix;
+    std::string new_tox_id;
     uint32_t new_friend_number = 0;
     {
         std::lock_guard<std::mutex> lock(endpoints_mutex_);
@@ -1111,7 +1127,8 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
         active_index_ = new_index;
         new_friend_number = endpoints_[new_index].friend_number;
         new_id_prefix = endpoints_[new_index].tox_id_hex.substr(0, 12);
-        server_tox_id_hex_ = endpoints_[new_index].tox_id_hex;
+        new_tox_id = endpoints_[new_index].tox_id_hex;
+        server_tox_id_hex_ = new_tox_id;
         server_online_.store(endpoints_[new_index].online, std::memory_order_release);
     }
     server_friend_number_.store(new_friend_number, std::memory_order_release);
@@ -1131,7 +1148,7 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
 
     // Refresh known-servers metadata if the new endpoint is already online.
     if (server_online_.load(std::memory_order_acquire)) {
-        record_server_connection();
+        record_server_connection(new_tox_id, new_friend_number);
         send_info_request();
     }
 }
