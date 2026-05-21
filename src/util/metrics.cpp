@@ -661,9 +661,17 @@ void MetricsServer::do_accept() {
         // socket if the request hasn't completed within 5 seconds.
         auto deadline = std::make_shared<asio::steady_timer>(io_ctx_);
         deadline->expires_after(std::chrono::seconds(5));
-        deadline->async_wait([socket](const asio::error_code& ec) {
+        // H-S-7 (2026-05-20 fix-storm review): check running_ before
+        // we cancel the socket. If the MetricsServer was stop()'d
+        // between async_read_until completing and the deadline firing,
+        // cancelling the socket here would tear down a request that
+        // may already be in its async_write tail and produce a noisy
+        // failure path on shutdown.
+        deadline->async_wait([this, socket](const asio::error_code& ec) {
             if (ec)
                 return;  // cancelled because the read completed first
+            if (!running_.load(std::memory_order_acquire))
+                return;
             asio::error_code ignore;
             socket->cancel(ignore);
         });
