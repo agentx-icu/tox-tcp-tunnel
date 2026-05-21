@@ -626,21 +626,21 @@ void TunnelClient::start_pipe_mode() {
                                config_.tunnel.coalesce_max_bytes);
     apply_coalesce_and_flow_control(*tunnel);
 
-    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
         std::vector<uint8_t> packet;
         packet.reserve(1 + data.size());
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), data.begin(), data.end());
-        (void)tox_adapter_->send_lossless_packet(
+        return tox_adapter_->send_lossless_packet(
             server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
     // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
     // lossless prefix + 5-byte tunnel header in its reserved prefix, so we
     // hand `wire_view()` straight to toxcore with zero further copies.
-    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) {
+    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) -> bool {
         const auto wire = buf.wire_view();
-        (void)tox_adapter_->send_lossless_packet(
+        return tox_adapter_->send_lossless_packet(
             server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
     });
 
@@ -738,20 +738,20 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     // Wire callback: when TunnelImpl wants to send data to Tox, prepend the
     // lossless packet prefix and forward to ToxAdapter. The frame is already
     // serialized — no need to round-trip through deserialize / re-serialize.
-    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
         std::vector<uint8_t> packet;
         packet.reserve(1 + data.size());
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), data.begin(), data.end());
 
-        (void)tox_adapter_->send_lossless_packet(
+        return tox_adapter_->send_lossless_packet(
             server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
     // Wave B zero-copy outbound for TUNNEL_DATA frames.
-    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) {
+    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) -> bool {
         const auto wire = buf.wire_view();
-        (void)tox_adapter_->send_lossless_packet(
+        return tox_adapter_->send_lossless_packet(
             server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
     });
 
@@ -846,19 +846,19 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     apply_coalesce_and_flow_control(*tunnel);
     tunnel->set_tcp_connection(conn);
 
-    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
         std::vector<uint8_t> packet;
         packet.reserve(1 + data.size());
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), data.begin(), data.end());
-        (void)tox_adapter_->send_lossless_packet(
+        return tox_adapter_->send_lossless_packet(
             server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
     });
 
     // Wave B zero-copy outbound for TUNNEL_DATA frames.
-    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) {
+    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) -> bool {
         const auto wire = buf.wire_view();
-        (void)tox_adapter_->send_lossless_packet(
+        return tox_adapter_->send_lossless_packet(
             server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
     });
 

@@ -51,8 +51,10 @@ class TunnelCoalesceTest : public ::testing::Test {
         // via make_unique would leave weak_from_this returning an expired
         // weak_ptr and the timer callbacks would silently no-op.
         tunnel_ = std::make_shared<TunnelImpl>(io_ctx_, 1, 0);
-        tunnel_->set_on_send_to_tox(
-            [this](std::span<const uint8_t> wire) { captured_.record(wire); });
+        tunnel_->set_on_send_to_tox([this](std::span<const uint8_t> wire) -> bool {
+            captured_.record(wire);
+            return true;
+        });
         tunnel_->set_state(Tunnel::State::Connecting);
         tunnel_->set_state(Tunnel::State::Connected);
     }

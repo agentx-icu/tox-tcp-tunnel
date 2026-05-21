@@ -141,11 +141,12 @@ TEST_F(TunnelTest, CloseTunnel_GracefulShutdown) {
     tunnel.set_state(Tunnel::State::Connected);
 
     bool close_frame_ready = false;
-    tunnel.set_on_send_to_tox([&close_frame_ready](std::span<const uint8_t> data) {
+    tunnel.set_on_send_to_tox([&close_frame_ready](std::span<const uint8_t> data) -> bool {
         // Verify it's a TUNNEL_CLOSE frame
-        ASSERT_GE(data.size(), 5u);
+        EXPECT_GE(data.size(), 5u);
         EXPECT_EQ(static_cast<FrameType>(data[0]), FrameType::TUNNEL_CLOSE);
         close_frame_ready = true;
+        return true;
     });
 
     tunnel.close();
@@ -218,10 +219,11 @@ TEST_F(TunnelTest, HandleFrame_Ping) {
     tunnel.set_state(Tunnel::State::Connected);
 
     bool pong_sent = false;
-    tunnel.set_on_send_to_tox([&pong_sent](std::span<const uint8_t> data) {
-        ASSERT_GE(data.size(), 5u);
+    tunnel.set_on_send_to_tox([&pong_sent](std::span<const uint8_t> data) -> bool {
+        EXPECT_GE(data.size(), 5u);
         EXPECT_EQ(static_cast<FrameType>(data[0]), FrameType::PONG);
         pong_sent = true;
+        return true;
     });
 
     tunnel.handle_frame(ProtocolFrame::make_ping());
@@ -256,8 +258,9 @@ TEST_F(TunnelTest, SendData_QueuesData) {
     tunnel.set_state(Tunnel::State::Connected);
 
     std::vector<std::vector<uint8_t>> sent_frames;
-    tunnel.set_on_send_to_tox([&sent_frames](std::span<const uint8_t> data) {
+    tunnel.set_on_send_to_tox([&sent_frames](std::span<const uint8_t> data) -> bool {
         sent_frames.emplace_back(data.begin(), data.end());
+        return true;
     });
 
     std::vector<uint8_t> test_data = {0x01, 0x02, 0x03};
@@ -278,10 +281,13 @@ TEST_F(TunnelTest, SendData_SplitsFramesToFitToxCustomPacketLimit) {
     tunnel.set_state(Tunnel::State::Connected);
 
     std::vector<ProtocolFrame> sent_frames;
-    tunnel.set_on_send_to_tox([&sent_frames](std::span<const uint8_t> data) {
+    tunnel.set_on_send_to_tox([&sent_frames](std::span<const uint8_t> data) -> bool {
         auto frame = ProtocolFrame::deserialize(data);
-        ASSERT_TRUE(frame.has_value()) << frame.error().message();
-        sent_frames.push_back(frame.value());
+        EXPECT_TRUE(frame.has_value()) << frame.error().message();
+        if (frame.has_value()) {
+            sent_frames.push_back(frame.value());
+        }
+        return true;
     });
 
     std::vector<uint8_t> payload(kMaxTcpPayloadPerFrame + 128, 0x5A);
@@ -363,11 +369,12 @@ TEST_F(TunnelTest, Backpressure_SendAckAfterThreshold) {
     tunnel.set_ack_threshold(5);
 
     bool ack_sent = false;
-    tunnel.set_on_send_to_tox([&ack_sent](std::span<const uint8_t> data) {
-        ASSERT_GE(data.size(), 5u);
+    tunnel.set_on_send_to_tox([&ack_sent](std::span<const uint8_t> data) -> bool {
+        EXPECT_GE(data.size(), 5u);
         if (static_cast<FrameType>(data[0]) == FrameType::TUNNEL_ACK) {
             ack_sent = true;
         }
+        return true;
     });
 
     // Receive data below threshold
@@ -392,10 +399,11 @@ TEST_F(TunnelTest, KeepAlive_RespondsWithPong) {
     tunnel.set_state(Tunnel::State::Connected);
 
     bool pong_sent = false;
-    tunnel.set_on_send_to_tox([&pong_sent](std::span<const uint8_t> data) {
-        ASSERT_GE(data.size(), 5u);
+    tunnel.set_on_send_to_tox([&pong_sent](std::span<const uint8_t> data) -> bool {
+        EXPECT_GE(data.size(), 5u);
         EXPECT_EQ(static_cast<FrameType>(data[0]), FrameType::PONG);
         pong_sent = true;
+        return true;
     });
 
     tunnel.handle_frame(ProtocolFrame::make_ping());
@@ -435,10 +443,11 @@ TEST_F(TunnelTest, TcpConnection_DataFromTcpSendsToTox) {
     tunnel.set_state(Tunnel::State::Connected);
 
     bool data_sent_to_tox = false;
-    tunnel.set_on_send_to_tox([&data_sent_to_tox](std::span<const uint8_t> data) {
-        ASSERT_GE(data.size(), 5u);
+    tunnel.set_on_send_to_tox([&data_sent_to_tox](std::span<const uint8_t> data) -> bool {
+        EXPECT_GE(data.size(), 5u);
         EXPECT_EQ(static_cast<FrameType>(data[0]), FrameType::TUNNEL_DATA);
         data_sent_to_tox = true;
+        return true;
     });
 
     // Simulate TCP data callback
@@ -457,10 +466,11 @@ TEST_F(TunnelTest, ErrorHandling_SendErrorFrame) {
     tunnel.set_state(Tunnel::State::Connected);
 
     bool error_sent = false;
-    tunnel.set_on_send_to_tox([&error_sent](std::span<const uint8_t> data) {
-        ASSERT_GE(data.size(), 5u);
+    tunnel.set_on_send_to_tox([&error_sent](std::span<const uint8_t> data) -> bool {
+        EXPECT_GE(data.size(), 5u);
         EXPECT_EQ(static_cast<FrameType>(data[0]), FrameType::TUNNEL_ERROR);
         error_sent = true;
+        return true;
     });
 
     tunnel.send_error(42, "Test error");

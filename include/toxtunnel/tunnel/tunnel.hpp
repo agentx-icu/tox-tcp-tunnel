@@ -146,7 +146,13 @@ class TunnelImpl : public Tunnel {
     // -----------------------------------------------------------------
 
     /// Called when a frame should be sent to the Tox peer.
-    using SendToToxCallback = std::function<void(std::span<const uint8_t> data)>;
+    ///
+    /// Returns true if the underlying Tox send accepted the bytes,
+    /// false if the send was dropped (toxcore queue full, friend
+    /// offline, etc.). The caller uses the return value to refund the
+    /// per-tunnel send-window accounting; without it a transient drop
+    /// would leak window bytes forever (S27 in the 2026-05-20 follow-up).
+    using SendToToxCallback = std::function<bool(std::span<const uint8_t> data)>;
 
     /// Zero-copy outbound (Wave B): called when a fully-framed TUNNEL_DATA
     /// frame should be sent to the Tox peer. The supplied `OwnedFrameBuffer`
@@ -158,7 +164,10 @@ class TunnelImpl : public Tunnel {
     /// `send_data_to_tox`; non-DATA control frames continue to take the
     /// span-based callback for simplicity (their payloads are tiny and the
     /// extra copy is not measurable).
-    using SendOwnedToToxCallback = std::function<void(OwnedFrameBuffer buf)>;
+    ///
+    /// Same drop/refund contract as `SendToToxCallback`: true = sent,
+    /// false = dropped so the tunnel can refund its window.
+    using SendOwnedToToxCallback = std::function<bool(OwnedFrameBuffer buf)>;
 
     /// Called when data should be written to the TCP connection.
     using SendToTcpCallback = std::function<void(std::span<const uint8_t> data)>;
@@ -452,13 +461,16 @@ class TunnelImpl : public Tunnel {
     // Internal helpers
     // -----------------------------------------------------------------
 
-    /// Send a frame to the Tox peer via the callback.
-    void send_frame_to_tox(const ProtocolFrame& frame);
+    /// Send a frame to the Tox peer via the callback. Returns the
+    /// underlying ToxAdapter accept/drop result; callers that need to
+    /// refund send-window accounting on drop should propagate it.
+    bool send_frame_to_tox(const ProtocolFrame& frame);
 
     /// Send a fully-framed TUNNEL_DATA OwnedFrameBuffer to the Tox peer via
     /// the zero-copy callback if it is set; otherwise fall back to the
-    /// span-based callback.
-    void send_owned_data_to_tox(OwnedFrameBuffer buf);
+    /// span-based callback. Same accept/drop return semantics as
+    /// `send_frame_to_tox`.
+    bool send_owned_data_to_tox(OwnedFrameBuffer buf);
 
     /// Append `data` to the coalesce buffer, draining full-MTU frames as it
     /// fills. The caller must hold `coalesce_mutex_`.

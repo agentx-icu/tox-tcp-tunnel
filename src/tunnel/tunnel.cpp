@@ -541,15 +541,28 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
     if (emit_immediate) {
         for (std::size_t offset = 0; offset < data.size(); offset += kMaxTcpPayloadPerToxFrame) {
             const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
+            bool sent = false;
             if (zero_copy) {
                 auto buf = OwnedFrameBuffer::with_payload(data.subspan(offset, chunk_size));
                 util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
                 ProtocolFrame::serialize_tunnel_data_in_place(buf, tunnel_id_);
-                send_owned_data_to_tox(std::move(buf));
+                sent = send_owned_data_to_tox(std::move(buf));
             } else {
                 auto frame =
                     ProtocolFrame::make_tunnel_data(tunnel_id_, data.subspan(offset, chunk_size));
-                send_frame_to_tox(frame);
+                sent = send_frame_to_tox(frame);
+            }
+            if (!sent) {
+                // S27 / 2026-05-20 follow-up: the underlying Tox send was
+                // dropped (toxcore queue full, friend offline mid-batch,
+                // etc.). Refund the bytes we charged at the top of this
+                // function so the send window doesn't leak forever; without
+                // the refund a few consecutive drops would saturate
+                // send_window_used_ and pause TCP read indefinitely.
+                send_window_used_.fetch_sub(chunk_size, std::memory_order_relaxed);
+                util::Logger::debug(
+                    "Tunnel {} dropped {} bytes (Tox send rejected); refunded send window",
+                    tunnel_id_, chunk_size);
             }
         }
         return true;
@@ -667,20 +680,21 @@ void TunnelImpl::set_on_close(CloseCallback cb) {
 // Internal helpers
 // ===========================================================================
 
-void TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
+bool TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
     SendToToxCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         cb = on_send_to_tox_;
     }
 
-    if (cb) {
-        auto wire = frame.serialize();
-        cb(std::span<const uint8_t>(wire.data(), wire.size()));
+    if (!cb) {
+        return false;
     }
+    auto wire = frame.serialize();
+    return cb(std::span<const uint8_t>(wire.data(), wire.size()));
 }
 
-void TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
+bool TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
     SendOwnedToToxCallback owned_cb;
     SendToToxCallback span_cb;
     {
@@ -690,8 +704,7 @@ void TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
     }
 
     if (owned_cb) {
-        owned_cb(std::move(buf));
-        return;
+        return owned_cb(std::move(buf));
     }
     // Fallback: surface the bytes through the span callback so a partially
     // configured tunnel (e.g. tests that only wire the legacy callback) still
@@ -701,9 +714,10 @@ void TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
         const auto wire = buf.wire_view();
         // Skip the lossless prefix byte that the legacy callback will re-prepend.
         if (wire.size() > 1) {
-            span_cb(std::span<const std::uint8_t>(wire.data() + 1, wire.size() - 1));
+            return span_cb(std::span<const std::uint8_t>(wire.data() + 1, wire.size() - 1));
         }
     }
+    return false;
 }
 
 void TunnelImpl::BumpActivity() noexcept {
@@ -791,16 +805,28 @@ void TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
         std::lock_guard<std::mutex> lock(mutex_);
         zero_copy = static_cast<bool>(on_send_to_tox_owned_);
     }
+    bool sent = false;
     if (zero_copy) {
         auto buf = OwnedFrameBuffer::with_payload(
             std::span<const std::uint8_t>(coalesce_buf_.data(), bytes));
         util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
         ProtocolFrame::serialize_tunnel_data_in_place(buf, tunnel_id_);
-        send_owned_data_to_tox(std::move(buf));
+        sent = send_owned_data_to_tox(std::move(buf));
     } else {
         auto frame = ProtocolFrame::make_tunnel_data(
             tunnel_id_, std::span<const uint8_t>(coalesce_buf_.data(), bytes));
-        send_frame_to_tox(frame);
+        sent = send_frame_to_tox(frame);
+    }
+    if (!sent) {
+        // S27 / 2026-05-20 follow-up: same window-refund contract as the
+        // immediate emit path. send_data_to_tox charged `bytes` to
+        // send_window_used_ when the data entered the coalesce buffer;
+        // if Tox now refuses the wire frame the budget has to come back
+        // or the tunnel will pause TCP read forever.
+        send_window_used_.fetch_sub(bytes, std::memory_order_relaxed);
+        util::Logger::debug(
+            "Tunnel {} dropped {} coalesced bytes (Tox send rejected); refunded send window",
+            tunnel_id_, bytes);
     }
     coalesce_buf_.erase(coalesce_buf_.begin(),
                         coalesce_buf_.begin() + static_cast<std::ptrdiff_t>(bytes));

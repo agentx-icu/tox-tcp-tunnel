@@ -24,12 +24,14 @@ std::unique_ptr<TunnelImpl> MakeConnectedTunnel(asio::io_context& io_ctx, uint16
                                                 std::atomic<int>* close_frames_seen = nullptr) {
     auto tunnel = std::make_unique<TunnelImpl>(io_ctx, tunnel_id, /*friend_number=*/1);
     if (close_frames_seen != nullptr) {
-        tunnel->set_on_send_to_tox([close_frames_seen, tunnel_id](std::span<const uint8_t> data) {
-            if (!data.empty() && data[0] == static_cast<uint8_t>(FrameType::TUNNEL_CLOSE)) {
-                close_frames_seen->fetch_add(1);
-            }
-            (void)tunnel_id;
-        });
+        tunnel->set_on_send_to_tox(
+            [close_frames_seen, tunnel_id](std::span<const uint8_t> data) -> bool {
+                if (!data.empty() && data[0] == static_cast<uint8_t>(FrameType::TUNNEL_CLOSE)) {
+                    close_frames_seen->fetch_add(1);
+                }
+                (void)tunnel_id;
+                return true;
+            });
     }
     tunnel->set_state(Tunnel::State::Connected);
     return tunnel;
@@ -92,7 +94,7 @@ TEST_F(IdleTunnelTest, OnDataFrameResetsIdleTimer) {
 
 TEST_F(IdleTunnelTest, SendDataResetsIdleTimer) {
     auto tunnel = std::make_unique<TunnelImpl>(io_ctx, /*tunnel_id=*/9, /*friend_number=*/1);
-    tunnel->set_on_send_to_tox([](std::span<const uint8_t>) {});
+    tunnel->set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
     tunnel->set_state(Tunnel::State::Connected);
 
     std::this_thread::sleep_for(30ms);
@@ -108,7 +110,7 @@ TEST_F(IdleTunnelTest, SendDataResetsIdleTimer) {
 
 TEST_F(IdleTunnelTest, PingPongDoesNotResetIdleTimer) {
     auto tunnel = std::make_unique<TunnelImpl>(io_ctx, /*tunnel_id=*/10, /*friend_number=*/1);
-    tunnel->set_on_send_to_tox([](std::span<const uint8_t>) {});
+    tunnel->set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
     tunnel->set_state(Tunnel::State::Connected);
 
     std::this_thread::sleep_for(30ms);

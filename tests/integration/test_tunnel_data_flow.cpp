@@ -69,7 +69,7 @@ class TunnelDataFlowTest : public ::testing::Test {
             mgr.for_each_tunnel([](uint16_t /*id*/, tunnel::Tunnel* t) {
                 auto* impl = dynamic_cast<tunnel::TunnelImpl*>(t);
                 if (impl) {
-                    impl->set_on_send_to_tox([](std::span<const uint8_t>) {});
+                    impl->set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
                     impl->set_on_data_for_tcp([](std::span<const uint8_t>) {});
                     impl->set_on_state_change([](tunnel::Tunnel::State) {});
                     impl->set_on_error([](const tunnel::TunnelErrorPayload&) {});
@@ -122,11 +122,12 @@ class TunnelDataFlowTest : public ::testing::Test {
         // Wire the tunnel's on_send_to_tox so frames are forwarded through
         // the client TunnelManager's send_handler (which routes to server).
         auto* client_raw = client_tunnel.get();
-        client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+        client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
             auto frame = tunnel::ProtocolFrame::deserialize(data);
             if (frame) {
-                (void)client_mgr_->send_frame(frame.value());
+                return client_mgr_->send_frame(frame.value());
             }
+            return false;
         });
 
         client_mgr_->add_tunnel(tid, std::move(client_tunnel));
@@ -143,11 +144,12 @@ class TunnelDataFlowTest : public ::testing::Test {
         auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
 
         auto* server_raw = server_tunnel.get();
-        server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+        server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
             auto frame = tunnel::ProtocolFrame::deserialize(data);
             if (frame) {
-                (void)server_mgr_->send_frame(frame.value());
+                return server_mgr_->send_frame(frame.value());
             }
+            return false;
         });
 
         // Mark server tunnel as Connected (server accepted the open).
@@ -200,11 +202,12 @@ TEST_F(TunnelDataFlowTest, TunnelPairOpenAckLifecycle) {
         });
 
     // Wire on_send_to_tox -> client manager send_frame -> server route_frame.
-    client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+    client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
         auto frame = tunnel::ProtocolFrame::deserialize(data);
         if (frame) {
-            (void)client_mgr_->send_frame(frame.value());
+            return client_mgr_->send_frame(frame.value());
         }
+        return false;
     });
 
     client_mgr_->add_tunnel(kTunnelId, std::move(client_tunnel));
@@ -224,11 +227,12 @@ TEST_F(TunnelDataFlowTest, TunnelPairOpenAckLifecycle) {
     auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, kTunnelId, kFriendNumber);
     auto* server_raw = server_tunnel.get();
 
-    server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) {
+    server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
         auto frame = tunnel::ProtocolFrame::deserialize(data);
         if (frame) {
-            (void)server_mgr_->send_frame(frame.value());
+            return server_mgr_->send_frame(frame.value());
         }
+        return false;
     });
 
     server_tunnel->set_state(tunnel::Tunnel::State::Connected);
@@ -496,8 +500,9 @@ TEST_F(TunnelDataFlowTest, TunnelManagerFrameRouting) {
     auto make_tunnel = [this, kFriendNumber](uint16_t tid) {
         auto t = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
         t->set_state(tunnel::Tunnel::State::Connected);
-        t->set_on_send_to_tox([](std::span<const uint8_t>) {
+        t->set_on_send_to_tox([](std::span<const uint8_t>) -> bool {
             // No-op: we only care about receiving, not sending ACKs back.
+            return true;
         });
         return t;
     };

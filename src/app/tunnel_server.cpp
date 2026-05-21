@@ -624,26 +624,32 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     // byte and send directly. Going via manager_ptr->send_frame would force a
     // deserialize + re-serialize round trip plus a redundant byte copy.
     server_tunnel->set_on_send_to_tox(
-        [this, manager_ptr, friend_number](std::span<const uint8_t> data) {
+        [this, manager_ptr, friend_number](std::span<const uint8_t> data) -> bool {
             std::vector<uint8_t> packet;
             packet.reserve(1 + data.size());
             packet.push_back(tunnel::kLosslessPacketByte);
             packet.insert(packet.end(), data.begin(), data.end());
-            if (tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size())) {
+            const bool sent =
+                tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size());
+            if (sent) {
                 manager_ptr->record_frame_sent();
                 manager_ptr->record_bytes_sent(data.size());
             }
+            return sent;
         });
     // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
     // lossless prefix + 5-byte tunnel header in the same allocation.
     server_tunnel->set_on_send_to_tox_owned(
-        [this, manager_ptr, friend_number](tunnel::OwnedFrameBuffer buf) {
+        [this, manager_ptr, friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
             const auto wire = buf.wire_view();
-            if (tox_adapter_->send_lossless_packet(friend_number, wire.data(), wire.size())) {
+            const bool sent =
+                tox_adapter_->send_lossless_packet(friend_number, wire.data(), wire.size());
+            if (sent) {
                 manager_ptr->record_frame_sent();
                 // The lossless prefix byte is bookkeeping overhead, not payload.
                 manager_ptr->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);
             }
+            return sent;
         });
     manager_ptr->add_tunnel(tunnel_id, std::move(server_tunnel));
     // add_tunnel re-set used_ids_[tunnel_id]; the guard's release would
