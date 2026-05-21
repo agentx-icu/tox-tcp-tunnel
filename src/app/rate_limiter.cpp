@@ -114,9 +114,28 @@ void RateLimiter::refill(Bucket& b) const {
     }
     // Compute integer refill amounts. Tokens are scaled to the bucket's burst
     // cap so the bucket never exceeds capacity.
+    //
+    // S25 / H-4 (2026-05-20 review): `per_sec * elapsed_ns` overflows int64
+    // for any bucket that's been idle for long enough (e.g. a friend that
+    // hasn't opened a tunnel in hours). per_sec is up to 2^32-1; elapsed_ns
+    // is unbounded in principle. The old code wrapped to a negative `add`,
+    // which then evaluated `cur + add` below burst and stored a negative
+    // token count — starving that friend permanently. Compute in __int128
+    // and cap `add` at the bucket's burst before falling back to int64.
+    // (Capping at burst is sound: any `add` larger than that would be
+    // clipped to burst by std::min anyway.)
+    const auto compute_add = [](std::int64_t per_sec_val, std::int64_t elapsed,
+                                std::int64_t burst) -> std::int64_t {
+        const __int128 raw =
+            (static_cast<__int128>(per_sec_val) * static_cast<__int128>(elapsed)) / 1'000'000'000;
+        if (raw <= 0) {
+            return 0;
+        }
+        return static_cast<std::int64_t>(std::min<__int128>(raw, burst));
+    };
+
     if (b.spec.open_per_sec > 0 && b.spec.open_burst > 0) {
-        const std::int64_t add =
-            (static_cast<std::int64_t>(b.spec.open_per_sec) * elapsed_ns) / 1'000'000'000;
+        const std::int64_t add = compute_add(b.spec.open_per_sec, elapsed_ns, b.spec.open_burst);
         if (add > 0) {
             auto cur = b.open_tokens.load(std::memory_order_relaxed);
             auto next =
@@ -125,8 +144,7 @@ void RateLimiter::refill(Bucket& b) const {
         }
     }
     if (b.spec.bytes_per_sec > 0 && b.spec.bytes_burst > 0) {
-        const std::int64_t add =
-            (static_cast<std::int64_t>(b.spec.bytes_per_sec) * elapsed_ns) / 1'000'000'000;
+        const std::int64_t add = compute_add(b.spec.bytes_per_sec, elapsed_ns, b.spec.bytes_burst);
         if (add > 0) {
             auto cur = b.bytes_tokens.load(std::memory_order_relaxed);
             auto next =
