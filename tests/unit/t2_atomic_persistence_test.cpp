@@ -15,6 +15,14 @@
 #include <sstream>
 #include <string>
 
+#ifdef _WIN32
+#include <process.h>
+#define toxtunnel_test_getpid() _getpid()
+#else
+#include <unistd.h>
+#define toxtunnel_test_getpid() ::getpid()
+#endif
+
 #include "toxtunnel/util/config.hpp"
 
 namespace fs = std::filesystem;
@@ -25,7 +33,7 @@ class TempDirFixture : public ::testing::Test {
    protected:
     void SetUp() override {
         dir_ = fs::temp_directory_path() /
-               (std::string("toxtunnel-t2-") + std::to_string(::getpid()) + "-" +
+               (std::string("toxtunnel-t2-") + std::to_string(toxtunnel_test_getpid()) + "-" +
                 std::to_string(reinterpret_cast<std::uintptr_t>(this)));
         fs::create_directories(dir_);
     }
