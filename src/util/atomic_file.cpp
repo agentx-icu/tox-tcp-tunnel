@@ -106,7 +106,24 @@ Expected<void, std::string> posix_write(const std::filesystem::path& path,
         if (!parent.empty()) {
             const int dfd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (dfd >= 0) {
+#if defined(__APPLE__)
+                // macOS fsync() does not flush platter caches; F_FULLFSYNC
+                // does. The header doc promises "F_FULLFSYNC on macOS for
+                // the identity file" — for that promise to hold end to
+                // end, the *directory entry* commit also needs the full
+                // barrier. F_FULLFSYNC may fail on some FS (network FS,
+                // older HFS); plain fsync is the documented fallback
+                // (H-35 in the 2026-05-20 review).
+                if (opts.use_full_fsync_macos) {
+                    if (::fcntl(dfd, F_FULLFSYNC) != 0) {
+                        (void)::fsync(dfd);
+                    }
+                } else {
+                    (void)::fsync(dfd);
+                }
+#else
                 (void)::fsync(dfd);
+#endif
                 ::close(dfd);
             }
             // Best-effort: a missing parent fsync is rarely fatal.
@@ -120,8 +137,12 @@ Expected<void, std::string> posix_write(const std::filesystem::path& path,
 Expected<void, std::string> windows_write(const std::filesystem::path& path,
                                           std::span<const std::uint8_t> contents,
                                           const AtomicFileOptions& /*opts*/) {
+    // Match the POSIX path: tmp file name carries the PID so two processes
+    // writing the same target don't truncate each other's tmp (C-25 in the
+    // 2026-05-20 review). The PID alone is sufficient because all callers
+    // run as a single ToxTunnel instance per process.
     auto tmp = path;
-    tmp += ".tmp";
+    tmp += L".tmp." + std::to_wstring(::GetCurrentProcessId());
 
     HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
@@ -129,13 +150,24 @@ Expected<void, std::string> windows_write(const std::filesystem::path& path,
         return make_unexpected(std::string("CreateFileW tmp failed: ") +
                                std::to_string(::GetLastError()));
     }
-    DWORD written = 0;
-    if (!::WriteFile(h, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr) ||
-        written != contents.size()) {
-        ::CloseHandle(h);
-        ::DeleteFileW(tmp.c_str());
-        return make_unexpected(std::string("WriteFile tmp failed: ") +
-                               std::to_string(::GetLastError()));
+    // WriteFile is limited to DWORD bytes per call; loop for larger inputs
+    // so a >4 GiB payload (theoretical, but a real bug waiting to happen
+    // if a caller ever passes one) is written in full instead of silently
+    // truncated.
+    const std::uint8_t* p = contents.data();
+    std::size_t remaining = contents.size();
+    while (remaining > 0) {
+        const DWORD chunk =
+            static_cast<DWORD>(std::min<std::size_t>(remaining, std::numeric_limits<DWORD>::max()));
+        DWORD written = 0;
+        if (!::WriteFile(h, p, chunk, &written, nullptr) || written != chunk) {
+            const auto err = ::GetLastError();
+            ::CloseHandle(h);
+            ::DeleteFileW(tmp.c_str());
+            return make_unexpected(std::string("WriteFile tmp failed: ") + std::to_string(err));
+        }
+        p += written;
+        remaining -= written;
     }
     ::FlushFileBuffers(h);
     ::CloseHandle(h);
