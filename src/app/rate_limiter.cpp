@@ -124,6 +124,10 @@ void RateLimiter::refill(Bucket& b) const {
     // and cap `add` at the bucket's burst before falling back to int64.
     // (Capping at burst is sound: any `add` larger than that would be
     // clipped to burst by std::min anyway.)
+    // -Wpedantic flags __int128 as non-ISO C++; we accept the extension
+    // explicitly here — see the matching note in bdp_flow_control.cpp.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
     const auto compute_add = [](std::int64_t per_sec_val, std::int64_t elapsed,
                                 std::int64_t burst) -> std::int64_t {
         const __int128 raw =
@@ -133,6 +137,7 @@ void RateLimiter::refill(Bucket& b) const {
         }
         return static_cast<std::int64_t>(std::min<__int128>(raw, burst));
     };
+#pragma GCC diagnostic pop
 
     if (b.spec.open_per_sec > 0 && b.spec.open_burst > 0) {
         const std::int64_t add = compute_add(b.spec.open_per_sec, elapsed_ns, b.spec.open_burst);
