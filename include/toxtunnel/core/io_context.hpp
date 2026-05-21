@@ -1,6 +1,7 @@
 #pragma once
 
 #include <asio.hpp>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <functional>
@@ -70,7 +71,9 @@ class IoContext {
     void restart();
 
     /// Return true if the thread pool is currently running.
-    [[nodiscard]] bool is_running() const noexcept { return running_; }
+    [[nodiscard]] bool is_running() const noexcept {
+        return running_.load(std::memory_order_acquire);
+    }
 
     /// Return the number of worker threads configured.
     [[nodiscard]] std::size_t num_threads() const noexcept { return num_threads_; }
@@ -182,7 +185,9 @@ class IoContext {
 
     std::vector<std::thread> threads_;
     std::size_t num_threads_;
-    bool running_{false};
+    /// Read from arbitrary threads via `is_running()`; written from the
+    /// caller of `run()` / `stop()`. Atomic prevents data races.
+    std::atomic<bool> running_{false};
 };
 
 }  // namespace toxtunnel::core

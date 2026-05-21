@@ -47,8 +47,7 @@ void TunnelManager::set_max_tunnels(std::size_t max) {
 }
 
 void TunnelManager::set_backpressure_threshold(std::size_t bytes) {
-    std::unique_lock lock(mutex_);
-    backpressure_threshold_ = bytes;
+    backpressure_threshold_.store(bytes, std::memory_order_relaxed);
 }
 
 // ===========================================================================
@@ -512,7 +511,7 @@ bool TunnelManager::has_backpressure() const {
 }
 
 std::size_t TunnelManager::backpressure_threshold() const noexcept {
-    return backpressure_threshold_;
+    return backpressure_threshold_.load(std::memory_order_relaxed);
 }
 
 // ===========================================================================

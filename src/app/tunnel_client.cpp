@@ -154,7 +154,10 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     // machine may promote a fallback later if the primary stays offline.
     active_index_ = 0;
     server_friend_number_.store(endpoints_[0].friend_number, std::memory_order_release);
-    server_tox_id_hex_ = endpoints_[0].tox_id_hex;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        server_tox_id_hex_ = endpoints_[0].tox_id_hex;
+    }
 
     // Create TunnelManager
     tunnel_mgr_ = std::make_unique<tunnel::TunnelManager>(io_ctx_->get_io_context());
@@ -216,9 +219,10 @@ void TunnelClient::start() {
         providers.friend_pk_prefix = [this](uint16_t /*tunnel_id*/) -> std::string {
             // Client mode talks to exactly one server, so every tunnel maps
             // to that single peer; ignore tunnel_id and return the prefix
-            // directly.
-            return server_tox_id_hex_.size() > 8 ? server_tox_id_hex_.substr(0, 8)
-                                                 : server_tox_id_hex_;
+            // directly. Snapshot under `endpoints_mutex_` to avoid racing
+            // with `switch_active_endpoint`.
+            const auto hex = server_tox_id_snapshot();
+            return hex.size() > 8 ? hex.substr(0, 8) : hex;
         };
         providers.snapshot = [this]() -> tunnel::ManagerSnapshot {
             if (!tunnel_mgr_) {
@@ -978,13 +982,19 @@ void TunnelClient::send_info_request() {
     }
 }
 
+std::string TunnelClient::server_tox_id_snapshot() const {
+    std::lock_guard<std::mutex> lock(endpoints_mutex_);
+    return server_tox_id_hex_;
+}
+
 void TunnelClient::record_server_connection() {
-    if (!known_servers_ || server_tox_id_hex_.empty())
+    const auto tox_id = server_tox_id_snapshot();
+    if (!known_servers_ || tox_id.empty())
         return;
     const auto state = tox_adapter_->get_friend_connection_status(
         server_friend_number_.load(std::memory_order_acquire));
     const auto type = to_known_connection_type(state);
-    if (!known_servers_->record_connection(server_tox_id_hex_, type)) {
+    if (!known_servers_->record_connection(tox_id, type)) {
         util::Logger::warn("known_servers: record_connection rejected tox_id");
         return;
     }
@@ -994,7 +1004,8 @@ void TunnelClient::record_server_connection() {
 }
 
 void TunnelClient::record_server_info(std::string_view yaml_payload) {
-    if (!known_servers_ || server_tox_id_hex_.empty())
+    const auto tox_id = server_tox_id_snapshot();
+    if (!known_servers_ || tox_id.empty())
         return;
 
     const auto snap = util::snapshot_from_yaml(yaml_payload);
@@ -1013,7 +1024,7 @@ void TunnelClient::record_server_info(std::string_view yaml_payload) {
         info.os.value_or("(undisclosed)"), info.arch.value_or("(undisclosed)"),
         info.toxtunnel_version.value_or("(undisclosed)"));
 
-    if (!known_servers_->record_info(server_tox_id_hex_, info)) {
+    if (!known_servers_->record_info(tox_id, info)) {
         util::Logger::warn("known_servers: record_info rejected tox_id");
         return;
     }

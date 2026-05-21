@@ -94,17 +94,17 @@ WriteCoalescer::Decision WriteCoalescer::decide() noexcept {
     // Hysteresis: require kHysteresisSamples observations in a row before
     // committing the transition. This avoids flapping on a brief mode change.
     if (candidate == d.previous) {
-        candidate_streak_ = 0;
+        candidate_streak_.store(0, std::memory_order_relaxed);
         d.policy = d.previous;
         return d;
     }
-    if (candidate != candidate_) {
-        candidate_ = candidate;
-        candidate_streak_ = 1;
+    if (candidate != candidate_.load(std::memory_order_relaxed)) {
+        candidate_.store(candidate, std::memory_order_relaxed);
+        candidate_streak_.store(1, std::memory_order_relaxed);
         d.policy = d.previous;
         return d;
     }
-    if (++candidate_streak_ < kHysteresisSamples) {
+    if (candidate_streak_.fetch_add(1, std::memory_order_relaxed) + 1 < kHysteresisSamples) {
         d.policy = d.previous;
         return d;
     }
@@ -112,7 +112,7 @@ WriteCoalescer::Decision WriteCoalescer::decide() noexcept {
     d.policy = candidate;
     d.transitioned = true;
     policy_.store(d.policy, std::memory_order_relaxed);
-    candidate_streak_ = 0;
+    candidate_streak_.store(0, std::memory_order_relaxed);
     return d;
 }
 

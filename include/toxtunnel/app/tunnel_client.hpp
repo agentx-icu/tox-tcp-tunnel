@@ -259,8 +259,15 @@ class TunnelClient {
     Config config_;
 
     /// Server's full Tox ID (uppercase 76-hex). Used as the persistent
-    /// identity in `known_servers_`. Captured during initialize().
+    /// identity in `known_servers_`. Written from `initialize()` and
+    /// `switch_active_endpoint()` under `endpoints_mutex_`; all reads
+    /// from non-init paths must also take `endpoints_mutex_` to avoid
+    /// data races (inspect-provider lambda, INFO callbacks). Helper
+    /// `server_tox_id_snapshot()` does the lock+copy.
     std::string server_tox_id_hex_;
+
+    /// Thread-safe snapshot of `server_tox_id_hex_` for any-thread reads.
+    [[nodiscard]] std::string server_tox_id_snapshot() const;
 
     /// Persistent registry of servers this client has connected to. Backed by
     /// `<config.data_dir>/known_servers.yaml`. Lazily initialised once we

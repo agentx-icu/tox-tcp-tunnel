@@ -148,9 +148,15 @@ class WriteCoalescer {
     std::atomic<std::int64_t> avg_write_gap_us_{0};
 
     // Hysteresis tracking.
+    // `candidate_` and `candidate_streak_` are read/written in `decide()`,
+    // which is called from `send_data_to_tox()` on any tunnel-data path
+    // before the coalesce mutex is taken — so concurrent inbound TCP reads
+    // race here. Use atomics to keep updates well-defined; the small loss
+    // of "strict" hysteresis under contention is acceptable because
+    // hysteresis itself is statistical.
     std::atomic<CoalescePolicy> policy_{CoalescePolicy::Batch};
-    CoalescePolicy candidate_{CoalescePolicy::Batch};
-    int candidate_streak_{0};
+    std::atomic<CoalescePolicy> candidate_{CoalescePolicy::Batch};
+    std::atomic<int> candidate_streak_{0};
 };
 
 }  // namespace toxtunnel::tunnel

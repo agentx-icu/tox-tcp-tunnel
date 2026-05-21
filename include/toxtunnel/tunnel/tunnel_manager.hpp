@@ -364,8 +364,10 @@ class TunnelManager {
     /// Maximum number of tunnels.
     std::size_t max_tunnels_{100};
 
-    /// Backpressure threshold in bytes.
-    std::size_t backpressure_threshold_{64 * 1024};
+    /// Backpressure threshold in bytes. Read via `backpressure_threshold()`
+    /// without taking `mutex_` (hot path), set via `set_backpressure_threshold()`
+    /// from arbitrary threads. Atomic prevents data races.
+    std::atomic<std::size_t> backpressure_threshold_{64 * 1024};
 
     /// Handler for sending frames. Guarded by handler_mutex_ rather than the
     /// general mutex_ so the (low-frequency) control-frame send path doesn't

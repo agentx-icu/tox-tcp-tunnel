@@ -30,13 +30,23 @@ endif()
 # Options
 option(TOXTUNNEL_BUILD_TESTS "Build tests" ON)
 option(TOXTUNNEL_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(TOXTUNNEL_ENABLE_TSAN "Enable ThreadSanitizer (mutually exclusive with ASAN)" OFF)
 option(TOXTUNNEL_WARNINGS_AS_ERRORS "Treat warnings as errors" ON)
 option(TOXTUNNEL_PORTABLE_RELEASE "Enable portability-oriented release flags" OFF)
+
+if(TOXTUNNEL_ENABLE_ASAN AND TOXTUNNEL_ENABLE_TSAN)
+    message(FATAL_ERROR "TOXTUNNEL_ENABLE_ASAN and TOXTUNNEL_ENABLE_TSAN are mutually exclusive")
+endif()
 
 # Sanitizer flags (applied globally since they affect linking too)
 if(NOT MSVC AND TOXTUNNEL_ENABLE_ASAN)
     add_compile_options(-fsanitize=address,undefined -g)
     add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(NOT MSVC AND TOXTUNNEL_ENABLE_TSAN)
+    add_compile_options(-fsanitize=thread -g -O1)
+    add_link_options(-fsanitize=thread)
 endif()
 
 if(TOXTUNNEL_PORTABLE_RELEASE)

@@ -131,10 +131,14 @@ class TcpListener {
     }
 
     /// Return the configured maximum number of connections.
-    [[nodiscard]] std::size_t max_connections() const noexcept { return max_connections_; }
+    [[nodiscard]] std::size_t max_connections() const noexcept {
+        return max_connections_.load(std::memory_order_relaxed);
+    }
 
     /// Return true if the accept loop is currently active.
-    [[nodiscard]] bool is_accepting() const noexcept { return accepting_; }
+    [[nodiscard]] bool is_accepting() const noexcept {
+        return accepting_.load(std::memory_order_relaxed);
+    }
 
     /// Return the local endpoint the acceptor is bound to.
     [[nodiscard]] asio::ip::tcp::endpoint local_endpoint() const;
@@ -164,8 +168,13 @@ class TcpListener {
     /// the increment/decrement and the `connection_count()` accessor are
     /// race-free.
     std::atomic<std::size_t> connection_count_{0};
-    std::size_t max_connections_{kDefaultMaxConnections};
-    bool accepting_{false};
+    /// Read from arbitrary threads via `max_connections()`, written from the
+    /// io thread (`set_max_connections`) and read in `do_accept` /
+    /// `on_connection_closed`. Atomic prevents data races.
+    std::atomic<std::size_t> max_connections_{kDefaultMaxConnections};
+    /// Same rationale as `max_connections_`: read from arbitrary threads via
+    /// `is_accepting()` and toggled from io thread (`start`/`stop`).
+    std::atomic<bool> accepting_{false};
 };
 
 }  // namespace toxtunnel::core

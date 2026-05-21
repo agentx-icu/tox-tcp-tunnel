@@ -19,12 +19,12 @@ IoContext::~IoContext() {
 // =========================================================================
 
 void IoContext::run() {
-    if (running_) {
+    if (running_.load(std::memory_order_acquire)) {
         util::Logger::debug("IoContext::run() called but already running; ignoring");
         return;
     }
 
-    running_ = true;
+    running_.store(true, std::memory_order_release);
 
     // Install a work guard so that io_context::run() does not return
     // while we want the thread pool to stay alive.
@@ -43,7 +43,7 @@ void IoContext::run() {
 }
 
 void IoContext::stop() {
-    if (!running_) {
+    if (!running_.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -59,12 +59,12 @@ void IoContext::stop() {
 
     join_threads();
 
-    running_ = false;
+    running_.store(false, std::memory_order_release);
     util::Logger::info("IoContext stopped");
 }
 
 void IoContext::restart() {
-    if (running_) {
+    if (running_.load(std::memory_order_acquire)) {
         util::Logger::warn("IoContext::restart() called while still running; stopping first");
         stop();
     }

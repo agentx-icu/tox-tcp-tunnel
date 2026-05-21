@@ -30,12 +30,12 @@ TcpListener::~TcpListener() {
 // ===========================================================================
 
 void TcpListener::start_accept(AcceptHandler handler) {
-    if (accepting_) {
+    if (accepting_.load(std::memory_order_relaxed)) {
         return;
     }
 
     accept_handler_ = std::move(handler);
-    accepting_ = true;
+    accepting_.store(true, std::memory_order_relaxed);
 
     util::Logger::info("TcpListener: accepting connections on port {}", port_);
 
@@ -43,11 +43,11 @@ void TcpListener::start_accept(AcceptHandler handler) {
 }
 
 void TcpListener::stop() {
-    if (!accepting_ && !acceptor_.is_open()) {
+    if (!accepting_.load(std::memory_order_relaxed) && !acceptor_.is_open()) {
         return;
     }
 
-    accepting_ = false;
+    accepting_.store(false, std::memory_order_relaxed);
 
     asio::error_code ec;
     acceptor_.close(ec);
@@ -68,25 +68,28 @@ void TcpListener::on_connection_closed() {
     while (prev > 0) {
         if (connection_count_.compare_exchange_weak(prev, prev - 1, std::memory_order_relaxed)) {
             util::Logger::debug("TcpListener: connection closed (active: {}/{})", prev - 1,
-                                max_connections_);
+                                max_connections_.load(std::memory_order_relaxed));
             break;
         }
     }
 
     // If the accept loop was paused because we hit the connection limit,
     // resume it now that there is room for a new connection.
-    if (accepting_ && connection_count_.load(std::memory_order_relaxed) < max_connections_) {
+    if (accepting_.load(std::memory_order_relaxed) &&
+        connection_count_.load(std::memory_order_relaxed) <
+            max_connections_.load(std::memory_order_relaxed)) {
         do_accept();
     }
 }
 
 void TcpListener::set_max_connections(std::size_t max) {
-    max_connections_ = max;
+    max_connections_.store(max, std::memory_order_relaxed);
 
-    util::Logger::debug("TcpListener: max connections set to {}", max_connections_);
+    util::Logger::debug("TcpListener: max connections set to {}", max);
 
     // If we now have room, resume accepting.
-    if (accepting_ && connection_count_.load(std::memory_order_relaxed) < max_connections_) {
+    if (accepting_.load(std::memory_order_relaxed) &&
+        connection_count_.load(std::memory_order_relaxed) < max) {
         do_accept();
     }
 }
@@ -121,14 +124,15 @@ void TcpListener::setup_acceptor(const asio::ip::tcp::endpoint& endpoint) {
 }
 
 void TcpListener::do_accept() {
-    if (!accepting_) {
+    if (!accepting_.load(std::memory_order_relaxed)) {
         return;
     }
 
+    std::size_t max = max_connections_.load(std::memory_order_relaxed);
     std::size_t current = connection_count_.load(std::memory_order_relaxed);
-    if (current >= max_connections_) {
+    if (current >= max) {
         util::Logger::warn("TcpListener: connection limit reached ({}/{}), pausing accept loop",
-                           current, max_connections_);
+                           current, max);
         return;
     }
 
@@ -151,7 +155,7 @@ void TcpListener::do_accept() {
 
         util::Logger::debug("TcpListener: accepted connection from {} (active: {}/{})",
                             conn->remote_endpoint().address().to_string(), new_count,
-                            max_connections_);
+                            max_connections_.load(std::memory_order_relaxed));
 
         if (accept_handler_) {
             accept_handler_(std::move(conn));

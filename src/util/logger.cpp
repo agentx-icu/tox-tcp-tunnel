@@ -108,13 +108,20 @@ void Logger::flush() {
 // =========================================================================
 
 std::shared_ptr<spdlog::logger> Logger::get() {
-    // Fast path: logger already initialised.
-    if (auto ptr = g_logger; ptr) {
-        return ptr;
+    // `g_logger` is a plain shared_ptr guarded by `g_mutex`; reading it
+    // without the lock would be a data race against `init()`/`shutdown()`.
+    // spdlog has its own per-sink locking, so the extra mutex hop here is
+    // dominated by the logging work itself.
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_logger) {
+            return g_logger;
+        }
     }
-
-    // Slow path: auto-init with defaults.
+    // Auto-init with defaults. `init()` itself takes `g_mutex`, so it must
+    // run without the lock held here.
     init();
+    std::lock_guard<std::mutex> lock(g_mutex);
     return g_logger;
 }
 
