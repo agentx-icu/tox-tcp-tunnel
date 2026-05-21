@@ -543,9 +543,19 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
         std::shared_lock rules_lock(rules_mutex_);
         access_result = rules_engine_.evaluate(access_req);
     }
-    if (access_result == AccessResult::Denied) {
-        util::Logger::warn("Access denied for friend {} to {}:{}", pk_hex, target_host,
-                           target_port);
+    // S14 / 2026-05-20 follow-up: RulesEngine documents a default-deny
+    // policy (`rules_engine.hpp:88`) and `evaluate()` itself comments
+    // "No matching rule - use default deny" when returning Default. The
+    // previous tunnel_server treated Default as "permissive default" and
+    // allowed the request — turning the documented default-deny ACL into
+    // a default-allow ACL. Only AccessResult::Allowed should pass through.
+    if (access_result != AccessResult::Allowed) {
+        const char* reason = access_result == AccessResult::Denied
+                                 ? "Access denied"
+                                 : "No matching allow rule (default deny)";
+        util::Logger::warn("Access {} for friend {} to {}:{} ({})",
+                           access_result == AccessResult::Denied ? "denied" : "default-denied",
+                           pk_hex, target_host, target_port, reason);
         util::MetricsRegistry::instance().inc_tunnels_opened(
             util::MetricsRegistry::OpenResult::Denied);
 
@@ -553,17 +563,13 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
         if (it != managers_.end()) {
-            auto error_frame =
-                tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 1, "Access denied");
+            auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 1, reason);
             it->second->send_frame(error_frame);
         }
         return;
     }
 
-    // Default and Allowed are both treated as permitted (permissive default).
-    util::Logger::debug("Access {} for friend {} to {}:{}",
-                        access_result == AccessResult::Allowed ? "allowed" : "default-allowed",
-                        pk_hex, target_host, target_port);
+    util::Logger::debug("Access allowed for friend {} to {}:{}", pk_hex, target_host, target_port);
 
     // Find or validate the TunnelManager. Hold a shared_ptr copy so the
     // long unlocked tail (handle_incoming_open + async_resolve + connect

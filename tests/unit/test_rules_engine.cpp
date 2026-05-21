@@ -155,6 +155,28 @@ TEST(RulesEngineEvaluate, UnknownFriendReturnsDefault) {
     EXPECT_EQ(engine.evaluate(req), AccessResult::Default);
 }
 
+// S14 / 2026-05-20 follow-up: a friend that has a rule entry but whose
+// request matches neither an allow nor a deny target also returns
+// Default. The TunnelServer must treat this as deny — see the header
+// doc "It follows a default-deny policy unless explicitly allowed".
+// This unit test pins the engine-side contract; the server-side
+// enforcement is unit-tested above the abstraction and verified by
+// inspection of TunnelServer::handle_tunnel_open.
+TEST(RulesEngineEvaluate, MissingAllowReturnsDefaultDeny) {
+    FriendRule rule;
+    rule.friend_pk = kTestPk1;
+    rule.allow.push_back(TargetSpec{"explicit.allowed.host", {80}});
+    rule.deny.push_back(TargetSpec{"explicit.denied.host", {}});
+
+    RulesEngine engine(std::vector<FriendRule>{rule});
+    // Friend known, but the requested target matches neither list.
+    AccessRequest req{kTestPk1, "neither.list.host", 443, {}, {}};
+
+    EXPECT_EQ(engine.evaluate(req), AccessResult::Default)
+        << "engine must return Default when no allow rule matches; "
+        << "TunnelServer is contract-bound to treat that as deny";
+}
+
 // ============================================================================
 // Evaluate - allow rules
 // ============================================================================
