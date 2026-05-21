@@ -248,8 +248,8 @@ TEST_F(ReaperTest, TimerFiresPeriodically) {
 
     // Pump the io_context until the timer fires and removes the tunnel,
     // or we time out.
-    const bool reaped = RunUntil(
-        io_ctx, [&] { return !manager->has_tunnel(500); }, 5000ms);
+    auto reaped_predicate = [&] { return !manager->has_tunnel(500); };
+    const bool reaped = RunUntil(io_ctx, reaped_predicate, 5000ms);
     EXPECT_TRUE(reaped);
 }
 
