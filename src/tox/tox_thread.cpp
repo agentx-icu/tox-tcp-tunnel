@@ -78,31 +78,57 @@ void ToxThread::stop() {
     // Wake the thread if it is sleeping on the condition variable.
     command_cv_.notify_one();
 
+    // H-S-5 (2026-05-20 fix-storm review): drain pending commands
+    // *before* joining the worker thread. Reasoning: tox_iterate can
+    // hang for arbitrary time (it's literally why ToxWatchdog exists);
+    // if it does, thread_.join() blocks forever. The original ordering
+    // (join → drain) meant any caller blocked on a future never woke
+    // up, even though we *could* have fulfilled the promise from this
+    // side. By draining first we guarantee caller-side unblock even if
+    // the worker is wedged; subsequent join can still hang, but that
+    // pathology is the watchdog's job to escalate to std::abort.
+    //
+    // Empty result matches the existing "operation failed" convention
+    // used elsewhere in process_commands (the short-data guards in
+    // AddFriend / SendData).
+    {
+        std::queue<Command> leftover;
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            std::swap(leftover, command_queue_);
+        }
+        while (!leftover.empty()) {
+            try {
+                leftover.front().result.set_value({});
+            } catch (const std::future_error&) {
+                // Promise already satisfied or abandoned; nothing to do.
+            }
+            leftover.pop();
+        }
+    }
+
     if (thread_.joinable()) {
         thread_.join();
     }
 
-    // S24 / H-14 (2026-05-20 review): the loop can exit with commands
-    // still sitting in the queue — e.g. a caller posted SendData and
-    // was waiting on its future when stop() flipped running_ to false
-    // and the loop bailed out before draining. Leaving those promises
-    // unfulfilled deadlocks any caller blocked on future::get(). Fail
-    // them explicitly with empty result vectors so callers unwind
-    // cleanly. Empty result matches the existing "operation failed"
-    // convention used elsewhere in process_commands (see e.g. the
-    // short-data guards in AddFriend / SendData).
-    std::queue<Command> leftover;
+    // Anything the worker enqueued *between* our drain above and the
+    // moment running_ went false (race window: worker was mid-iteration
+    // and a third party still posted) — drain again so future::get
+    // callers don't stick. After join the queue is single-owner so
+    // no lock contention.
     {
-        std::lock_guard<std::mutex> lock(command_mutex_);
-        std::swap(leftover, command_queue_);
-    }
-    while (!leftover.empty()) {
-        try {
-            leftover.front().result.set_value({});
-        } catch (const std::future_error&) {
-            // Promise already satisfied or abandoned; nothing to do.
+        std::queue<Command> leftover;
+        {
+            std::lock_guard<std::mutex> lock(command_mutex_);
+            std::swap(leftover, command_queue_);
         }
-        leftover.pop();
+        while (!leftover.empty()) {
+            try {
+                leftover.front().result.set_value({});
+            } catch (const std::future_error&) {
+            }
+            leftover.pop();
+        }
     }
 
     save_state();
