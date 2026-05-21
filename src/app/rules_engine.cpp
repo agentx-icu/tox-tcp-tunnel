@@ -197,48 +197,60 @@ bool RulesEngine::host_matches(std::string_view host, std::string_view pattern) 
         return false;
     }
 
-    // Exact match
-    if (pattern == host) {
-        return true;
-    }
-
-    // Single wildcard matches everything
+    // Single wildcard matches everything (no normalisation needed).
     if (pattern == "*") {
         return true;
     }
 
+    // Hostnames are case-insensitive (RFC 1035 §2.3.3); IPv4 literals are
+    // unaffected by tolower (digits/dots only). Normalise both sides
+    // *before* taking the exact/wildcard branches so that, e.g.,
+    // `deny: *.EXAMPLE.COM` correctly blocks `sub.example.com` and vice
+    // versa. The previous implementation only lowered for the exact-match
+    // fallback and let the wildcard path through case-sensitive, which
+    // allowed callers to bypass deny rules with a single uppercase letter
+    // (C-3 in the 2026-05-20 review).
+    std::string host_lower(host);
+    std::string pattern_lower(pattern);
+    std::transform(host_lower.begin(), host_lower.end(), host_lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    // Exact match
+    if (pattern_lower == host_lower) {
+        return true;
+    }
+
     // Handle wildcard patterns
-    if (pattern.find('*') != std::string_view::npos) {
+    if (pattern_lower.find('*') != std::string::npos) {
         // Simple wildcard matching
         // We support patterns like:
         // - *.example.com (matches subdomain.example.com)
         // - 192.168.*.* (matches 192.168.1.100)
         // - localhost* (matches localhost, localhost:8080)
 
-        std::string host_str(host);
-        std::string pattern_str(pattern);
-
         // Find the wildcard position
-        size_t wildcard_pos = pattern_str.find('*');
-        std::string prefix = pattern_str.substr(0, wildcard_pos);
-        std::string suffix = pattern_str.substr(wildcard_pos + 1);
+        size_t wildcard_pos = pattern_lower.find('*');
+        std::string prefix = pattern_lower.substr(0, wildcard_pos);
+        std::string suffix = pattern_lower.substr(wildcard_pos + 1);
 
         // Check prefix match
         if (!prefix.empty()) {
-            if (host_str.length() < prefix.length()) {
+            if (host_lower.length() < prefix.length()) {
                 return false;
             }
-            if (host_str.substr(0, prefix.length()) != prefix) {
+            if (host_lower.substr(0, prefix.length()) != prefix) {
                 return false;
             }
         }
 
         // Check suffix match
         if (!suffix.empty()) {
-            if (host_str.length() < suffix.length()) {
+            if (host_lower.length() < suffix.length()) {
                 return false;
             }
-            if (host_str.substr(host_str.length() - suffix.length()) != suffix) {
+            if (host_lower.substr(host_lower.length() - suffix.length()) != suffix) {
                 return false;
             }
         }
@@ -246,13 +258,7 @@ bool RulesEngine::host_matches(std::string_view host, std::string_view pattern) 
         return true;
     }
 
-    // Case-insensitive comparison for hostnames
-    std::string host_lower(host);
-    std::string pattern_lower(pattern);
-    std::transform(host_lower.begin(), host_lower.end(), host_lower.begin(), ::tolower);
-    std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
-
-    return host_lower == pattern_lower;
+    return false;
 }
 
 bool RulesEngine::ip_matches(std::string_view ip, std::string_view pattern) {

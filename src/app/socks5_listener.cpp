@@ -422,6 +422,17 @@ std::string Socks5Listener::start(asio::io_context& io_ctx, const std::string& h
         ec.clear();
     }
 
+    // SOCKS5 v1 has no authentication, so a non-loopback bind would expose
+    // an open proxy to anyone on the network. Config-level validation
+    // (util::is_loopback_host) catches the YAML-supplied path, but the
+    // listener's own contract is the right place to enforce this — any
+    // caller that constructs Socks5Listener directly (tests, future code)
+    // must hit the same guard (C-7 in the 2026-05-20 review).
+    if (!addr.is_loopback()) {
+        return "Socks5Listener: refused to bind non-loopback address " + addr.to_string() +
+               " — SOCKS5 has no authentication";
+    }
+
     asio::ip::tcp::endpoint endpoint(addr, port);
     acceptor_ = std::make_unique<asio::ip::tcp::acceptor>(io_ctx);
     acceptor_->open(endpoint.protocol(), ec);

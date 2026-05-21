@@ -248,6 +248,17 @@ TEST_F(Socks5ListenerLifecycleTest, StopIsIdempotent) {
     EXPECT_FALSE(listener_->is_running());
 }
 
+// C-7 / 2026-05-20 finding: Socks5Listener::start() must refuse a
+// non-loopback bind, not delegate that check to the upstream config
+// parser. SOCKS5 v1 has no authentication; an accidental 0.0.0.0 bind
+// is an open proxy on the LAN.
+TEST_F(Socks5ListenerLifecycleTest, RejectsNonLoopbackBind) {
+    auto err = listener_->start(io_ctx_, "0.0.0.0", 0, [](auto, auto, auto, auto, auto) {});
+    EXPECT_FALSE(err.empty()) << "start() should refuse non-loopback bind";
+    EXPECT_NE(err.find("non-loopback"), std::string::npos) << err;
+    EXPECT_FALSE(listener_->is_running());
+}
+
 TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
     std::atomic<bool> got_dest{false};
     std::string got_host;

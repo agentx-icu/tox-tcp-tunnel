@@ -48,6 +48,22 @@ TEST(RulesEngineHostMatches, CaseInsensitive) {
     EXPECT_TRUE(RulesEngine::host_matches("localhost", "LOCALHOST"));
 }
 
+// C-3 / 2026-05-20 finding: wildcard host matching used to be
+// case-sensitive, so a deny rule of `*.EXAMPLE.COM` would not block a
+// request to `sub.example.com` (and vice versa) — a bypass for any
+// admin who happened to type the rule in uppercase. Hostnames are
+// case-insensitive per RFC 1035 §2.3.3.
+TEST(RulesEngineHostMatches, WildcardIsCaseInsensitive) {
+    // Pattern upper, host lower.
+    EXPECT_TRUE(RulesEngine::host_matches("sub.example.com", "*.EXAMPLE.COM"));
+    EXPECT_TRUE(RulesEngine::host_matches("LOCALNET", "local*"));
+    // Pattern lower, host upper (the original failure mode).
+    EXPECT_TRUE(RulesEngine::host_matches("SUB.EXAMPLE.COM", "*.example.com"));
+    EXPECT_TRUE(RulesEngine::host_matches("LOCALHOST", "local*"));
+    // Negative case: case-folding doesn't make non-matches match.
+    EXPECT_FALSE(RulesEngine::host_matches("OTHER.NET", "*.example.com"));
+}
+
 // ============================================================================
 // IP matching
 // ============================================================================
