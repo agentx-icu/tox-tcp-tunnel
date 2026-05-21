@@ -1,6 +1,7 @@
 #include "toxtunnel/app/rules_engine.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 
@@ -194,8 +195,20 @@ bool RulesEngine::has_rules_for_friend(const std::string& friend_pk) const {
 }
 
 const FriendRule* RulesEngine::find_friend_rule(const std::string& friend_pk) const {
-    auto it = std::find_if(rules_.begin(), rules_.end(), [&friend_pk](const FriendRule& rule) {
-        return rule.friend_pk == friend_pk;
+    // C-S-3 (2026-05-20 fix-storm review): normalise both sides to
+    // uppercase. Rule keys are canonicalised on load (see
+    // from_string), but request keys come from many sources — the Tox
+    // adapter emits uppercase via bytes_to_hex, but tests and
+    // future callers may pass lowercase. Doing the case fold here
+    // keeps the contract local: "any hex form matches its canonical
+    // rule".
+    std::string canonical;
+    canonical.reserve(friend_pk.size());
+    for (char c : friend_pk) {
+        canonical.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    auto it = std::find_if(rules_.begin(), rules_.end(), [&canonical](const FriendRule& rule) {
+        return rule.friend_pk == canonical;
     });
     return it != rules_.end() ? &(*it) : nullptr;
 }
@@ -443,6 +456,13 @@ util::Expected<void, std::string> RulesEngine::save(const std::filesystem::path&
 }
 
 void RulesEngine::add_rule(FriendRule rule) {
+    // C-S-3 (2026-05-20 fix-storm review): canonicalise friend_pk on
+    // insert so add_rule and from_string both produce uppercase keys.
+    // find_friend_rule also case-folds the lookup, so requests via
+    // either convention will still match.
+    for (auto& c : rule.friend_pk) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
     rules_.push_back(std::move(rule));
 }
 

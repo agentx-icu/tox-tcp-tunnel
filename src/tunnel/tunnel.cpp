@@ -401,12 +401,23 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
     util::Logger::debug("Tunnel {} received ACK for {} bytes (window now {})", tunnel_id_, acked,
                         new_window);
 
-    // C-18 follow-up: if on_tcp_data_received paused the TCP read because
-    // the send window was full, resume it now that there is room again.
-    // resume_read is idempotent + thread-safe, so it's cheap to call
-    // unconditionally; the no-op fast path returns early.
-    if (new_window < current_window && tcp_conn_) {
-        tcp_conn_->resume_read();
+    // C-S-1 + H-S-1 (2026-05-20 fix-storm review):
+    // (1) C-S-1: snapshot `tcp_conn_` under `mutex_` before deref —
+    //     `force_close()` resets it under the same lock from any thread.
+    // (2) H-S-1: the earlier `new_window < current_window` predicate
+    //     silently broke after S29's saturating-CAS refund: a refund
+    //     could drive send_window_used_ to 0 *before* this ACK landed,
+    //     so by the time we read it both values are 0 and the resume is
+    //     skipped — TCP read stays paused forever. Trigger resume on any
+    //     ACK that carried bytes; resume_read is idempotent so it's a
+    //     no-op when the loop wasn't paused.
+    std::shared_ptr<core::TcpConnection> conn;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        conn = tcp_conn_;
+    }
+    if (conn && acked > 0) {
+        conn->resume_read();
     }
 }
 
@@ -458,10 +469,17 @@ void TunnelImpl::on_tcp_data_received(const uint8_t* data, std::size_t length) {
     // upstream by pausing TCP reads — otherwise the data would be silently
     // dropped (C-18 in the 2026-05-20 review). handle_tunnel_ack_frame
     // calls resume_read once the window drains.
+    // L-S-1 (2026-05-20 fix-storm review): snapshot tcp_conn_ under
+    // mutex_ before deref — force_close() resets it from any thread.
     const bool accepted = send_data_to_tox(std::span<const uint8_t>(data, length));
     if (!accepted) {
-        if (tcp_conn_) {
-            tcp_conn_->pause_read();
+        std::shared_ptr<core::TcpConnection> conn;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            conn = tcp_conn_;
+        }
+        if (conn) {
+            conn->pause_read();
         }
     }
 }
