@@ -324,6 +324,29 @@ TEST(RulesEngineYaml, ParseEmptyYaml) {
     EXPECT_TRUE(result.value().rules().empty());
 }
 
+// C-S-3 (fix-storm review): friend_pk loaded from YAML is normalised
+// to the uppercase form `bytes_to_hex` emits at runtime. A YAML rule
+// using lowercase hex (Tox community convention) must still match
+// incoming friend requests / TUNNEL_OPEN frames whose pk is uppercased
+// by `get_friend_pk_hex`.
+TEST(RulesEngineYaml, FriendPkNormalisedToUppercaseOnLoad) {
+    const char* yaml = R"(
+rules:
+  - friend: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    allow:
+      - host: localhost
+)";
+    auto result = RulesEngine::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& engine = result.value();
+    ASSERT_EQ(engine.rules().size(), 1u);
+    EXPECT_EQ(engine.rules()[0].friend_pk, kTestPk1)
+        << "loaded friend_pk must be canonicalised to uppercase";
+    // And the lookup must match an uppercase key (what bytes_to_hex emits).
+    EXPECT_TRUE(engine.has_rules_for_friend(kTestPk1))
+        << "uppercase lookup should hit the rule loaded from lowercase YAML";
+}
+
 TEST(RulesEngineYaml, ParseInvalidPublicKeyLength) {
     const char* yaml = R"(
 rules:

@@ -116,6 +116,17 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_vi
                     return util::make_unexpected(std::string("Invalid public key: ") +
                                                  pk_result.error());
                 }
+                // C-S-3 (2026-05-20 fix-storm review): canonicalise the
+                // friend_pk to uppercase hex so it compares equal to the
+                // value `bytes_to_hex` produces at lookup time. Without
+                // this an operator who wrote the rule in lowercase (the
+                // Tox community convention) silently gets an ACL that
+                // never matches — friend requests are refused (S28) and
+                // TUNNEL_OPEN requests hit the default-deny path (S14).
+                // Use bytes_to_hex on the parsed key so the canonical
+                // form matches whatever the runtime path emits.
+                rule.friend_pk =
+                    tox::bytes_to_hex(pk_result.value().data(), pk_result.value().size());
 
                 // Validate port ranges
                 for (const auto& target : rule.allow) {
