@@ -44,6 +44,15 @@ class BootstrapSource {
     /// process's still-needed globals (H-S-6 in the 2026-05-20
     /// fix-storm review).
     static void cancel_pending_refreshes() noexcept;
+
+    /// Re-arm the cancellation flag so a *subsequent*
+    /// `resolve_bootstrap_nodes` call can spawn refresh threads again.
+    /// Required because the flag is process-global: without an
+    /// explicit reset, `ToxAdapter::start` after a previous `stop`
+    /// would inherit a permanently-cancelled refresh path
+    /// (Finding-3 user-reported, 2026-05-21). Called by
+    /// `ToxAdapter::start`. Idempotent.
+    static void arm_refreshes() noexcept;
 };
 
 }  // namespace toxtunnel::tox

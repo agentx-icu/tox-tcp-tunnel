@@ -560,62 +560,73 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         zero_copy = static_cast<bool>(on_send_to_tox_owned_);
     }
 
-    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+    // Finding-1 (user-reported, 2026-05-21): a chunk failure mid-stream
+    // is unrecoverable — the bytes are already consumed from the caller
+    // and toxcore lossless gave up on them. The previous code logged
+    // and continued, returning true from this function, so the caller
+    // (on_tcp_data_received) had no way to know the stream was now
+    // broken: TCP stayed in Connected state and the peer would observe
+    // a truncated read. We now break out on first failure, then
+    // transition the tunnel to Error *after* releasing the coalesce
+    // lock so the on_state_change callback (user code) can't deadlock
+    // by re-entering us.
+    bool send_failed = false;
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
 
-    // `Bypass` policy and the legacy `max_delay_us == 0` path both emit each
-    // chunk immediately with no coalesce buffer involvement. The two paths
-    // are bit-identical on the wire; bypass is what the adaptive state
-    // machine settles on for bulk transfers with MTU-sized writes.
-    const bool emit_immediate =
-        coalesce_max_delay_us_ == 0 || decision.policy == CoalescePolicy::Bypass;
-    if (emit_immediate) {
-        for (std::size_t offset = 0; offset < data.size(); offset += kMaxTcpPayloadPerToxFrame) {
-            const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
-            bool sent = false;
-            if (zero_copy) {
-                auto buf = OwnedFrameBuffer::with_payload(data.subspan(offset, chunk_size));
-                util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
-                ProtocolFrame::serialize_tunnel_data_in_place(buf, tunnel_id_);
-                sent = send_owned_data_to_tox(std::move(buf));
-            } else {
-                auto frame =
-                    ProtocolFrame::make_tunnel_data(tunnel_id_, data.subspan(offset, chunk_size));
-                sent = send_frame_to_tox(frame);
-            }
-            if (!sent) {
-                // S27 / 2026-05-20 follow-up: the underlying Tox send was
-                // dropped (toxcore queue full, friend offline mid-batch,
-                // etc.). Refund the bytes we charged at the top of this
-                // function so the send window doesn't leak forever; without
-                // the refund a few consecutive drops would saturate
-                // send_window_used_ and pause TCP read indefinitely.
-                // S29 (2026-05-20 follow-up): refund via a CAS loop that
-                // saturates at zero — a plain fetch_sub can underflow an
-                // unsigned counter if a racing TUNNEL_ACK already reduced
-                // it below `chunk_size` (size_t wraps to ~SIZE_MAX, which
-                // would then trip backpressure permanently).
-                std::size_t cur = send_window_used_.load(std::memory_order_relaxed);
-                while (true) {
-                    const std::size_t next = cur >= chunk_size ? cur - chunk_size : 0;
-                    if (send_window_used_.compare_exchange_weak(cur, next,
-                                                                std::memory_order_relaxed)) {
-                        break;
-                    }
+        // `Bypass` policy and the legacy `max_delay_us == 0` path both emit
+        // each chunk immediately with no coalesce buffer involvement.
+        const bool emit_immediate =
+            coalesce_max_delay_us_ == 0 || decision.policy == CoalescePolicy::Bypass;
+        if (emit_immediate) {
+            for (std::size_t offset = 0; offset < data.size();
+                 offset += kMaxTcpPayloadPerToxFrame) {
+                const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
+                bool sent = false;
+                if (zero_copy) {
+                    auto buf = OwnedFrameBuffer::with_payload(data.subspan(offset, chunk_size));
+                    util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
+                    ProtocolFrame::serialize_tunnel_data_in_place(buf, tunnel_id_);
+                    sent = send_owned_data_to_tox(std::move(buf));
+                } else {
+                    auto frame = ProtocolFrame::make_tunnel_data(tunnel_id_,
+                                                                 data.subspan(offset, chunk_size));
+                    sent = send_frame_to_tox(frame);
                 }
-                util::Logger::debug(
-                    "Tunnel {} dropped {} bytes (Tox send rejected); refunded send window",
-                    tunnel_id_, chunk_size);
+                if (!sent) {
+                    // S27 / S29 follow-up: refund-to-floor so the send
+                    // window doesn't leak and can't underflow.
+                    std::size_t cur = send_window_used_.load(std::memory_order_relaxed);
+                    while (true) {
+                        const std::size_t next = cur >= chunk_size ? cur - chunk_size : 0;
+                        if (send_window_used_.compare_exchange_weak(cur, next,
+                                                                    std::memory_order_relaxed)) {
+                            break;
+                        }
+                    }
+                    util::Logger::debug(
+                        "Tunnel {} dropped {} bytes (Tox send rejected); refunded send window",
+                        tunnel_id_, chunk_size);
+                    send_failed = true;
+                    break;
+                }
+            }
+        } else {
+            // `Drain` / `Batch` policy: write into the coalesce buffer and
+            // (for Batch) arm the timer. Both helpers require coalesce_mutex_.
+            coalesce_append_locked(data);
+            if (decision.policy != CoalescePolicy::Drain) {
+                coalesce_arm_timer_locked();
             }
         }
-        return true;
     }
 
-    // `Drain` policy: write into the coalesce buffer, but never arm the timer
-    // — emission only happens on full-MTU overflow. Falls back to `Batch`
-    // behaviour for sub-MTU residuals so we don't leak unflushed bytes.
-    coalesce_append_locked(data);
-    if (decision.policy != CoalescePolicy::Drain) {
-        coalesce_arm_timer_locked();
+    if (send_failed) {
+        util::Logger::warn(
+            "Tunnel {} send path broken (toxcore rejected a frame); transitioning to Error",
+            tunnel_id_);
+        transition_state(State::Error);
+        return false;
     }
     return true;
 }

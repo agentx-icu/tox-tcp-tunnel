@@ -45,17 +45,22 @@ void hammer(int num_threads, Fn fn) {
 }  // namespace
 
 // F-CORE-9 / R5: accepting_ and max_connections_ accessed from any thread.
+// Finding-2 (user-reported, 2026-05-21): TcpListener uses
+// enable_shared_from_this; the listener MUST live in a shared_ptr or
+// any code path that calls shared_from_this() (do_accept,
+// set_max_connections's resume tail) throws bad_weak_ptr.
 TEST(T8DataRace, TcpListenerAcceptingAndMaxConnections) {
     toxtunnel::core::IoContext ctx(2);
-    toxtunnel::core::TcpListener listener(ctx.get_io_context(), "127.0.0.1", 0);
+    auto listener =
+        std::make_shared<toxtunnel::core::TcpListener>(ctx.get_io_context(), "127.0.0.1", 0);
 
     hammer(4, [&](int t, int i) {
         if (t == 0) {
-            listener.set_max_connections(static_cast<std::size_t>(i % 1000 + 1));
+            listener->set_max_connections(static_cast<std::size_t>(i % 1000 + 1));
         } else {
-            (void)listener.max_connections();
-            (void)listener.is_accepting();
-            (void)listener.connection_count();
+            (void)listener->max_connections();
+            (void)listener->is_accepting();
+            (void)listener->connection_count();
         }
     });
 }

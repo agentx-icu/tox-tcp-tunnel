@@ -240,6 +240,14 @@ bool ToxAdapter::start() {
         return false;
     }
 
+    // Finding-3 (user-reported, 2026-05-21): the bootstrap-refresh
+    // cancel flag is process-global; a prior stop() left it set, and
+    // without re-arming here every detached refresh thread spawned by
+    // bootstrap() below would short-circuit on its first check —
+    // permanently silencing background cache refresh for any subsequent
+    // start-stop-start cycle.
+    BootstrapSource::arm_refreshes();
+
     running_.store(true);
     iterate_thread_ = std::thread(&ToxAdapter::run_loop, this);
     util::Logger::info("Tox iteration thread started");

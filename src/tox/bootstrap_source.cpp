@@ -260,4 +260,8 @@ void BootstrapSource::cancel_pending_refreshes() noexcept {
     g_refresh_cancelled.store(true, std::memory_order_release);
 }
 
+void BootstrapSource::arm_refreshes() noexcept {
+    g_refresh_cancelled.store(false, std::memory_order_release);
+}
+
 }  // namespace toxtunnel::tox

@@ -27,23 +27,29 @@ namespace toxtunnel::core {
 /// io_context.  The accept callback is dispatched on the io_context's
 /// executor.
 ///
+/// **MUST be held via `std::shared_ptr`** — never stack-allocated,
+/// never `std::unique_ptr`. The implementation relies on
+/// `enable_shared_from_this` for two paths:
+///   - `do_accept` keeps a shared_ptr alive across the in-flight
+///     `async_accept` callback (S19, 2026-05-20 follow-up).
+///   - `on_connection_closed` / `set_max_connections` post the
+///     accept-resume onto the acceptor's executor (M-S-2).
+/// All of these call `shared_from_this()`. A listener held by raw
+/// storage (stack / `unique_ptr`) throws `std::bad_weak_ptr` the
+/// moment any of those code paths runs — this is the "obvious"
+/// example from older docs that user-reported Finding-2 (2026-05-21)
+/// flagged.
+///
 /// Typical usage:
 /// @code
 ///   asio::io_context io;
-///   TcpListener listener(io, 8080);
-///   listener.set_max_connections(100);
-///   listener.start_accept([](std::shared_ptr<TcpConnection> conn) {
+///   auto listener = std::make_shared<TcpListener>(io, 8080);
+///   listener->set_max_connections(100);
+///   listener->start_accept([](std::shared_ptr<TcpConnection> conn) {
 ///       // handle new connection ...
 ///   });
 ///   io.run();
 /// @endcode
-/// Always held via shared_ptr: TunnelClient/TunnelServer stash
-/// listeners in containers and reload paths swap them in/out while
-/// async_accept callbacks may still be in flight on io_context worker
-/// threads. enable_shared_from_this lets the accept callback capture
-/// a shared_ptr keep-alive, so a listener whose unique slot was just
-/// erased can finish its current callback without UAF (S19 in the
-/// 2026-05-20 follow-up).
 class TcpListener : public std::enable_shared_from_this<TcpListener> {
    public:
     /// Callback invoked for each accepted connection.
