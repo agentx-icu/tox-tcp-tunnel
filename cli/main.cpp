@@ -1139,11 +1139,17 @@ int main(int argc, char* argv[]) {
         has_overrides = true;
     }
 
+    // Defer log-level application until after merge_cli_overrides — that
+    // function uses "is the value != the default" as a stand-in for "was
+    // it set" (C-22 in the 2026-05-20 review), so passing `--log-level
+    // info` (the default LogLevel value) would not override a non-info
+    // YAML level. Capture the parsed level here, and apply it directly
+    // to `config.logging.level` below.
+    std::optional<util::LogLevel> cli_log_level;
     if (!log_level_str.empty()) {
         util::LogLevel level{};
         if (parse_log_level(log_level_str, level)) {
-            overrides.logging.level = level;
-            has_overrides = true;
+            cli_log_level = level;
         }
     }
 
@@ -1202,6 +1208,9 @@ int main(int argc, char* argv[]) {
     if (has_overrides) {
         config.merge_cli_overrides(overrides);
     }
+    if (cli_log_level.has_value()) {
+        config.logging.level = *cli_log_level;
+    }
 
     // -----------------------------------------------------------------------
     // Resolve known-servers aliases in client.server_id and
@@ -1212,22 +1221,41 @@ int main(int argc, char* argv[]) {
     // -----------------------------------------------------------------------
     if (config.is_client() && config.client.has_value()) {
         toxtunnel::app::KnownServersStore lookup(config.data_dir);
-        auto try_resolve = [&](std::string& id) {
+        // try_resolve replaces an alias with its tox_id in-place. If the
+        // input is neither a 76-hex tox_id nor a known alias, set out_err
+        // and return false — this is C-21 in the 2026-05-20 review: an
+        // unresolved alias used to fall through to validate() which
+        // reported "must be 76 hex chars", leaving the operator
+        // wondering why their alias was treated as malformed instead of
+        // unknown.
+        std::string resolve_err;
+        auto try_resolve = [&](std::string& id, const char* which) -> bool {
             if (id.empty() || id.size() == 76) {
-                return;
+                return true;
             }
             const auto original = id;
             const auto resolved = lookup.resolve_tox_id(original);
-            if (resolved != original) {
-                std::cerr << "Resolved alias '" << original << "' to "
-                          << (resolved.size() == 76 ? resolved.substr(0, 12) + "..." : resolved)
-                          << "\n";
-                id = resolved;
+            if (resolved == original) {
+                resolve_err = std::string("Unknown server alias '") + original + "' in " + which +
+                              " (run `toxtunnel servers list` to see known aliases, or "
+                              "supply a 76-character Tox ID)";
+                return false;
             }
+            std::cerr << "Resolved alias '" << original << "' to "
+                      << (resolved.size() == 76 ? resolved.substr(0, 12) + "..." : resolved)
+                      << "\n";
+            id = resolved;
+            return true;
         };
-        try_resolve(config.client->server_id);
+        if (!try_resolve(config.client->server_id, "--server-id / client.server_id")) {
+            std::cerr << resolve_err << "\n";
+            return 1;
+        }
         for (auto& fb : config.client->fallback_server_ids) {
-            try_resolve(fb);
+            if (!try_resolve(fb, "--server-id-fallback / client.fallback_server_ids")) {
+                std::cerr << resolve_err << "\n";
+                return 1;
+            }
         }
     }
 

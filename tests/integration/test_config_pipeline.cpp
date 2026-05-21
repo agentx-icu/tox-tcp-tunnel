@@ -220,7 +220,10 @@ logging:
 
     // Overridden values should be updated
     EXPECT_EQ(base.data_dir, "/override/path");
-    EXPECT_EQ(base.logging.level, util::LogLevel::Debug);
+    // logging.level is no longer applied by merge_cli_overrides (C-22 in
+    // the 2026-05-20 review): main.cpp applies it directly so that
+    // `--log-level info` can override a YAML value of Debug.
+    EXPECT_EQ(base.logging.level, util::LogLevel::Info);
     ASSERT_TRUE(base.logging.file.has_value());
     EXPECT_EQ(*base.logging.file, "/var/log/override.log");
     ASSERT_TRUE(base.server.has_value());

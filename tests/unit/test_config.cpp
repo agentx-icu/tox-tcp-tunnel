@@ -711,15 +711,24 @@ TEST_F(ConfigTest, MergeOverrideDataDir) {
     EXPECT_EQ(base.data_dir, "/overridden");
 }
 
-TEST_F(ConfigTest, MergeOverrideLogLevel) {
+// C-22 / 2026-05-20 finding: merge_cli_overrides previously used
+// `overrides.logging.level != Info` as a stand-in for "the user passed
+// --log-level". That made it impossible to override a Debug YAML
+// setting back to Info from the CLI, because the override value
+// "looked unset" to the merge logic. The fix moves logging.level
+// application out of merge_cli_overrides into main.cpp (which knows
+// whether the flag was actually passed). This test pins the new
+// behaviour: merge_cli_overrides leaves logging.level alone.
+TEST_F(ConfigTest, MergeDoesNotTouchLogLevel) {
     Config base = Config::default_server();
-    base.logging.level = util::LogLevel::Info;
+    base.logging.level = util::LogLevel::Debug;
 
     Config overrides;
-    overrides.logging.level = util::LogLevel::Debug;
+    overrides.logging.level = util::LogLevel::Info;  // would have been a no-op pre-fix
 
     base.merge_cli_overrides(overrides);
-    EXPECT_EQ(base.logging.level, util::LogLevel::Debug);
+    EXPECT_EQ(base.logging.level, util::LogLevel::Debug)
+        << "merge_cli_overrides should not touch logging.level; main.cpp applies it directly";
 }
 
 TEST_F(ConfigTest, MergeOverrideTcpPort) {

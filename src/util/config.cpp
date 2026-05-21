@@ -480,16 +480,20 @@ void Config::merge_cli_overrides(const Config& overrides) {
         data_dir = overrides.data_dir;
     }
 
-    // Override logging settings
-    if (overrides.logging.level != util::LogLevel::Info || overrides.logging.file.has_value()) {
-        if (overrides.logging.level != util::LogLevel::Info) {
-            logging.level = overrides.logging.level;
-        }
-        if (overrides.logging.file.has_value()) {
-            logging.file = overrides.logging.file;
-        }
+    // logging.level is applied directly from main.cpp after this call —
+    // see C-22 in the 2026-05-20 review. The original "level != Info"
+    // check was a false negative for `--log-level info`. Only `logging.file`
+    // still goes through here because it is std::optional (a real "set vs
+    // unset" signal).
+    if (overrides.logging.file.has_value()) {
+        logging.file = overrides.logging.file;
     }
 
+    // NOTE: `tox.udp_enabled` is a plain bool, so this branch can only
+    // turn it OFF (since CLI overrides never push `true` explicitly).
+    // There is no CLI flag today that exercises this path; if one is
+    // added it should bypass merge_cli_overrides and apply directly,
+    // the same pattern logging.level now follows.
     if (!overrides.tox.udp_enabled) {
         tox.udp_enabled = overrides.tox.udp_enabled;
     }
