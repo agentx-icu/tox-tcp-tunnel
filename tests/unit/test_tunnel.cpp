@@ -92,6 +92,7 @@ TEST_F(TunnelTest, StateTransition_ErrorToClosed) {
 
 TEST_F(TunnelTest, OpenTunnel_TransitionsToConnecting) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
 
     bool callback_called = false;
     tunnel.set_on_state_change([&callback_called](Tunnel::State new_state) {
@@ -108,6 +109,7 @@ TEST_F(TunnelTest, OpenTunnel_TransitionsToConnecting) {
 
 TEST_F(TunnelTest, OpenTunnel_StoresTargetInfo) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
     (void)tunnel.open("example.com", 443);
 
     EXPECT_EQ(tunnel.target_host(), "example.com");
@@ -119,6 +121,14 @@ TEST_F(TunnelTest, OpenTunnel_FailsIfNotInNoneState) {
     tunnel.set_state(Tunnel::State::Connecting);
 
     EXPECT_FALSE(tunnel.open("localhost", 8080));
+}
+
+TEST_F(TunnelTest, OpenTunnel_FailsIfInitialOpenSendRejected) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return false; });
+
+    EXPECT_FALSE(tunnel.open("localhost", 8080));
+    EXPECT_EQ(tunnel.state(), Tunnel::State::None);
 }
 
 // ============================================================================
@@ -501,6 +511,7 @@ TEST_F(TunnelTest, ErrorHandling_InvalidTunnelIdIgnored) {
 
 TEST_F(TunnelTest, Callbacks_OnStateChange) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
 
     std::vector<Tunnel::State> state_changes;
     tunnel.set_on_state_change([&state_changes](Tunnel::State s) { state_changes.push_back(s); });

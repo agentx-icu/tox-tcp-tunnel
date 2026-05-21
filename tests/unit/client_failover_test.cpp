@@ -9,6 +9,7 @@
 #include "toxtunnel/app/known_servers.hpp"
 #include "toxtunnel/app/tunnel_client.hpp"
 #include "toxtunnel/tox/types.hpp"
+#include "toxtunnel/tunnel/owned_frame_buffer.hpp"
 #include "toxtunnel/util/config.hpp"
 
 namespace {
@@ -303,6 +304,37 @@ TEST(ClientFailoverDecisionTest, SequentialFailoverThenSwitchback) {
     auto r2 = decide_failover_switch(eps_t2, 1, fo, t2);
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(*r2, 0u);
+}
+
+TEST(ClientTunnelSenderTest, FixedFriendSenderUsesCapturedFriendForSpanFrames) {
+    std::vector<uint32_t> friend_numbers;
+    auto sender = detail::make_fixed_friend_lossless_sender(
+        [&friend_numbers](uint32_t friend_number, const uint8_t* /*data*/, std::size_t /*length*/) {
+            friend_numbers.push_back(friend_number);
+            return true;
+        },
+        /*friend_number=*/41);
+
+    const std::array<uint8_t, 3> frame = {0x01, 0x02, 0x03};
+    ASSERT_TRUE(sender(std::span<const uint8_t>(frame.data(), frame.size())));
+    ASSERT_EQ(friend_numbers.size(), 1u);
+    EXPECT_EQ(friend_numbers[0], 41u);
+}
+
+TEST(ClientTunnelSenderTest, FixedFriendSenderUsesCapturedFriendForOwnedFrames) {
+    std::vector<uint32_t> friend_numbers;
+    auto sender = detail::make_fixed_friend_lossless_owned_sender(
+        [&friend_numbers](uint32_t friend_number, const uint8_t* /*data*/, std::size_t /*length*/) {
+            friend_numbers.push_back(friend_number);
+            return true;
+        },
+        /*friend_number=*/73);
+
+    auto buf = tunnel::OwnedFrameBuffer::with_payload(std::span<const uint8_t>{});
+    tunnel::ProtocolFrame::serialize_tunnel_data_in_place(buf, /*tunnel_id=*/9);
+    ASSERT_TRUE(sender(std::move(buf)));
+    ASSERT_EQ(friend_numbers.size(), 1u);
+    EXPECT_EQ(friend_numbers[0], 73u);
 }
 
 }  // namespace

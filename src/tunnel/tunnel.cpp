@@ -137,15 +137,18 @@ bool TunnelImpl::open(const std::string& host, uint16_t port) {
         return false;
     }
 
+    // Send TUNNEL_OPEN frame
+    auto frame = ProtocolFrame::make_tunnel_open(tunnel_id_, host, port);
+    if (!send_frame_to_tox(frame)) {
+        util::Logger::warn("Tunnel {} open failed: initial TUNNEL_OPEN send rejected", tunnel_id_);
+        return false;
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         target_host_ = host;
         target_port_ = port;
     }
-
-    // Send TUNNEL_OPEN frame
-    auto frame = ProtocolFrame::make_tunnel_open(tunnel_id_, host, port);
-    send_frame_to_tox(frame);
 
     // Transition to Connecting state
     transition_state(State::Connecting);
@@ -316,16 +319,7 @@ void TunnelImpl::handle_tunnel_close_frame(const ProtocolFrame& /*frame*/) {
     }
 
     transition_state(State::Closed);
-
-    // Invoke close callback
-    CloseCallback cb;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        cb = on_close_;
-    }
-    if (cb) {
-        cb();
-    }
+    notify_close_once();
 }
 
 void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
@@ -461,6 +455,7 @@ void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
     if (cb) {
         cb(*payload);
     }
+    notify_close_once();
 }
 
 void TunnelImpl::handle_ping_frame(const ProtocolFrame& /*frame*/) {
@@ -632,6 +627,7 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
             "Tunnel {} send path broken (toxcore rejected a frame); transitioning to Error",
             tunnel_id_);
         transition_state(State::Error);
+        notify_close_once();
         return false;
     }
     return true;
@@ -649,6 +645,7 @@ void TunnelImpl::send_error(uint8_t error_code, const std::string& description) 
     auto frame = ProtocolFrame::make_tunnel_error(tunnel_id_, error_code, description);
     send_frame_to_tox(frame);
     transition_state(State::Error);
+    notify_close_once();
 
     util::Logger::error("Tunnel {} sent error: code={}, desc='{}'", tunnel_id_, error_code,
                         description);
@@ -680,6 +677,21 @@ void TunnelImpl::send_ack() {
         send_frame_to_tox(frame);
 
         util::Logger::debug("Tunnel {} sent ACK for {} bytes", tunnel_id_, ack_value);
+    }
+}
+
+void TunnelImpl::notify_close_once() {
+    if (close_notified_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    CloseCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cb = std::move(on_close_);
+    }
+    if (cb) {
+        cb();
     }
 }
 

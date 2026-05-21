@@ -498,6 +498,9 @@ class TunnelImpl : public Tunnel {
     /// Send ACK frame for received bytes.
     void send_ack();
 
+    /// Invoke the close callback at most once for terminal states (Closed/Error).
+    void notify_close_once();
+
     // -----------------------------------------------------------------
     // Data members
     // -----------------------------------------------------------------
@@ -581,6 +584,7 @@ class TunnelImpl : public Tunnel {
     StateChangedCallback on_state_change_;
     ErrorCallback on_error_;
     CloseCallback on_close_;
+    std::atomic<bool> close_notified_{false};
 };
 
 }  // namespace toxtunnel::tunnel

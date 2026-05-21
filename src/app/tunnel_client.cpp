@@ -17,6 +17,31 @@
 
 namespace toxtunnel::app {
 
+namespace detail {
+
+tunnel::TunnelImpl::SendToToxCallback make_fixed_friend_lossless_sender(
+    LosslessPacketSendFn send_lossless, uint32_t friend_number) {
+    return [send_lossless = std::move(send_lossless),
+            friend_number](std::span<const uint8_t> data) -> bool {
+        std::vector<uint8_t> packet;
+        packet.reserve(1 + data.size());
+        packet.push_back(tunnel::kLosslessPacketByte);
+        packet.insert(packet.end(), data.begin(), data.end());
+        return send_lossless(friend_number, packet.data(), packet.size());
+    };
+}
+
+tunnel::TunnelImpl::SendOwnedToToxCallback make_fixed_friend_lossless_owned_sender(
+    LosslessPacketSendFn send_lossless, uint32_t friend_number) {
+    return [send_lossless = std::move(send_lossless),
+            friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
+        const auto wire = buf.wire_view();
+        return send_lossless(friend_number, wire.data(), wire.size());
+    };
+}
+
+}  // namespace detail
+
 // -------------------------------------------------------------------------
 // Construction / Destruction
 // -------------------------------------------------------------------------
@@ -625,24 +650,24 @@ void TunnelClient::start_pipe_mode() {
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
     apply_coalesce_and_flow_control(*tunnel);
+    const uint32_t tunnel_friend_number = server_friend_number_.load(std::memory_order_acquire);
 
-    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
-        std::vector<uint8_t> packet;
-        packet.reserve(1 + data.size());
-        packet.push_back(tunnel::kLosslessPacketByte);
-        packet.insert(packet.end(), data.begin(), data.end());
-        return tox_adapter_->send_lossless_packet(
-            server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
-    });
+    tunnel->set_on_send_to_tox(detail::make_fixed_friend_lossless_sender(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) -> bool {
+            return tox_adapter_->send_lossless_packet(friend_number, data, length);
+        },
+        tunnel_friend_number));
 
     // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
     // lossless prefix + 5-byte tunnel header in its reserved prefix, so we
     // hand `wire_view()` straight to toxcore with zero further copies.
-    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) -> bool {
-        const auto wire = buf.wire_view();
-        return tox_adapter_->send_lossless_packet(
-            server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
-    });
+    tunnel->set_on_send_to_tox_owned(detail::make_fixed_friend_lossless_owned_sender(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) -> bool {
+            return tox_adapter_->send_lossless_packet(friend_number, data, length);
+        },
+        tunnel_friend_number));
+
+    const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel;
 
     tunnel->set_on_data_for_tcp([this](std::span<const uint8_t> data) {
         if (pipe_bridge_) {
@@ -650,17 +675,27 @@ void TunnelClient::start_pipe_mode() {
         }
     });
 
-    tunnel->set_on_state_change([this, tunnel, tunnel_id](tunnel::Tunnel::State new_state) {
+    tunnel->set_on_state_change([this, weak_tunnel, tunnel_id](tunnel::Tunnel::State new_state) {
         if (new_state == tunnel::Tunnel::State::Connected) {
+            auto locked_tunnel = weak_tunnel.lock();
+            if (!locked_tunnel) {
+                return;
+            }
             auto start_result = pipe_bridge_->start(
-                [tunnel](std::span<const uint8_t> data) {
-                    tunnel->on_tcp_data_received(data.data(), data.size());
+                [weak_tunnel](std::span<const uint8_t> data) {
+                    if (auto tunnel = weak_tunnel.lock()) {
+                        tunnel->on_tcp_data_received(data.data(), data.size());
+                    }
                 },
-                [tunnel]() { tunnel->close(); });
+                [weak_tunnel]() {
+                    if (auto tunnel = weak_tunnel.lock()) {
+                        tunnel->close();
+                    }
+                });
             if (!start_result) {
                 util::Logger::error("Failed to start stdio pipe bridge for tunnel {}: {}",
                                     tunnel_id, start_result.error());
-                tunnel->close();
+                locked_tunnel->close();
                 request_stop();
             }
         } else if (new_state == tunnel::Tunnel::State::Error) {
@@ -734,6 +769,7 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                config_.tunnel.coalesce_max_bytes);
     apply_coalesce_and_flow_control(*tunnel);
+    const uint32_t tunnel_friend_number = server_friend_number_.load(std::memory_order_acquire);
 
     // Set the TCP connection on the tunnel
     tunnel->set_tcp_connection(conn);
@@ -741,22 +777,18 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     // Wire callback: when TunnelImpl wants to send data to Tox, prepend the
     // lossless packet prefix and forward to ToxAdapter. The frame is already
     // serialized — no need to round-trip through deserialize / re-serialize.
-    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
-        std::vector<uint8_t> packet;
-        packet.reserve(1 + data.size());
-        packet.push_back(tunnel::kLosslessPacketByte);
-        packet.insert(packet.end(), data.begin(), data.end());
-
-        return tox_adapter_->send_lossless_packet(
-            server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
-    });
+    tunnel->set_on_send_to_tox(detail::make_fixed_friend_lossless_sender(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) -> bool {
+            return tox_adapter_->send_lossless_packet(friend_number, data, length);
+        },
+        tunnel_friend_number));
 
     // Wave B zero-copy outbound for TUNNEL_DATA frames.
-    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) -> bool {
-        const auto wire = buf.wire_view();
-        return tox_adapter_->send_lossless_packet(
-            server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
-    });
+    tunnel->set_on_send_to_tox_owned(detail::make_fixed_friend_lossless_owned_sender(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) -> bool {
+            return tox_adapter_->send_lossless_packet(friend_number, data, length);
+        },
+        tunnel_friend_number));
 
     // Wire callback: when data arrives from Tox for this tunnel, write to TCP.
     // Prefer the zero-copy owned-buffer route so the payload buffer
@@ -804,13 +836,20 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
         mgr->remove_tunnel(tunnel_id);
     });
 
+    const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel;
     // Wire TCP data + disconnect callbacks. Capturing the tunnel shared_ptr by
-    // value keeps the tunnel alive past `remove_tunnel()`; the TcpConnection's
-    // callback slots are the last refs to drop when the socket is destroyed.
-    conn->set_on_data([tunnel](const uint8_t* data, std::size_t length) {
-        tunnel->on_tcp_data_received(data, length);
+    // weak_ptr breaks the TcpConnection<->TunnelImpl ownership cycle while
+    // still letting in-flight callbacks lock the tunnel if it is alive.
+    conn->set_on_data([weak_tunnel](const uint8_t* data, std::size_t length) {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->on_tcp_data_received(data, length);
+        }
     });
-    conn->set_on_disconnect([tunnel](const std::error_code& /*ec*/) { tunnel->close(); });
+    conn->set_on_disconnect([weak_tunnel](const std::error_code& /*ec*/) {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->close();
+        }
+    });
 
     // Initiate tunnel opening: sends TUNNEL_OPEN frame to server
     bool opened = tunnel->open(rule.remote_host, rule.remote_port);
@@ -850,22 +889,20 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
                                config_.tunnel.coalesce_max_bytes);
     apply_coalesce_and_flow_control(*tunnel);
     tunnel->set_tcp_connection(conn);
+    const uint32_t tunnel_friend_number = server_friend_number_.load(std::memory_order_acquire);
 
-    tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
-        std::vector<uint8_t> packet;
-        packet.reserve(1 + data.size());
-        packet.push_back(tunnel::kLosslessPacketByte);
-        packet.insert(packet.end(), data.begin(), data.end());
-        return tox_adapter_->send_lossless_packet(
-            server_friend_number_.load(std::memory_order_acquire), packet.data(), packet.size());
-    });
+    tunnel->set_on_send_to_tox(detail::make_fixed_friend_lossless_sender(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) -> bool {
+            return tox_adapter_->send_lossless_packet(friend_number, data, length);
+        },
+        tunnel_friend_number));
 
     // Wave B zero-copy outbound for TUNNEL_DATA frames.
-    tunnel->set_on_send_to_tox_owned([this](tunnel::OwnedFrameBuffer buf) -> bool {
-        const auto wire = buf.wire_view();
-        return tox_adapter_->send_lossless_packet(
-            server_friend_number_.load(std::memory_order_acquire), wire.data(), wire.size());
-    });
+    tunnel->set_on_send_to_tox_owned(detail::make_fixed_friend_lossless_owned_sender(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) -> bool {
+            return tox_adapter_->send_lossless_packet(friend_number, data, length);
+        },
+        tunnel_friend_number));
 
     tunnel->set_on_data_for_tcp(
         [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
@@ -881,16 +918,21 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     // upstream BEFORE we start_read so the tunnel sees them in original order.
     auto initial_payload_holder =
         std::make_shared<std::vector<uint8_t>>(std::move(initial_payload));
-    tunnel->set_on_state_change([conn, tunnel_id, tunnel, reply_sent, open_counted,
+    const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel;
+    tunnel->set_on_state_change([conn, tunnel_id, weak_tunnel, reply_sent, open_counted,
                                  active_dec_latch, reply_cb,
                                  initial_payload_holder](tunnel::Tunnel::State new_state) {
         if (new_state == tunnel::Tunnel::State::Connected) {
+            auto locked_tunnel = weak_tunnel.lock();
+            if (!locked_tunnel) {
+                return;
+            }
             if (!reply_sent->exchange(true)) {
                 (*reply_cb)(true);
             }
             if (!initial_payload_holder->empty()) {
-                tunnel->on_tcp_data_received(initial_payload_holder->data(),
-                                             initial_payload_holder->size());
+                locked_tunnel->on_tcp_data_received(initial_payload_holder->data(),
+                                                    initial_payload_holder->size());
                 initial_payload_holder->clear();
             }
             util::Logger::debug("SOCKS5 tunnel {} connected, starting TCP read", tunnel_id);
@@ -916,15 +958,21 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         }
     });
 
-    auto* tunnel_mgr_ptr = tunnel_mgr_.get();
-    tunnel->set_on_close([tunnel_mgr_ptr, tunnel_id]() {
+    auto mgr = tunnel_mgr_;
+    tunnel->set_on_close([mgr, tunnel_id]() {
         util::Logger::debug("SOCKS5 tunnel {} on_close, removing from manager", tunnel_id);
-        tunnel_mgr_ptr->remove_tunnel(tunnel_id);
+        mgr->remove_tunnel(tunnel_id);
     });
-    conn->set_on_data([tunnel](const uint8_t* data, std::size_t length) {
-        tunnel->on_tcp_data_received(data, length);
+    conn->set_on_data([weak_tunnel](const uint8_t* data, std::size_t length) {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->on_tcp_data_received(data, length);
+        }
     });
-    conn->set_on_disconnect([tunnel](const std::error_code& /*ec*/) { tunnel->close(); });
+    conn->set_on_disconnect([weak_tunnel](const std::error_code& /*ec*/) {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->close();
+        }
+    });
 
     bool opened = tunnel->open(host, port);
     if (!opened) {

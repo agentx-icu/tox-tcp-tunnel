@@ -273,6 +273,18 @@ TEST_F(TunnelManagerTest, FrameRouting_HandlesUnknownTunnelId) {
     EXPECT_NO_THROW(manager->route_frame(data_frame));
 }
 
+TEST_F(TunnelManagerTest, FrameRouting_TunnelErrorTriggersOnCloseCleanup) {
+    auto tunnel = std::make_shared<TunnelImpl>(io_ctx, /*tunnel_id=*/77, /*friend_number=*/1);
+    tunnel->set_state(Tunnel::State::Connecting);
+    tunnel->set_on_close([this]() { manager->remove_tunnel(77); });
+    manager->add_tunnel(77, tunnel);
+
+    auto frame = ProtocolFrame::make_tunnel_error(77, /*error_code=*/9, "upstream failed");
+    manager->route_frame(frame);
+
+    EXPECT_FALSE(manager->has_tunnel(77));
+}
+
 TEST_F(TunnelManagerTest, FrameRouting_HandlePingPong) {
     // Ping/Pong have tunnel_id = 0, should be handled by manager itself
     ProtocolFrame ping = ProtocolFrame::make_ping();

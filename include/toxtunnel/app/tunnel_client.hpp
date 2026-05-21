@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,6 +61,22 @@ struct ClientServerEndpoint {
 [[nodiscard]] std::optional<std::size_t> decide_failover_switch(
     const std::vector<ClientServerEndpoint>& endpoints, std::size_t active_index,
     const FailoverConfig& failover, std::chrono::steady_clock::time_point now);
+
+namespace detail {
+
+using LosslessPacketSendFn = std::function<bool(uint32_t, const uint8_t*, std::size_t)>;
+
+/// Build a tunnel send callback pinned to one friend_number for the tunnel's
+/// full lifetime. This prevents failover from rerouting an already-open tunnel's
+/// late TUNNEL_DATA / TUNNEL_CLOSE frames onto the newly-active server.
+[[nodiscard]] tunnel::TunnelImpl::SendToToxCallback make_fixed_friend_lossless_sender(
+    LosslessPacketSendFn send_lossless, uint32_t friend_number);
+
+/// Zero-copy variant of make_fixed_friend_lossless_sender().
+[[nodiscard]] tunnel::TunnelImpl::SendOwnedToToxCallback make_fixed_friend_lossless_owned_sender(
+    LosslessPacketSendFn send_lossless, uint32_t friend_number);
+
+}  // namespace detail
 
 /// Client-side application that listens on local TCP ports and forwards
 /// traffic through Tox tunnels to the server.

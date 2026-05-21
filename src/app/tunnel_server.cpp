@@ -792,16 +792,18 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     }
 
     // All wiring below happens WITHOUT holding managers_mutex_.
-    // Capturing tunnel_impl by value into each callback keeps the underlying
-    // Tunnel alive past remove_tunnel(); the last shared_ptr to release the
-    // tunnel is the TcpConnection's callback slot when the TCP socket dies.
+    // Use weak_ptr on the TcpConnection -> TunnelImpl callback edge so the
+    // socket callbacks do not form a permanent ownership cycle with the tunnel.
+    const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel_impl;
 
     // Associate the TCP connection with the tunnel.
     tunnel_impl->set_tcp_connection(tcp_conn);
 
     // TCP data -> Tox: when data arrives from TCP, forward it to the tunnel.
-    tcp_conn->set_on_data([tunnel_impl](const uint8_t* data, std::size_t length) {
-        tunnel_impl->on_tcp_data_received(data, length);
+    tcp_conn->set_on_data([weak_tunnel](const uint8_t* data, std::size_t length) {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->on_tcp_data_received(data, length);
+        }
     });
 
     // TCP disconnect: close the tunnel gracefully.
