@@ -295,49 +295,52 @@ void TunnelClient::stop() {
 
     util::Logger::info("Stopping TunnelClient...");
 
+    // Phase 1: signal everything to wind down. We only *cancel* pending
+    // async work here; we do NOT yet free the owners. Several of our
+    // sub-servers (InspectServer / MetricsServer / Socks5Listener)
+    // captured `this` into their async_accept callbacks. If a callback
+    // had already been dispatched onto an io_context worker queue but
+    // hadn't run yet, freeing the server out from under it would UAF.
+    // (S20 in the 2026-05-20 follow-up.)
     if (inspect_server_) {
         inspect_server_->stop();
-        inspect_server_.reset();
     }
-
     if (info_refresh_timer_) {
         info_refresh_timer_->cancel();
-        info_refresh_timer_.reset();
     }
-
     if (failover_timer_) {
         failover_timer_->cancel();
-        failover_timer_.reset();
     }
-
     if (socks5_listener_) {
         socks5_listener_->stop();
-        socks5_listener_.reset();
     }
-
-    // Stop all TCP listeners
     for (auto& listener : listeners_) {
         listener->stop();
     }
-
     if (pipe_bridge_) {
         pipe_bridge_->stop();
-        pipe_bridge_.reset();
     }
-
     if (metrics_server_) {
         metrics_server_->stop();
-        metrics_server_.reset();
     }
 
-    // Close all tunnels
+    // Phase 2: close all tunnels and stop the Tox thread. Both of these
+    // post final work onto the io_context; we want it drained too.
     tunnel_mgr_->close_all();
-
-    // Stop ToxAdapter
     tox_adapter_->stop();
 
-    // Stop IoContext
+    // Phase 3: stop the io_context and join all workers. After this
+    // returns, no callback can possibly run any more.
     io_ctx_->stop();
+
+    // Phase 4: NOW it's safe to free the sub-servers. Any pending
+    // async_accept callback was drained in phase 3.
+    inspect_server_.reset();
+    info_refresh_timer_.reset();
+    failover_timer_.reset();
+    socks5_listener_.reset();
+    pipe_bridge_.reset();
+    metrics_server_.reset();
 
     running_ = false;
     stop_cv_.notify_all();

@@ -226,10 +226,16 @@ void TunnelServer::stop() {
 
     util::Logger::info("TunnelServer stopping...");
 
-    // Tear down inspect before io_context so its acceptor cancels cleanly.
+    // Phase 1: cancel pending async work but keep the owners alive — the
+    // InspectServer/MetricsServer acceptor callbacks captured `this`, so
+    // freeing them now (before io_context drains) would UAF on a
+    // dispatched-but-not-yet-executed handler (S20 in the 2026-05-20
+    // follow-up).
     if (inspect_server_) {
         inspect_server_->stop();
-        inspect_server_.reset();
+    }
+    if (metrics_server_) {
+        metrics_server_->stop();
     }
 
     // Close all tunnel managers.
@@ -242,14 +248,7 @@ void TunnelServer::stop() {
         managers_.clear();
     }
 
-    // Stop the metrics HTTP server first so it doesn't keep posting to the
-    // io_context after we've torn down the acceptor.
-    if (metrics_server_) {
-        metrics_server_->stop();
-        metrics_server_.reset();
-    }
-
-    // Stop ToxAdapter.
+    // Stop watchdog before Tox so it doesn't trip during shutdown.
     if (watchdog_) {
         tox_adapter_->set_watchdog(nullptr);
         watchdog_->stop();
@@ -257,8 +256,14 @@ void TunnelServer::stop() {
     }
     tox_adapter_->stop();
 
-    // Stop IoContext.
+    // Phase 2: stop the io_context and join its workers. After this
+    // returns, no async callback can run any more.
     io_context_->stop();
+
+    // Phase 3: NOW it's safe to free the sub-servers; their callbacks
+    // have all been drained.
+    inspect_server_.reset();
+    metrics_server_.reset();
 
     running_.store(false, std::memory_order_release);
     util::Logger::info("TunnelServer stopped");
