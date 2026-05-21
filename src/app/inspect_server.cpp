@@ -359,16 +359,33 @@ util::Expected<void, std::string> InspectServer::start(asio::io_context& io_ctx,
         while (running_.load(std::memory_order_acquire)) {
             PSECURITY_DESCRIPTOR sd = build_current_user_sd();
             SECURITY_ATTRIBUTES sa = {sizeof(sa), sd, FALSE};
-            HANDLE pipe = CreateNamedPipeA(pipe_name.c_str(), PIPE_ACCESS_DUPLEX,
-                                           PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 8192,
-                                           8192, 0, sd ? &sa : nullptr);
+            // PIPE_UNLIMITED_INSTANCES (S22 in the 2026-05-20 follow-up):
+            // the previous nMaxInstances = 1 meant a stale handle from a
+            // racing client could keep CreateNamedPipeA returning
+            // ERROR_PIPE_BUSY until the OS reclaimed it. With unlimited
+            // instances the new request is always accepted; we still only
+            // ever have one connection in flight here because the loop is
+            // single-threaded.
+            HANDLE pipe =
+                CreateNamedPipeA(pipe_name.c_str(), PIPE_ACCESS_DUPLEX,
+                                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                 PIPE_UNLIMITED_INSTANCES, 8192, 8192, 0, sd ? &sa : nullptr);
             if (sd) {
                 LocalFree(sd);
             }
             if (pipe == INVALID_HANDLE_VALUE) {
-                util::Logger::warn("InspectServer: CreateNamedPipe failed ({}); IPC unavailable",
-                                   GetLastError());
-                return;
+                // Don't permanently brick IPC just because one create
+                // call failed (transient EMFILE, racing client holding
+                // the pipe instance, etc.). Sleep briefly and retry —
+                // breaking out of the loop here is what the previous
+                // `return` did, and it left the daemon with no inspect
+                // endpoint for the rest of its lifetime.
+                const auto err = GetLastError();
+                util::Logger::warn("InspectServer: CreateNamedPipe failed ({}); retrying", err);
+                for (int i = 0; i < 100 && running_.load(std::memory_order_acquire); ++i) {
+                    Sleep(10);
+                }
+                continue;
             }
             const BOOL connected =
                 ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
