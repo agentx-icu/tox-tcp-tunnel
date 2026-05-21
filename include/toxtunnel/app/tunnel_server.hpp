@@ -182,7 +182,16 @@ class TunnelServer {
     mutable std::shared_mutex rules_mutex_;
 
     /// Map of friend_number -> TunnelManager.
-    std::unordered_map<uint32_t, std::unique_ptr<tunnel::TunnelManager>> managers_;
+    ///
+    /// shared_ptr (not unique_ptr): callbacks running on the io_context
+    /// strand routinely retrieve a manager pointer under
+    /// `managers_mutex_`, release the lock, then call into the manager.
+    /// A concurrent `on_friend_connection(offline)` on the Tox thread
+    /// could erase the unique_ptr between the lookup and the call. The
+    /// shared_ptr lets each call site copy the handle inside the lock
+    /// and keep the manager alive across the unlocked call (T1/C-1/C-2
+    /// in the 2026-05-20 review).
+    std::unordered_map<uint32_t, std::shared_ptr<tunnel::TunnelManager>> managers_;
 
     /// Protects managers_ map. Recursive to avoid self-deadlock when
     /// callbacks (e.g., on_disconnect) re-enter while the lock is held.

@@ -398,7 +398,10 @@ void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* dat
     // IMPORTANT: We must NOT hold managers_mutex_ when calling route_frame(),
     // because route_frame() can synchronously trigger callbacks (e.g., via
     // tcp_conn->close() -> on_disconnect) that need to re-acquire managers_mutex_.
-    tunnel::TunnelManager* manager_ptr = nullptr;
+    // Copy the shared_ptr inside the lock so a racing teardown can't free
+    // the manager between the lookup and the call (C-1 in the 2026-05-20
+    // review).
+    std::shared_ptr<tunnel::TunnelManager> manager_ptr;
     {
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
@@ -407,7 +410,7 @@ void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* dat
                                friend_number);
             return;
         }
-        manager_ptr = it->second.get();
+        manager_ptr = it->second;
     }
 
     manager_ptr->route_frame(frame);
@@ -458,7 +461,7 @@ void TunnelServer::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
 // ---------------------------------------------------------------------------
 
 void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
-    auto manager = std::make_unique<tunnel::TunnelManager>(io_context_->get_io_context());
+    auto manager = std::make_shared<tunnel::TunnelManager>(io_context_->get_io_context());
 
     // Set up the send handler: serialize frame, prepend lossless packet byte,
     // send via ToxAdapter.
@@ -562,8 +565,11 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                         access_result == AccessResult::Allowed ? "allowed" : "default-allowed",
                         pk_hex, target_host, target_port);
 
-    // Find or validate the TunnelManager.
-    tunnel::TunnelManager* manager_ptr = nullptr;
+    // Find or validate the TunnelManager. Hold a shared_ptr copy so the
+    // long unlocked tail (handle_incoming_open + async_resolve + connect
+    // wiring + add_tunnel) cannot race with a friend-offline teardown
+    // (C-2 in the 2026-05-20 review).
+    std::shared_ptr<tunnel::TunnelManager> manager_ptr;
     {
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
@@ -571,7 +577,7 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
             util::Logger::warn("No TunnelManager for friend {} during TUNNEL_OPEN", friend_number);
             return;
         }
-        manager_ptr = it->second.get();
+        manager_ptr = it->second;
     }
 
     // Let TunnelManager handle the incoming open (creates the Tunnel).
@@ -676,9 +682,11 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
                                       std::shared_ptr<core::TcpConnection> tcp_conn) {
     // Hold a shared_ptr to the TunnelImpl so its lifetime extends across the
     // TCP strand's async callbacks, even if remove_tunnel() fires from the Tox
-    // strand mid-flight.
+    // strand mid-flight. Same shared_ptr discipline for the manager
+    // (M-1 in the 2026-05-20 review): the unlocked tail below calls
+    // manager_ptr->send_frame(ack) after the lock is released.
     std::shared_ptr<tunnel::TunnelImpl> tunnel_impl;
-    tunnel::TunnelManager* manager_ptr = nullptr;
+    std::shared_ptr<tunnel::TunnelManager> manager_ptr;
 
     // Look up manager and tunnel under the lock, then release immediately.
     {
@@ -690,7 +698,7 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
             tcp_conn->close();
             return;
         }
-        manager_ptr = it->second.get();
+        manager_ptr = it->second;
 
         auto tunnel = manager_ptr->get_tunnel(tunnel_id);
         if (!tunnel) {
