@@ -655,10 +655,14 @@ int run_server(const toxtunnel::Config& config, bool run_as_service,
     asio::io_context signal_ctx;
     asio::signal_set signals(signal_ctx, SIGINT, SIGTERM);
 
-    signals.async_wait([&server](const asio::error_code& ec, int signum) {
+    // POSIX: reload_signals (SIGHUP) re-arms itself inside its handler, so
+    // signal_ctx always has a pending op and signal_ctx.run() never returns
+    // on its own. Explicitly stop the io_context here so run() unblocks.
+    signals.async_wait([&server, &signal_ctx](const asio::error_code& ec, int signum) {
         if (!ec) {
             toxtunnel::util::Logger::info("Received signal {}, shutting down...", signum);
             server.stop();
+            signal_ctx.stop();
         }
     });
 
