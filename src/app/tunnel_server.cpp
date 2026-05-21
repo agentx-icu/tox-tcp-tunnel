@@ -580,12 +580,29 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
         manager_ptr = it->second;
     }
 
-    // Let TunnelManager handle the incoming open (creates the Tunnel).
+    // Let TunnelManager handle the incoming open (reserves the tunnel_id
+    // slot via used_ids_). The slot is released by the RAII guard below
+    // unless we successfully reach add_tunnel(), which re-claims it
+    // through the same code path. Without the guard, any future early
+    // return between handle_incoming_open() and add_tunnel() would leak
+    // the slot — 65534 leaks and all IDs are gone (C-19 in the
+    // 2026-05-20 review).
     if (!manager_ptr->handle_incoming_open(frame)) {
         util::Logger::warn("TunnelManager rejected TUNNEL_OPEN for tunnel_id={} from friend {}",
                            tunnel_id, friend_number);
         return;
     }
+    struct TunnelIdGuard {
+        tunnel::TunnelManager* mgr;
+        uint16_t id;
+        bool committed = false;
+        ~TunnelIdGuard() {
+            if (!committed && mgr) {
+                mgr->release_tunnel_id(id);
+            }
+        }
+    };
+    TunnelIdGuard id_guard{manager_ptr.get(), tunnel_id, false};
 
     auto server_tunnel = std::make_shared<tunnel::TunnelImpl>(io_context_->get_io_context(),
                                                               tunnel_id, friend_number);
@@ -618,6 +635,9 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
             }
         });
     manager_ptr->add_tunnel(tunnel_id, std::move(server_tunnel));
+    // add_tunnel re-set used_ids_[tunnel_id]; the guard's release would
+    // now wrongly free it. Commit so the destructor skips the release.
+    id_guard.committed = true;
 
     // Create a TCP connection to the target host:port.
     auto tcp_conn = std::make_shared<core::TcpConnection>(io_context_->get_io_context());

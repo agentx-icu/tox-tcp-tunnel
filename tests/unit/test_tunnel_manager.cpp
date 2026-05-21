@@ -135,6 +135,30 @@ TEST_F(TunnelManagerTest, TunnelIdAllocation_SkipsZero) {
     EXPECT_EQ(id, 1u);
 }
 
+// C-19 / 2026-05-20 finding: handle_incoming_open() marks used_ids_ but
+// does not actually insert a Tunnel into tunnels_ — the caller is
+// expected to follow up with add_tunnel(). If the caller fails or is
+// killed between the two calls, the used_ids_ slot leaks forever:
+// reaper/remove_tunnel can't reach it (tunnels_.find returns end). The
+// public release_tunnel_id() is the documented escape hatch, used by
+// TunnelServer's RAII guard at the call site. This test pins the
+// invariant: after handle_incoming_open + release_tunnel_id, a new
+// allocate_tunnel_id can reclaim that slot.
+TEST_F(TunnelManagerTest, IncomingOpenSlotReclaimableAfterRelease) {
+    constexpr uint16_t kProbeId = 137;
+    // Forge a TUNNEL_OPEN frame for the probe ID.
+    auto frame = ProtocolFrame::make_tunnel_open(kProbeId, "host.example", 22);
+    ASSERT_TRUE(manager->handle_incoming_open(frame));
+
+    // Caller failed to register: simulate the RAII guard's destructor.
+    manager->release_tunnel_id(kProbeId);
+
+    // The slot must now be free: a fresh allocator pointed at kProbeId
+    // should return it, not skip it.
+    manager->set_next_tunnel_id(kProbeId);
+    EXPECT_EQ(manager->allocate_tunnel_id(), kProbeId);
+}
+
 TEST_F(TunnelManagerTest, TunnelIdAllocation_SkipsInUseIds) {
     // Allocate and create a tunnel with ID 2
     auto id1 = manager->allocate_tunnel_id();  // 1
