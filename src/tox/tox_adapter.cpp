@@ -256,6 +256,13 @@ void ToxAdapter::stop() {
     // wake_cv_.wait_for() window before joining.
     wake_cv_.notify_all();
 
+    // H-S-6 (2026-05-20 fix-storm review): signal any in-flight
+    // bootstrap-cache refresh thread to bail out before we tear down
+    // application globals. The thread is detached so we can't join it,
+    // but the cancel flag stops it before its next observation point
+    // (fetch return / parse return / write_cache call).
+    BootstrapSource::cancel_pending_refreshes();
+
     if (iterate_thread_.joinable()) {
         iterate_thread_.join();
     }

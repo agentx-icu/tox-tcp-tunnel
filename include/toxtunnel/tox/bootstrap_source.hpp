@@ -35,6 +35,15 @@ class BootstrapSource {
 
     [[nodiscard]] static std::filesystem::path cache_file_path(
         const std::filesystem::path& data_dir);
+
+    /// Signal any in-flight background refresh thread spawned by
+    /// `resolve_bootstrap_nodes` to bail out before its next
+    /// observation point. Idempotent. The application should call this
+    /// from `ToxAdapter::stop` (or any other "we're shutting down"
+    /// hook) so that detached refresh threads don't outlive the
+    /// process's still-needed globals (H-S-6 in the 2026-05-20
+    /// fix-storm review).
+    static void cancel_pending_refreshes() noexcept;
 };
 
 }  // namespace toxtunnel::tox

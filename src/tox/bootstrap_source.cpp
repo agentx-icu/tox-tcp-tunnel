@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -18,6 +19,12 @@ namespace toxtunnel::tox {
 namespace {
 
 constexpr const char* kCacheFileName = "bootstrap_nodes.json";
+
+// H-S-6 (2026-05-20 fix-storm review): module-local cancel flag for
+// detached refresh threads spawned by `resolve_bootstrap_nodes`.
+// `cancel_pending_refreshes()` flips it to true so the threads
+// short-circuit before touching application-globals during shutdown.
+std::atomic<bool> g_refresh_cancelled{false};
 
 std::string trim_trailing_whitespace(std::string value) {
     while (!value.empty()) {
@@ -161,13 +168,24 @@ util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve
         // `std::async` with a detached future would run-to-completion in
         // the destructor of std::future (which blocks). A bare thread
         // with `detach()` matches the fire-and-forget intent.
+        //
+        // H-S-6 (2026-05-20 fix-storm review): the detached thread can
+        // outlive process-level teardown. Capture a snapshot of the
+        // global cancel flag and re-check it before each observation
+        // point (fetch return, parse return, write_cache). The flag is
+        // set by `cancel_pending_refreshes()` (called from
+        // ToxAdapter::stop) so a clean shutdown short-circuits the
+        // thread before it touches globals like spdlog, std::filesystem
+        // internals, or atomic_write_file.
         try {
             std::thread([fetcher = std::move(fetcher), cache_path, max_nodes]() mutable {
+                if (g_refresh_cancelled.load(std::memory_order_acquire))
+                    return;
                 const auto fetched = fetcher();
-                if (!fetched)
+                if (g_refresh_cancelled.load(std::memory_order_acquire) || !fetched)
                     return;
                 const auto parsed = parse_nodes_json(fetched.value(), max_nodes);
-                if (!parsed)
+                if (g_refresh_cancelled.load(std::memory_order_acquire) || !parsed)
                     return;
                 write_cache(cache_path, fetched.value());
             }).detach();
@@ -236,6 +254,10 @@ std::filesystem::path BootstrapSource::cache_file_path(const std::filesystem::pa
         return std::filesystem::path(kCacheFileName);
     }
     return data_dir / kCacheFileName;
+}
+
+void BootstrapSource::cancel_pending_refreshes() noexcept {
+    g_refresh_cancelled.store(true, std::memory_order_release);
 }
 
 }  // namespace toxtunnel::tox
