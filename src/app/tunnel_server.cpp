@@ -53,7 +53,16 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
         rules_engine_ = std::move(rules_result.value());
         util::Logger::info("Loaded access rules from {}", server_cfg.rules_file.value());
     } else {
-        util::Logger::info("No rules file configured; using permissive defaults");
+        // M-S-3 (2026-05-20 fix-storm review): S14 made the empty
+        // rules engine default-deny. The previous "permissive
+        // defaults" message lied — every incoming TUNNEL_OPEN would
+        // be silently refused, and operators reading logs while
+        // debugging a "tunnel never connects" issue would never
+        // suspect this was the cause. Tell the truth, and tell them
+        // where to fix it.
+        util::Logger::warn(
+            "No rules file configured; ALL incoming tunnels will be denied "
+            "(default-deny). Configure server.rules_file in toxtunnel.yaml.");
     }
     // Propagate the rate-limit configuration from the rules engine into the
     // process-wide singleton. Idempotent — safe to call again on reload.
