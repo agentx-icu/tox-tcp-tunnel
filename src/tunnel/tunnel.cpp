@@ -380,14 +380,15 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
                 // feeding the EWMA so a hostile peer can't pump the
                 // estimator with bogus values.
                 constexpr std::int64_t kMaxBpsCap = 12'500'000'000LL;  // 100 Gbps
-                // -Wpedantic flags __int128 as non-ISO C++; accept the
-                // extension explicitly — same shape as in BdpFlowControl.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-                const __int128 bps128 = (static_cast<__int128>(acked) * 1'000'000'000) / delta_ns;
-                const std::int64_t bps =
-                    static_cast<std::int64_t>(std::min<__int128>(bps128, kMaxBpsCap));
-#pragma GCC diagnostic pop
+                // C-S-2 (2026-05-20) used __int128; CI-pedantic-fix
+                // (2026-05-21) replaces it because MSVC has no __int128.
+                // `acked` is uint32_t so `acked * 1e9` tops out at
+                // ~4.3e18 < INT64_MAX with headroom — plain int64 is
+                // safe. The kMaxBpsCap saturation below still handles
+                // divide-by-tiny-delta_ns.
+                const std::int64_t bps_raw =
+                    (static_cast<std::int64_t>(acked) * 1'000'000'000LL) / delta_ns;
+                const std::int64_t bps = std::min(bps_raw, kMaxBpsCap);
                 observe_bandwidth_bps(bps);
                 util::MetricsRegistry::instance().observe_tunnel_bandwidth_bps(bps);
             }

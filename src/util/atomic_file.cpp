@@ -150,9 +150,13 @@ Expected<void, std::string> posix_write(const std::filesystem::path& path,
 namespace {
 
 // A POSIX mode of 0600/0400 has the group + world bits all zero.
-bool is_owner_only_mode(unsigned mode) {
-    constexpr unsigned kGroupOrWorldRW = 077;  // S_IRWXG | S_IRWXO equivalent
-    return (mode & kGroupOrWorldRW) == 0;
+// Accept the strongly-typed std::filesystem::perms so callers can pass
+// opts.mode without an explicit cast; on MSVC the conversion to
+// unsigned is not implicit (CI-pedantic-fix follow-up 2026-05-21).
+bool is_owner_only_mode(std::filesystem::perms mode) {
+    using P = std::filesystem::perms;
+    constexpr auto kGroupOrWorld = P::group_all | P::others_all;
+    return (mode & kGroupOrWorld) == P::none;
 }
 
 struct OwnerOnlySa {
@@ -243,8 +247,12 @@ Expected<void, std::string> windows_write(const std::filesystem::path& path,
     const std::uint8_t* p = contents.data();
     std::size_t remaining = contents.size();
     while (remaining > 0) {
-        const DWORD chunk =
-            static_cast<DWORD>(std::min<std::size_t>(remaining, std::numeric_limits<DWORD>::max()));
+        // The extra parens around `(std::numeric_limits<DWORD>::max)`
+        // suppress Windows.h's `max(a,b)` macro — without them, MSVC
+        // expands the macro and fails to parse the call (CI-pedantic-fix
+        // 2026-05-21).
+        const DWORD chunk = static_cast<DWORD>(
+            std::min<std::size_t>(remaining, (std::numeric_limits<DWORD>::max)()));
         DWORD written = 0;
         if (!::WriteFile(h, p, chunk, &written, nullptr) || written != chunk) {
             const auto err = ::GetLastError();

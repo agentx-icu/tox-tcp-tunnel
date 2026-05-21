@@ -1,7 +1,6 @@
 #include "toxtunnel/tunnel/bdp_flow_control.hpp"
 
 #include <algorithm>
-#include <limits>
 
 namespace toxtunnel::tunnel {
 
@@ -64,28 +63,21 @@ void BdpFlowControl::recompute_window_locked() noexcept {
     }
 
     // bdp_bytes = bandwidth (bytes/sec) * rtt (us) / 1_000_000.
-    // The original "worked in int64_t for a 10 Gbps × 100 ms link" was
-    // fine for *honest* links, but the inputs are fed from peer-controlled
-    // ACK timestamps and byte counts (see handle_tunnel_ack_frame). A
-    // malicious peer can pump the EWMA toward 4.3e12 bps and a multi-
-    // second RTT, at which point bps × rtt > INT64_MAX and the product
-    // wraps negative. The negative bdp then survives the * safety_factor
-    // step and clamps to `floor_bytes` instead of `max_window_bytes` —
-    // which is "safe" by accident but masks a real overflow. Compute in
-    // __int128 (universally available on the platforms we target — GCC,
-    // Clang, MSVC has __int128 in MSVC 19.36+), then clamp into int64
-    // before the safety-factor scaling. (S21 in the 2026-05-20 follow-up.)
-    //
-    // -Wpedantic warns that __int128 is a non-ISO C++ extension; we accept
-    // the extension explicitly because every compiler in our build matrix
-    // supports it and the alternative (manual hi/lo 64-bit arithmetic) is
-    // much harder to read.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
-    const auto bdp_raw = (static_cast<__int128>(bps) * static_cast<__int128>(rtt)) / 1'000'000;
-    const std::int64_t bdp = static_cast<std::int64_t>(
-        std::clamp<__int128>(bdp_raw, 0, std::numeric_limits<std::int64_t>::max() / 100));
-#pragma GCC diagnostic pop
+    // S21 (2026-05-20) protected against peer-controlled overflow of
+    // `bps * rtt`. The original fix used __int128 — portable on GCC
+    // and Clang but not on MSVC, which has no __int128 of any spelling.
+    // CI-pedantic-fix follow-up (2026-05-21): replace with input
+    // saturation. We cap both factors so the product is provably
+    // < INT64_MAX without needing wide-integer arithmetic, then run
+    // the multiplication in plain int64. Caps are loose enough that
+    // honest links are unaffected — 1 Gbps × 1000 s RTT bounds the
+    // product at 1e18, comfortably below INT64_MAX (~9.2e18) with
+    // headroom for the * safety_factor step below.
+    constexpr std::int64_t kBpsCap = 1'000'000'000;    // 1 Gbps
+    constexpr std::int64_t kRttCapUs = 1'000'000'000;  // 1000 seconds
+    const std::int64_t bps_capped = std::min(bps, kBpsCap);
+    const std::int64_t rtt_capped = std::min(rtt, kRttCapUs);
+    const std::int64_t bdp = (bps_capped * rtt_capped) / 1'000'000;
     const std::int64_t target = (bdp * cfg_.safety_factor_x100) / 100;
     // Never shrink below the configured seed (fixed_window_bytes). On a
     // high-RTT / low-throughput path (e.g. Tox public TCP relay), the BDP

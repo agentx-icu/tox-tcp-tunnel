@@ -116,28 +116,30 @@ void RateLimiter::refill(Bucket& b) const {
     // cap so the bucket never exceeds capacity.
     //
     // S25 / H-4 (2026-05-20 review): `per_sec * elapsed_ns` overflows int64
-    // for any bucket that's been idle for long enough (e.g. a friend that
-    // hasn't opened a tunnel in hours). per_sec is up to 2^32-1; elapsed_ns
-    // is unbounded in principle. The old code wrapped to a negative `add`,
-    // which then evaluated `cur + add` below burst and stored a negative
-    // token count — starving that friend permanently. Compute in __int128
-    // and cap `add` at the bucket's burst before falling back to int64.
-    // (Capping at burst is sound: any `add` larger than that would be
-    // clipped to burst by std::min anyway.)
-    // -Wpedantic flags __int128 as non-ISO C++; we accept the extension
-    // explicitly here — see the matching note in bdp_flow_control.cpp.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpedantic"
+    // for any bucket that's been idle long enough (per_sec up to 2^32-1,
+    // elapsed_ns unbounded). The old code wrapped to a negative `add` and
+    // starved the friend permanently.
+    //
+    // CI-pedantic-fix follow-up (2026-05-21): the first fix used __int128
+    // which MSVC doesn't have. Replace with the observation that once a
+    // bucket has been idle for `burst / per_sec` seconds it's already
+    // saturated at `burst` regardless of any more elapsed time — so we
+    // can short-circuit and skip the dangerous multiplication entirely.
+    // `burst * 1e9` is safe (burst is at most uint32_t -> 4.3e9 * 1e9 =
+    // 4.3e18 < INT64_MAX). Below that idle threshold, `per_sec *
+    // elapsed_ns` is itself bounded by `burst * 1e9` and therefore safe
+    // too.
     const auto compute_add = [](std::int64_t per_sec_val, std::int64_t elapsed,
                                 std::int64_t burst) -> std::int64_t {
-        const __int128 raw =
-            (static_cast<__int128>(per_sec_val) * static_cast<__int128>(elapsed)) / 1'000'000'000;
-        if (raw <= 0) {
+        if (per_sec_val <= 0 || elapsed <= 0 || burst <= 0) {
             return 0;
         }
-        return static_cast<std::int64_t>(std::min<__int128>(raw, burst));
+        const std::int64_t ns_to_full = (burst * 1'000'000'000LL) / per_sec_val;
+        if (elapsed >= ns_to_full) {
+            return burst;
+        }
+        return (per_sec_val * elapsed) / 1'000'000'000LL;
     };
-#pragma GCC diagnostic pop
 
     if (b.spec.open_per_sec > 0 && b.spec.open_burst > 0) {
         const std::int64_t add = compute_add(b.spec.open_per_sec, elapsed_ns, b.spec.open_burst);
