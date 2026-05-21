@@ -9,6 +9,8 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <utility>
 
 #include "toxtunnel/util/atomic_file.hpp"
 
@@ -147,6 +149,36 @@ util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve
     }
 
     const auto cache_path = cache_file_path(data_dir);
+
+    // Cache-first: if we have a usable cache, return it immediately and
+    // refresh in the background. Previously this code synchronously called
+    // `curl` via popen on the caller's thread, blocking startup for up to
+    // 20 seconds on every boot (C-15 in the 2026-05-20 review). The
+    // fire-and-forget refresh keeps subsequent boots current without
+    // blocking initialisation.
+    auto cached = load_cached_nodes(cache_path, max_nodes);
+    if (cached) {
+        // `std::async` with a detached future would run-to-completion in
+        // the destructor of std::future (which blocks). A bare thread
+        // with `detach()` matches the fire-and-forget intent.
+        try {
+            std::thread([fetcher = std::move(fetcher), cache_path, max_nodes]() mutable {
+                const auto fetched = fetcher();
+                if (!fetched)
+                    return;
+                const auto parsed = parse_nodes_json(fetched.value(), max_nodes);
+                if (!parsed)
+                    return;
+                write_cache(cache_path, fetched.value());
+            }).detach();
+        } catch (...) {
+            // Failure to spawn a refresher is non-fatal; cache stays as-is.
+        }
+        return cached;
+    }
+
+    // No (usable) cache — we have no choice but to block, otherwise the
+    // first-ever startup has no DHT entry points at all.
     const auto fetched_json = fetcher();
     if (fetched_json) {
         auto parsed = parse_nodes_json(fetched_json.value(), max_nodes);

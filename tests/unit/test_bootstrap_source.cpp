@@ -115,6 +115,46 @@ TEST_F(BootstrapSourceTest, ResolveBootstrapNodesFallsBackToCacheWhenFetchFails)
     EXPECT_EQ(result.value()[0].ip, "203.0.113.30");
 }
 
+// C-15 / 2026-05-20 finding: when a usable cache exists,
+// resolve_bootstrap_nodes must return immediately without waiting on the
+// (potentially long-running) fetcher. The previous implementation blocked
+// startup for up to 20 seconds on every boot. The fetcher is now invoked
+// fire-and-forget for the next-run refresh; this test guards the
+// no-block-on-cache-hit invariant.
+TEST_F(BootstrapSourceTest, ResolveBootstrapNodesDoesNotBlockOnFetcherWhenCacheValid) {
+    write_cache(R"([
+  {
+    "ipv4": "203.0.113.40",
+    "port": 33445,
+    "public_key": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    "status_udp": true,
+    "status_tcp": true
+  }
+])");
+
+    std::atomic<bool> fetcher_called{false};
+    auto slow_fetcher = [&fetcher_called]() -> util::Expected<std::string, BootstrapFetchError> {
+        fetcher_called.store(true);
+        // Pretend the network call takes 5s; the foreground path must not
+        // wait for us.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        return util::unexpected(BootstrapFetchError{std::string("slow")});
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result =
+        BootstrapSource::resolve_bootstrap_nodes({}, BootstrapMode::Auto, temp_dir_, slow_fetcher);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_EQ(result.value().size(), 1u);
+    EXPECT_EQ(result.value()[0].ip, "203.0.113.40");
+
+    // Generous bound — must be well under the 5s the fetcher would burn.
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 500)
+        << "resolve_bootstrap_nodes blocked on fetcher despite a valid cache";
+}
+
 TEST_F(BootstrapSourceTest, ResolveBootstrapNodesLanModeSkipsFetchAndCache) {
     write_cache(R"([
   {

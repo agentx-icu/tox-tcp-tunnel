@@ -174,9 +174,17 @@ void ToxThread::run_loop() {
         // 3. Dispatch events (from callbacks) to registered handlers.
         process_events();
 
-        // 4. Sleep for the recommended interval before iterating again.
-        uint32_t interval_ms = tox_iteration_interval(tox_.get());
-        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+        // 4. Sleep for toxcore's recommended interval before iterating
+        // again — but wake early if another thread posts a command or
+        // requests shutdown. Previously this used a plain `sleep_for`,
+        // which ignored `command_cv_` entirely: notifications from
+        // command-posting paths (and from `stop()`) were dropped, so
+        // Shutdown could sit on the queue for ~50 ms and outbound data
+        // had the same worst-case latency.
+        const uint32_t interval_ms = tox_iteration_interval(tox_.get());
+        std::unique_lock<std::mutex> lock(command_mutex_);
+        command_cv_.wait_for(lock, std::chrono::milliseconds(interval_ms),
+                             [this]() { return !command_queue_.empty() || !running_.load(); });
     }
 
     util::Logger::info("Tox event-loop thread stopped");
