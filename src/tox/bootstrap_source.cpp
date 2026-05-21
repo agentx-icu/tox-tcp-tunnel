@@ -10,6 +10,8 @@
 #include <string>
 #include <system_error>
 
+#include "toxtunnel/util/atomic_file.hpp"
+
 namespace toxtunnel::tox {
 namespace {
 
@@ -50,11 +52,14 @@ void write_cache(const std::filesystem::path& cache_path, std::string_view json)
         return;
     }
 
-    std::ofstream output(cache_path);
-    if (!output) {
-        return;
-    }
-    output << json;
+    // Bootstrap cache is best-effort recovery: a corrupted file from a
+    // mid-write crash would leave the daemon with no DHT nodes on the next
+    // boot. atomic_write_file removes that failure mode. Parent-dir fsync
+    // off because the cache is not security-critical.
+    util::AtomicFileOptions opts{};
+    opts.fsync_parent_dir = false;
+    opts.use_full_fsync_macos = false;
+    (void)util::atomic_write_file(cache_path, json, opts);
 }
 
 }  // namespace

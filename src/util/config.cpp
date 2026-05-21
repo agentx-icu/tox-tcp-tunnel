@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/metrics.hpp"
 
 namespace toxtunnel {
@@ -713,12 +714,16 @@ std::string Config::to_yaml() const {
 
 util::Expected<void, std::string> Config::save(const std::filesystem::path& filepath) const {
     try {
-        std::ofstream ofs(filepath);
-        if (!ofs) {
-            return util::make_unexpected(std::string("Failed to open file for writing: ") +
-                                         filepath.string());
+        const std::string serialised = to_yaml();
+        // Atomic write so a crash mid-save does not leave a truncated YAML
+        // that fails to parse on the next start. Parent-dir fsync on:
+        // user config is durability-sensitive.
+        util::AtomicFileOptions opts{};
+        opts.fsync_parent_dir = true;
+        auto written = util::atomic_write_file(filepath, serialised, opts);
+        if (!written) {
+            return util::make_unexpected(std::string("Failed to write config: ") + written.error());
         }
-        ofs << to_yaml();
         return {};
     } catch (const std::exception& e) {
         return util::make_unexpected(std::string("Failed to save config: ") + e.what());

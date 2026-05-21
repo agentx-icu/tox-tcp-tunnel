@@ -8,6 +8,7 @@
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
 #include "toxtunnel/tox/tox_watchdog.hpp"
+#include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tox {
@@ -899,32 +900,17 @@ bool ToxAdapter::write_save_data() const {
     std::vector<uint8_t> data(save_size);
     tox_get_savedata(tox_.get(), data.data());
 
-    // Write to a temporary file and rename for atomicity.
-    auto tmp_path = path;
-    tmp_path += ".tmp";
+    // The Tox identity is the most security-critical file we own; loss of it
+    // breaks every existing tunnel forever. Use the strongest durability
+    // setting: parent-dir fsync + F_FULLFSYNC on macOS.
+    util::AtomicFileOptions opts{};
+    opts.fsync_parent_dir = true;
+    opts.use_full_fsync_macos = true;
 
-    std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        util::Logger::error("Could not open save file for writing: {}", tmp_path.string());
-        return false;
-    }
-
-    file.write(reinterpret_cast<const char*>(data.data()),
-               static_cast<std::streamsize>(data.size()));
-    file.close();
-
-    if (!file) {
-        util::Logger::error("Failed to write save data to: {}", tmp_path.string());
-        return false;
-    }
-
-    // Atomic rename.
-    std::error_code ec;
-    std::filesystem::rename(tmp_path, path, ec);
-    if (ec) {
-        util::Logger::error("Failed to rename save file: {}", ec.message());
-        // Try to clean up the temp file.
-        std::filesystem::remove(tmp_path, ec);
+    auto written = util::atomic_write_file(path, std::span<const std::uint8_t>(data), opts);
+    if (!written) {
+        util::Logger::error("Failed to atomically write save file {}: {}", path.string(),
+                            written.error());
         return false;
     }
 

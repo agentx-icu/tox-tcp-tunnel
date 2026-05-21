@@ -2,7 +2,9 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <string>
 
+#include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/logger.hpp"
 #include "toxtunnel/util/metrics.hpp"
 #include "toxtunnel/util/systemd_notify.hpp"
@@ -119,10 +121,11 @@ void ToxWatchdog::persist_abort_count() {
             }
         }
         ++current;
-        std::ofstream out(path, std::ios::trunc);
-        if (out) {
-            out << current << '\n';
-        }
+        // Use atomic_write_file so an abort triggered between truncate and
+        // write does not zero the persisted counter (the previous
+        // ios::trunc + write was vulnerable to exactly that race).
+        const std::string serialised = std::to_string(current) + '\n';
+        (void)util::atomic_write_file(path, serialised);
     } catch (...) {
         // Best-effort; never let the abort path itself throw.
     }
