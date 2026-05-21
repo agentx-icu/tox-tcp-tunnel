@@ -1,6 +1,7 @@
 #include "toxtunnel/tunnel/bdp_flow_control.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace toxtunnel::tunnel {
 
@@ -63,8 +64,20 @@ void BdpFlowControl::recompute_window_locked() noexcept {
     }
 
     // bdp_bytes = bandwidth (bytes/sec) * rtt (us) / 1_000_000.
-    // Worked in int64_t to avoid overflow on a 10 Gbps × 100 ms link.
-    const std::int64_t bdp = (bps * rtt) / 1'000'000;
+    // The original "worked in int64_t for a 10 Gbps × 100 ms link" was
+    // fine for *honest* links, but the inputs are fed from peer-controlled
+    // ACK timestamps and byte counts (see handle_tunnel_ack_frame). A
+    // malicious peer can pump the EWMA toward 4.3e12 bps and a multi-
+    // second RTT, at which point bps × rtt > INT64_MAX and the product
+    // wraps negative. The negative bdp then survives the * safety_factor
+    // step and clamps to `floor_bytes` instead of `max_window_bytes` —
+    // which is "safe" by accident but masks a real overflow. Compute in
+    // __int128 (universally available on the platforms we target — GCC,
+    // Clang, MSVC has __int128 in MSVC 19.36+), then clamp into int64
+    // before the safety-factor scaling. (S21 in the 2026-05-20 follow-up.)
+    const auto bdp_raw = (static_cast<__int128>(bps) * static_cast<__int128>(rtt)) / 1'000'000;
+    const std::int64_t bdp = static_cast<std::int64_t>(
+        std::clamp<__int128>(bdp_raw, 0, std::numeric_limits<std::int64_t>::max() / 100));
     const std::int64_t target = (bdp * cfg_.safety_factor_x100) / 100;
     // Never shrink below the configured seed (fixed_window_bytes). On a
     // high-RTT / low-throughput path (e.g. Tox public TCP relay), the BDP

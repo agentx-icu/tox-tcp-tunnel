@@ -228,5 +228,37 @@ TEST(BdpFlowControlTest, AckThresholdScalesWithWindow) {
     EXPECT_EQ(bdp.ack_threshold_bytes(), 65536);
 }
 
+// S21 / 2026-05-20 follow-up: peer-controlled ACK timing + byte counts
+// can pump the EWMA estimates toward huge values. The bdp = bps * rtt
+// computation must not wrap around int64. Feed obviously-out-of-band
+// samples and assert the window stays inside [min, max] and finite.
+TEST(BdpFlowControlTest, BdpModeSurvivesAdversarialSamplesWithoutOverflow) {
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.fixed_window_bytes = 256 * 1024;  // seed = 256 KiB
+    cfg.min_window_bytes = 64 * 1024;
+    cfg.max_window_bytes = 4 * 1024 * 1024;
+    cfg.safety_factor_x100 = 200;  // 2.0x
+    BdpFlowControl bdp(cfg);
+
+    // Hostile sample 1: very large bandwidth — close to int64_t / 1e9.
+    // Pumped repeatedly so the EWMA settles near it.
+    for (int i = 0; i < 50; ++i) {
+        bdp.observe_bandwidth_bps(static_cast<std::int64_t>(4'000'000'000'000'000LL));  // 4e15 B/s
+    }
+    // Hostile sample 2: huge RTT (e.g. 10 seconds = 1e7 us).
+    for (int i = 0; i < 50; ++i) {
+        bdp.observe_rtt_us(10'000'000);
+    }
+
+    const auto win = bdp.target_window_bytes();
+    EXPECT_GE(win, cfg.min_window_bytes) << "window underflowed below floor";
+    EXPECT_LE(win, cfg.max_window_bytes) << "window overflowed past ceiling";
+
+    const auto thr = bdp.ack_threshold_bytes();
+    EXPECT_GT(thr, 0) << "ack threshold should never go negative";
+    EXPECT_LE(thr, win) << "ack threshold should not exceed the window";
+}
+
 }  // namespace
 }  // namespace toxtunnel::test
