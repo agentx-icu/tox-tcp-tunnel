@@ -53,7 +53,20 @@ void ToxThread::start() {
         return;  // Already running.
     }
 
-    init_tox();
+    // S30 (2026-05-20 follow-up): init_tox can throw on
+    // tox_options_new / tox_new failure. The previous code left
+    // `running_ = true` in that case, so a later `is_running()` lied
+    // (no thread had been started), `stop()` was a no-op (joinable
+    // returned false), and any caller waiting on a posted command's
+    // future would block forever — the queue's draining loop never
+    // existed. Roll the flag back and rethrow so callers see the real
+    // failure.
+    try {
+        init_tox();
+    } catch (...) {
+        running_.store(false);
+        throw;
+    }
     thread_ = std::thread([this]() { run_loop(); });
 }
 
