@@ -388,13 +388,17 @@ void TunnelManager::route_frame(const ProtocolFrame& frame) {
         return;
     }
 
-    // Route to the appropriate tunnel
-    Tunnel* tunnel = nullptr;
+    // Route to the appropriate tunnel. Hold the shared_ptr (not a raw
+    // Tunnel*) across the unlocked handle_frame() call so that a racing
+    // close_all() / remove_tunnel() cannot destroy the Tunnel before
+    // handle_frame returns (C-20 in the 2026-05-20 review). The map
+    // already stores shared_ptr<Tunnel>; a local copy is the cheap fix.
+    std::shared_ptr<Tunnel> tunnel;
     {
         std::shared_lock lock(mutex_);
         auto it = tunnels_.find(tid);
         if (it != tunnels_.end()) {
-            tunnel = it->second.get();
+            tunnel = it->second;
         }
     }
 

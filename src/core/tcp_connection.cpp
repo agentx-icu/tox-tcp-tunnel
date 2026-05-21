@@ -313,10 +313,25 @@ void TcpConnection::force_close() {
         }
         util::Logger::debug("TcpConnection: force close");
 
-        // Discard pending writes.
+        // Discard pending writes. Subtract their bytes from the
+        // accounting; do NOT touch the in-flight write — its completion
+        // handler (which holds the buffer in a `shared_ptr<WriteBuffer>`)
+        // will fire with `operation_aborted` and refund its own bytes.
+        // The previous `store(0)` + `write_in_progress_ = false` racey
+        // pair caused an underflow because the in-flight completion still
+        // ran fetch_sub after store(0). (C-10 / H-13 in the 2026-05-20
+        // review.)
+        std::size_t pending = 0;
+        for (auto& wb : write_queue_) {
+            pending += wb.size();
+        }
+        if (pending > 0) {
+            write_buffer_bytes_.fetch_sub(pending, std::memory_order_relaxed);
+        }
         write_queue_.clear();
-        write_buffer_bytes_.store(0, std::memory_order_relaxed);
-        write_in_progress_ = false;
+        // write_in_progress_ is intentionally left alone: the in-flight
+        // completion lambda flips it back to false (or do_close handles
+        // re-entry, since state_ is already Disconnected after do_close).
 
         do_close(asio::error::operation_aborted);
     });
@@ -414,16 +429,34 @@ void TcpConnection::do_write() {
     }
 
     write_in_progress_ = true;
-    auto& front = write_queue_.front();
+
+    // Move the front entry into the completion lambda's captures so the
+    // backing bytes outlive asio's internal buffer reference even if
+    // force_close() / clear() races with the in-flight write (C-10 in
+    // the 2026-05-20 review). Previously the lambda only held a
+    // shared_from_this(), and `front.bytes()` pointed into the deque
+    // node — a force_close that cleared the deque while the kernel
+    // had not yet drained the buffer would leave asio with a dangling
+    // pointer.
+    auto inflight = std::make_shared<WriteBuffer>(std::move(write_queue_.front()));
+    write_queue_.pop_front();
 
     auto self = shared_from_this();
+    const auto* data_ptr = inflight->bytes();
+    const auto data_size = inflight->size();
     asio::async_write(
-        socket_, asio::buffer(front.bytes(), front.size()),
-        asio::bind_executor(strand_, [this, self](const std::error_code& ec,
-                                                  std::size_t bytes_transferred) {
+        socket_, asio::buffer(data_ptr, data_size),
+        asio::bind_executor(strand_, [this, self, inflight](const std::error_code& ec,
+                                                            std::size_t bytes_transferred) {
             if (ec) {
                 util::Logger::debug("TcpConnection: write error: {}", ec.message());
                 write_in_progress_ = false;
+                // The buffer for the failed write was already moved out
+                // of write_queue_ before async_write started — its
+                // accounting was charged at enqueue time but never
+                // refunded by the normal pop path. Refund it now so
+                // write_buffer_bytes_ does not skew permanently.
+                write_buffer_bytes_.fetch_sub(inflight->size(), std::memory_order_relaxed);
                 notify_error(ec);
                 if (state_.load(std::memory_order_acquire) == ConnectionState::Connected) {
                     set_state(ConnectionState::Disconnecting);
@@ -432,12 +465,11 @@ void TcpConnection::do_write() {
                 return;
             }
 
-            assert(!write_queue_.empty());
-            write_buffer_bytes_.fetch_sub(write_queue_.front().size(), std::memory_order_relaxed);
-            // Pop releases either the owned `vector` or the shared buffer
-            // ref held by the `OwnedBufferView`. Either way the bytes are
-            // freed exactly when their async_write completes — RAII.
-            write_queue_.pop_front();
+            write_buffer_bytes_.fetch_sub(inflight->size(), std::memory_order_relaxed);
+            // `inflight` releases either the owned `vector` or the shared
+            // buffer ref held by the `OwnedBufferView` exactly when this
+            // completion lambda destructs — RAII keeps the bytes alive
+            // for the full duration of asio's internal use.
 
             (void)bytes_transferred;
             do_write();
@@ -455,8 +487,18 @@ void TcpConnection::do_close(const std::error_code& ec) {
         socket_.close(shutdown_ec);
     }
 
+    // Symmetric with force_close: subtract only the queued bytes, not
+    // the in-flight write's bytes. The in-flight completion lambda
+    // holds its WriteBuffer in a shared_ptr and will refund itself when
+    // operation_aborted fires.
+    std::size_t pending = 0;
+    for (auto& wb : write_queue_) {
+        pending += wb.size();
+    }
+    if (pending > 0) {
+        write_buffer_bytes_.fetch_sub(pending, std::memory_order_relaxed);
+    }
     write_queue_.clear();
-    write_buffer_bytes_.store(0, std::memory_order_relaxed);
     write_in_progress_ = false;
 
     set_state(ConnectionState::Disconnected);
