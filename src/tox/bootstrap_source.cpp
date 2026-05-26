@@ -4,11 +4,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
-#include <stop_token>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -22,18 +23,30 @@ namespace {
 
 constexpr const char* kCacheFileName = "bootstrap_nodes.json";
 
+// Portable cooperative stop token. Apple Clang's libc++ still lacks
+// std::jthread / std::stop_token, so we hand-roll the minimum the worker needs:
+// a shared atomic flag the worker polls at each observation point. A fresh flag
+// is created per worker so cancelling one never affects a later one.
+struct RefreshStopToken {
+    std::shared_ptr<std::atomic<bool>> flag;
+    [[nodiscard]] bool stop_requested() const noexcept {
+        return flag && flag->load(std::memory_order_acquire);
+    }
+};
+
 // H-11 (2026-05-26): owned, joinable background-refresh worker.
 //
 // The previous design spawned a *detached* std::thread and relied on a
 // process-global cancel flag, so the thread could outlive the owning
 // ToxAdapter and touch freed/global state (spdlog, std::filesystem,
 // atomic_write_file) during teardown. RefreshManager replaces that with a
-// single owned std::jthread:
+// single owned std::thread + per-worker stop flag (std::jthread/std::stop_token
+// would be cleaner but are unavailable on Apple's libc++):
 //   * spawn() joins any prior worker before launching a new one, so at most
 //     one refresh runs at a time and none ever leaks.
 //   * cancel_and_join() (wired to BootstrapSource::cancel_pending_refreshes)
-//     requests cooperative stop via the jthread's stop_token AND joins, so by
-//     the time ToxAdapter::stop() returns no refresh thread is still running.
+//     sets the worker's stop flag AND joins, so by the time ToxAdapter::stop()
+//     returns no refresh thread is still running.
 //   * arm()/cancel state gates whether new refreshes may be spawned across
 //     stop -> start cycles, preserving the previous arm_refreshes() contract.
 // The manager itself is a function-local static; its destructor joins the
@@ -54,24 +67,29 @@ class RefreshManager {
     /// Request the in-flight worker (if any) to stop and join it. Also blocks
     /// further spawns until arm() is called again.
     void cancel_and_join() {
-        std::jthread worker;
+        std::thread worker;
+        std::shared_ptr<std::atomic<bool>> flag;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             accepting_ = false;
             worker = std::move(worker_);  // take ownership, join outside lock
+            flag = std::move(stop_flag_);
+        }
+        if (flag) {
+            flag->store(true, std::memory_order_release);
         }
         if (worker.joinable()) {
-            worker.request_stop();
             worker.join();
         }
     }
 
     /// Launch @p task on an owned thread, joining any previous worker first.
-    /// @p task receives a std::stop_token it must poll at its observation
+    /// @p task receives a RefreshStopToken it must poll at its observation
     /// points. No-op while cancelled (not armed).
     template <typename Task>
     void spawn(Task&& task) {
-        std::jthread previous;
+        std::thread previous;
+        std::shared_ptr<std::atomic<bool>> prev_flag;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!accepting_) {
@@ -80,9 +98,12 @@ class RefreshManager {
             // Take the previous worker so it can be joined below; threads
             // never leak because at most one is ever live.
             previous = std::move(worker_);
+            prev_flag = std::move(stop_flag_);
+        }
+        if (prev_flag) {
+            prev_flag->store(true, std::memory_order_release);
         }
         if (previous.joinable()) {
-            previous.request_stop();
             previous.join();
         }
         {
@@ -92,7 +113,11 @@ class RefreshManager {
             if (!accepting_) {
                 return;
             }
-            worker_ = std::jthread(std::forward<Task>(task));
+            auto flag = std::make_shared<std::atomic<bool>>(false);
+            stop_flag_ = flag;
+            RefreshStopToken token{flag};
+            worker_ =
+                std::thread([task = std::forward<Task>(task), token]() mutable { task(token); });
         }
     }
 
@@ -105,7 +130,8 @@ class RefreshManager {
 
     std::mutex mutex_;
     bool accepting_{true};
-    std::jthread worker_;
+    std::thread worker_;
+    std::shared_ptr<std::atomic<bool>> stop_flag_;
 };
 
 std::string trim_trailing_whitespace(std::string value) {
@@ -247,12 +273,12 @@ util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve
     auto cached = load_cached_nodes(cache_path, max_nodes);
     if (cached) {
         // H-11 (2026-05-26): the refresh runs on an OWNED, joinable thread
-        // managed by RefreshManager. It polls the provided std::stop_token at
+        // managed by RefreshManager. It polls the provided RefreshStopToken at
         // each observation point (fetch return, parse return, write_cache) so
         // cancel_pending_refreshes() — wired to ToxAdapter::stop — can request
         // stop and join it before any application globals are torn down.
         RefreshManager::instance().spawn(
-            [fetcher = std::move(fetcher), cache_path, max_nodes](std::stop_token stop) mutable {
+            [fetcher = std::move(fetcher), cache_path, max_nodes](RefreshStopToken stop) mutable {
                 if (stop.stop_requested()) {
                     return;
                 }
