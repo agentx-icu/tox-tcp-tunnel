@@ -102,12 +102,21 @@ Forward any TCP port through Tox with end-to-end encryption, no central server, 
   macOS for the identity file). A new `TunnelIdAllocator` exposes
   `reserve(id)` for the resume protocol.
 
-- **Tunnel resume (opt-in, partial in v0.4.0)** — new wire opcodes
-  `TUNNEL_RESUME_REQUEST` (0x08) and `TUNNEL_RESUME_ACK` (0x09) plus a
-  client-side persistent state store. Default off
-  (`tunnel.resume.enabled: false`); v0.3.0 peers see no change when the
-  flag is off. Full live handshake wiring is tracked for v0.4.1 — see
-  `docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
+- **Tunnel resume (opt-in)** — wire opcodes `TUNNEL_RESUME_REQUEST` (0x08)
+  and `TUNNEL_RESUME_ACK` (0x09). Default off (`tunnel.resume.enabled: false`);
+  v0.3.0 peers see no change when the flag is off. When enabled, a brief
+  Tox-network blip no longer kills your tunnels: the server holds a
+  disconnected friend's tunnels (and their target connections) for
+  `tunnel.resume.max_age_seconds` and reattaches them on reconnect, while the
+  client re-requests each surviving tunnel and reconciles byte offsets. Gaps
+  (bytes lost in the disconnect) are handled by `tunnel.resume.on_gap`
+  (`close` or `passthrough`). Covers live reconnects only — not process
+  restarts, since local TCP sockets are lost. See
+  [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+- **Application keepalive (opt-in)** — set `tunnel.keepalive_interval_seconds`
+  above 0 to PING each peer on an interval and drop a tunnel / fail over when
+  an app is wedged but its Tox link still looks alive.
 
 ---
 

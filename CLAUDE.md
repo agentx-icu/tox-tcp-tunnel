@@ -112,9 +112,15 @@ Frame types: `TUNNEL_OPEN`, `TUNNEL_DATA`, `TUNNEL_CLOSE`, `TUNNEL_ACK`, `TUNNEL
 `TUNNEL_RESUME_REQUEST` (0x08), `TUNNEL_RESUME_ACK` (0x09).
 
 The resume opcodes are wire-inactive when `tunnel.resume.enabled: false` (the
-v0.4.0 default); v0.3.0 peers see no behavioural change. Wiring the live
-resume handshake into the data flow is tracked separately — see
-`docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
+default); v0.3.0 peers see no behavioural change. When enabled, the handshake is
+live: the server holds a disconnected friend's tunnels (and their target TCP
+connections) for `tunnel.resume.max_age_seconds` and reattaches them on
+reconnect, while the client re-sends `TUNNEL_RESUME_REQUEST` per surviving tunnel
+and reconciles byte offsets. There is no app-level retransmit buffer, so any gap
+(bytes lost in the disconnect) is handled by `tunnel.resume.on_gap`
+(`close` = drop the tunnel, `passthrough` = continue with a logged hole). Resume
+covers the live-reconnect case only (both processes stay up); it cannot survive a
+process restart, since the local TCP sockets do not.
 
 `INFO_REQUEST` / `INFO_REPLY` carry only the metadata the server has explicitly
 opted into via `server.disclose.*` (all fields default to `false`). There is **no**
@@ -142,7 +148,7 @@ tests/integration/   # Integration tests
 tests/packaging/     # Package-layout tests (run via ctest)
 tests/soak/          # Long-running soak fixtures (ctest -L soak)
 tests/chaos/         # Chaos / fault-injection fixtures (ctest -L chaos)
-                     # Total test count: ~493 across all suites.
+                     # Total test count: ~525 across all suites.
 third_party/c-toxcore/   # Git submodule — required for build
 cmake/Packaging.cmake    # CPack configuration
 packaging/{linux,macos,windows}/   # Service units, installer scripts, MSI/WIX fragments
@@ -202,10 +208,20 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
 - **Atomic writes** — `tox_save.dat` and `known_servers.yaml` go through
   `util::atomic_write_file` (tmp + fsync + rename, plus parent-dir
   fsync; `F_FULLFSYNC` on macOS for the identity file).
-- **Tunnel resume** — `tunnel.resume.enabled: false` by default. New
-  opcodes `0x08 / 0x09` are wire-inactive in that mode. Driver wiring
-  is partial in v0.4.0; see
-  `docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
+- **Tunnel resume** — `tunnel.resume.enabled: false` by default (opcodes
+  `0x08 / 0x09` wire-inactive in that mode). When enabled the live
+  hold-across-reconnect handshake runs: the server holds a disconnected
+  friend's manager (tunnels + target TCPs) for `resume.max_age_seconds`
+  and resurrects it on reconnect; the client re-sends `TUNNEL_RESUME_REQUEST`
+  for surviving tunnels and reconciles offsets, with gaps handled per
+  `resume.on_gap` (`close` / `passthrough`). Live-reconnect only — does not
+  survive a process restart (local TCP sockets are lost).
+- **Application keepalive** — `tunnel.keepalive_interval_seconds: 0`
+  (disabled) by default. When >0, each peer is PINGed every interval and
+  declared dead after 3× of no PONG: the server drops that friend's tunnels;
+  the client marks the active server offline so failover promotes a fallback.
+  Catches an application that is wedged while its toxcore link still looks
+  alive (toxcore's own connection tracking covers transport-level death).
 
 ## Dependencies
 

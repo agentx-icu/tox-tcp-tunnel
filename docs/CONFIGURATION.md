@@ -360,6 +360,10 @@ tunnel:
   reaper_tick_seconds: 30          # how often the reaper scans; only matters
                                     # if idle_timeout_seconds > 0.
 
+  keepalive_interval_seconds: 0    # 0 = disabled (default). >0 sends a PING to
+                                    # each peer every interval and declares it
+                                    # dead after 3× of no PONG.
+
   coalesce_max_delay_us: 200       # 0 disables coalescing. Otherwise the
                                     # per-tunnel WriteQueue holds small writes
                                     # for up to this many microseconds before
@@ -373,6 +377,7 @@ tunnel:
 |---|---|---|---|
 | `idle_timeout_seconds` | `0` (off) | restart | Idle reaper threshold. When >0 the reaper closes tunnels with no TUNNEL_DATA in either direction for the given duration. |
 | `reaper_tick_seconds` | `30` | restart | Reaper scan period. Lower = faster reclaim, higher = less wake-up overhead. |
+| `keepalive_interval_seconds` | `0` (off) | restart | Application-level PING/PONG liveness. When >0, each peer is PINGed every interval and declared dead after `3×interval` of no PONG — the server drops that friend's tunnels, the client marks the active server offline so failover promotes a fallback. Catches an app wedged while its toxcore link still looks alive. |
 | `coalesce_max_delay_us` | `200` | restart | Max time a small write is buffered before being emitted. `0` disables coalescing — every write becomes its own TUNNEL_DATA frame, matching pre-v0.3.0 behaviour. |
 | `coalesce_max_bytes` | `1362` | restart | Buffer-size flush threshold. Should be ≤ TUNNEL_DATA payload MTU; higher values are clamped. |
 | `coalesce_mode` | `fixed` | restart | Coalescer policy. `fixed` (v0.3.0 behaviour), `adaptive` (state machine selects between bypass / drain / batch per push), `bypass` (no hold timer ever), `drain` (emit on overflow only). |
@@ -415,23 +420,40 @@ clamped to `[min, max]`. ACK threshold scales proportionally to keep
 `mode: fixed` preserves the v0.3.0 256 KiB / 16 KiB cadence
 byte-for-byte. Non-reloadable.
 
-### Tunnel-resume protocol (`tunnel.resume:`) — opt-in, v0.4.0 partial
+### Tunnel-resume protocol (`tunnel.resume:`) — opt-in
 
 ```yaml
 tunnel:
   resume:
-    enabled: false                  # OPT-IN. Default false in v0.4.0.
+    enabled: false                  # OPT-IN. Default false.
     state_path: ""                  # default: <data_dir>/tunnel_resume_state.yaml
-    max_age_seconds: 300            # entries older than this are dropped on load
+    max_age_seconds: 300            # how long the server holds a disconnected
+                                    # friend's tunnels for reattach
     on_gap: passthrough             # passthrough (default) | close
 ```
 
-The wire-format additions (opcodes `0x08` / `0x09`) and the client-side
-persistent state store ship in v0.4.0. The live handshake driver is
-partial — see
-[`docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`](plans/2026-05-15-tunnel-resume-protocol-partial.md)
-for the v0.4.1 follow-up scope. With `enabled: false` the new opcodes
-are wire-inactive and v0.3.0 peers see no change.
+When `enabled: true`, the live hold-across-reconnect handshake runs:
+
+- **Server** — on a friend disconnect it holds that friend's whole manager
+  (its tunnels and their target TCP connections, keepalive paused) for
+  `max_age_seconds` instead of tearing it down, then resurrects it when the
+  friend reconnects. A prune timer closes the held tunnels if the friend never
+  returns.
+- **Client** — on reconnect it sends `TUNNEL_RESUME_REQUEST` for each surviving
+  tunnel, carrying its sent/received byte offsets, and acts on the
+  `TUNNEL_RESUME_ACK`: continue on `Ok`, close on any decline.
+- **Gaps** — there is no application-level retransmit buffer, so bytes lost in
+  the disconnect cannot be replayed. `on_gap` decides: `close` drops the tunnel
+  (safe — no silent corruption), `passthrough` continues with a logged hole
+  (lossy; only for streams that tolerate it).
+
+Resume covers the **live-reconnect** case (a brief Tox-network blip with both
+processes still running). It cannot survive a process restart, because the local
+TCP sockets do not — the persistent `state_path` store is reserved for that
+future use and is not consulted by the live path.
+
+With `enabled: false` the new opcodes (`0x08` / `0x09`) are wire-inactive and
+v0.3.0 peers see no change.
 
 The reaper, coalescer, BDP flow control, and resume store all live in
 the existing I/O pool — none start new threads. See
