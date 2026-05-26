@@ -159,7 +159,7 @@ TEST_F(ZeroCopyReadTest, TunneledBytesArriveIntactAndInOrder) {
                                                        /*friend_number=*/42);
     tunnel->set_state(tunnel::Tunnel::State::Connected);
     tunnel->set_on_data_for_tcp_owned(
-        [client_conn](core::OwnedBufferView buf) { client_conn->write(std::move(buf)); });
+        [client_conn](core::OwnedBufferView buf) { return client_conn->write(std::move(buf)); });
 
     // --- Drive a stream of TUNNEL_DATA frames through the tunnel --------
     constexpr std::size_t kFrameSize = 1300;  // below MTU ceiling
@@ -371,7 +371,7 @@ TEST_F(ZeroCopyReadTest, ConcurrentTunnelsDoNotCrossContaminate) {
 
         auto client = entry->client;
         entry->tunnel->set_on_data_for_tcp_owned(
-            [client](core::OwnedBufferView buf) { client->write(std::move(buf)); });
+            [client](core::OwnedBufferView buf) { return client->write(std::move(buf)); });
 
         tunnels.push_back(std::move(entry));
     }

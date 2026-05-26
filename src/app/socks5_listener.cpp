@@ -475,18 +475,26 @@ void Socks5Listener::do_accept() {
     if (!acceptor_ || !running_) {
         return;
     }
-    acceptor_->async_accept([this](const asio::error_code& ec, asio::ip::tcp::socket sock) {
+    // M-09: capture a weak_ptr, not `this`. If the listener is destroyed while
+    // this accept is still queued on the io_context, the handler locks an empty
+    // weak and returns instead of touching freed state.
+    std::weak_ptr<Socks5Listener> weak = weak_from_this();
+    acceptor_->async_accept([weak](const asio::error_code& ec, asio::ip::tcp::socket sock) {
+        auto self = weak.lock();
+        if (!self) {
+            return;  // Listener destroyed before this accept completed.
+        }
         if (ec) {
-            if (running_) {
+            if (self->running_) {
                 util::Logger::debug("Socks5Listener accept error: {}", ec.message());
-                do_accept();
+                self->do_accept();
             }
             return;
         }
         auto conn = std::make_shared<core::TcpConnection>(std::move(sock));
         auto session = std::make_shared<Socks5Session>();
         session->conn = conn;
-        session->open_tunnel = open_tunnel_;
+        session->open_tunnel = self->open_tunnel_;
 
         // The connection's on_data callback keeps the session alive across
         // async-read callbacks; on_disconnect clears the cycle if the peer
@@ -499,7 +507,7 @@ void Socks5Listener::do_accept() {
         conn->set_on_disconnect(
             [session](const std::error_code& /*ec*/) { session->conn.reset(); });
         conn->start_read();
-        do_accept();
+        self->do_accept();
     });
 }
 

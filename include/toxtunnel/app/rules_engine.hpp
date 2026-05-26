@@ -169,6 +169,12 @@ class RulesEngine {
     std::vector<FriendRule> rules_;
     RateLimitSpec rate_limit_defaults_;
 
+    /// Parse a RulesEngine directly from an already-loaded YAML node. Both
+    /// `from_file` and `from_string` funnel through this so the original
+    /// line/column (YAML Mark) info survives into parse diagnostics instead of
+    /// being lost to a re-serialisation round trip.
+    [[nodiscard]] static util::Expected<RulesEngine, std::string> from_node(const YAML::Node& node);
+
     /// Find rules for a specific friend.
     [[nodiscard]] const FriendRule* find_friend_rule(const std::string& friend_pk) const;
 

@@ -122,9 +122,17 @@ struct TunnelConfig {
     std::string coalesce_mode = "fixed";
     uint32_t idle_timeout_seconds = 0;
     uint32_t reaper_tick_seconds = 10;
+    /// Application-level PING/PONG keepalive interval (seconds). 0 disables it
+    /// (the default — toxcore's own connection tracking is relied upon). When
+    /// set, each peer is PINGed every interval and declared dead — closing its
+    /// tunnels (server) / triggering failover (client) — after
+    /// `keepalive_interval_seconds * 3` of no PONG. Detects an application that
+    /// is wedged while its toxcore link still looks alive (M-02).
+    uint32_t keepalive_interval_seconds = 0;
     TunnelResumeConfig resume;
 
     [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }
+    [[nodiscard]] bool keepalive_enabled() const noexcept { return keepalive_interval_seconds > 0; }
 
     bool operator==(const TunnelConfig& other) const = default;
 };

@@ -71,11 +71,11 @@ TcpConnection::~TcpConnection() {
 // ===========================================================================
 
 void TcpConnection::set_max_write_buffer_size(std::size_t bytes) noexcept {
-    max_write_buffer_size_ = bytes;
+    max_write_buffer_size_.store(bytes, std::memory_order_relaxed);
 }
 
 std::size_t TcpConnection::max_write_buffer_size() const noexcept {
-    return max_write_buffer_size_;
+    return max_write_buffer_size_.load(std::memory_order_relaxed);
 }
 
 void TcpConnection::set_read_buffer_size(std::size_t bytes) {
@@ -104,6 +104,10 @@ void TcpConnection::set_on_disconnect(DisconnectCallback cb) {
 
 void TcpConnection::set_on_error(ErrorCallback cb) {
     on_error_ = std::move(cb);
+}
+
+void TcpConnection::set_on_writable(WritableCallback cb) {
+    on_writable_ = std::move(cb);
 }
 
 // ===========================================================================
@@ -185,12 +189,12 @@ bool TcpConnection::write(const uint8_t* data, std::size_t length) {
         return true;
     }
 
-    // Snapshot check before paying the copy + post. Real enforcement still
-    // happens inside the strand.
-    if (write_buffer_bytes_.load(std::memory_order_relaxed) + length > max_write_buffer_size_) {
-        util::Logger::debug("TcpConnection: write rejected, buffer full");
-        return false;
-    }
+    // C-03 backpressure: when over the limit we still ENQUEUE (so tunnel egress
+    // is never silently dropped — that truncates a lossless stream) but return
+    // false so the caller defers TUNNEL_ACK. The queue is then bounded by the
+    // peer's send window, which stops growing once ACKs are withheld.
+    const bool over = write_buffer_bytes_.load(std::memory_order_relaxed) + length >
+                      max_write_buffer_size_.load(std::memory_order_relaxed);
 
     std::vector<uint8_t> buf(data, data + length);
     auto self = shared_from_this();
@@ -199,19 +203,9 @@ bool TcpConnection::write(const uint8_t* data, std::size_t length) {
         if (inner_s != ConnectionState::Connected && inner_s != ConnectionState::Disconnecting) {
             return;
         }
-        std::size_t len = buf.size();
-        if (write_buffer_bytes_.load(std::memory_order_relaxed) + len > max_write_buffer_size_) {
-            return;
-        }
-        WriteBuffer wb;
-        wb.data = std::move(buf);
-        write_buffer_bytes_.fetch_add(len, std::memory_order_relaxed);
-        write_queue_.push_back(std::move(wb));
-        if (!write_in_progress_) {
-            do_write();
-        }
+        enqueue_write_locked(WriteBuffer{std::move(buf), {}});
     });
-    return true;
+    return !over;
 }
 
 bool TcpConnection::write(std::vector<uint8_t> data) {
@@ -223,11 +217,8 @@ bool TcpConnection::write(std::vector<uint8_t> data) {
     if (data.empty()) {
         return true;
     }
-    if (write_buffer_bytes_.load(std::memory_order_relaxed) + data.size() >
-        max_write_buffer_size_) {
-        util::Logger::debug("TcpConnection: write rejected, buffer full");
-        return false;
-    }
+    const bool over = write_buffer_bytes_.load(std::memory_order_relaxed) + data.size() >
+                      max_write_buffer_size_.load(std::memory_order_relaxed);
 
     auto self = shared_from_this();
     asio::post(strand_, [this, self, data = std::move(data)]() mutable {
@@ -235,19 +226,9 @@ bool TcpConnection::write(std::vector<uint8_t> data) {
         if (inner_s != ConnectionState::Connected && inner_s != ConnectionState::Disconnecting) {
             return;
         }
-        std::size_t len = data.size();
-        if (write_buffer_bytes_.load(std::memory_order_relaxed) + len > max_write_buffer_size_) {
-            return;
-        }
-        WriteBuffer wb;
-        wb.data = std::move(data);
-        write_buffer_bytes_.fetch_add(len, std::memory_order_relaxed);
-        write_queue_.push_back(std::move(wb));
-        if (!write_in_progress_) {
-            do_write();
-        }
+        enqueue_write_locked(WriteBuffer{std::move(data), {}});
     });
-    return true;
+    return !over;
 }
 
 bool TcpConnection::write(OwnedBufferView buf) {
@@ -259,11 +240,8 @@ bool TcpConnection::write(OwnedBufferView buf) {
     if (buf.empty()) {
         return true;
     }
-    const std::size_t length = buf.size();
-    if (write_buffer_bytes_.load(std::memory_order_relaxed) + length > max_write_buffer_size_) {
-        util::Logger::debug("TcpConnection: zero-copy write rejected, buffer full");
-        return false;
-    }
+    const bool over = write_buffer_bytes_.load(std::memory_order_relaxed) + buf.size() >
+                      max_write_buffer_size_.load(std::memory_order_relaxed);
 
     auto self = shared_from_this();
     asio::post(strand_, [this, self, buf = std::move(buf)]() mutable {
@@ -271,19 +249,26 @@ bool TcpConnection::write(OwnedBufferView buf) {
         if (inner_s != ConnectionState::Connected && inner_s != ConnectionState::Disconnecting) {
             return;
         }
-        const std::size_t len = buf.size();
-        if (write_buffer_bytes_.load(std::memory_order_relaxed) + len > max_write_buffer_size_) {
-            return;
-        }
-        WriteBuffer wb;
-        wb.view = std::move(buf);
-        write_buffer_bytes_.fetch_add(len, std::memory_order_relaxed);
-        write_queue_.push_back(std::move(wb));
-        if (!write_in_progress_) {
-            do_write();
-        }
+        enqueue_write_locked(WriteBuffer{{}, std::move(buf)});
     });
-    return true;
+    return !over;
+}
+
+void TcpConnection::enqueue_write_locked(WriteBuffer&& wb) {
+    const std::size_t len = wb.size();
+    if (len == 0) {
+        return;
+    }
+    const std::size_t total = write_buffer_bytes_.fetch_add(len, std::memory_order_relaxed) + len;
+    if (total >= max_write_buffer_size_.load(std::memory_order_relaxed)) {
+        // Crossed the backpressure limit; remember so the drain in do_write()
+        // fires on_writable_ once the socket catches up (C-03).
+        write_hit_watermark_ = true;
+    }
+    write_queue_.push_back(std::move(wb));
+    if (!write_in_progress_) {
+        do_write();
+    }
 }
 
 void TcpConnection::close() {
@@ -498,11 +483,30 @@ void TcpConnection::do_write() {
                 return;
             }
 
-            write_buffer_bytes_.fetch_sub(inflight->size(), std::memory_order_relaxed);
+            const std::size_t remaining =
+                write_buffer_bytes_.fetch_sub(inflight->size(), std::memory_order_relaxed) -
+                inflight->size();
             // `inflight` releases either the owned `vector` or the shared
             // buffer ref held by the `OwnedBufferView` exactly when this
             // completion lambda destructs — RAII keeps the bytes alive
             // for the full duration of asio's internal use.
+
+            // C-03: once the queue drains back below half the limit after having
+            // crossed it, let the tunnel layer flush its deferred TUNNEL_ACK so
+            // the peer's send window reopens. Half-limit hysteresis avoids
+            // ACK thrash right at the boundary.
+            if (write_hit_watermark_ &&
+                remaining <= max_write_buffer_size_.load(std::memory_order_relaxed) / 2) {
+                // Clear the watermark only if the callback fully flushed its
+                // deferred work. If it returns false (e.g. the ACK send is
+                // itself backpressured), keep the watermark set so the next
+                // drained frame calls again — otherwise a one-shot clear could
+                // strand the deferred ACK and stall the peer's window forever.
+                const bool flushed = on_writable_ ? on_writable_() : true;
+                if (flushed) {
+                    write_hit_watermark_ = false;
+                }
+            }
 
             (void)bytes_transferred;
             do_write();

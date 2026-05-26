@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -152,16 +153,42 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     std::size_t reap_idle_tunnels_once();
 
     // -----------------------------------------------------------------
+    // Application-level keepalive (PING/PONG liveness) — M-02
+    // -----------------------------------------------------------------
+
+    /// Enable periodic PING keepalive. Every `interval_seconds` a PING control
+    /// frame is sent to the peer; if no PONG arrives for `timeout_seconds`, the
+    /// peer is declared dead and the `on_peer_dead` callback (if set) fires
+    /// once. `interval_seconds == 0` is a no-op. Re-enabling resets the
+    /// liveness baseline (use this on every reconnect).
+    void enable_keepalive(uint32_t interval_seconds, uint32_t timeout_seconds);
+
+    /// Cancel the keepalive timer. Idempotent; safe from the destructor.
+    void disable_keepalive();
+
+    /// Set the callback fired once when the peer is declared dead by the
+    /// keepalive check. Invoked on an io_context thread.
+    void set_on_peer_dead(std::function<void()> cb);
+
+    /// Record a PONG (or any liveness signal) — refreshes the keepalive
+    /// deadline. Exposed for tests; production calls it from handle_pong_frame.
+    void note_pong();
+
+    // -----------------------------------------------------------------
     // Tunnel ID allocation
     // -----------------------------------------------------------------
 
     /// Allocate a new, unique tunnel ID.
     ///
     /// IDs are allocated sequentially starting from 1, wrapping around
-    /// at 65535. IDs that are currently in use are skipped.
+    /// at 65535. IDs that are currently in use are skipped. ID 0 is reserved
+    /// for control frames (PING/PONG) and is never allocated.
     ///
-    /// @return A unique tunnel ID in the range [1, 65535].
-    [[nodiscard]] uint16_t allocate_tunnel_id();
+    /// @return A unique tunnel ID in [1, 65535], or std::nullopt if every ID
+    ///         is currently in use. Callers MUST handle exhaustion — returning
+    ///         0 as a sentinel (the old behaviour) collided with the
+    ///         control-plane tunnel id and produced undefined routing (C-07).
+    [[nodiscard]] std::optional<uint16_t> allocate_tunnel_id();
 
     /// Release a tunnel ID back to the pool.
     ///
@@ -185,7 +212,11 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     ///
     /// @param tunnel_id  The tunnel identifier.
     /// @param tunnel     The tunnel instance to add.
-    void add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunnel);
+    /// @return true if the tunnel was added; false if the manager is at its
+    ///         max-tunnel limit (or @p tunnel is null). Callers must handle
+    ///         false by tearing down the half-built tunnel and releasing its
+    ///         id, rather than assuming the manager registered it (H-05).
+    bool add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunnel);
 
     /// Remove and destroy a tunnel.
     ///
@@ -342,11 +373,15 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// Handle a PONG frame (tunnel_id == 0).
     void handle_pong_frame(const ProtocolFrame& frame);
 
-    /// Find the next available tunnel ID.
-    [[nodiscard]] uint16_t find_available_id();
+    /// Find the next available tunnel ID, or std::nullopt if all are in use.
+    /// Caller must hold the unique lock on mutex_.
+    [[nodiscard]] std::optional<uint16_t> find_available_id();
 
     /// Arm `reaper_timer_` to fire `reaper_tick_` from now.
     void schedule_reaper_tick();
+
+    /// Arm `keepalive_timer_` to fire `keepalive_interval_` from now.
+    void schedule_keepalive_tick();
 
     // -----------------------------------------------------------------
     // Data members
@@ -417,6 +452,20 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// false from the timer's completion handler. Lets disable_reaper()
     /// distinguish "armed" from "idle" without racing the io_ctx thread.
     std::atomic<bool> reaper_active_{false};
+
+    // ---- Keepalive (M-02) ------------------------------------------------
+    /// Keepalive timer; armed only while keepalive is enabled.
+    asio::steady_timer keepalive_timer_;
+    /// steady_clock ns of the most recent PONG / liveness signal. 0 = none yet.
+    std::atomic<int64_t> last_pong_ns_{0};
+    std::chrono::seconds keepalive_interval_{0};
+    std::chrono::seconds keepalive_timeout_{0};
+    /// True while a keepalive tick is scheduled (mirrors reaper_active_).
+    std::atomic<bool> keepalive_active_{false};
+    /// Latches the peer-dead transition so on_peer_dead_ fires at most once.
+    std::atomic<bool> peer_dead_latched_{false};
+    /// Fired once when the peer is declared dead. Guarded by handler_mutex_.
+    std::function<void()> on_peer_dead_;
 };
 
 }  // namespace toxtunnel::tunnel

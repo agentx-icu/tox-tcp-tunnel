@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -67,12 +68,20 @@ struct KnownServer {
 /// All operations are in-memory; call `save()` to persist. The file is loaded
 /// once at construction (or by `reload()`).
 ///
-/// **Concurrency**: this store does NOT take a file lock. The on-disk file is
-/// treated as single-writer. In practice that means: while the toxtunnel
-/// client daemon is running, do NOT mutate the registry from the CLI
-/// (`toxtunnel servers add|remove`) — the daemon's next `record_connection`
-/// will overwrite your change (and vice versa). Stop the daemon first
-/// (`systemctl stop toxtunnel` / `sc stop ToxTunnel` /
+/// **In-process thread safety**: every public method takes an internal mutex,
+/// so the store is safe to call concurrently from multiple threads in the same
+/// process (H-03). In the daemon, `record_connection` runs on the Tox thread
+/// while `record_info` / `save` run on the INFO_REPLY inbound strand — both
+/// the in-memory vector and the persist path are now serialised. The
+/// mutex covers the whole `save()` (serialise + atomic write) so a concurrent
+/// mutation can't tear the snapshot being written.
+///
+/// **Cross-process**: this store still does NOT take a file lock. The on-disk
+/// file is treated as single-writer across processes. In practice that means:
+/// while the toxtunnel client daemon is running, do NOT mutate the registry
+/// from the CLI (`toxtunnel servers add|remove`) — the daemon's next
+/// `record_connection` will overwrite your change (and vice versa). Stop the
+/// daemon first (`systemctl stop toxtunnel` / `sc stop ToxTunnel` /
 /// `launchctl kickstart …`) before editing.
 ///
 /// Format on disk (YAML):
@@ -168,12 +177,21 @@ class KnownServersStore {
     }
 
    private:
+    /// Guards `servers_`, `last_load_error_`, and `save()`. Acquired at the
+    /// public-method boundary; the `*_locked` helpers below assume it is held
+    /// to avoid recursive locking (H-03).
+    mutable std::mutex mu_;
     std::filesystem::path data_dir_;
     std::filesystem::path path_;
     std::vector<KnownServer> servers_;
     std::optional<std::string> last_load_error_;
 
-    [[nodiscard]] util::Expected<void, std::string> load_from_disk();
+    // Unlocked helpers — caller must hold `mu_`.
+    [[nodiscard]] util::Expected<void, std::string> load_from_disk_locked();
+    [[nodiscard]] util::Expected<void, std::string> save_locked() const;
+    [[nodiscard]] const KnownServer* find_by_alias_locked(std::string_view alias) const;
+    [[nodiscard]] std::string resolve_tox_id_locked(std::string_view id_or_alias) const;
+
     [[nodiscard]] static bool is_valid_tox_id(std::string_view candidate);
     [[nodiscard]] static std::string to_upper_hex(std::string_view input);
 };

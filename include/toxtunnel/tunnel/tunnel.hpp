@@ -170,14 +170,25 @@ class TunnelImpl : public Tunnel {
     using SendOwnedToToxCallback = std::function<bool(OwnedFrameBuffer buf)>;
 
     /// Called when data should be written to the TCP connection.
-    using SendToTcpCallback = std::function<void(std::span<const uint8_t> data)>;
+    ///
+    /// Returns true if the local TCP side accepted the bytes (queued for
+    /// sending), false if it is backpressured. The tunnel uses the result to
+    /// decide whether to ACK the peer: it only ACKs accepted bytes, so a slow
+    /// local socket throttles the peer's send window instead of silently
+    /// dropping inbound data (C-03). The bytes themselves are NOT lost on
+    /// false — TcpConnection still enqueues them; false is purely the
+    /// "withhold ACK" signal.
+    using SendToTcpCallback = std::function<bool(std::span<const uint8_t> data)>;
 
     /// Zero-copy variant: called when an owned (shared_ptr-backed) buffer
     /// should be written to the TCP connection. The callee can hand the
     /// view straight to `TcpConnection::write(OwnedBufferView)` without
     /// any payload copy. When this callback is set on a tunnel, it takes
     /// precedence over `SendToTcpCallback` for inbound TUNNEL_DATA frames.
-    using SendToTcpOwnedCallback = std::function<void(core::OwnedBufferView buf)>;
+    ///
+    /// Same return contract as SendToTcpCallback: true = accepted, false =
+    /// backpressured (withhold ACK, bytes still enqueued — C-03).
+    using SendToTcpOwnedCallback = std::function<bool(core::OwnedBufferView buf)>;
 
     /// Called when the tunnel state changes.
     using StateChangedCallback = std::function<void(State new_state)>;
@@ -373,6 +384,16 @@ class TunnelImpl : public Tunnel {
     /// Used by close() / force_close() and exposed for tests.
     void flush_pending_writes();
 
+    /// Called (on the TcpConnection strand) when the local TCP write queue has
+    /// drained back below its low-water mark. Flushes any TUNNEL_ACK that was
+    /// withheld while the socket was backpressured, reopening the peer's send
+    /// window so inbound data resumes (C-03 receiver-side flow control).
+    ///
+    /// Returns true if the ACK was fully flushed (nothing left pending), false
+    /// if the ACK send itself backpressured — the TcpConnection keeps its
+    /// watermark armed and calls again on the next drained frame.
+    bool notify_tcp_writable();
+
     // -----------------------------------------------------------------
     // Error handling
     // -----------------------------------------------------------------
@@ -478,12 +499,32 @@ class TunnelImpl : public Tunnel {
 
     /// Emit a single TUNNEL_DATA frame carrying the front of the coalesce
     /// buffer (up to `coalesce_max_bytes_` bytes). The caller must hold
-    /// `coalesce_mutex_`.
-    void coalesce_emit_front_locked(std::size_t bytes);
+    /// `coalesce_mutex_`. Returns true if the frame was handed to Tox (and the
+    /// bytes erased from the buffer); returns false if Tox backpressured
+    /// (toxcore lossless SENDQ full) — in that case the bytes are RETAINED for
+    /// a later retry and the send window is NOT refunded. Dropping them would
+    /// silently truncate the tunnel (a lossless stream must never lose bytes to
+    /// transient transport backpressure).
+    [[nodiscard]] bool coalesce_emit_front_locked(std::size_t bytes);
+
+    /// Drain the coalesce buffer in <= MTU frames (full frames then the
+    /// remainder). Stops at the first backpressured emit. Returns true iff the
+    /// buffer is now empty. The caller must hold `coalesce_mutex_`.
+    [[nodiscard]] bool coalesce_try_drain_locked();
+
+    /// Send TUNNEL_CLOSE and move to Disconnecting. Must be called WITHOUT
+    /// `coalesce_mutex_` held (it sends through the Tox callback).
+    void emit_close_and_transition();
 
     /// (Re)arm the flush timer if the buffer is non-empty and no timer is
     /// pending. The caller must hold `coalesce_mutex_`.
     void coalesce_arm_timer_locked();
+
+    /// Bytes still pending in the coalesce buffer (total minus the already-
+    /// emitted prefix). The caller must hold `coalesce_mutex_`.
+    [[nodiscard]] std::size_t coalesce_pending_locked() const noexcept {
+        return coalesce_buf_.size() - coalesce_consumed_;
+    }
 
     /// Bump the last-activity timestamp to "now". Called only on TUNNEL_DATA
     /// in either direction; keep-alive and control frames do NOT bump.
@@ -495,8 +536,10 @@ class TunnelImpl : public Tunnel {
     /// Check if ACK should be sent and send it.
     void maybe_send_ack();
 
-    /// Send ACK frame for received bytes.
-    void send_ack();
+    /// Send ACK frame for received bytes. Returns true if all accumulated
+    /// bytes were acked (nothing left pending), false if a send backpressured
+    /// and some remain in `bytes_received_since_ack_` for a later retry.
+    bool send_ack();
 
     /// Invoke the close callback at most once for terminal states (Closed/Error).
     void notify_close_once();
@@ -547,11 +590,22 @@ class TunnelImpl : public Tunnel {
     // never races with state/callback edits (which also call into us).
     mutable std::mutex coalesce_mutex_;
     std::vector<std::uint8_t> coalesce_buf_;
+    // Bytes already emitted from the front of coalesce_buf_ but not yet erased.
+    // Consuming via this offset (instead of erase-from-front on every frame)
+    // keeps draining a large backpressured buffer O(n) instead of O(n^2). The
+    // prefix is reclaimed lazily: reset to 0 when the buffer fully drains, and
+    // compacted in coalesce_append_locked once the consumed prefix dominates.
+    std::size_t coalesce_consumed_{0};
     asio::steady_timer coalesce_timer_;
     std::uint32_t coalesce_max_delay_us_{kDefaultCoalesceMaxDelayUs};
     std::uint32_t coalesce_max_bytes_{kDefaultCoalesceMaxBytes};
     bool coalesce_timer_armed_{false};
     std::uint64_t coalesce_timer_epoch_{0};
+    // A local close() arrived while the coalesce buffer was backpressured.
+    // TUNNEL_CLOSE is deferred until the retry timer fully drains the buffer,
+    // otherwise the CLOSE would overtake the still-buffered DATA and the peer
+    // would drop the trailing bytes as frames for an "unknown tunnel".
+    bool close_pending_{false};
 
     // Adaptive coalescer + BDP flow control. Updated on the data path.
     WriteCoalescer coalescer_;

@@ -275,6 +275,14 @@ void ToxAdapter::stop() {
         iterate_thread_.join();
     }
 
+    // Drain any tasks that slipped in during the join race (posted after the
+    // loop's final process_tox_tasks() but before running_ was observed false
+    // by the poster). The iterate thread is gone, so it is now safe to run
+    // them inline on this thread; the Tox instance is still alive until our
+    // own destruction. Without this, a blocked run_on_tox_thread() caller
+    // would wait on a future that is never fulfilled.
+    process_tox_tasks();
+
     // Persist state.
     if (initialized_.load()) {
         (void)write_save_data();
@@ -322,32 +330,35 @@ std::size_t ToxAdapter::bootstrap() {
                            resolved.error());
     }
 
-    std::size_t success_count = 0;
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    std::size_t success_count = run_on_tox_thread([&]() -> std::size_t {
+        std::size_t count = 0;
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    for (const auto& node : bootstrap_nodes) {
-        TOX_ERR_BOOTSTRAP err;
-        bool ok =
-            tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
+        for (const auto& node : bootstrap_nodes) {
+            TOX_ERR_BOOTSTRAP err;
+            bool ok =
+                tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
 
-        if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
-            ++success_count;
-            util::Logger::debug("Bootstrap success: {}:{}", node.ip, node.port);
-        } else {
-            util::Logger::warn("Bootstrap failed for {}:{} (error {})", node.ip, node.port,
-                               static_cast<int>(err));
+            if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
+                ++count;
+                util::Logger::debug("Bootstrap success: {}:{}", node.ip, node.port);
+            } else {
+                util::Logger::warn("Bootstrap failed for {}:{} (error {})", node.ip, node.port,
+                                   static_cast<int>(err));
+            }
+
+            // Also add as TCP relay for TCP-only connections.
+            TOX_ERR_BOOTSTRAP relay_err;
+            tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
+                              &relay_err);
+
+            if (relay_err != TOX_ERR_BOOTSTRAP_OK) {
+                util::Logger::debug("TCP relay add failed for {}:{} (error {})", node.ip, node.port,
+                                    static_cast<int>(relay_err));
+            }
         }
-
-        // Also add as TCP relay for TCP-only connections.
-        TOX_ERR_BOOTSTRAP relay_err;
-        tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
-                          &relay_err);
-
-        if (relay_err != TOX_ERR_BOOTSTRAP_OK) {
-            util::Logger::debug("TCP relay add failed for {}:{} (error {})", node.ip, node.port,
-                                static_cast<int>(relay_err));
-        }
-    }
+        return count;
+    });
 
     util::Logger::info("Bootstrap complete: {}/{} nodes contacted", success_count,
                        bootstrap_nodes.size());
@@ -359,20 +370,23 @@ bool ToxAdapter::add_bootstrap_node(const BootstrapNode& node) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return run_on_tox_thread([&]() -> bool {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_BOOTSTRAP err;
-    bool ok = tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
+        TOX_ERR_BOOTSTRAP err;
+        bool ok =
+            tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
 
-    if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
-        // Also add as TCP relay.
-        TOX_ERR_BOOTSTRAP relay_err;
-        tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
-                          &relay_err);
-        return true;
-    }
+        if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
+            // Also add as TCP relay.
+            TOX_ERR_BOOTSTRAP relay_err;
+            tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
+                              &relay_err);
+            return true;
+        }
 
-    return false;
+        return false;
+    });
 }
 
 // ===========================================================================
@@ -380,27 +394,35 @@ bool ToxAdapter::add_bootstrap_node(const BootstrapNode& node) {
 // ===========================================================================
 
 ToxId ToxAdapter::get_address() const {
-    std::lock_guard<std::mutex> lock(tox_mutex_);
-    ToxIdArray addr{};
-    tox_self_get_address(tox_.get(), addr.data());
-    return ToxId::from_bytes_unchecked(addr);
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([this]() -> ToxId {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
+        ToxIdArray addr{};
+        tox_self_get_address(tox_.get(), addr.data());
+        return ToxId::from_bytes_unchecked(addr);
+    });
 }
 
 PublicKeyArray ToxAdapter::get_public_key() const {
-    std::lock_guard<std::mutex> lock(tox_mutex_);
-    PublicKeyArray pk{};
-    tox_self_get_public_key(tox_.get(), pk.data());
-    return pk;
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([this]() -> PublicKeyArray {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
+        PublicKeyArray pk{};
+        tox_self_get_public_key(tox_.get(), pk.data());
+        return pk;
+    });
 }
 
 uint32_t ToxAdapter::get_nospam() const {
-    std::lock_guard<std::mutex> lock(tox_mutex_);
-    return tox_self_get_nospam(tox_.get());
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([this]() -> uint32_t {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
+        return tox_self_get_nospam(tox_.get());
+    });
 }
 
 void ToxAdapter::set_nospam(uint32_t nospam) {
-    std::lock_guard<std::mutex> lock(tox_mutex_);
-    tox_self_set_nospam(tox_.get(), nospam);
+    run_on_tox_thread([this, nospam]() {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
+        tox_self_set_nospam(tox_.get(), nospam);
+    });
 }
 
 // ===========================================================================
@@ -413,24 +435,28 @@ util::Expected<uint32_t, std::string> ToxAdapter::add_friend(const ToxId& tox_id
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return run_on_tox_thread([&]() -> util::Expected<uint32_t, std::string> {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_ADD err;
-    uint32_t friend_number =
-        tox_friend_add(tox_.get(), tox_id.bytes().data(),
-                       reinterpret_cast<const uint8_t*>(message.data()), message.size(), &err);
+        TOX_ERR_FRIEND_ADD err;
+        uint32_t friend_number =
+            tox_friend_add(tox_.get(), tox_id.bytes().data(),
+                           reinterpret_cast<const uint8_t*>(message.data()), message.size(), &err);
 
-    if (err != TOX_ERR_FRIEND_ADD_OK) {
-        return util::unexpected(std::string("failed to add friend: ") +
-                                friend_add_error_string(err));
-    }
+        if (err != TOX_ERR_FRIEND_ADD_OK) {
+            return util::unexpected(std::string("failed to add friend: ") +
+                                    friend_add_error_string(err));
+        }
 
-    // Persist the updated friend list.
-    (void)write_save_data();
+        // Persist the updated friend list. write_save_data_locked() assumes
+        // the caller already holds tox_mutex_ (we do) and is on the Tox
+        // thread (we are).
+        (void)write_save_data_locked();
 
-    util::Logger::info("Friend added: number={}, id={}", friend_number,
-                       tox_id.public_key_hex().substr(0, 16) + "...");
-    return friend_number;
+        util::Logger::info("Friend added: number={}, id={}", friend_number,
+                           tox_id.public_key_hex().substr(0, 16) + "...");
+        return util::Expected<uint32_t, std::string>(friend_number);
+    });
 }
 
 util::Expected<uint32_t, std::string> ToxAdapter::add_friend_norequest(
@@ -439,20 +465,22 @@ util::Expected<uint32_t, std::string> ToxAdapter::add_friend_norequest(
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return run_on_tox_thread([&]() -> util::Expected<uint32_t, std::string> {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_ADD err;
-    uint32_t friend_number = tox_friend_add_norequest(tox_.get(), public_key.data(), &err);
+        TOX_ERR_FRIEND_ADD err;
+        uint32_t friend_number = tox_friend_add_norequest(tox_.get(), public_key.data(), &err);
 
-    if (err != TOX_ERR_FRIEND_ADD_OK) {
-        return util::unexpected(std::string("failed to add friend (norequest): ") +
-                                friend_add_error_string(err));
-    }
+        if (err != TOX_ERR_FRIEND_ADD_OK) {
+            return util::unexpected(std::string("failed to add friend (norequest): ") +
+                                    friend_add_error_string(err));
+        }
 
-    (void)write_save_data();
+        (void)write_save_data_locked();
 
-    util::Logger::info("Friend added (norequest): number={}", friend_number);
-    return friend_number;
+        util::Logger::info("Friend added (norequest): number={}", friend_number);
+        return util::Expected<uint32_t, std::string>(friend_number);
+    });
 }
 
 bool ToxAdapter::remove_friend(uint32_t friend_number) {
@@ -460,20 +488,22 @@ bool ToxAdapter::remove_friend(uint32_t friend_number) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return run_on_tox_thread([&]() -> bool {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_DELETE err;
-    bool ok = tox_friend_delete(tox_.get(), friend_number, &err);
+        TOX_ERR_FRIEND_DELETE err;
+        bool ok = tox_friend_delete(tox_.get(), friend_number, &err);
 
-    if (ok && err == TOX_ERR_FRIEND_DELETE_OK) {
-        (void)write_save_data();
-        util::Logger::info("Friend removed: number={}", friend_number);
-        return true;
-    }
+        if (ok && err == TOX_ERR_FRIEND_DELETE_OK) {
+            (void)write_save_data_locked();
+            util::Logger::info("Friend removed: number={}", friend_number);
+            return true;
+        }
 
-    util::Logger::warn("Failed to remove friend {}: error {}", friend_number,
-                       static_cast<int>(err));
-    return false;
+        util::Logger::warn("Failed to remove friend {}: error {}", friend_number,
+                           static_cast<int>(err));
+        return false;
+    });
 }
 
 bool ToxAdapter::is_friend_connected(uint32_t friend_number) const {
@@ -485,16 +515,18 @@ FriendState ToxAdapter::get_friend_connection_status(uint32_t friend_number) con
         return FriendState::None;
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([&]() -> FriendState {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_QUERY err;
-    TOX_CONNECTION conn = tox_friend_get_connection_status(tox_.get(), friend_number, &err);
+        TOX_ERR_FRIEND_QUERY err;
+        TOX_CONNECTION conn = tox_friend_get_connection_status(tox_.get(), friend_number, &err);
 
-    if (err != TOX_ERR_FRIEND_QUERY_OK) {
-        return FriendState::None;
-    }
+        if (err != TOX_ERR_FRIEND_QUERY_OK) {
+            return FriendState::None;
+        }
 
-    return connection_to_state(conn);
+        return connection_to_state(conn);
+    });
 }
 
 util::Expected<PublicKeyArray, std::string> ToxAdapter::get_friend_public_key(
@@ -503,18 +535,21 @@ util::Expected<PublicKeyArray, std::string> ToxAdapter::get_friend_public_key(
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread(
+        [&]() -> util::Expected<PublicKeyArray, std::string> {
+            std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    PublicKeyArray pk{};
-    TOX_ERR_FRIEND_GET_PUBLIC_KEY err;
-    bool ok = tox_friend_get_public_key(tox_.get(), friend_number, pk.data(), &err);
+            PublicKeyArray pk{};
+            TOX_ERR_FRIEND_GET_PUBLIC_KEY err;
+            bool ok = tox_friend_get_public_key(tox_.get(), friend_number, pk.data(), &err);
 
-    if (!ok || err != TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
-        return util::unexpected(std::string("failed to get public key for friend ") +
-                                std::to_string(friend_number));
-    }
+            if (!ok || err != TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
+                return util::unexpected(std::string("failed to get public key for friend ") +
+                                        std::to_string(friend_number));
+            }
 
-    return pk;
+            return util::Expected<PublicKeyArray, std::string>(pk);
+        });
 }
 
 util::Expected<uint32_t, std::string> ToxAdapter::friend_by_public_key(
@@ -523,16 +558,19 @@ util::Expected<uint32_t, std::string> ToxAdapter::friend_by_public_key(
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread(
+        [&]() -> util::Expected<uint32_t, std::string> {
+            std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_BY_PUBLIC_KEY err;
-    uint32_t friend_number = tox_friend_by_public_key(tox_.get(), public_key.data(), &err);
+            TOX_ERR_FRIEND_BY_PUBLIC_KEY err;
+            uint32_t friend_number = tox_friend_by_public_key(tox_.get(), public_key.data(), &err);
 
-    if (err != TOX_ERR_FRIEND_BY_PUBLIC_KEY_OK) {
-        return util::unexpected(std::string("friend not found for given public key"));
-    }
+            if (err != TOX_ERR_FRIEND_BY_PUBLIC_KEY_OK) {
+                return util::unexpected(std::string("friend not found for given public key"));
+            }
 
-    return friend_number;
+            return util::Expected<uint32_t, std::string>(friend_number);
+        });
 }
 
 std::vector<uint32_t> ToxAdapter::get_friend_list() const {
@@ -540,14 +578,16 @@ std::vector<uint32_t> ToxAdapter::get_friend_list() const {
         return {};
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([this]() -> std::vector<uint32_t> {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    std::size_t count = tox_self_get_friend_list_size(tox_.get());
-    std::vector<uint32_t> list(count);
-    if (count > 0) {
-        tox_self_get_friend_list(tox_.get(), list.data());
-    }
-    return list;
+        std::size_t count = tox_self_get_friend_list_size(tox_.get());
+        std::vector<uint32_t> list(count);
+        if (count > 0) {
+            tox_self_get_friend_list(tox_.get(), list.data());
+        }
+        return list;
+    });
 }
 
 std::vector<FriendInfo> ToxAdapter::get_friend_info_list() const {
@@ -555,33 +595,35 @@ std::vector<FriendInfo> ToxAdapter::get_friend_info_list() const {
         return {};
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([this]() -> std::vector<FriendInfo> {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    std::size_t count = tox_self_get_friend_list_size(tox_.get());
-    std::vector<uint32_t> numbers(count);
-    if (count > 0) {
-        tox_self_get_friend_list(tox_.get(), numbers.data());
-    }
+        std::size_t count = tox_self_get_friend_list_size(tox_.get());
+        std::vector<uint32_t> numbers(count);
+        if (count > 0) {
+            tox_self_get_friend_list(tox_.get(), numbers.data());
+        }
 
-    std::vector<FriendInfo> infos;
-    infos.reserve(count);
+        std::vector<FriendInfo> infos;
+        infos.reserve(count);
 
-    for (uint32_t fn : numbers) {
-        FriendInfo info;
-        info.friend_number = fn;
+        for (uint32_t fn : numbers) {
+            FriendInfo info;
+            info.friend_number = fn;
 
-        TOX_ERR_FRIEND_GET_PUBLIC_KEY pk_err;
-        tox_friend_get_public_key(tox_.get(), fn, info.public_key.data(), &pk_err);
+            TOX_ERR_FRIEND_GET_PUBLIC_KEY pk_err;
+            tox_friend_get_public_key(tox_.get(), fn, info.public_key.data(), &pk_err);
 
-        TOX_ERR_FRIEND_QUERY q_err;
-        TOX_CONNECTION conn = tox_friend_get_connection_status(tox_.get(), fn, &q_err);
-        info.state =
-            (q_err == TOX_ERR_FRIEND_QUERY_OK) ? connection_to_state(conn) : FriendState::None;
+            TOX_ERR_FRIEND_QUERY q_err;
+            TOX_CONNECTION conn = tox_friend_get_connection_status(tox_.get(), fn, &q_err);
+            info.state =
+                (q_err == TOX_ERR_FRIEND_QUERY_OK) ? connection_to_state(conn) : FriendState::None;
 
-        infos.push_back(info);
-    }
+            infos.push_back(info);
+        }
 
-    return infos;
+        return infos;
+    });
 }
 
 // ===========================================================================
@@ -594,24 +636,32 @@ bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const uint8_t* dat
         return false;
     }
 
-    bool ok;
-    {
-        std::lock_guard<std::mutex> lock(tox_mutex_);
+    // Hot data path. The dominant caller is the Tox thread itself (the lossless
+    // packet / friend-connection handlers run from run_loop() and call back
+    // into send), which takes the inline fast path in run_on_tox_thread() — no
+    // promise/future, no allocation. TCP I/O-thread callers marshal a single
+    // closure across to the Tox thread and block on a future; that round-trip
+    // is the unavoidable cost of toxcore's single-thread requirement.
+    return run_on_tox_thread([&]() -> bool {
+        bool ok;
+        {
+            std::lock_guard<std::mutex> lock(tox_mutex_);
 
-        TOX_ERR_FRIEND_CUSTOM_PACKET err;
-        ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
+            TOX_ERR_FRIEND_CUSTOM_PACKET err;
+            ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
 
-        if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
-            util::Logger::debug("Send lossless packet failed for friend {}: error {}",
-                                friend_number, static_cast<int>(err));
-            return false;
+            if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
+                util::Logger::debug("Send lossless packet failed for friend {}: error {}",
+                                    friend_number, static_cast<int>(err));
+                return false;
+            }
         }
-    }
 
-    // Wake the iterate loop so the packet hits the network now rather than at
-    // the next 50ms tick.
-    wake_cv_.notify_one();
-    return true;
+        // Wake the iterate loop so the packet hits the network now rather than
+        // at the next idle tick. Harmless no-op when already on the Tox thread.
+        wake_cv_.notify_one();
+        return true;
+    });
 }
 
 bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const std::vector<uint8_t>& data) {
@@ -624,21 +674,23 @@ bool ToxAdapter::send_lossy_packet(uint32_t friend_number, const uint8_t* data,
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return run_on_tox_thread([&]() -> bool {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_CUSTOM_PACKET err;
-    bool ok = tox_friend_send_lossy_packet(tox_.get(), friend_number, data, length, &err);
-    if (ok) {
-        wake_cv_.notify_one();
-    }
+        TOX_ERR_FRIEND_CUSTOM_PACKET err;
+        bool ok = tox_friend_send_lossy_packet(tox_.get(), friend_number, data, length, &err);
+        if (ok) {
+            wake_cv_.notify_one();
+        }
 
-    if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
-        util::Logger::debug("Send lossy packet failed for friend {}: error {}", friend_number,
-                            static_cast<int>(err));
-        return false;
-    }
+        if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
+            util::Logger::debug("Send lossy packet failed for friend {}: error {}", friend_number,
+                                static_cast<int>(err));
+            return false;
+        }
 
-    return true;
+        return true;
+    });
 }
 
 util::Expected<uint32_t, std::string> ToxAdapter::send_message(uint32_t friend_number,
@@ -647,42 +699,44 @@ util::Expected<uint32_t, std::string> ToxAdapter::send_message(uint32_t friend_n
         return util::unexpected(std::string("ToxAdapter not initialized"));
     }
 
-    std::lock_guard<std::mutex> lock(tox_mutex_);
+    return run_on_tox_thread([&]() -> util::Expected<uint32_t, std::string> {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
 
-    TOX_ERR_FRIEND_SEND_MESSAGE err;
-    uint32_t msg_id = tox_friend_send_message(tox_.get(), friend_number, TOX_MESSAGE_TYPE_NORMAL,
-                                              reinterpret_cast<const uint8_t*>(message.data()),
-                                              message.size(), &err);
+        TOX_ERR_FRIEND_SEND_MESSAGE err;
+        uint32_t msg_id = tox_friend_send_message(
+            tox_.get(), friend_number, TOX_MESSAGE_TYPE_NORMAL,
+            reinterpret_cast<const uint8_t*>(message.data()), message.size(), &err);
 
-    if (err != TOX_ERR_FRIEND_SEND_MESSAGE_OK) {
-        std::string reason;
-        switch (err) {
-            case TOX_ERR_FRIEND_SEND_MESSAGE_NULL:
-                reason = "null argument";
-                break;
-            case TOX_ERR_FRIEND_SEND_MESSAGE_FRIEND_NOT_FOUND:
-                reason = "friend not found";
-                break;
-            case TOX_ERR_FRIEND_SEND_MESSAGE_FRIEND_NOT_CONNECTED:
-                reason = "friend not connected";
-                break;
-            case TOX_ERR_FRIEND_SEND_MESSAGE_SENDQ:
-                reason = "send queue allocation failed";
-                break;
-            case TOX_ERR_FRIEND_SEND_MESSAGE_TOO_LONG:
-                reason = "message too long";
-                break;
-            case TOX_ERR_FRIEND_SEND_MESSAGE_EMPTY:
-                reason = "message is empty";
-                break;
-            default:
-                reason = "unknown error (" + std::to_string(static_cast<int>(err)) + ")";
-                break;
+        if (err != TOX_ERR_FRIEND_SEND_MESSAGE_OK) {
+            std::string reason;
+            switch (err) {
+                case TOX_ERR_FRIEND_SEND_MESSAGE_NULL:
+                    reason = "null argument";
+                    break;
+                case TOX_ERR_FRIEND_SEND_MESSAGE_FRIEND_NOT_FOUND:
+                    reason = "friend not found";
+                    break;
+                case TOX_ERR_FRIEND_SEND_MESSAGE_FRIEND_NOT_CONNECTED:
+                    reason = "friend not connected";
+                    break;
+                case TOX_ERR_FRIEND_SEND_MESSAGE_SENDQ:
+                    reason = "send queue allocation failed";
+                    break;
+                case TOX_ERR_FRIEND_SEND_MESSAGE_TOO_LONG:
+                    reason = "message too long";
+                    break;
+                case TOX_ERR_FRIEND_SEND_MESSAGE_EMPTY:
+                    reason = "message is empty";
+                    break;
+                default:
+                    reason = "unknown error (" + std::to_string(static_cast<int>(err)) + ")";
+                    break;
+            }
+            return util::unexpected(std::string("failed to send message: ") + reason);
         }
-        return util::unexpected(std::string("failed to send message: ") + reason);
-    }
 
-    return msg_id;
+        return util::Expected<uint32_t, std::string>(msg_id);
+    });
 }
 
 // ===========================================================================
@@ -731,8 +785,10 @@ uint32_t ToxAdapter::iteration_interval() const {
     if (!initialized_.load()) {
         return 50;  // sensible default
     }
-    std::lock_guard<std::mutex> lock(tox_mutex_);
-    return tox_iteration_interval(tox_.get());
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([this]() -> uint32_t {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
+        return tox_iteration_interval(tox_.get());
+    });
 }
 
 bool ToxAdapter::save() const {
@@ -758,6 +814,12 @@ void ToxAdapter::dispatch_pending_events_for_test() {
 void ToxAdapter::run_loop() {
     util::Logger::debug("Tox iterate loop started");
 
+    // Publish the iterate-thread id so run_on_tox_thread() can detect
+    // re-entrant calls (toxcore callbacks calling back into the public API)
+    // and run them inline instead of self-deadlocking on a cross-thread post.
+    iterate_thread_id_ = std::this_thread::get_id();
+    iterate_thread_id_valid_.store(true, std::memory_order_release);
+
     while (running_.load()) {
         uint32_t interval;
         {
@@ -770,6 +832,10 @@ void ToxAdapter::run_loop() {
             }
             interval = tox_iteration_interval(tox_.get());
         }
+
+        // Execute any toxcore work posted from other threads. Runs outside the
+        // tox_mutex_ lock above; each task re-acquires the mutex itself.
+        process_tox_tasks();
 
         dispatch_pending_events();
 
@@ -787,10 +853,38 @@ void ToxAdapter::run_loop() {
         }
 
         std::unique_lock<std::mutex> wake_lock(wake_mutex_);
-        wake_cv_.wait_for(wake_lock, std::chrono::milliseconds(interval));
+        wake_cv_.wait_for(wake_lock, std::chrono::milliseconds(interval), [this]() {
+            std::lock_guard<std::mutex> task_lock(tox_tasks_mutex_);
+            return !running_.load() || !tox_tasks_.empty();
+        });
     }
 
+    // Run any tasks posted during the final iteration so their futures resolve
+    // before the iterate thread is gone (stop() also drains, but doing it here
+    // keeps the common case off the joining thread).
+    process_tox_tasks();
+
+    iterate_thread_id_valid_.store(false, std::memory_order_release);
     util::Logger::debug("Tox iterate loop stopped");
+}
+
+bool ToxAdapter::on_tox_thread() const noexcept {
+    return iterate_thread_id_valid_.load(std::memory_order_acquire) &&
+           std::this_thread::get_id() == iterate_thread_id_;
+}
+
+void ToxAdapter::process_tox_tasks() {
+    std::deque<std::function<void()>> local;
+    {
+        std::lock_guard<std::mutex> lock(tox_tasks_mutex_);
+        if (tox_tasks_.empty()) {
+            return;
+        }
+        local.swap(tox_tasks_);
+    }
+    for (auto& task : local) {
+        task();
+    }
 }
 
 // ===========================================================================
@@ -906,6 +1000,17 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
 }
 
 bool ToxAdapter::write_save_data() const {
+    // Route the toxcore read (tox_get_savedata*) onto the Tox thread and take
+    // tox_mutex_ there. Previously these calls ran on the caller's thread with
+    // no lock held when invoked via save(), violating toxcore's single-thread
+    // requirement.
+    return const_cast<ToxAdapter*>(this)->run_on_tox_thread([this]() -> bool {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
+        return write_save_data_locked();
+    });
+}
+
+bool ToxAdapter::write_save_data_locked() const {
     auto path = save_file_path();
     if (path.empty()) {
         return false;

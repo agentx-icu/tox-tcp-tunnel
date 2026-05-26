@@ -243,3 +243,118 @@ TEST_F(TunnelCoalesceTest, ExplicitFlushIsIdempotent) {
     tunnel_->flush_pending_writes();  // No-op: buffer already drained.
     EXPECT_EQ(captured_.data_payloads.size(), 1u);
 }
+
+// ---------------------------------------------------------------------------
+// 8. Tox SENDQ backpressure must NOT drop bytes (close-before-drain fix).
+//    A failing send retains the bytes for retry; once the queue drains, every
+//    byte is delivered, in order. Regression for the ~85-90 KiB truncation
+//    where coalesce_emit_front_locked erased the bytes on a full Tox queue.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, BackpressuredSendRetainsBytesUntilDrained) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+        if (!allow_send) {
+            return false;  // toxcore lossless SENDQ full: nothing transmitted
+        }
+        captured_.record(wire);
+        return true;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/1000, /*max_bytes=*/1362);
+
+    // 3 full MTUs + a sub-MTU remainder.
+    std::vector<uint8_t> payload(3 * 1362 + 100);
+    std::iota(payload.begin(), payload.end(), uint8_t{0});
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+
+    // Backpressured: nothing transmitted, but nothing dropped either — the
+    // bytes are parked in the coalesce buffer and the retry timer is armed.
+    run_for(20ms);
+    EXPECT_TRUE(captured_.data_payloads.empty());
+
+    // Release backpressure; the retry timer must now drain everything, in
+    // order, with zero loss.
+    allow_send = true;
+    run_for(20ms);
+
+    EXPECT_EQ(captured_.concatenated_data(), payload);
+}
+
+// ---------------------------------------------------------------------------
+// 8b. Regression (/ship adversarial review): on the immediate-emit path
+//     (zero-delay / bypass), a write that arrives while a prior backpressured
+//     remainder is still buffered must queue BEHIND it. Emitting it directly —
+//     which succeeds once Tox un-backpressures — would put the newer bytes on
+//     the wire ahead of the older buffered ones (drained later by the retry
+//     timer), silently reordering a lossless stream.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, ImmediatePathPreservesOrderAcrossBackpressure) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+        if (!allow_send) {
+            return false;  // SENDQ full
+        }
+        captured_.record(wire);
+        return true;
+    });
+    // Zero delay selects the immediate-emit path.
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    // First write backpressures and parks in the coalesce buffer (timer armed).
+    std::vector<uint8_t> first(100, 0xAA);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(first));
+    EXPECT_TRUE(captured_.data_payloads.empty());
+
+    // Release backpressure, THEN issue the second write. Without the FIFO
+    // guard the second write would emit directly here and reach the wire before
+    // the still-buffered first.
+    allow_send = true;
+    std::vector<uint8_t> second(100, 0xBB);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(second));
+
+    // Drain the retry timer and assert strict first-then-second ordering.
+    run_for(20ms);
+
+    std::vector<uint8_t> expected;
+    expected.insert(expected.end(), first.begin(), first.end());
+    expected.insert(expected.end(), second.begin(), second.end());
+    EXPECT_EQ(captured_.concatenated_data(), expected);
+}
+
+// ---------------------------------------------------------------------------
+// 9. close() during backpressure defers TUNNEL_CLOSE until the buffer drains,
+//    so CLOSE never overtakes the still-buffered DATA (the peer would drop the
+//    trailing frames as "unknown tunnel"). Regression for the 0-byte / partial
+//    transfers observed under a slow link.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, CloseDeferredUntilBackpressureDrains) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+        if (!allow_send) {
+            return false;
+        }
+        captured_.record(wire);
+        return true;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/1000, /*max_bytes=*/1362);
+
+    std::vector<uint8_t> payload(2 * 1362 + 50);
+    std::iota(payload.begin(), payload.end(), uint8_t{0});
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+
+    // Close while the queue is backpressured: CLOSE must be withheld.
+    tunnel_->close();
+    run_for(20ms);
+    EXPECT_TRUE(captured_.all_frame_types.empty());
+
+    // Release: the timer drains all DATA first, then emits the deferred CLOSE.
+    allow_send = true;
+    run_for(20ms);
+
+    EXPECT_EQ(captured_.concatenated_data(), payload);
+    ASSERT_FALSE(captured_.all_frame_types.empty());
+    EXPECT_EQ(captured_.all_frame_types.front(), FrameType::TUNNEL_DATA);
+    EXPECT_EQ(captured_.all_frame_types.back(), FrameType::TUNNEL_CLOSE);
+}

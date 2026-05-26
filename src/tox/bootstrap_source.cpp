@@ -4,27 +4,109 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
 
 #include "toxtunnel/util/atomic_file.hpp"
+#include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tox {
 namespace {
 
 constexpr const char* kCacheFileName = "bootstrap_nodes.json";
 
-// H-S-6 (2026-05-20 fix-storm review): module-local cancel flag for
-// detached refresh threads spawned by `resolve_bootstrap_nodes`.
-// `cancel_pending_refreshes()` flips it to true so the threads
-// short-circuit before touching application-globals during shutdown.
-std::atomic<bool> g_refresh_cancelled{false};
+// H-11 (2026-05-26): owned, joinable background-refresh worker.
+//
+// The previous design spawned a *detached* std::thread and relied on a
+// process-global cancel flag, so the thread could outlive the owning
+// ToxAdapter and touch freed/global state (spdlog, std::filesystem,
+// atomic_write_file) during teardown. RefreshManager replaces that with a
+// single owned std::jthread:
+//   * spawn() joins any prior worker before launching a new one, so at most
+//     one refresh runs at a time and none ever leaks.
+//   * cancel_and_join() (wired to BootstrapSource::cancel_pending_refreshes)
+//     requests cooperative stop via the jthread's stop_token AND joins, so by
+//     the time ToxAdapter::stop() returns no refresh thread is still running.
+//   * arm()/cancel state gates whether new refreshes may be spawned across
+//     stop -> start cycles, preserving the previous arm_refreshes() contract.
+// The manager itself is a function-local static; its destructor joins the
+// worker as a final backstop.
+class RefreshManager {
+   public:
+    static RefreshManager& instance() {
+        static RefreshManager manager;
+        return manager;
+    }
+
+    /// Allow subsequent spawn() calls again after a cancel.
+    void arm() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        accepting_ = true;
+    }
+
+    /// Request the in-flight worker (if any) to stop and join it. Also blocks
+    /// further spawns until arm() is called again.
+    void cancel_and_join() {
+        std::jthread worker;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            accepting_ = false;
+            worker = std::move(worker_);  // take ownership, join outside lock
+        }
+        if (worker.joinable()) {
+            worker.request_stop();
+            worker.join();
+        }
+    }
+
+    /// Launch @p task on an owned thread, joining any previous worker first.
+    /// @p task receives a std::stop_token it must poll at its observation
+    /// points. No-op while cancelled (not armed).
+    template <typename Task>
+    void spawn(Task&& task) {
+        std::jthread previous;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!accepting_) {
+                return;
+            }
+            // Take the previous worker so it can be joined below; threads
+            // never leak because at most one is ever live.
+            previous = std::move(worker_);
+        }
+        if (previous.joinable()) {
+            previous.request_stop();
+            previous.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Re-check: a concurrent cancel_and_join() may have flipped
+            // accepting_ false while we were joining the previous worker.
+            if (!accepting_) {
+                return;
+            }
+            worker_ = std::jthread(std::forward<Task>(task));
+        }
+    }
+
+   private:
+    RefreshManager() = default;
+    ~RefreshManager() { cancel_and_join(); }
+
+    RefreshManager(const RefreshManager&) = delete;
+    RefreshManager& operator=(const RefreshManager&) = delete;
+
+    std::mutex mutex_;
+    bool accepting_{true};
+    std::jthread worker_;
+};
 
 std::string trim_trailing_whitespace(std::string value) {
     while (!value.empty()) {
@@ -158,40 +240,42 @@ util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve
     const auto cache_path = cache_file_path(data_dir);
 
     // Cache-first: if we have a usable cache, return it immediately and
-    // refresh in the background. Previously this code synchronously called
-    // `curl` via popen on the caller's thread, blocking startup for up to
-    // 20 seconds on every boot (C-15 in the 2026-05-20 review). The
-    // fire-and-forget refresh keeps subsequent boots current without
+    // refresh in the background. The synchronous `curl` path used to block
+    // startup for up to 20 seconds on every boot (C-15 in the 2026-05-20
+    // review); the background refresh keeps subsequent boots current without
     // blocking initialisation.
     auto cached = load_cached_nodes(cache_path, max_nodes);
     if (cached) {
-        // `std::async` with a detached future would run-to-completion in
-        // the destructor of std::future (which blocks). A bare thread
-        // with `detach()` matches the fire-and-forget intent.
-        //
-        // H-S-6 (2026-05-20 fix-storm review): the detached thread can
-        // outlive process-level teardown. Capture a snapshot of the
-        // global cancel flag and re-check it before each observation
-        // point (fetch return, parse return, write_cache). The flag is
-        // set by `cancel_pending_refreshes()` (called from
-        // ToxAdapter::stop) so a clean shutdown short-circuits the
-        // thread before it touches globals like spdlog, std::filesystem
-        // internals, or atomic_write_file.
-        try {
-            std::thread([fetcher = std::move(fetcher), cache_path, max_nodes]() mutable {
-                if (g_refresh_cancelled.load(std::memory_order_acquire))
+        // H-11 (2026-05-26): the refresh runs on an OWNED, joinable thread
+        // managed by RefreshManager. It polls the provided std::stop_token at
+        // each observation point (fetch return, parse return, write_cache) so
+        // cancel_pending_refreshes() — wired to ToxAdapter::stop — can request
+        // stop and join it before any application globals are torn down.
+        RefreshManager::instance().spawn(
+            [fetcher = std::move(fetcher), cache_path, max_nodes](std::stop_token stop) mutable {
+                if (stop.stop_requested()) {
                     return;
+                }
                 const auto fetched = fetcher();
-                if (g_refresh_cancelled.load(std::memory_order_acquire) || !fetched)
+                if (stop.stop_requested()) {
                     return;
+                }
+                if (!fetched) {
+                    util::Logger::debug("Background bootstrap refresh failed: {}",
+                                        fetched.error().message);
+                    return;
+                }
                 const auto parsed = parse_nodes_json(fetched.value(), max_nodes);
-                if (g_refresh_cancelled.load(std::memory_order_acquire) || !parsed)
+                if (stop.stop_requested()) {
                     return;
+                }
+                if (!parsed) {
+                    util::Logger::debug("Background bootstrap refresh parse failed: {}",
+                                        parsed.error());
+                    return;
+                }
                 write_cache(cache_path, fetched.value());
-            }).detach();
-        } catch (...) {
-            // Failure to spawn a refresher is non-fatal; cache stays as-is.
-        }
+            });
         return cached;
     }
 
@@ -204,6 +288,9 @@ util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve
             write_cache(cache_path, fetched_json.value());
             return parsed;
         }
+        util::Logger::warn("Bootstrap node fetch parse failed: {}", parsed.error());
+    } else {
+        util::Logger::warn("Bootstrap node fetch failed: {}", fetched_json.error().message);
     }
 
     return load_cached_nodes(cache_path, max_nodes);
@@ -257,11 +344,20 @@ std::filesystem::path BootstrapSource::cache_file_path(const std::filesystem::pa
 }
 
 void BootstrapSource::cancel_pending_refreshes() noexcept {
-    g_refresh_cancelled.store(true, std::memory_order_release);
+    // Deterministically stop and join the in-flight refresh worker (if any)
+    // so it cannot touch application globals during shutdown. Joining can
+    // block briefly; swallow any exception to honour noexcept.
+    try {
+        RefreshManager::instance().cancel_and_join();
+    } catch (...) {
+    }
 }
 
 void BootstrapSource::arm_refreshes() noexcept {
-    g_refresh_cancelled.store(false, std::memory_order_release);
+    try {
+        RefreshManager::instance().arm();
+    } catch (...) {
+    }
 }
 
 }  // namespace toxtunnel::tox

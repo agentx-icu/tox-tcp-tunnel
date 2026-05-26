@@ -27,10 +27,14 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#include <cerrno>
 #endif
 
 namespace {
@@ -280,13 +284,48 @@ std::optional<std::string> inspect_send_request(const std::filesystem::path& dat
         return std::nullopt;
     }
     std::memcpy(addr.sun_path, path_str.data(), path_str.size());
-    if (::connect(fd, reinterpret_cast< ::sockaddr*>(&addr), sizeof(addr)) < 0) {
+
+    // M-10: bound connect/write/read so a half-hung daemon (socket exists but
+    // the daemon never accepts/responds) can't wedge the CLI forever. Use a
+    // non-blocking connect with poll() for the connect deadline, then
+    // SO_SNDTIMEO/SO_RCVTIMEO for the write/read loop.
+    constexpr int kTimeoutMs = 5000;
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    int crc = ::connect(fd, reinterpret_cast< ::sockaddr*>(&addr), sizeof(addr));
+    if (crc < 0 && errno == EINPROGRESS) {
+        ::pollfd pfd{fd, POLLOUT, 0};
+        const int pr = ::poll(&pfd, 1, kTimeoutMs);
+        if (pr <= 0) {
+            std::cerr << "Inspect: connect() to " << path_str << " timed out\n";
+            ::close(fd);
+            return std::nullopt;
+        }
+        int so_err = 0;
+        ::socklen_t errlen = sizeof(so_err);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &errlen) < 0 || so_err != 0) {
+            std::cerr << "Inspect: connect() to " << path_str
+                      << " failed (is the daemon running?)\n";
+            ::close(fd);
+            return std::nullopt;
+        }
+    } else if (crc < 0) {
         std::cerr << "Inspect: connect() to " << path_str << " failed (is the daemon running?)\n";
         ::close(fd);
         return std::nullopt;
     }
+    // Back to blocking, but with send/recv deadlines.
+    if (flags >= 0) {
+        ::fcntl(fd, F_SETFL, flags);
+    }
+    ::timeval tv{kTimeoutMs / 1000, (kTimeoutMs % 1000) * 1000};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     if (::write(fd, request.data(), request.size()) < 0) {
-        std::cerr << "Inspect: write() to " << path_str << " failed\n";
+        std::cerr << "Inspect: write() to " << path_str << " failed (timed out?)\n";
         ::close(fd);
         return std::nullopt;
     }
@@ -295,6 +334,11 @@ std::optional<std::string> inspect_send_request(const std::filesystem::path& dat
     ssize_t n = 0;
     while ((n = ::read(fd, buf, sizeof(buf))) > 0) {
         out.append(buf, static_cast<std::size_t>(n));
+    }
+    if (n < 0) {
+        std::cerr << "Inspect: read() from " << path_str << " failed or timed out\n";
+        ::close(fd);
+        return std::nullopt;
     }
     ::close(fd);
     return out;

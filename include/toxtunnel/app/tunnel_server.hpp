@@ -22,6 +22,18 @@
 
 namespace toxtunnel::app {
 
+/// Pure offset-reconciliation check for tunnel resume (H-07). Given the local
+/// side's sent/received byte counts and the peer's reported sent/received
+/// counts, returns true if there is a gap — bytes one side transmitted that the
+/// other never received. Because there is no app-level retransmit buffer, a gap
+/// cannot be filled, so callers either close (on_gap=close) or accept a hole
+/// (on_gap=passthrough). Pure — extracted for unit testing.
+[[nodiscard]] inline bool resume_offsets_have_gap(uint64_t local_send, uint64_t peer_recv,
+                                                  uint64_t local_recv,
+                                                  uint64_t peer_send) noexcept {
+    return local_send > peer_recv || peer_send > local_recv;
+}
+
 /// Server application that accepts Tox friend connections and tunnels
 /// their traffic to local TCP targets based on access control rules.
 ///
@@ -141,6 +153,20 @@ class TunnelServer {
     /// create TcpConnection, and wire data flow.
     void handle_tunnel_open(uint32_t friend_number, const tunnel::ProtocolFrame& frame);
 
+    /// Handle an inbound TUNNEL_RESUME_REQUEST (H-07). When resume is enabled,
+    /// the friend's prior manager was held across the disconnect and resurrected
+    /// in setup_tunnel_manager(), so the prior tunnel (+ its target TCP) is still
+    /// present: reconcile byte offsets via resume_offsets_have_gap() and either
+    /// continue the stream (RESUME_ACK Ok) or, on a gap with on_gap=close, reply
+    /// a decline and drop the tunnel. When resume is disabled or the hold has
+    /// expired, reply with a decline so the client re-opens. Never silently
+    /// drops the frame.
+    void handle_resume_request(uint32_t friend_number, const tunnel::ProtocolFrame& frame);
+
+    /// Send a TUNNEL_RESUME_ACK to a friend (H-07 helper).
+    void send_resume_ack(uint32_t friend_number, uint16_t tunnel_id, uint64_t server_recv_offset,
+                         uint64_t server_send_offset, tunnel::TunnelResumeStatus status);
+
     /// Wire a TCP connection to a tunnel for bidirectional data flow.
     void wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id,
                             std::shared_ptr<core::TcpConnection> tcp_conn);
@@ -193,8 +219,20 @@ class TunnelServer {
     /// in the 2026-05-20 review).
     std::unordered_map<uint32_t, std::shared_ptr<tunnel::TunnelManager>> managers_;
 
-    /// Protects managers_ map. Recursive to avoid self-deadlock when
-    /// callbacks (e.g., on_disconnect) re-enter while the lock is held.
+    /// A manager held alive across a brief friend disconnect so its tunnels +
+    /// target TCP connections can be reattached on reconnect (H-07 resume).
+    /// `prune_timer` closes the held tunnels after resume.max_age_seconds if
+    /// the friend never comes back.
+    struct HeldManager {
+        std::shared_ptr<tunnel::TunnelManager> manager;
+        std::shared_ptr<asio::steady_timer> prune_timer;
+    };
+    /// friend_number -> held manager (resume hold). Guarded by managers_mutex_.
+    std::unordered_map<uint32_t, HeldManager> held_managers_;
+
+    /// Protects managers_ map AND held_managers_. Recursive to avoid
+    /// self-deadlock when callbacks (e.g., on_disconnect) re-enter while the
+    /// lock is held.
     mutable std::recursive_mutex managers_mutex_;
 
     /// Whether the server is running.

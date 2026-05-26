@@ -12,13 +12,14 @@ namespace toxtunnel::tunnel {
 // ===========================================================================
 
 TunnelManager::TunnelManager(asio::io_context& io_ctx)
-    : io_ctx_(io_ctx), used_ids_(65536, false), reaper_timer_(io_ctx) {
+    : io_ctx_(io_ctx), used_ids_(65536, false), reaper_timer_(io_ctx), keepalive_timer_(io_ctx) {
     // ID 0 is reserved for control frames (PING/PONG)
     used_ids_[0] = true;
 }
 
 TunnelManager::~TunnelManager() {
     disable_reaper();
+    disable_keepalive();
     close_all();
 }
 
@@ -157,15 +158,98 @@ std::size_t TunnelManager::reap_idle_tunnels_once() {
 }
 
 // ===========================================================================
+// Keepalive (M-02)
+// ===========================================================================
+
+void TunnelManager::set_on_peer_dead(std::function<void()> cb) {
+    std::lock_guard<std::mutex> lock(handler_mutex_);
+    on_peer_dead_ = std::move(cb);
+}
+
+void TunnelManager::note_pong() {
+    last_pong_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                        std::memory_order_relaxed);
+}
+
+void TunnelManager::enable_keepalive(uint32_t interval_seconds, uint32_t timeout_seconds) {
+    if (interval_seconds == 0) {
+        return;
+    }
+    keepalive_interval_ = std::chrono::seconds(interval_seconds);
+    keepalive_timeout_ =
+        std::chrono::seconds(timeout_seconds == 0 ? interval_seconds * 3 : timeout_seconds);
+    // Reset the liveness baseline + the one-shot dead latch so re-enabling on a
+    // reconnect starts fresh.
+    last_pong_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                        std::memory_order_relaxed);
+    peer_dead_latched_.store(false, std::memory_order_release);
+    schedule_keepalive_tick();
+    util::Logger::info("TunnelManager: keepalive enabled (interval={}s, timeout={}s)",
+                       interval_seconds, static_cast<uint32_t>(keepalive_timeout_.count()));
+}
+
+void TunnelManager::disable_keepalive() {
+    if (keepalive_active_.exchange(false, std::memory_order_acq_rel)) {
+        keepalive_timer_.cancel();
+    }
+}
+
+void TunnelManager::schedule_keepalive_tick() {
+    keepalive_active_.store(true, std::memory_order_release);
+    keepalive_timer_.expires_after(keepalive_interval_);
+    // weak_ptr capture so a teardown racing a dispatched tick bails gracefully
+    // (mirrors the reaper).
+    std::weak_ptr<TunnelManager> weak = weak_from_this();
+    keepalive_timer_.async_wait([weak](const asio::error_code& ec) {
+        if (ec == asio::error::operation_aborted) {
+            return;
+        }
+        auto self = weak.lock();
+        if (!self || !self->keepalive_active_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        // Liveness check: if no PONG within the timeout, declare the peer dead.
+        const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        const int64_t last_ns = self->last_pong_ns_.load(std::memory_order_relaxed);
+        const int64_t timeout_ns = std::chrono::nanoseconds(self->keepalive_timeout_).count();
+        if (last_ns > 0 && now_ns - last_ns > timeout_ns) {
+            if (!self->peer_dead_latched_.exchange(true, std::memory_order_acq_rel)) {
+                util::Logger::warn(
+                    "TunnelManager: keepalive — no PONG for >{}s, declaring peer dead",
+                    static_cast<int64_t>(self->keepalive_timeout_.count()));
+                std::function<void()> cb;
+                {
+                    std::lock_guard<std::mutex> lock(self->handler_mutex_);
+                    cb = self->on_peer_dead_;
+                }
+                if (cb) {
+                    cb();
+                }
+            }
+            // Stop pinging a peer we've given up on; re-enable on reconnect.
+            self->keepalive_active_.store(false, std::memory_order_release);
+            return;
+        }
+
+        // Send a PING and re-arm. send_frame is a no-op-ish false when the peer
+        // is unreachable; we keep the timer running so the timeout still trips.
+        ProtocolFrame ping = ProtocolFrame::make_ping();
+        self->send_frame(ping);
+        self->schedule_keepalive_tick();
+    });
+}
+
+// ===========================================================================
 // Tunnel ID allocation
 // ===========================================================================
 
-uint16_t TunnelManager::allocate_tunnel_id() {
+std::optional<uint16_t> TunnelManager::allocate_tunnel_id() {
     std::unique_lock lock(mutex_);
     return find_available_id();
 }
 
-uint16_t TunnelManager::find_available_id() {
+std::optional<uint16_t> TunnelManager::find_available_id() {
     // Try to find an available ID starting from next_tunnel_id_
     uint16_t start = next_tunnel_id_;
     do {
@@ -181,9 +265,10 @@ uint16_t TunnelManager::find_available_id() {
             (next_tunnel_id_ == 65535) ? 1 : static_cast<uint16_t>(next_tunnel_id_ + 1);
     } while (next_tunnel_id_ != start);
 
-    // No available IDs - this should be very rare
+    // Every id in [1, 65535] is in use. Return nullopt so the caller refuses
+    // the new tunnel instead of falling back to id 0 (the control-plane id).
     util::Logger::error("TunnelManager: no available tunnel IDs");
-    return 0;
+    return std::nullopt;
 }
 
 void TunnelManager::release_tunnel_id(uint16_t tunnel_id) {
@@ -203,10 +288,10 @@ void TunnelManager::set_next_tunnel_id(uint16_t next_id) {
 // Tunnel lifecycle
 // ===========================================================================
 
-void TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunnel) {
+bool TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunnel) {
     if (!tunnel) {
         util::Logger::warn("TunnelManager::add_tunnel: null tunnel for id {}", tunnel_id);
-        return;
+        return false;
     }
 
     TunnelCreatedCallback created_cb;
@@ -218,7 +303,7 @@ void TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
         if (tunnels_.size() >= max_tunnels_ && tunnels_.find(tunnel_id) == tunnels_.end()) {
             util::Logger::warn("TunnelManager: max tunnels ({}) reached, cannot add tunnel {}",
                                max_tunnels_, tunnel_id);
-            return;
+            return false;
         }
 
         // If a tunnel with this ID already exists, close it first
@@ -244,6 +329,7 @@ void TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
     if (created_cb) {
         asio::post(io_ctx_, [created_cb, tunnel_id]() { created_cb(tunnel_id); });
     }
+    return true;
 }
 
 void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
@@ -297,11 +383,12 @@ bool TunnelManager::has_tunnel(uint16_t tunnel_id) const {
 
 uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
     // Allocate an ID first
-    uint16_t tunnel_id = allocate_tunnel_id();
-    if (tunnel_id == 0) {
+    auto allocated = allocate_tunnel_id();
+    if (!allocated) {
         util::Logger::error("TunnelManager::create_tunnel: failed to allocate tunnel ID");
         return 0;
     }
+    const uint16_t tunnel_id = *allocated;
 
     // Send TUNNEL_OPEN frame to the remote peer
     ProtocolFrame open_frame = ProtocolFrame::make_tunnel_open(tunnel_id, host, port);
@@ -432,6 +519,13 @@ bool TunnelManager::handle_incoming_open(const ProtocolFrame& frame) {
     }
 
     uint16_t tunnel_id = frame.tunnel_id();
+
+    // C-07: tunnel id 0 is the control-plane id (PING/PONG). A peer must never
+    // open a data tunnel on it; reject without touching the reserved slot.
+    if (tunnel_id == 0) {
+        util::Logger::warn("TunnelManager: rejecting incoming open on reserved tunnel id 0");
+        return false;
+    }
 
     {
         std::unique_lock lock(mutex_);
@@ -628,7 +722,9 @@ void TunnelManager::handle_ping_frame(const ProtocolFrame& /*frame*/) {
 
 void TunnelManager::handle_pong_frame(const ProtocolFrame& /*frame*/) {
     util::Logger::debug("TunnelManager: received PONG");
-    // PONG received - could update last-seen timestamp for keepalive tracking
+    // Refresh the keepalive liveness deadline (M-02). No-op when keepalive is
+    // disabled — last_pong_ns_ is simply never read.
+    note_pong();
 }
 
 }  // namespace toxtunnel::tunnel

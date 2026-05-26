@@ -1,9 +1,12 @@
 #include "toxtunnel/util/atomic_file.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
 #include <aclapi.h>
@@ -23,6 +26,28 @@
 namespace toxtunnel::util {
 
 namespace {
+
+// Process-monotonic counter so two calls in the same process (and even the
+// same thread) never collide on a temp name. Combined with the thread id and
+// PID below, the staging file is unique per call — the M-04 fix. Without it,
+// two threads writing the same target path shared `<path>.tmp.<pid>` and
+// truncated / renamed over each other.
+std::atomic<std::uint64_t> g_tmp_counter{0};
+
+// Build the per-call unique suffix appended after ".tmp.". Form is
+// "<pid>.<thread-id>.<counter>" so it is stable to read in a directory listing
+// yet collision-free across threads and repeated calls.
+std::string unique_tmp_suffix() {
+    std::ostringstream oss;
+#if defined(_WIN32)
+    oss << ::GetCurrentProcessId();
+#else
+    oss << static_cast<long long>(::getpid());
+#endif
+    oss << '.' << std::this_thread::get_id() << '.'
+        << g_tmp_counter.fetch_add(1, std::memory_order_relaxed);
+    return oss.str();
+}
 
 #if !defined(_WIN32)
 [[nodiscard]] bool write_all(int fd, const std::uint8_t* data, std::size_t size) noexcept {
@@ -48,14 +73,30 @@ namespace {
 Expected<void, std::string> posix_write(const std::filesystem::path& path,
                                         std::span<const std::uint8_t> contents,
                                         const AtomicFileOptions& opts) {
-    auto tmp = path;
-    tmp += ".tmp." + std::to_string(::getpid());
-
     const auto mode_bits = static_cast<mode_t>(opts.mode);
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode_bits);
-    if (fd < 0) {
+
+    // M-04: open the staging file with O_EXCL so two concurrent writers can
+    // never share one temp file. The suffix is unique per call, but O_EXCL is
+    // the hard guarantee — on the astronomically unlikely collision we retry
+    // with a fresh suffix rather than clobber an in-flight writer.
+    std::filesystem::path tmp;
+    int fd = -1;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        tmp = path;
+        tmp += ".tmp." + unique_tmp_suffix();
+        fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_bits);
+        if (fd >= 0) {
+            break;
+        }
+        if (errno == EEXIST) {
+            continue;
+        }
         return make_unexpected(std::string("open tmp '") + tmp.string() +
                                "': " + std::strerror(errno));
+    }
+    if (fd < 0) {
+        return make_unexpected(std::string("open tmp '") + tmp.string() +
+                               "': could not create a unique staging file");
     }
     if (!write_all(fd, contents.data(), contents.size())) {
         const auto err = std::strerror(errno);
@@ -222,23 +263,47 @@ bool build_owner_only_sa(OwnerOnlySa& out) {
 Expected<void, std::string> windows_write(const std::filesystem::path& path,
                                           std::span<const std::uint8_t> contents,
                                           const AtomicFileOptions& opts) {
-    // Match the POSIX path: tmp file name carries the PID so two processes
-    // writing the same target don't truncate each other's tmp (C-25 in the
-    // 2026-05-20 review). The PID alone is sufficient because all callers
-    // run as a single ToxTunnel instance per process.
-    auto tmp = path;
-    tmp += L".tmp." + std::to_wstring(::GetCurrentProcessId());
-
+    // M-04: the staging file name is unique per call (PID + thread id +
+    // process-monotonic counter), and CREATE_NEW makes that a hard guarantee —
+    // two concurrent writers of the same target can never share one temp file
+    // and clobber each other. The old code used the PID alone with
+    // CREATE_ALWAYS, so two threads in one process raced the same temp.
     OwnerOnlySa owner_only;
     SECURITY_ATTRIBUTES* sa_ptr = nullptr;
     if (is_owner_only_mode(opts.mode) && build_owner_only_sa(owner_only)) {
         sa_ptr = &owner_only.sa;
     }
-    HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, sa_ptr, CREATE_ALWAYS,
-                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
+
+    // unique_tmp_suffix() returns narrow chars (digits, dots, hex thread id);
+    // widen them trivially since they are all 7-bit ASCII.
+    const std::string suffix_narrow = unique_tmp_suffix();
+    std::wstring suffix_wide(suffix_narrow.begin(), suffix_narrow.end());
+
+    std::filesystem::path tmp;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        tmp = path;
+        if (attempt == 0) {
+            tmp += L".tmp." + suffix_wide;
+        } else {
+            // Fresh suffix on the (near-impossible) CREATE_NEW collision.
+            const std::string retry = unique_tmp_suffix();
+            tmp += L".tmp." + std::wstring(retry.begin(), retry.end());
+        }
+        h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, sa_ptr, CREATE_NEW,
+                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            break;
+        }
+        if (::GetLastError() == ERROR_FILE_EXISTS) {
+            continue;
+        }
         return make_unexpected(std::string("CreateFileW tmp failed: ") +
                                std::to_string(::GetLastError()));
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        return make_unexpected(
+            std::string("CreateFileW tmp failed: could not create a unique staging file"));
     }
     // WriteFile is limited to DWORD bytes per call; loop for larger inputs
     // so a >4 GiB payload (theoretical, but a real bug waiting to happen

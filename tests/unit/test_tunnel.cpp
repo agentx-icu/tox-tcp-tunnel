@@ -189,8 +189,9 @@ TEST_F(TunnelTest, HandleFrame_TunnelData) {
     tunnel.set_state(Tunnel::State::Connected);
 
     std::vector<uint8_t> received_data;
-    tunnel.set_on_data_for_tcp([&received_data](std::span<const uint8_t> data) {
+    tunnel.set_on_data_for_tcp([&received_data](std::span<const uint8_t> data) -> bool {
         received_data.assign(data.begin(), data.end());
+        return true;
     });
 
     std::vector<uint8_t> test_data = {0x01, 0x02, 0x03, 0x04};
@@ -495,8 +496,10 @@ TEST_F(TunnelTest, ErrorHandling_InvalidTunnelIdIgnored) {
 
     // Frame with wrong tunnel ID should be ignored
     bool data_callback_called = false;
-    tunnel.set_on_data_for_tcp(
-        [&data_callback_called](std::span<const uint8_t>) { data_callback_called = true; });
+    tunnel.set_on_data_for_tcp([&data_callback_called](std::span<const uint8_t>) -> bool {
+        data_callback_called = true;
+        return true;
+    });
 
     std::vector<uint8_t> data = {0x01, 0x02, 0x03};
     auto frame = ProtocolFrame::make_tunnel_data(test_tunnel_id + 1, data);

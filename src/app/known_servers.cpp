@@ -90,15 +90,17 @@ std::string KnownServersStore::to_upper_hex(std::string_view input) {
 
 KnownServersStore::KnownServersStore(std::filesystem::path data_dir)
     : data_dir_(std::move(data_dir)), path_(data_dir_ / "known_servers.yaml") {
-    auto load_result = load_from_disk();
+    std::lock_guard<std::mutex> lock(mu_);
+    auto load_result = load_from_disk_locked();
     if (!load_result) {
         last_load_error_ = load_result.error();
     }
 }
 
 util::Expected<void, std::string> KnownServersStore::reload() {
+    std::lock_guard<std::mutex> lock(mu_);
     last_load_error_.reset();
-    auto result = load_from_disk();
+    auto result = load_from_disk_locked();
     if (!result) {
         last_load_error_ = result.error();
         return result;
@@ -106,7 +108,7 @@ util::Expected<void, std::string> KnownServersStore::reload() {
     return {};
 }
 
-util::Expected<void, std::string> KnownServersStore::load_from_disk() {
+util::Expected<void, std::string> KnownServersStore::load_from_disk_locked() {
     servers_.clear();
 
     std::error_code ec;
@@ -193,6 +195,11 @@ util::Expected<void, std::string> KnownServersStore::load_from_disk() {
 }
 
 util::Expected<void, std::string> KnownServersStore::save() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return save_locked();
+}
+
+util::Expected<void, std::string> KnownServersStore::save_locked() const {
     std::error_code ec;
     if (!data_dir_.empty()) {
         std::filesystem::create_directories(data_dir_, ec);
@@ -260,6 +267,7 @@ util::Expected<void, std::string> KnownServersStore::save() const {
 }
 
 const KnownServer* KnownServersStore::find_by_tox_id(std::string_view tox_id) const {
+    std::lock_guard<std::mutex> lock(mu_);
     const auto upper = to_upper_hex(tox_id);
     auto it = std::find_if(servers_.begin(), servers_.end(),
                            [&](const KnownServer& s) { return s.tox_id == upper; });
@@ -267,22 +275,33 @@ const KnownServer* KnownServersStore::find_by_tox_id(std::string_view tox_id) co
 }
 
 const KnownServer* KnownServersStore::find_by_alias(std::string_view alias) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return find_by_alias_locked(alias);
+}
+
+const KnownServer* KnownServersStore::find_by_alias_locked(std::string_view alias) const {
     auto it = std::find_if(servers_.begin(), servers_.end(),
                            [&](const KnownServer& s) { return s.alias && *s.alias == alias; });
     return it == servers_.end() ? nullptr : &*it;
 }
 
 std::string KnownServersStore::resolve_tox_id(std::string_view id_or_alias) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return resolve_tox_id_locked(id_or_alias);
+}
+
+std::string KnownServersStore::resolve_tox_id_locked(std::string_view id_or_alias) const {
     if (is_valid_tox_id(id_or_alias)) {
         return to_upper_hex(id_or_alias);
     }
-    if (auto* hit = find_by_alias(id_or_alias)) {
+    if (auto* hit = find_by_alias_locked(id_or_alias)) {
         return hit->tox_id;
     }
     return std::string(id_or_alias);
 }
 
 bool KnownServersStore::upsert(const KnownServer& entry) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (!is_valid_tox_id(entry.tox_id))
         return false;
 
@@ -310,6 +329,7 @@ bool KnownServersStore::upsert(const KnownServer& entry) {
 }
 
 bool KnownServersStore::record_connection(std::string_view tox_id, KnownConnectionType type) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (!is_valid_tox_id(tox_id))
         return false;
     const auto upper = to_upper_hex(tox_id);
@@ -333,6 +353,7 @@ bool KnownServersStore::record_connection(std::string_view tox_id, KnownConnecti
 }
 
 bool KnownServersStore::record_info(std::string_view tox_id, const KnownServerInfo& info) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (!is_valid_tox_id(tox_id))
         return false;
     const auto upper = to_upper_hex(tox_id);
@@ -354,7 +375,8 @@ bool KnownServersStore::record_info(std::string_view tox_id, const KnownServerIn
 }
 
 bool KnownServersStore::remove(std::string_view alias_or_tox_id) {
-    const auto target = resolve_tox_id(alias_or_tox_id);
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto target = resolve_tox_id_locked(alias_or_tox_id);
     auto it = std::find_if(servers_.begin(), servers_.end(),
                            [&](const KnownServer& s) { return s.tox_id == target; });
     if (it == servers_.end())
@@ -364,6 +386,7 @@ bool KnownServersStore::remove(std::string_view alias_or_tox_id) {
 }
 
 std::vector<KnownServer> KnownServersStore::entries() const {
+    std::lock_guard<std::mutex> lock(mu_);
     auto sorted = servers_;
     std::sort(sorted.begin(), sorted.end(), [](const KnownServer& a, const KnownServer& b) {
         // Entries with alias come first, alphabetical; others sorted by tox_id.
@@ -379,10 +402,12 @@ std::vector<KnownServer> KnownServersStore::entries() const {
 }
 
 std::size_t KnownServersStore::size() const noexcept {
+    std::lock_guard<std::mutex> lock(mu_);
     return servers_.size();
 }
 
 bool KnownServersStore::empty() const noexcept {
+    std::lock_guard<std::mutex> lock(mu_);
     return servers_.empty();
 }
 

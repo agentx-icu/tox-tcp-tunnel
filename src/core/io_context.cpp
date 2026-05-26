@@ -78,10 +78,25 @@ void IoContext::restart() {
 // =========================================================================
 
 void IoContext::join_threads() {
+    const auto this_id = std::this_thread::get_id();
     for (auto& thread : threads_) {
-        if (thread.joinable()) {
-            thread.join();
+        if (!thread.joinable()) {
+            continue;
         }
+        if (thread.get_id() == this_id) {
+            // Defense-in-depth: stop()/join must never run on one of our own
+            // worker threads (that would self-join → std::system_error or a
+            // hang). Callers route shutdown to a non-worker thread (see
+            // TunnelClient::request_stop). If we somehow land here anyway,
+            // detaching is the least-bad option — io_context_.stop() has
+            // already been requested, so this thread's run() returns promptly.
+            util::Logger::error(
+                "IoContext::join_threads called from a worker thread; detaching to avoid "
+                "self-join deadlock (shutdown should be driven from a non-worker thread)");
+            thread.detach();
+            continue;
+        }
+        thread.join();
     }
     threads_.clear();
 }

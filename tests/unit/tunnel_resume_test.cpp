@@ -16,6 +16,7 @@
 #include <fstream>
 
 #include "toxtunnel/app/tunnel_resume_store.hpp"
+#include "toxtunnel/app/tunnel_server.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 
 namespace toxtunnel::test {
@@ -26,6 +27,31 @@ using tunnel::ProtocolFrame;
 using tunnel::TunnelResumeAckPayload;
 using tunnel::TunnelResumeRequestPayload;
 using tunnel::TunnelResumeStatus;
+
+// H-07 offset reconciliation (pure decision used by the server's
+// handle_resume_request). Argument order: local_send, peer_recv, local_recv,
+// peer_send.
+TEST(ResumeOffsetTest, NoGapWhenOffsetsMatch) {
+    // Everything the server sent the client received, and vice versa.
+    EXPECT_FALSE(app::resume_offsets_have_gap(/*local_send=*/1000, /*peer_recv=*/1000,
+                                              /*local_recv=*/2000, /*peer_send=*/2000));
+}
+
+TEST(ResumeOffsetTest, GapWhenPeerMissedOurBytes) {
+    // We sent 1000 but the peer only received 900 — 100-byte hole.
+    EXPECT_TRUE(app::resume_offsets_have_gap(/*local_send=*/1000, /*peer_recv=*/900,
+                                             /*local_recv=*/2000, /*peer_send=*/2000));
+}
+
+TEST(ResumeOffsetTest, GapWhenWeMissedPeerBytes) {
+    // The peer sent 2000 but we only received 1500.
+    EXPECT_TRUE(app::resume_offsets_have_gap(/*local_send=*/1000, /*peer_recv=*/1000,
+                                             /*local_recv=*/1500, /*peer_send=*/2000));
+}
+
+TEST(ResumeOffsetTest, NoGapAtZeroOffsets) {
+    EXPECT_FALSE(app::resume_offsets_have_gap(0, 0, 0, 0));
+}
 
 TEST(TunnelResumeProtocolTest, RoundTripRequest) {
     TunnelResumeRequestPayload p;

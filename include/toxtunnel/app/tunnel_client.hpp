@@ -184,6 +184,16 @@ class TunnelClient {
     /// Stop the client from a callback without blocking the current thread.
     void request_stop();
 
+    /// H-07 resume: after the active server reconnects, send a
+    /// TUNNEL_RESUME_REQUEST for every still-Connected tunnel so the server can
+    /// reattach the held tunnel and reconcile byte offsets. A no-op on the
+    /// first connect (no tunnels exist yet) and when resume is disabled.
+    void send_resume_requests();
+
+    /// Handle an inbound TUNNEL_RESUME_ACK: on Ok the tunnel continues; on any
+    /// decline status the local tunnel is closed so its TCP peer is reset.
+    void handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack);
+
     // -----------------------------------------------------------------
     // Data members
     // -----------------------------------------------------------------
@@ -222,7 +232,15 @@ class TunnelClient {
     std::vector<std::shared_ptr<core::TcpListener>> listeners_;
 
     /// Optional stdio bridge used in pipe mode.
-    std::unique_ptr<StdioPipeBridge> pipe_bridge_;
+    // shared_ptr + pipe_mutex_ (H-04): the bridge is touched from several
+    // tunnel callbacks (data/state/close, which run on io-worker / inbound-
+    // strand threads) AND from stop() (a non-worker thread). The previous
+    // unsynchronized unique_ptr could be reset under one thread while another
+    // dereferenced it. Callers snapshot a local shared_ptr under pipe_mutex_
+    // and operate on the copy, so a concurrent reset can't pull the object out
+    // from under an in-flight use.
+    std::shared_ptr<StdioPipeBridge> pipe_bridge_;
+    mutable std::mutex pipe_mutex_;
 
     /// Forwarding rules from configuration (parallel with listeners_).
     std::vector<ForwardRule> forward_rules_;
@@ -284,6 +302,18 @@ class TunnelClient {
 
     mutable std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
+
+    /// Set by request_stop() (called from Tox-iterate / io-worker callbacks)
+    /// to ask the thread blocked in wait_until_stopped() to perform the actual
+    /// teardown. Driving stop() — which joins the io_context worker pool — from
+    /// a worker thread would self-join and deadlock (C-01). Guarded by
+    /// stop_mutex_ for the cv wait.
+    bool stop_requested_{false};
+
+    /// Single-entry guard so stop() runs its teardown exactly once even when
+    /// the signal thread (SIGINT/SIGTERM) and the wait_until_stopped() thread
+    /// race to call it.
+    std::atomic<bool> stop_started_{false};
 
     /// Stored configuration.
     Config config_;
@@ -350,7 +380,9 @@ class TunnelClient {
     std::unique_ptr<InspectServer> inspect_server_;
 
     /// Optional SOCKS5 / HTTP CONNECT listener for dynamic destinations.
-    std::unique_ptr<Socks5Listener> socks5_listener_;
+    // shared_ptr (M-09): Socks5Listener uses enable_shared_from_this so its
+    // accept loop can capture a weak_ptr to itself.
+    std::shared_ptr<Socks5Listener> socks5_listener_;
 
     /// Open a brand-new tunnel for a SOCKS5-supplied destination. Wires up
     /// the same TCP-to-tunnel plumbing as `on_tcp_connection_accepted`, but

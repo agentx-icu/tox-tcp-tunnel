@@ -70,7 +70,7 @@ class TunnelDataFlowTest : public ::testing::Test {
                 auto* impl = dynamic_cast<tunnel::TunnelImpl*>(t);
                 if (impl) {
                     impl->set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
-                    impl->set_on_data_for_tcp([](std::span<const uint8_t>) {});
+                    impl->set_on_data_for_tcp([](std::span<const uint8_t>) { return true; });
                     impl->set_on_state_change([](tunnel::Tunnel::State) {});
                     impl->set_on_error([](const tunnel::TunnelErrorPayload&) {});
                     impl->set_on_close([]() {});
@@ -113,7 +113,7 @@ class TunnelDataFlowTest : public ::testing::Test {
     // (owned by their respective managers).
     uint16_t create_connected_pair(tunnel::TunnelImpl*& client_tunnel_out,
                                    tunnel::TunnelImpl*& server_tunnel_out) {
-        const uint16_t tid = client_mgr_->allocate_tunnel_id();
+        const uint16_t tid = client_mgr_->allocate_tunnel_id().value();
         constexpr uint32_t kFriendNumber = 1;
 
         // --- Client side ---
@@ -287,12 +287,14 @@ TEST_F(TunnelDataFlowTest, TunnelPairDataExchange) {
         [&data_at_server, &server_data_mu](std::span<const uint8_t> data) {
             std::lock_guard lock(server_data_mu);
             data_at_server.insert(data_at_server.end(), data.begin(), data.end());
+            return true;
         });
 
     client_raw->set_on_data_for_tcp(
         [&data_at_client, &client_data_mu](std::span<const uint8_t> data) {
             std::lock_guard lock(client_data_mu);
             data_at_client.insert(data_at_client.end(), data.begin(), data.end());
+            return true;
         });
 
     // --- Client -> Server ---
@@ -443,11 +445,13 @@ TEST_F(TunnelDataFlowTest, MultipleTunnelsOnSameManager) {
         pair->server->set_on_data_for_tcp([p = pair.get()](std::span<const uint8_t> data) {
             std::lock_guard lock(p->server_mu);
             p->server_received.insert(p->server_received.end(), data.begin(), data.end());
+            return true;
         });
 
         pair->client->set_on_data_for_tcp([p = pair.get()](std::span<const uint8_t> data) {
             std::lock_guard lock(p->client_mu);
             p->client_received.insert(p->client_received.end(), data.begin(), data.end());
+            return true;
         });
     }
 
@@ -521,18 +525,21 @@ TEST_F(TunnelDataFlowTest, TunnelManagerFrameRouting) {
     t1->set_on_data_for_tcp([rd1](std::span<const uint8_t> d) {
         std::lock_guard lock(rd1->mu);
         rd1->data.insert(rd1->data.end(), d.begin(), d.end());
+        return true;
     });
 
     auto t2 = make_tunnel(kId2);
     t2->set_on_data_for_tcp([rd2](std::span<const uint8_t> d) {
         std::lock_guard lock(rd2->mu);
         rd2->data.insert(rd2->data.end(), d.begin(), d.end());
+        return true;
     });
 
     auto t3 = make_tunnel(kId3);
     t3->set_on_data_for_tcp([rd3](std::span<const uint8_t> d) {
         std::lock_guard lock(rd3->mu);
         rd3->data.insert(rd3->data.end(), d.begin(), d.end());
+        return true;
     });
 
     server_mgr_->add_tunnel(kId1, std::move(t1));
@@ -573,6 +580,228 @@ TEST_F(TunnelDataFlowTest, TunnelManagerFrameRouting) {
         std::lock_guard lock(rd3->mu);
         EXPECT_EQ(rd3->data, payload3);
     }
+}
+
+// ============================================================================
+// BackpressuredServerDeliversFullStreamThenClose
+//    End-to-end regression for the close-before-drain / SENDQ-drop truncation:
+//    while the server->client transport is backpressured (toxcore SENDQ full),
+//    a large payload is fed to the server tunnel and the server is then closed
+//    (origin EOF). With the fix, NO bytes are dropped — once the transport
+//    drains, the client receives the entire payload, in order, and the
+//    TUNNEL_CLOSE arrives only AFTER the last data byte.
+// ============================================================================
+
+TEST_F(TunnelDataFlowTest, BackpressuredServerDeliversFullStreamThenClose) {
+    tunnel::TunnelImpl* client_tunnel = nullptr;
+    tunnel::TunnelImpl* server_tunnel = nullptr;
+    create_connected_pair(client_tunnel, server_tunnel);
+
+    // Capture, in order, everything the client delivers to its local TCP side,
+    // and note when the close lands.
+    std::vector<uint8_t> received;
+    std::mutex recv_mu;
+    std::atomic<bool> got_close{false};
+    client_tunnel->set_on_data_for_tcp([&](std::span<const uint8_t> d) {
+        std::lock_guard lk(recv_mu);
+        // A data byte must never arrive after the close signal.
+        EXPECT_FALSE(got_close.load());
+        received.insert(received.end(), d.begin(), d.end());
+        return true;
+    });
+    client_tunnel->set_on_close([&]() { got_close.store(true); });
+
+    // Gate the server->client path to simulate a full toxcore lossless SENDQ.
+    std::atomic<bool> blocked{true};
+    server_tunnel->set_on_send_to_tox([this, &blocked](std::span<const uint8_t> data) -> bool {
+        if (blocked.load()) {
+            return false;  // SENDQ full: transient backpressure
+        }
+        auto frame = tunnel::ProtocolFrame::deserialize(data);
+        if (frame) {
+            return server_mgr_->send_frame(frame.value());
+        }
+        return false;
+    });
+
+    // ~150 KiB — well above the old ~85 KiB truncation point, under the window.
+    std::vector<uint8_t> payload(150u * 1024u);
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xFFu);
+    }
+
+    // Feed the whole payload while blocked, then close (origin EOF).
+    ASSERT_TRUE(server_tunnel->send_data_to_tox(payload));
+    server_tunnel->close();
+    poll();
+
+    // Nothing delivered yet, and CLOSE is withheld (deferred until drain).
+    {
+        std::lock_guard lk(recv_mu);
+        EXPECT_TRUE(received.empty());
+    }
+    EXPECT_FALSE(got_close.load());
+
+    // Release backpressure; the retry timer must now drain everything in order,
+    // then emit the deferred CLOSE.
+    blocked.store(false);
+    for (int i = 0; i < 200; ++i) {
+        {
+            std::lock_guard lk(recv_mu);
+            if (received.size() == payload.size() && got_close.load()) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    std::lock_guard lk(recv_mu);
+    EXPECT_EQ(received.size(), payload.size());  // zero loss
+    EXPECT_EQ(received, payload);                // intact + in order
+    EXPECT_TRUE(got_close.load());               // CLOSE delivered, after all data
+}
+
+// ============================================================================
+// DISABLED_BackpressureDrainThroughput  (manual benchmark)
+//   Drives ~12 MiB through the server->client tunnel in repeated
+//   block-fill / unblock-drain cycles so the coalesce buffer grows toward the
+//   send window before each drain. This is the sustained-backpressure pattern
+//   a slow transport produces. Reports wall time + throughput so the O(n^2)
+//   coalesce front-erase cost (and any fix) is measurable.
+//   Run with: integration_tests --gtest_also_run_disabled_tests \
+//             --gtest_filter='*BackpressureDrainThroughput'
+// ============================================================================
+
+TEST_F(TunnelDataFlowTest, DISABLED_BackpressureDrainThroughput) {
+    tunnel::TunnelImpl* client_tunnel = nullptr;
+    tunnel::TunnelImpl* server_tunnel = nullptr;
+    create_connected_pair(client_tunnel, server_tunnel);
+
+    std::atomic<std::size_t> received{0};
+    client_tunnel->set_on_data_for_tcp([&](std::span<const uint8_t> d) {
+        received.fetch_add(d.size());
+        return true;
+    });
+
+    std::atomic<bool> blocked{false};
+    server_tunnel->set_on_send_to_tox([this, &blocked](std::span<const uint8_t> data) -> bool {
+        if (blocked.load()) {
+            return false;
+        }
+        auto frame = tunnel::ProtocolFrame::deserialize(data);
+        return frame ? server_mgr_->send_frame(frame.value()) : false;
+    });
+
+    const std::vector<uint8_t> chunk(16u * 1024u, 0xCD);
+    std::size_t total_sent = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    for (int cycle = 0; cycle < 64; ++cycle) {
+        // Block the transport and fill the coalesce buffer toward the window.
+        blocked.store(true);
+        for (int i = 0; i < 16; ++i) {
+            if (server_tunnel->send_data_to_tox(chunk)) {
+                total_sent += chunk.size();
+            } else {
+                break;  // send window full
+            }
+        }
+        // Unblock and wait for the retry timer to drain everything fed so far.
+        const std::size_t target = total_sent;
+        blocked.store(false);
+        while (received.load() < target) {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    const double mib = static_cast<double>(total_sent) / (1024.0 * 1024.0);
+    std::printf("[BENCH] backpressure-drain: %.2f MiB in %.3f s = %.1f MiB/s\n", mib, secs,
+                mib / secs);
+
+    EXPECT_EQ(received.load(), total_sent);  // zero loss
+}
+
+// ============================================================================
+// DISABLED_SendPathThroughput  (manual benchmark / profiling target)
+//   Isolates the steady-state SEND data path: a huge send window (so flow
+//   control never gates), the Wave-B owned-buffer callback wired to a counting
+//   sink (so the transport accepts instantly). Pushes a large stream so the
+//   coalesce + frame-build + hand-off hot path can be profiled with
+//   `sample <pid>` while it runs. Reports MiB/s.
+//   Run: integration_tests --gtest_also_run_disabled_tests \
+//        --gtest_filter='*SendPathThroughput'
+// ============================================================================
+
+TEST_F(TunnelDataFlowTest, DISABLED_SendPathThroughput) {
+    // 2 GiB window: flow control never limits, so we measure pure send path.
+    auto tunnel =
+        std::make_shared<tunnel::TunnelImpl>(*io_ctx_, 1, 1, static_cast<std::size_t>(2) << 30);
+
+    std::atomic<std::size_t> sent_wire{0};
+    tunnel->set_on_send_to_tox_owned([&](tunnel::OwnedFrameBuffer buf) -> bool {
+        sent_wire.fetch_add(buf.wire_view().size(), std::memory_order_relaxed);
+        return true;  // transport accepts instantly
+    });
+    tunnel->set_state(tunnel::Tunnel::State::Connecting);
+    tunnel->set_state(tunnel::Tunnel::State::Connected);
+
+    const std::vector<uint8_t> chunk(64u * 1024u, 0xAB);
+    const std::size_t total = static_cast<std::size_t>(2) * 1024 * 1024 * 1024;  // 2 GiB
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::size_t pushed = 0;
+    while (pushed < total) {
+        (void)tunnel->send_data_to_tox(chunk);  // huge window -> always accepted
+        pushed += chunk.size();
+    }
+    tunnel->flush_pending_writes();
+    const auto t1 = std::chrono::steady_clock::now();
+
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    const double mib = static_cast<double>(pushed) / (1024.0 * 1024.0);
+    std::printf("[BENCH] send-path: %.0f MiB in %.3f s = %.0f MiB/s\n", mib, secs, mib / secs);
+
+    // Clear the callback before the tunnel/io_context tear down.
+    tunnel->set_on_send_to_tox_owned([](tunnel::OwnedFrameBuffer) -> bool { return true; });
+}
+
+// ============================================================================
+// DISABLED_ReceivePathThroughput  (manual benchmark / profiling target)
+//   Isolates the RECEIVE data path: deserialize a TUNNEL_DATA wire frame and
+//   dispatch it through handle_frame -> handle_tunnel_data_frame -> the
+//   data-for-tcp sink (+ periodic ACK). This is the other half of the
+//   round-trip and the suspected limiter vs the ~9 GiB/s send path.
+// ============================================================================
+
+TEST_F(TunnelDataFlowTest, DISABLED_ReceivePathThroughput) {
+    auto tunnel = std::make_shared<tunnel::TunnelImpl>(*io_ctx_, 1, 1);
+    std::atomic<std::size_t> recv{0};
+    tunnel->set_on_data_for_tcp([&](std::span<const uint8_t> d) {
+        recv.fetch_add(d.size(), std::memory_order_relaxed);
+        return true;
+    });
+    tunnel->set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });  // ACKs
+    tunnel->set_state(tunnel::Tunnel::State::Connecting);
+    tunnel->set_state(tunnel::Tunnel::State::Connected);
+
+    // One MTU-sized TUNNEL_DATA wire frame, re-deserialized each iteration to
+    // include the receive-side parse cost.
+    const std::vector<uint8_t> payload(1362, 0xCD);
+    const auto wire = tunnel::ProtocolFrame::make_tunnel_data(1, payload).serialize();
+
+    const std::size_t frames = (static_cast<std::size_t>(2) * 1024 * 1024 * 1024) / payload.size();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < frames; ++i) {
+        auto frame = tunnel::ProtocolFrame::deserialize(wire);
+        tunnel->handle_frame(frame.value());
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    const double mib = static_cast<double>(recv.load()) / (1024.0 * 1024.0);
+    std::printf("[BENCH] recv-path: %.0f MiB in %.3f s = %.0f MiB/s\n", mib, secs, mib / secs);
 }
 
 }  // namespace

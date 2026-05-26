@@ -99,7 +99,7 @@ TEST_F(TunnelManagerTest, InitialState_NoTunnelExists) {
 }
 
 TEST_F(TunnelManagerTest, InitialState_NextTunnelIdIsOne) {
-    EXPECT_EQ(manager->allocate_tunnel_id(), 1u);
+    EXPECT_EQ(manager->allocate_tunnel_id().value(), 1u);
 }
 
 // ============================================================================
@@ -107,9 +107,9 @@ TEST_F(TunnelManagerTest, InitialState_NextTunnelIdIsOne) {
 // ============================================================================
 
 TEST_F(TunnelManagerTest, TunnelIdAllocation_Sequential) {
-    auto id1 = manager->allocate_tunnel_id();
-    auto id2 = manager->allocate_tunnel_id();
-    auto id3 = manager->allocate_tunnel_id();
+    auto id1 = manager->allocate_tunnel_id().value();
+    auto id2 = manager->allocate_tunnel_id().value();
+    auto id3 = manager->allocate_tunnel_id().value();
 
     EXPECT_EQ(id1, 1u);
     EXPECT_EQ(id2, 2u);
@@ -120,9 +120,9 @@ TEST_F(TunnelManagerTest, TunnelIdAllocation_WrapsOnOverflow) {
     // Simulate being near the end of the ID space
     manager->set_next_tunnel_id(65534);
 
-    auto id1 = manager->allocate_tunnel_id();
-    auto id2 = manager->allocate_tunnel_id();
-    auto id3 = manager->allocate_tunnel_id();
+    auto id1 = manager->allocate_tunnel_id().value();
+    auto id2 = manager->allocate_tunnel_id().value();
+    auto id3 = manager->allocate_tunnel_id().value();
 
     EXPECT_EQ(id1, 65534u);
     EXPECT_EQ(id2, 65535u);
@@ -131,7 +131,7 @@ TEST_F(TunnelManagerTest, TunnelIdAllocation_WrapsOnOverflow) {
 
 TEST_F(TunnelManagerTest, TunnelIdAllocation_SkipsZero) {
     manager->set_next_tunnel_id(0);
-    auto id = manager->allocate_tunnel_id();
+    auto id = manager->allocate_tunnel_id().value();
     EXPECT_EQ(id, 1u);
 }
 
@@ -156,13 +156,13 @@ TEST_F(TunnelManagerTest, IncomingOpenSlotReclaimableAfterRelease) {
     // The slot must now be free: a fresh allocator pointed at kProbeId
     // should return it, not skip it.
     manager->set_next_tunnel_id(kProbeId);
-    EXPECT_EQ(manager->allocate_tunnel_id(), kProbeId);
+    EXPECT_EQ(manager->allocate_tunnel_id().value(), kProbeId);
 }
 
 TEST_F(TunnelManagerTest, TunnelIdAllocation_SkipsInUseIds) {
     // Allocate and create a tunnel with ID 2
-    auto id1 = manager->allocate_tunnel_id();  // 1
-    auto id2 = manager->allocate_tunnel_id();  // 2
+    auto id1 = manager->allocate_tunnel_id().value();  // 1
+    auto id2 = manager->allocate_tunnel_id().value();  // 2
 
     // Create tunnel with id2
     auto tunnel = create_test_tunnel(id2);
@@ -172,7 +172,7 @@ TEST_F(TunnelManagerTest, TunnelIdAllocation_SkipsInUseIds) {
     manager->release_tunnel_id(id1);
 
     // Next allocation should skip 2 (in use) and find 3
-    auto id3 = manager->allocate_tunnel_id();
+    auto id3 = manager->allocate_tunnel_id().value();
     EXPECT_EQ(id3, 3u);
 }
 

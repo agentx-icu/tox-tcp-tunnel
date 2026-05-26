@@ -131,17 +131,25 @@ class ToxConnection {
     /// Return the total number of bytes currently queued for sending.
     [[nodiscard]] std::size_t send_buffer_size() const;
 
-    /// Queue data for sending to this friend.
+    /// Queue data for sending to this friend, honouring the send window.
     ///
-    /// The data is appended to the internal send buffer.  The send-window
-    /// usage counter is incremented accordingly.
+    /// Only as many bytes as fit in the remaining send-window space are
+    /// appended to the internal send buffer; the rest are rejected so the
+    /// buffer cannot grow without bound even if a caller skips the can_send()
+    /// check. The send-window usage counter is incremented by exactly the
+    /// number of bytes accepted.
     ///
     /// @param data    Pointer to the bytes to queue.
-    /// @param length  Number of bytes.
-    void queue_data(const uint8_t* data, std::size_t length);
+    /// @param length  Number of bytes offered.
+    /// @return        The number of bytes actually accepted (0 when the
+    ///                window is already exhausted, up to @p length when there
+    ///                is room for all of it). A short return signals
+    ///                backpressure: the caller must retry the remainder after
+    ///                acknowledgements free up window space.
+    std::size_t queue_data(const uint8_t* data, std::size_t length);
 
     /// @overload  Convenience accepting a vector.
-    void queue_data(const std::vector<uint8_t>& data);
+    std::size_t queue_data(const std::vector<uint8_t>& data);
 
     /// Retrieve up to @p max_bytes of pending outbound data.
     ///

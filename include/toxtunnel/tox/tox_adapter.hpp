@@ -5,13 +5,18 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -149,9 +154,12 @@ struct FriendInfo {
 
 /// High-level API for interacting with the Tox network.
 ///
-/// ToxAdapter manages a Tox instance on a dedicated thread.  All toxcore
-/// calls are serialized through this thread to satisfy the library's single-
-/// threaded requirement.
+/// ToxAdapter manages a Tox instance on a dedicated thread.  Every public
+/// method that calls a `tox_*` function is routed onto that thread via
+/// run_on_tox_thread(), because toxcore is not merely non-reentrant: it
+/// requires all of its calls to originate from the single thread that drives
+/// `tox_iterate`.  Calls made from a toxcore callback (which already runs on
+/// the iterate thread) execute inline to avoid self-deadlock.
 ///
 /// Typical usage:
 /// @code
@@ -391,6 +399,31 @@ class ToxAdapter {
     // Internal helpers
     // -----------------------------------------------------------------
 
+    /// Execute @p fn on the dedicated Tox thread and return its result.
+    ///
+    /// toxcore is not thread-safe and additionally requires that every
+    /// `tox_*` call originate from the same thread that drives
+    /// `tox_iterate`. This helper enforces that invariant for the public
+    /// API:
+    ///   * If the caller is already running on the Tox thread (e.g. a
+    ///     toxcore callback dispatched from `run_loop` re-enters a public
+    ///     method), @p fn is executed inline — re-posting and then waiting
+    ///     on the same thread would self-deadlock.
+    ///   * If the iterate thread is not running, @p fn runs inline on the
+    ///     caller (single-threaded init / shutdown paths). The Tox mutex
+    ///     still serialises against any in-flight iterate.
+    ///   * Otherwise @p fn is posted to the Tox thread and the caller
+    ///     blocks on a future until it has executed.
+    template <typename Fn>
+    std::invoke_result_t<Fn> run_on_tox_thread(Fn&& fn);
+
+    /// True if the calling thread is the dedicated Tox iterate thread.
+    [[nodiscard]] bool on_tox_thread() const noexcept;
+
+    /// Drain and execute tasks posted via run_on_tox_thread(). Runs on the
+    /// Tox thread from within run_loop().
+    void process_tox_tasks();
+
     /// The tox_iterate loop executed on the dedicated thread.
     void run_loop();
 
@@ -403,7 +436,16 @@ class ToxAdapter {
     [[nodiscard]] std::vector<uint8_t> load_save_data() const;
 
     /// Write current Tox state to disk.
+    ///
+    /// Routes onto the Tox thread and acquires tox_mutex_ before reading the
+    /// save data out of the Tox instance.
     [[nodiscard]] bool write_save_data() const;
+
+    /// Write current Tox state to disk, assuming the caller is already on the
+    /// Tox thread and already holds tox_mutex_. Used by public methods that
+    /// mutate the friend list and want to persist atomically within the same
+    /// critical section.
+    [[nodiscard]] bool write_save_data_locked() const;
 
     /// Return the full path to the save file.
     [[nodiscard]] std::filesystem::path save_file_path() const;
@@ -451,6 +493,18 @@ class ToxAdapter {
 
     /// Dedicated thread running tox_iterate().
     std::thread iterate_thread_;
+
+    /// Identifier of the iterate thread, published once run_loop() starts so
+    /// run_on_tox_thread() can detect re-entrant calls and run them inline.
+    /// `iterate_thread_id_valid_` gates reads until the id is set.
+    std::thread::id iterate_thread_id_{};
+    std::atomic<bool> iterate_thread_id_valid_{false};
+
+    /// Queue of toxcore work items posted from other threads, executed on the
+    /// iterate thread inside run_loop(). Each task carries its own result
+    /// plumbing (captured promise), so this stores type-erased closures.
+    std::deque<std::function<void()>> tox_tasks_;
+    std::mutex tox_tasks_mutex_;
 
     /// Flag signalling the iterate thread to stop.
     std::atomic<bool> running_{false};
@@ -524,6 +578,56 @@ template <typename Event>
 void ToxAdapter::enqueue_event(Event&& event) {
     std::lock_guard<std::mutex> lock(event_mutex_);
     pending_events_.emplace_back(std::forward<Event>(event));
+}
+
+template <typename Fn>
+std::invoke_result_t<Fn> ToxAdapter::run_on_tox_thread(Fn&& fn) {
+    using Result = std::invoke_result_t<Fn>;
+
+    // Fast / re-entrant path: already on the Tox thread, or no iterate thread
+    // is running yet (init/shutdown). Run inline. tox_mutex_ inside fn (held
+    // by the individual callers) serialises against an in-flight iterate.
+    if (on_tox_thread() || !running_.load(std::memory_order_acquire)) {
+        return std::forward<Fn>(fn)();
+    }
+
+    // Cross-thread path: post the work and block until the Tox thread runs it.
+    {
+        std::unique_lock<std::mutex> lock(tox_tasks_mutex_);
+        // Re-check running_ under the queue lock. stop() flips running_ to
+        // false and then drains the queue under this same lock, so observing
+        // running_ == true here guarantees our task will be picked up by
+        // either run_loop() or stop()'s post-join drain; observing false means
+        // the thread is gone and we must run inline to avoid a stuck future.
+        if (running_.load(std::memory_order_acquire)) {
+            // The promise is held by a shared_ptr so the closure remains
+            // copy-constructible: tox_tasks_ is a std::function queue, which
+            // requires copyable callables (a moved-in std::promise would make
+            // the lambda move-only and fail to compile).
+            auto promise = std::make_shared<std::promise<Result>>();
+            std::future<Result> future = promise->get_future();
+            tox_tasks_.emplace_back([fn = std::forward<Fn>(fn), promise]() mutable {
+                try {
+                    if constexpr (std::is_void_v<Result>) {
+                        fn();
+                        promise->set_value();
+                    } else {
+                        promise->set_value(fn());
+                    }
+                } catch (...) {
+                    promise->set_exception(std::current_exception());
+                }
+            });
+            lock.unlock();
+            // Wake the iterate loop so the task is picked up without waiting
+            // for the next idle tick.
+            wake_cv_.notify_one();
+            return future.get();
+        }
+    }
+
+    // Thread stopped between the outer check and acquiring the lock; run inline.
+    return std::forward<Fn>(fn)();
 }
 
 }  // namespace toxtunnel::tox

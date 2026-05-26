@@ -205,7 +205,7 @@ TEST(HttpConnectTest, RejectsBadHttpVersionToken) {
 class Socks5ListenerLifecycleTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        listener_ = std::make_unique<Socks5Listener>();
+        listener_ = std::make_shared<Socks5Listener>();
         work_guard_ = std::make_unique<asio::executor_work_guard<asio::io_context::executor_type>>(
             asio::make_work_guard(io_ctx_));
         worker_ = std::thread([this] { io_ctx_.run(); });
@@ -231,7 +231,7 @@ class Socks5ListenerLifecycleTest : public ::testing::Test {
     asio::io_context io_ctx_;
     std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>> work_guard_;
     std::thread worker_;
-    std::unique_ptr<Socks5Listener> listener_;
+    std::shared_ptr<Socks5Listener> listener_;
 };
 
 TEST_F(Socks5ListenerLifecycleTest, StartsBindsRandomPort) {
