@@ -55,6 +55,13 @@ inline constexpr uint8_t kLosslessPacketByte = 0xA0;
 
 /// Identifies the kind of control or data message carried by a ProtocolFrame.
 enum class FrameType : uint8_t {
+    /// Sentinel for an opcode this build does not recognise. `deserialize()`
+    /// maps any unknown wire type byte to this so the frame still parses
+    /// structurally (tunnel_id + payload) and the routing layer can ignore it,
+    /// rather than failing the whole packet. This is what lets old peers
+    /// tolerate new opcodes (e.g. progressive resume rollout) and is never
+    /// produced by a factory or sent on the wire (H-06).
+    Unknown = 0x00,
     TUNNEL_OPEN = 0x01,   ///< Request to open a new tunnel to a host:port.
     TUNNEL_DATA = 0x02,   ///< Carry raw TCP payload for an existing tunnel.
     TUNNEL_CLOSE = 0x03,  ///< Gracefully close a tunnel.

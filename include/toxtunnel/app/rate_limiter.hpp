@@ -119,16 +119,22 @@ class RateLimiter {
 
     /// Attempt to consume one TUNNEL_OPEN token. Returns true if the friend
     /// is allowed to proceed (no limit, mode Off/Report, or token available);
-    /// false if the bucket is empty AND the mode is Enforce.
+    /// false only when the bucket is empty AND the mode is Enforce.
     ///
     /// `Report` mode always returns true but still increments the rejection
-    /// counter so operators can see shadow data.
+    /// counter so operators can see shadow data. It is *count-only*: it never
+    /// drives the token bucket negative (see `try_consume_bytes` for the same
+    /// contract on the data path).
     [[nodiscard]] bool try_consume_open(std::string_view friend_pk);
 
     /// Attempt to consume `bytes` from the data-bytes bucket. Returns true if
-    /// the friend is within budget. When the bucket goes negative in
-    /// `Enforce` mode this returns false; the data path uses the result to
-    /// decide whether to drop the read or apply backpressure.
+    /// the friend is within budget. When the request exceeds the available
+    /// tokens in `Enforce` mode this returns false; the data path uses the
+    /// result to decide whether to drop the read or apply backpressure.
+    ///
+    /// `Report` mode is *count-only*, mirroring `try_consume_open`: when the
+    /// request is short it increments the throttle counter, clamps the bucket
+    /// at zero (never negative / never into debt), and returns true.
     [[nodiscard]] bool try_consume_bytes(std::string_view friend_pk, std::size_t bytes);
 
     /// Read-only metric / inspect snapshots. Numbers are eventually

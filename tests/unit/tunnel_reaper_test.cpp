@@ -291,3 +291,61 @@ TEST_F(ReaperTest, DisableThenEnableRestartsTimer) {
     EXPECT_EQ(manager->reap_idle_tunnels_once(), 1u);
     EXPECT_FALSE(manager->has_tunnel(700));
 }
+
+// ============================================================================
+// KeepaliveTest: application-level PING/PONG liveness (M-02)
+// ============================================================================
+
+class KeepaliveTest : public ::testing::Test {
+   protected:
+    asio::io_context io_ctx;
+    std::shared_ptr<TunnelManager> manager;
+
+    void SetUp() override {
+        manager = std::make_shared<TunnelManager>(io_ctx);
+        manager->set_send_handler([](const std::vector<uint8_t>&) { return true; });
+    }
+    void TearDown() override {
+        if (manager) {
+            manager->disable_keepalive();
+        }
+        manager.reset();
+    }
+};
+
+TEST_F(KeepaliveTest, DeclaresPeerDeadWhenNoPong) {
+    std::atomic<bool> dead{false};
+    manager->set_on_peer_dead([&dead]() { dead.store(true); });
+    // Ping every 1s, declare dead after 1s of silence. No PONGs are ever fed.
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/1);
+    EXPECT_TRUE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 5000ms));
+}
+
+TEST_F(KeepaliveTest, StaysAliveWhilePongsArrive) {
+    std::atomic<bool> dead{false};
+    manager->set_on_peer_dead([&dead]() { dead.store(true); });
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/2);
+
+    // Feed a PONG every 200ms for ~3s; the peer must never be declared dead.
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < 3000ms) {
+        manager->note_pong();
+        io_ctx.poll();
+        std::this_thread::sleep_for(200ms);
+    }
+    EXPECT_FALSE(dead.load());
+}
+
+TEST_F(KeepaliveTest, SendsPeriodicPingFrames) {
+    std::atomic<int> pings{0};
+    manager->set_send_handler([&pings](const std::vector<uint8_t>& f) {
+        if (!f.empty() && f[0] == static_cast<uint8_t>(FrameType::PING)) {
+            pings.fetch_add(1);
+        }
+        return true;
+    });
+    // Long timeout so the peer is never declared dead during the test; we just
+    // want to observe PINGs being emitted on the interval.
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/30);
+    EXPECT_TRUE(RunUntil(io_ctx, [&pings] { return pings.load() >= 2; }, 5000ms));
+}

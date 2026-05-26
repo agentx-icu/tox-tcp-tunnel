@@ -53,18 +53,30 @@ std::size_t ToxConnection::send_buffer_size() const {
     return send_buffer_.size();
 }
 
-void ToxConnection::queue_data(const uint8_t* data, std::size_t length) {
-    if (length == 0) {
-        return;
+std::size_t ToxConnection::queue_data(const uint8_t* data, std::size_t length) {
+    if (length == 0 || data == nullptr) {
+        return 0;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    send_buffer_.insert(send_buffer_.end(), data, data + length);
-    send_window_used_.fetch_add(length, std::memory_order_acq_rel);
+
+    // Enforce the send window internally so a missed can_send() check can't
+    // grow send_buffer_ without bound. Accept only what fits in the remaining
+    // window; the caller learns from the (possibly short) return value that it
+    // must retry the remainder after on_ack() frees up space.
+    const std::size_t used = send_window_used_.load(std::memory_order_acquire);
+    if (used >= send_window_size_) {
+        return 0;
+    }
+    const std::size_t accepted = std::min(length, send_window_size_ - used);
+
+    send_buffer_.insert(send_buffer_.end(), data, data + accepted);
+    send_window_used_.fetch_add(accepted, std::memory_order_acq_rel);
+    return accepted;
 }
 
-void ToxConnection::queue_data(const std::vector<uint8_t>& data) {
-    queue_data(data.data(), data.size());
+std::size_t ToxConnection::queue_data(const std::vector<uint8_t>& data) {
+    return queue_data(data.data(), data.size());
 }
 
 std::vector<uint8_t> ToxConnection::get_pending_data(std::size_t max_bytes) {

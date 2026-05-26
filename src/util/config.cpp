@@ -6,6 +6,8 @@
 #include <fstream>
 #include <sstream>
 
+#include "toxtunnel/tunnel/bdp_flow_control.hpp"
+#include "toxtunnel/tunnel/write_coalescer.hpp"
 #include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/metrics.hpp"
 
@@ -372,6 +374,70 @@ util::Expected<void, std::string> Config::validate() const {
     if (effective_tox.bootstrap_mode == BootstrapMode::Lan && !effective_tox.udp_enabled) {
         return util::make_unexpected(
             std::string("LAN bootstrap mode requires tox.udp_enabled to be true"));
+    }
+
+    // H-09: validate the coalesce / flow-control / resume knobs. The YAML
+    // decoders keep these as plain strings/ints and `parse_*_mode` ignore
+    // failures (silently falling back to defaults), so a typo like
+    // `coalesce_mode: addaptive` was previously accepted and silently
+    // downgraded. Reject it at config-validation time instead.
+    {
+        // Note: inside Config::validate() the unqualified name `tunnel` binds
+        // to the TunnelConfig *member*, so the namespace must be spelled out
+        // in full (`toxtunnel::tunnel`) to reach the parser / enum.
+        ::toxtunnel::tunnel::CoalesceMode coalesce_mode{};
+        if (!::toxtunnel::tunnel::parse_coalesce_mode(tunnel.coalesce_mode, coalesce_mode)) {
+            return util::make_unexpected(
+                std::string("Invalid tunnel.coalesce_mode '") + tunnel.coalesce_mode +
+                "': must be one of 'fixed', 'adaptive', 'bypass', 'drain'");
+        }
+    }
+    {
+        ::toxtunnel::tunnel::FlowControlMode fc_mode{};
+        if (!::toxtunnel::tunnel::parse_flow_control_mode(flow_control.mode, fc_mode)) {
+            return util::make_unexpected(std::string("Invalid flow_control.mode '") +
+                                         flow_control.mode + "': must be one of 'bdp', 'fixed'");
+        }
+    }
+
+    // Flow-control numeric ranges. The BdpFlowControl resizer clamps the
+    // window to [min, max] and seeds it from fixed_window_bytes, so an
+    // inverted or zero range would either never grow or never shrink.
+    if (flow_control.send_window_min_bytes == 0) {
+        return util::make_unexpected(std::string("flow_control.send_window_min_bytes must be > 0"));
+    }
+    if (flow_control.send_window_min_bytes > flow_control.send_window_max_bytes) {
+        return util::make_unexpected(std::string("flow_control.send_window_min_bytes (") +
+                                     std::to_string(flow_control.send_window_min_bytes) +
+                                     ") must be <= flow_control.send_window_max_bytes (" +
+                                     std::to_string(flow_control.send_window_max_bytes) + ")");
+    }
+    if (flow_control.fixed_window_bytes == 0) {
+        return util::make_unexpected(std::string("flow_control.fixed_window_bytes must be > 0"));
+    }
+    if (flow_control.fixed_window_bytes < flow_control.send_window_min_bytes ||
+        flow_control.fixed_window_bytes > flow_control.send_window_max_bytes) {
+        return util::make_unexpected(
+            std::string("flow_control.fixed_window_bytes (") +
+            std::to_string(flow_control.fixed_window_bytes) +
+            ") must be within [send_window_min_bytes, send_window_max_bytes] = [" +
+            std::to_string(flow_control.send_window_min_bytes) + ", " +
+            std::to_string(flow_control.send_window_max_bytes) + "]");
+    }
+    if (flow_control.safety_factor_x100 == 0) {
+        return util::make_unexpected(std::string("flow_control.safety_factor_x100 must be > 0"));
+    }
+
+    // Tunnel resume parameters. on_gap is a closed enum of string values; a
+    // typo silently behaved as passthrough before.
+    if (tunnel.resume.enabled && tunnel.resume.max_age_seconds == 0) {
+        return util::make_unexpected(
+            std::string("tunnel.resume.max_age_seconds must be > 0 when tunnel.resume.enabled"));
+    }
+    if (tunnel.resume.on_gap != "passthrough" && tunnel.resume.on_gap != "close") {
+        return util::make_unexpected(std::string("Invalid tunnel.resume.on_gap '") +
+                                     tunnel.resume.on_gap +
+                                     "': must be one of 'passthrough', 'close'");
     }
 
     // Validate mode-specific configuration
@@ -1128,6 +1194,7 @@ Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs
     node["coalesce_mode"] = rhs.coalesce_mode;
     node["idle_timeout_seconds"] = rhs.idle_timeout_seconds;
     node["reaper_tick_seconds"] = rhs.reaper_tick_seconds;
+    node["keepalive_interval_seconds"] = rhs.keepalive_interval_seconds;
     if (!(rhs.resume == toxtunnel::TunnelResumeConfig{})) {
         node["resume"] = rhs.resume;
     }
@@ -1152,6 +1219,9 @@ bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::Tunne
     }
     if (node["reaper_tick_seconds"]) {
         rhs.reaper_tick_seconds = node["reaper_tick_seconds"].as<uint32_t>();
+    }
+    if (node["keepalive_interval_seconds"]) {
+        rhs.keepalive_interval_seconds = node["keepalive_interval_seconds"].as<uint32_t>();
     }
     if (node["resume"]) {
         rhs.resume = node["resume"].as<toxtunnel::TunnelResumeConfig>();

@@ -47,6 +47,17 @@ using DisconnectCallback = std::function<void(const std::error_code&)>;
 /// Called when an error occurs during an async operation.
 using ErrorCallback = std::function<void(const std::error_code&)>;
 
+/// Called (on the strand) when the write queue drains back below the
+/// low-water mark after having crossed the backpressure limit. Lets the
+/// tunnel layer flush a deferred TUNNEL_ACK so the peer's send window
+/// reopens once the local socket has caught up (C-03 receiver flow control).
+///
+/// Returns true if the deferred work was fully flushed, false if it still has
+/// pending work (e.g. the ACK send itself backpressured). On false the
+/// TcpConnection keeps the watermark armed so the next drain step calls again,
+/// instead of clearing it one-shot and stranding the deferred ACK.
+using WritableCallback = std::function<bool()>;
+
 // ---------------------------------------------------------------------------
 // TcpConnection
 // ---------------------------------------------------------------------------
@@ -125,10 +136,22 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // Callbacks
     // -----------------------------------------------------------------
 
+    // NOTE (thread-safety contract, H-10): set_on_connect / set_on_data /
+    // set_on_disconnect / set_on_error / set_on_writable / set_read_buffer_size
+    // are NOT internally synchronized and must be called during setup — before
+    // start_read() / async_connect() begin delivering — never concurrently with
+    // live I/O. The write-buffer limit (set_max_write_buffer_size) IS atomic and
+    // may be changed at any time. Public I/O operations (write/close/pause/
+    // resume) remain safe from any thread.
     void set_on_connect(ConnectCallback cb);
     void set_on_data(DataCallback cb);
     void set_on_disconnect(DisconnectCallback cb);
     void set_on_error(ErrorCallback cb);
+
+    /// Set the low-water-mark callback (see WritableCallback). Fired on the
+    /// strand once the write queue drains back below half the configured limit
+    /// after having crossed it. Configure before start_read().
+    void set_on_writable(WritableCallback cb);
 
     // -----------------------------------------------------------------
     // Connection lifecycle
@@ -223,12 +246,20 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     [[nodiscard]] asio::any_io_executor get_executor() noexcept;
 
    private:
+    // Forward declaration; full definition lives in the data-members section.
+    struct WriteBuffer;
+
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------
 
     /// Post the next async_read_some if reading is active.
     void do_read();
+
+    /// Append an already-built WriteBuffer to the queue, update accounting,
+    /// arm the backpressure watermark, and kick do_write() if idle. Must run
+    /// on the strand. Pre-checked by callers for connection state.
+    void enqueue_write_locked(WriteBuffer&& wb);
 
     /// If a write is not already in flight, dequeue the next buffer and
     /// start an async_write.
@@ -298,14 +329,24 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// one is still in flight (S16 in the 2026-05-20 follow-up).
     bool read_in_flight_{false};
 
-    // Limits
-    std::size_t max_write_buffer_size_ = kDefaultMaxWriteBufferSize;
+    /// True once a write enqueue pushed the queue at/above the backpressure
+    /// limit; reset (and on_writable_ fired) when the queue drains back below
+    /// half the limit. Strand-only. Drives the receiver-side TUNNEL_ACK
+    /// deferral (C-03): write() keeps accepting tunnel egress so no bytes are
+    /// dropped, but signals the caller to withhold ACKs until the socket
+    /// catches up, bounding the queue by the peer's send window.
+    bool write_hit_watermark_{false};
+
+    // Limits. Atomic so write()'s fast-path pre-check can read it from any
+    // thread while set_max_write_buffer_size() runs concurrently (H-10).
+    std::atomic<std::size_t> max_write_buffer_size_{kDefaultMaxWriteBufferSize};
 
     // Callbacks
     ConnectCallback on_connect_;
     DataCallback on_data_;
     DisconnectCallback on_disconnect_;
     ErrorCallback on_error_;
+    WritableCallback on_writable_;
 };
 
 }  // namespace toxtunnel::core

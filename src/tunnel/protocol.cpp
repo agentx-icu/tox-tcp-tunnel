@@ -301,6 +301,17 @@ std::vector<uint8_t> ProtocolFrame::serialize() const {
         payload_total = payload_.size();
     }
 
+    // H-12: a payload must fit the 16-bit length field. All factory inputs in
+    // this codebase are bounded well below the cap (TUNNEL_DATA is chunked to
+    // one Tox MTU; control payloads are tiny), so exceeding it signals a logic
+    // error upstream. Log loudly rather than silently emitting a truncated,
+    // structurally-valid-but-semantically-corrupt frame.
+    if (payload_total > kMaxPayloadSize) {
+        util::Logger::error(
+            "ProtocolFrame::serialize: {} payload of {} bytes exceeds {}-byte wire cap; "
+            "truncating (upstream should have chunked or rejected this)",
+            to_string(type_), payload_total, kMaxPayloadSize);
+    }
     auto payload_len = static_cast<uint16_t>(std::min<std::size_t>(payload_total, kMaxPayloadSize));
 
     // One allocation + direct writes; previously a string of push_back/insert
@@ -341,12 +352,13 @@ util::Expected<ProtocolFrame, std::error_code> ProtocolFrame::deserialize(
         return util::unexpected(std::make_error_code(std::errc::message_size));
     }
 
-    // [type:1]
+    // [type:1] — H-06: tolerate unknown opcodes. Rather than failing the whole
+    // packet (which would break forward compatibility / progressive opcode
+    // rollout), map an unrecognised type byte to FrameType::Unknown. The frame
+    // still parses structurally and the routing layer ignores Unknown frames.
     uint8_t raw_type = data[0];
-    if (!is_valid_frame_type(raw_type)) {
-        return util::unexpected(std::make_error_code(std::errc::invalid_argument));
-    }
-    auto type = static_cast<FrameType>(raw_type);
+    auto type =
+        is_valid_frame_type(raw_type) ? static_cast<FrameType>(raw_type) : FrameType::Unknown;
 
     // [tunnel_id:2] -- big-endian
     uint16_t tunnel_id = read_u16_be(&data[1]);

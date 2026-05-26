@@ -73,7 +73,7 @@ class HttpTunnelTest : public ::testing::Test {
                 auto* impl = dynamic_cast<tunnel::TunnelImpl*>(t);
                 if (impl) {
                     impl->set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
-                    impl->set_on_data_for_tcp([](std::span<const uint8_t>) {});
+                    impl->set_on_data_for_tcp([](std::span<const uint8_t>) { return true; });
                     impl->set_on_state_change([](tunnel::Tunnel::State) {});
                     impl->set_on_error([](const tunnel::TunnelErrorPayload&) {});
                     impl->set_on_close([]() {});
@@ -152,7 +152,7 @@ class HttpTunnelTest : public ::testing::Test {
     // Helper: create a connected tunnel pair and return pointers to both tunnels
     std::pair<tunnel::TunnelImpl*, tunnel::TunnelImpl*> create_connected_tunnel_pair(
         uint16_t& tid_out) {
-        const uint16_t tid = client_mgr_->allocate_tunnel_id();
+        const uint16_t tid = client_mgr_->allocate_tunnel_id().value();
         constexpr uint32_t kFriendNumber = 1;
 
         // Client tunnel
@@ -224,6 +224,7 @@ TEST_F(HttpTunnelTest, BasicHttpRequestResponse) {
     std::vector<uint8_t> received_request;
     server_tunnel->set_on_data_for_tcp([&received_request](std::span<const uint8_t> data) {
         received_request.insert(received_request.end(), data.begin(), data.end());
+        return true;
     });
 
     const std::string http_request =
@@ -312,12 +313,14 @@ TEST_F(HttpTunnelTest, HttpStreaming) {
         [&streamed_data, &data_mutex](std::span<const uint8_t> data) {
             std::lock_guard lock(data_mutex);
             streamed_data.insert(streamed_data.end(), data.begin(), data.end());
+            return true;
         });
 
     // Server side: receive client request
     std::vector<uint8_t> server_received;
     server_tunnel->set_on_data_for_tcp([&server_received](std::span<const uint8_t> data) {
         server_received.insert(server_received.end(), data.begin(), data.end());
+        return true;
     });
 
     // Client requests large response
@@ -492,6 +495,7 @@ TEST_F(HttpTunnelTest, MultipleHttpStreams) {
                 std::lock_guard lock(requests_mutex);
                 received_requests.push_back(request_str);
             }
+            return true;
         });
 
     // Client sends multiple requests quickly

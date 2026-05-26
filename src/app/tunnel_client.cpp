@@ -1,6 +1,7 @@
 #include "toxtunnel/app/tunnel_client.hpp"
 
 #include <cstdio>
+#include <future>
 #include <span>
 
 #include "toxtunnel/core/tcp_connection.hpp"
@@ -270,7 +271,7 @@ void TunnelClient::start() {
         std::string s5_host;
         uint16_t s5_port = 0;
         if (util::parse_listen_spec(config_.client->socks5.listen, s5_host, s5_port)) {
-            socks5_listener_ = std::make_unique<Socks5Listener>();
+            socks5_listener_ = std::make_shared<Socks5Listener>();
             auto err = socks5_listener_->start(
                 io_ctx_->get_io_context(), s5_host, s5_port,
                 [this](std::shared_ptr<core::TcpConnection> conn, std::string host, uint16_t port,
@@ -314,6 +315,12 @@ void TunnelClient::start() {
 }
 
 void TunnelClient::stop() {
+    // Single-entry: the signal thread (SIGINT/SIGTERM) and the
+    // wait_until_stopped() thread (woken by request_stop) can race here. Only
+    // the first caller runs the teardown; the loser returns immediately.
+    if (stop_started_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
     if (!running_) {
         return;
     }
@@ -342,8 +349,15 @@ void TunnelClient::stop() {
     for (auto& listener : listeners_) {
         listener->stop();
     }
-    if (pipe_bridge_) {
-        pipe_bridge_->stop();
+    {
+        std::shared_ptr<StdioPipeBridge> pb;
+        {
+            std::lock_guard<std::mutex> lock(pipe_mutex_);
+            pb = pipe_bridge_;
+        }
+        if (pb) {
+            pb->stop();
+        }
     }
     if (metrics_server_) {
         metrics_server_->stop();
@@ -364,7 +378,10 @@ void TunnelClient::stop() {
     info_refresh_timer_.reset();
     failover_timer_.reset();
     socks5_listener_.reset();
-    pipe_bridge_.reset();
+    {
+        std::lock_guard<std::mutex> lock(pipe_mutex_);
+        pipe_bridge_.reset();
+    }
     metrics_server_.reset();
 
     running_ = false;
@@ -378,8 +395,19 @@ bool TunnelClient::is_running() const noexcept {
 }
 
 void TunnelClient::wait_until_stopped() {
-    std::unique_lock<std::mutex> lock(stop_mutex_);
-    stop_cv_.wait(lock, [this] { return !running_.load(std::memory_order_acquire); });
+    {
+        std::unique_lock<std::mutex> lock(stop_mutex_);
+        stop_cv_.wait(
+            lock, [this] { return !running_.load(std::memory_order_acquire) || stop_requested_; });
+    }
+    // If a callback asked us to stop (rather than an external stop() having
+    // already torn everything down), perform the teardown here — on this
+    // non-worker thread — so io_ctx_->stop()'s join never runs on one of the
+    // pool's own workers (C-01). stop() is single-entry, so racing with the
+    // signal-thread stop() is safe.
+    if (running_.load(std::memory_order_acquire)) {
+        stop();
+    }
 }
 
 util::Expected<void, std::string> TunnelClient::reload(const Config& new_config) {
@@ -390,46 +418,68 @@ util::Expected<void, std::string> TunnelClient::reload(const Config& new_config)
     const auto& new_client = new_config.client.value();
     const auto diff = util::diff_forwards(forward_rules_, new_client.forwards);
 
-    if (is_pipe_mode()) {
-        if (!diff.empty()) {
-            return util::make_unexpected(std::string(
-                "client is in pipe mode; forwards cannot be reloaded (restart to switch modes)"));
-        }
-    } else if (!diff.empty()) {
-        for (const auto& removed : diff.removed) {
-            for (std::size_t i = 0; i < forward_rules_.size();) {
-                if (forward_rules_[i] == removed) {
-                    listeners_[i]->stop();
-                    listeners_.erase(listeners_.begin() + static_cast<std::ptrdiff_t>(i));
-                    forward_rules_.erase(forward_rules_.begin() + static_cast<std::ptrdiff_t>(i));
-                    util::Logger::info("Stopped listener on local port {} -> {}:{}",
-                                       removed.local_port, removed.remote_host,
-                                       removed.remote_port);
-                } else {
-                    ++i;
+    if (is_pipe_mode() && !diff.empty()) {
+        return util::make_unexpected(std::string(
+            "client is in pipe mode; forwards cannot be reloaded (restart to switch modes)"));
+    }
+
+    // H-02: the listeners_ / forward_rules_ vectors and TcpListener lifetimes
+    // must only be touched from the io_context threads that run the accept
+    // callbacks — the SIGHUP/reload thread parses, diffs, and validates above,
+    // but the mutation itself is posted onto io_ctx_ and we block on the
+    // future so the CLI still gets a synchronous result. (TcpListener's own
+    // contract also requires operations from its io_context thread.)
+    auto apply = [this, new_config, diff]() {
+        if (!is_pipe_mode() && !diff.empty()) {
+            for (const auto& removed : diff.removed) {
+                for (std::size_t i = 0; i < forward_rules_.size();) {
+                    if (forward_rules_[i] == removed) {
+                        listeners_[i]->stop();
+                        listeners_.erase(listeners_.begin() + static_cast<std::ptrdiff_t>(i));
+                        forward_rules_.erase(forward_rules_.begin() +
+                                             static_cast<std::ptrdiff_t>(i));
+                        util::Logger::info("Stopped listener on local port {} -> {}:{}",
+                                           removed.local_port, removed.remote_host,
+                                           removed.remote_port);
+                    } else {
+                        ++i;
+                    }
                 }
+            }
+
+            for (const auto& added : diff.added) {
+                auto listener = std::make_shared<core::TcpListener>(io_ctx_->get_io_context(),
+                                                                    added.local_port);
+                const auto rule = added;
+                listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
+                    on_tcp_connection_accepted(std::move(conn), rule);
+                });
+                listeners_.push_back(std::move(listener));
+                forward_rules_.push_back(added);
+                util::Logger::info("Started listener on local port {} -> {}:{}", added.local_port,
+                                   added.remote_host, added.remote_port);
             }
         }
 
-        for (const auto& added : diff.added) {
-            auto listener =
-                std::make_shared<core::TcpListener>(io_ctx_->get_io_context(), added.local_port);
-            const auto rule = added;
-            listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
-                on_tcp_connection_accepted(std::move(conn), rule);
-            });
-            listeners_.push_back(std::move(listener));
-            forward_rules_.push_back(added);
-            util::Logger::info("Started listener on local port {} -> {}:{}", added.local_port,
-                               added.remote_host, added.remote_port);
+        if (config_.logging.level != new_config.logging.level) {
+            util::Logger::set_level(new_config.logging.level);
         }
+        config_ = new_config;
+    };
+
+    if (io_ctx_ && running_.load(std::memory_order_acquire)) {
+        std::promise<void> done;
+        auto fut = done.get_future();
+        asio::post(io_ctx_->get_io_context(), [&apply, &done]() {
+            apply();
+            done.set_value();
+        });
+        fut.wait();
+    } else {
+        // Not running yet (no io threads to serialize against): apply inline.
+        apply();
     }
 
-    if (config_.logging.level != new_config.logging.level) {
-        util::Logger::set_level(new_config.logging.level);
-    }
-
-    config_ = new_config;
     util::Logger::info("config reloaded (forwards: +{} -{})", diff.added.size(),
                        diff.removed.size());
     return {};
@@ -490,12 +540,25 @@ void TunnelClient::setup_tox_callbacks() {
                 util::Logger::info("Server friend {} is now online", friend_number);
                 record_server_connection(sender_tox_id, friend_number);
                 send_info_request();
+                // M-02: (re)start keepalive — enable_keepalive resets the
+                // liveness baseline + dead latch, so a reconnect starts fresh.
+                if (config_.tunnel.keepalive_enabled() && tunnel_mgr_) {
+                    tunnel_mgr_->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
+                }
+                // H-07: ask the server to reattach any tunnels that survived a
+                // brief disconnect (no-op on the first connect / when disabled).
+                if (config_.tunnel.resume.enabled && running_) {
+                    io_ctx_->post([this] { send_resume_requests(); });
+                }
                 if (is_pipe_mode() && running_) {
                     io_ctx_->post([this] { start_pipe_mode(); });
                 }
             } else {
                 util::Logger::warn("Server friend {} went offline", friend_number);
                 info_request_sent_.store(false);
+                if (tunnel_mgr_) {
+                    tunnel_mgr_->disable_keepalive();
+                }
                 if (is_pipe_mode() && running_) {
                     request_stop();
                 }
@@ -562,6 +625,15 @@ void TunnelClient::setup_tox_callbacks() {
                     return;
                 }
 
+                // H-07: TUNNEL_RESUME_ACK is a per-friend control frame (not
+                // routed to a tunnel by the manager). Intercept it here.
+                if (frame_result.value().type() == tunnel::FrameType::TUNNEL_RESUME_ACK) {
+                    if (auto ack = frame_result.value().as_tunnel_resume_ack()) {
+                        handle_resume_ack(*ack);
+                    }
+                    return;
+                }
+
                 tunnel_mgr_->route_frame(frame_result.value());
             });
         });
@@ -591,6 +663,31 @@ void TunnelClient::setup_tunnel_manager() {
     // Tunnel closed callback
     tunnel_mgr_->set_on_tunnel_closed(
         [](uint16_t tunnel_id) { util::Logger::debug("Tunnel {} closed", tunnel_id); });
+
+    // M-02: when the active server stops answering keepalive PINGs (its
+    // toxcore link still looks alive but the app is wedged), mark it offline
+    // and drop its tunnels so the failover state machine promotes a fallback.
+    if (config_.tunnel.keepalive_enabled()) {
+        tunnel_mgr_->set_on_peer_dead([this]() {
+            io_ctx_->post([this]() {
+                util::Logger::warn(
+                    "Active server unresponsive (keepalive); marking offline and failing over");
+                {
+                    std::lock_guard<std::mutex> lock(endpoints_mutex_);
+                    if (active_index_ < endpoints_.size() && endpoints_[active_index_].online) {
+                        endpoints_[active_index_].online = false;
+                        endpoints_[active_index_].offline_since = std::chrono::steady_clock::now();
+                    }
+                    server_online_.store(false, std::memory_order_release);
+                    util::MetricsRegistry::instance().set_friends_online(0);
+                }
+                if (tunnel_mgr_) {
+                    tunnel_mgr_->close_all();
+                }
+                info_request_sent_.store(false);
+            });
+        });
+    }
 }
 
 void TunnelClient::create_listeners(const std::vector<ForwardRule>& forwards) {
@@ -640,10 +737,24 @@ void TunnelClient::start_pipe_mode() {
     request_stop();
     return;
 #else
-    pipe_bridge_ = std::make_unique<StdioPipeBridge>(STDIN_FILENO, STDOUT_FILENO);
+    {
+        std::lock_guard<std::mutex> lock(pipe_mutex_);
+        pipe_bridge_ = std::make_shared<StdioPipeBridge>(STDIN_FILENO, STDOUT_FILENO);
+    }
 #endif
 
-    const uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
+    auto allocated_id = tunnel_mgr_->allocate_tunnel_id();
+    if (!allocated_id) {
+        util::Logger::error("No available tunnel IDs for pipe mode");
+        {
+            std::lock_guard<std::mutex> lock(pipe_mutex_);
+            pipe_bridge_.reset();
+        }
+        pipe_mode_started_ = false;
+        request_stop();
+        return;
+    }
+    const uint16_t tunnel_id = *allocated_id;
     auto tunnel =
         std::make_shared<tunnel::TunnelImpl>(io_ctx_->get_io_context(), tunnel_id,
                                              server_friend_number_.load(std::memory_order_acquire));
@@ -669,10 +780,19 @@ void TunnelClient::start_pipe_mode() {
 
     const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel;
 
-    tunnel->set_on_data_for_tcp([this](std::span<const uint8_t> data) {
-        if (pipe_bridge_) {
-            pipe_bridge_->write_output(data);
+    // H-04: snapshot pipe_bridge_ under pipe_mutex_ before each use, so a
+    // concurrent stop()/on_close reset can't free it mid-call. Stdout is
+    // treated as always-accepting (the OS buffers), so we report true.
+    tunnel->set_on_data_for_tcp([this](std::span<const uint8_t> data) -> bool {
+        std::shared_ptr<StdioPipeBridge> pb;
+        {
+            std::lock_guard<std::mutex> lock(pipe_mutex_);
+            pb = pipe_bridge_;
         }
+        if (pb) {
+            pb->write_output(data);
+        }
+        return true;
     });
 
     tunnel->set_on_state_change([this, weak_tunnel, tunnel_id](tunnel::Tunnel::State new_state) {
@@ -681,7 +801,15 @@ void TunnelClient::start_pipe_mode() {
             if (!locked_tunnel) {
                 return;
             }
-            auto start_result = pipe_bridge_->start(
+            std::shared_ptr<StdioPipeBridge> pb;
+            {
+                std::lock_guard<std::mutex> lock(pipe_mutex_);
+                pb = pipe_bridge_;
+            }
+            if (!pb) {
+                return;
+            }
+            auto start_result = pb->start(
                 [weak_tunnel](std::span<const uint8_t> data) {
                     if (auto tunnel = weak_tunnel.lock()) {
                         tunnel->on_tcp_data_received(data.data(), data.size());
@@ -699,8 +827,13 @@ void TunnelClient::start_pipe_mode() {
                 request_stop();
             }
         } else if (new_state == tunnel::Tunnel::State::Error) {
-            if (pipe_bridge_) {
-                pipe_bridge_->stop();
+            std::shared_ptr<StdioPipeBridge> pb;
+            {
+                std::lock_guard<std::mutex> lock(pipe_mutex_);
+                pb = pipe_bridge_;
+            }
+            if (pb) {
+                pb->stop();
             }
             request_stop();
         }
@@ -711,9 +844,15 @@ void TunnelClient::start_pipe_mode() {
     // lambda; without this the lambda could deref a destroyed manager.
     auto mgr = tunnel_mgr_;
     tunnel->set_on_close([this, mgr, tunnel_id]() {
-        if (pipe_bridge_) {
-            pipe_bridge_->stop();
-            pipe_bridge_.reset();
+        // Move the bridge out under the lock, then stop()/destroy the local
+        // copy outside it (stop() may join the read thread).
+        std::shared_ptr<StdioPipeBridge> pb;
+        {
+            std::lock_guard<std::mutex> lock(pipe_mutex_);
+            pb = std::move(pipe_bridge_);
+        }
+        if (pb) {
+            pb->stop();
         }
         pipe_mode_started_ = false;
         mgr->remove_tunnel(tunnel_id);
@@ -726,7 +865,10 @@ void TunnelClient::start_pipe_mode() {
         util::Logger::error("Failed to open pipe-mode tunnel {} to {}:{}", tunnel_id,
                             target.remote_host, target.remote_port);
         tunnel_mgr_->remove_tunnel(tunnel_id);
-        pipe_bridge_.reset();
+        {
+            std::lock_guard<std::mutex> lock(pipe_mutex_);
+            pipe_bridge_.reset();
+        }
         pipe_mode_started_ = false;
         request_stop();
         return;
@@ -737,15 +879,69 @@ void TunnelClient::start_pipe_mode() {
 }
 
 void TunnelClient::request_stop() {
-    // Use io_ctx_ to post the stop operation, avoiding detached threads.
-    // This ensures stop() runs on the I/O thread pool and any exceptions
-    // are handled within the asio context.
-    if (io_ctx_ && running_.load()) {
-        io_ctx_->post([this] {
-            if (running_.load()) {
-                stop();
-            }
-        });
+    // Called from Tox-iterate and io-worker callbacks (pipe-mode errors,
+    // server-offline, etc.). We must NOT run stop() here: stop() joins the
+    // io_context worker pool, and these callbacks already run on a worker (or
+    // the Tox thread), so a direct/posted stop() would self-join and deadlock
+    // (C-01). Instead, signal the thread blocked in wait_until_stopped() — a
+    // non-worker thread — to perform the teardown.
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(stop_mutex_);
+        stop_requested_ = true;
+    }
+    stop_cv_.notify_all();
+}
+
+void TunnelClient::send_resume_requests() {
+    if (!tunnel_mgr_ || !config_.tunnel.resume.enabled) {
+        return;
+    }
+    const uint32_t fn = server_friend_number_.load(std::memory_order_acquire);
+    // Snapshot ids, then look up each tunnel without holding the manager lock
+    // across the (cross-thread) send.
+    for (uint16_t id : tunnel_mgr_->get_tunnel_ids()) {
+        auto impl = std::dynamic_pointer_cast<tunnel::TunnelImpl>(tunnel_mgr_->get_tunnel(id));
+        if (!impl || impl->state() != tunnel::Tunnel::State::Connected) {
+            continue;
+        }
+        tunnel::TunnelResumeRequestPayload req;
+        req.prior_tunnel_id = id;
+        req.last_local_recv_offset = impl->bytes_received();
+        req.last_local_send_offset = impl->bytes_sent();
+        req.host = impl->target_host();
+        req.target_port = impl->target_port();
+
+        auto frame = tunnel::ProtocolFrame::make_tunnel_resume_request(req);
+        auto wire = frame.serialize();
+        std::vector<uint8_t> packet;
+        packet.reserve(1 + wire.size());
+        packet.push_back(tunnel::kLosslessPacketByte);
+        packet.insert(packet.end(), wire.begin(), wire.end());
+        (void)tox_adapter_->send_lossless_packet(fn, packet.data(), packet.size());
+        util::Logger::info("Sent RESUME_REQUEST for tunnel {} (recv={} send={})", id,
+                           req.last_local_recv_offset, req.last_local_send_offset);
+    }
+}
+
+void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack) {
+    auto impl = std::dynamic_pointer_cast<tunnel::TunnelImpl>(
+        tunnel_mgr_ ? tunnel_mgr_->get_tunnel(ack.new_tunnel_id) : nullptr);
+    if (!impl) {
+        util::Logger::debug("RESUME_ACK for unknown/closed tunnel {}", ack.new_tunnel_id);
+        return;
+    }
+    if (ack.status == tunnel::TunnelResumeStatus::Ok) {
+        util::Logger::info("Tunnel {} resumed (server recv={} send={})", ack.new_tunnel_id,
+                           ack.server_recv_offset, ack.server_send_offset);
+        // The tunnel kept its Connected state and TCP connection; nothing more
+        // to do — buffered bytes flush via the coalesce retry timer.
+    } else {
+        util::Logger::warn("Tunnel {} resume declined (status {}); closing", ack.new_tunnel_id,
+                           static_cast<int>(ack.status));
+        impl->close();
     }
 }
 
@@ -758,8 +954,16 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
         return;
     }
 
-    // Allocate a tunnel ID and create the tunnel
-    uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
+    // Allocate a tunnel ID and create the tunnel. C-07: handle exhaustion
+    // (nullopt) instead of proceeding with the control-plane id 0.
+    auto allocated_id = tunnel_mgr_->allocate_tunnel_id();
+    if (!allocated_id) {
+        util::Logger::error("No available tunnel IDs; closing connection on port {}",
+                            rule.local_port);
+        conn->close();
+        return;
+    }
+    const uint16_t tunnel_id = *allocated_id;
     util::Logger::debug("New TCP connection on port {}, creating tunnel {} -> {}:{}",
                         rule.local_port, tunnel_id, rule.remote_host, rule.remote_port);
 
@@ -795,9 +999,10 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     // allocated during `ProtocolFrame::deserialize` is handed straight to
     // the TCP write queue without an intermediate `vector<uint8_t>` copy.
     tunnel->set_on_data_for_tcp_owned(
-        [conn](core::OwnedBufferView buf) { conn->write(std::move(buf)); });
-    tunnel->set_on_data_for_tcp(
-        [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
+        [conn](core::OwnedBufferView buf) -> bool { return conn->write(std::move(buf)); });
+    tunnel->set_on_data_for_tcp([conn](std::span<const uint8_t> data) -> bool {
+        return conn->write(data.data(), data.size());
+    });
 
     // Wire state change: when Connected (ACK received), start TCP read loop.
     // Latch the open + active-gauge bookkeeping so the same tunnel can't
@@ -850,20 +1055,35 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
             tunnel->close();
         }
     });
+    // C-03: flush a deferred ACK once the local TCP write queue drains.
+    conn->set_on_writable([weak_tunnel]() -> bool {
+        if (auto tunnel = weak_tunnel.lock()) {
+            return tunnel->notify_tcp_writable();
+        }
+        return true;  // tunnel gone — nothing to flush
+    });
 
-    // Initiate tunnel opening: sends TUNNEL_OPEN frame to server
-    bool opened = tunnel->open(rule.remote_host, rule.remote_port);
-    if (!opened) {
-        util::Logger::error("Failed to open tunnel {} to {}:{}", tunnel_id, rule.remote_host,
-                            rule.remote_port);
+    // C-04: register the tunnel with the manager BEFORE sending TUNNEL_OPEN, so
+    // a fast ACK/ERROR from the server routes to a known tunnel instead of being
+    // dropped as "unknown tunnel". Roll back (release the id) if the manager is
+    // at capacity (H-05).
+    if (!tunnel_mgr_->add_tunnel(tunnel_id, tunnel)) {
+        util::Logger::error("Tunnel manager at capacity; dropping connection on port {}",
+                            rule.local_port);
+        tunnel_mgr_->release_tunnel_id(tunnel_id);
         conn->close();
         return;
     }
 
-    // Add tunnel to manager. The manager takes a strong ref; the local
-    // `tunnel` shared_ptr (and the conn callback captures above) keep it alive
-    // independently.
-    tunnel_mgr_->add_tunnel(tunnel_id, tunnel);
+    // Initiate tunnel opening: sends TUNNEL_OPEN frame to server.
+    if (!tunnel->open(rule.remote_host, rule.remote_port)) {
+        util::Logger::error("Failed to open tunnel {} to {}:{}", tunnel_id, rule.remote_host,
+                            rule.remote_port);
+        // remove_tunnel() closes the tunnel and releases the id.
+        tunnel_mgr_->remove_tunnel(tunnel_id);
+        conn->close();
+        return;
+    }
 
     util::Logger::debug("Tunnel {} created and TUNNEL_OPEN sent to {}:{}", tunnel_id,
                         rule.remote_host, rule.remote_port);
@@ -879,7 +1099,14 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         return;
     }
 
-    const uint16_t tunnel_id = tunnel_mgr_->allocate_tunnel_id();
+    auto allocated_id = tunnel_mgr_->allocate_tunnel_id();
+    if (!allocated_id) {
+        util::Logger::error("No available tunnel IDs for SOCKS5 destination {}:{}", host, port);
+        on_tunnel_state(false);
+        conn->close();
+        return;
+    }
+    const uint16_t tunnel_id = *allocated_id;
     util::Logger::debug("SOCKS5 destination {}:{} -> tunnel {}", host, port, tunnel_id);
 
     auto tunnel =
@@ -904,8 +1131,9 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         },
         tunnel_friend_number));
 
-    tunnel->set_on_data_for_tcp(
-        [conn](std::span<const uint8_t> data) { conn->write(data.data(), data.size()); });
+    tunnel->set_on_data_for_tcp([conn](std::span<const uint8_t> data) -> bool {
+        return conn->write(data.data(), data.size());
+    });
 
     // The reply gate latch ensures the listener's reply callback is invoked
     // exactly once across all possible state transitions of this tunnel.
@@ -973,17 +1201,34 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
             tunnel->close();
         }
     });
+    conn->set_on_writable([weak_tunnel]() -> bool {
+        if (auto tunnel = weak_tunnel.lock()) {
+            return tunnel->notify_tcp_writable();
+        }
+        return true;  // tunnel gone — nothing to flush
+    });
 
-    bool opened = tunnel->open(host, port);
-    if (!opened) {
-        util::Logger::error("Failed to open SOCKS5 tunnel {} to {}:{}", tunnel_id, host, port);
+    // C-04: register before opening (see on_tcp_connection_accepted).
+    if (!tunnel_mgr_->add_tunnel(tunnel_id, tunnel)) {
+        util::Logger::error("Tunnel manager at capacity; rejecting SOCKS5 {}:{}", host, port);
+        tunnel_mgr_->release_tunnel_id(tunnel_id);
         if (!reply_sent->exchange(true)) {
             (*reply_cb)(false);
         }
         conn->close();
         return;
     }
-    tunnel_mgr_->add_tunnel(tunnel_id, tunnel);
+
+    bool opened = tunnel->open(host, port);
+    if (!opened) {
+        util::Logger::error("Failed to open SOCKS5 tunnel {} to {}:{}", tunnel_id, host, port);
+        tunnel_mgr_->remove_tunnel(tunnel_id);
+        if (!reply_sent->exchange(true)) {
+            (*reply_cb)(false);
+        }
+        conn->close();
+        return;
+    }
 }
 
 // ---------------------------------------------------------------------------

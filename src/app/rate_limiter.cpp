@@ -173,6 +173,11 @@ bool RateLimiter::try_consume_open(std::string_view friend_pk) {
 
     auto cur = b.open_tokens.load(std::memory_order_relaxed);
     if (cur <= 0) {
+        // M-03: Report mode is count-only and never goes into debt. When the
+        // bucket is empty we increment the shadow counter and allow, leaving
+        // open_tokens clamped at its floor (already <= 0 here, so no deduction
+        // is needed). This is the same count-only contract the bytes path
+        // (`try_consume_bytes`) now follows.
         b.open_rejected.fetch_add(1, std::memory_order_relaxed);
         util::MetricsRegistry::instance().inc_rate_limit_open_rejected();
         if (b.spec.mode == RateLimitMode::Report) {
@@ -197,11 +202,19 @@ bool RateLimiter::try_consume_bytes(std::string_view friend_pk, std::size_t byte
     const auto need = static_cast<std::int64_t>(bytes);
     auto cur = b.bytes_tokens.load(std::memory_order_relaxed);
     if (cur < need) {
+        // M-03: Report mode is count-only. It increments the metric so
+        // operators can see what *would* be throttled, but it never denies
+        // and never drives the bucket negative. This matches the open path
+        // (`try_consume_open`): when short, count + allow, leave bookkeeping
+        // clamped at the floor. The previous code subtracted into debt only
+        // on the bytes path, which made the two paths' bucket semantics
+        // diverge (and could leave the bucket permanently negative under a
+        // sustained over-budget flow).
         b.bytes_throttled.fetch_add(1, std::memory_order_relaxed);
         util::MetricsRegistry::instance().inc_rate_limit_bytes_throttled();
         if (b.spec.mode == RateLimitMode::Report) {
-            // Account against the bucket but don't deny.
-            b.bytes_tokens.store(cur - need, std::memory_order_relaxed);
+            // Drain whatever is available (clamp to zero) and allow.
+            b.bytes_tokens.store(cur > 0 ? 0 : cur, std::memory_order_relaxed);
             return true;
         }
         return false;

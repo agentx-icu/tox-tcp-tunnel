@@ -14,8 +14,11 @@ namespace toxtunnel::util {
 // ---------------------------------------------------------------------------
 
 /// Options for `atomic_write_file`. The defaults match the v0.4.0 design
-/// doc: write to `<path>.tmp.<pid>`, fsync the temp file, rename, and on
-/// POSIX optionally fsync the parent directory for full durability.
+/// doc: write to a per-call-unique `<path>.tmp.<pid>.<tid>.<counter>` staging
+/// file, fsync the temp file, rename, and on POSIX optionally fsync the parent
+/// directory for full durability. The unique suffix lets two threads in the
+/// same process write the same target concurrently without clobbering each
+/// other's staging file.
 struct AtomicFileOptions {
     /// File permissions (POSIX); ignored on Windows.
     std::filesystem::perms mode =
@@ -37,8 +40,9 @@ struct AtomicFileOptions {
 // atomic_write_file
 // ---------------------------------------------------------------------------
 
-/// Write `contents` to `path` atomically: stage in `<path>.tmp.<pid>`,
-/// fsync the temp, rename over `path`, optionally fsync the parent dir.
+/// Write `contents` to `path` atomically: stage in a per-call-unique
+/// `<path>.tmp.<pid>.<tid>.<counter>`, fsync the temp, rename over `path`,
+/// optionally fsync the parent dir.
 ///
 /// On POSIX the rename is atomic with respect to crash recovery; on Windows
 /// the equivalent is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING |

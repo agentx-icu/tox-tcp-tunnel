@@ -137,21 +137,39 @@ bool TunnelImpl::open(const std::string& host, uint16_t port) {
         return false;
     }
 
-    // Send TUNNEL_OPEN frame
-    auto frame = ProtocolFrame::make_tunnel_open(tunnel_id_, host, port);
-    if (!send_frame_to_tox(frame)) {
-        util::Logger::warn("Tunnel {} open failed: initial TUNNEL_OPEN send rejected", tunnel_id_);
+    // H-08: the wire host_len field is a single byte. Reject an overlong host
+    // here instead of letting make_tunnel_open silently truncate it and dial a
+    // prefix of the intended target (a real DNS name is <= 253 bytes, so this
+    // only fires on a malformed rule / proxy request).
+    if (host.size() > 255) {
+        util::Logger::error("Tunnel {} open rejected: host length {} exceeds 255-byte limit",
+                            tunnel_id_, host.size());
         return false;
     }
 
+    // M-08: record target + move to Connecting BEFORE sending TUNNEL_OPEN, so a
+    // synchronous send callback or a fast ACK observes a coherent target and
+    // state (the old order left a window where state was still None / target
+    // empty). On send failure we roll back to None so the caller can release
+    // the id without the tunnel lingering in Connecting.
     {
         std::lock_guard<std::mutex> lock(mutex_);
         target_host_ = host;
         target_port_ = port;
     }
-
-    // Transition to Connecting state
     transition_state(State::Connecting);
+
+    auto frame = ProtocolFrame::make_tunnel_open(tunnel_id_, host, port);
+    if (!send_frame_to_tox(frame)) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            target_host_.clear();
+            target_port_ = 0;
+        }
+        transition_state(State::None);
+        util::Logger::warn("Tunnel {} open failed: initial TUNNEL_OPEN send rejected", tunnel_id_);
+        return false;
+    }
 
     util::Logger::info("Tunnel {} opening: {}:{}", tunnel_id_, host, port);
     return true;
@@ -160,17 +178,52 @@ bool TunnelImpl::open(const std::string& host, uint16_t port) {
 void TunnelImpl::close() {
     State current = state_.load(std::memory_order_acquire);
 
-    // Only close from Connected state
+    // C-05: close requested while the open handshake is still in flight (the
+    // local TCP side disconnected before the peer ACKed our TUNNEL_OPEN).
+    // Without handling this, the tunnel stays in Connecting forever — the
+    // reaper deliberately skips Connecting tunnels — leaking both the object
+    // and its tunnel id. Send a best-effort TUNNEL_CLOSE so the peer can
+    // release its half, then move straight to Closed and notify so the manager
+    // reclaims the id. No coalesce buffer can hold data here (send_data_to_tox
+    // refuses while not Connected), so there is nothing to drain.
+    if (current == State::Connecting) {
+        auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
+        send_frame_to_tox(frame);
+        util::MetricsRegistry::instance().inc_tunnels_closed(
+            util::MetricsRegistry::CloseReason::Local);
+        transition_state(State::Closed);
+        notify_close_once();
+        util::Logger::info("Tunnel {} closed during handshake", tunnel_id_);
+        return;
+    }
+
+    // Only close from Connected state (None/Disconnecting/Closed/Error: no-op).
     if (current != State::Connected) {
         util::Logger::debug("Tunnel {} close ignored: state {}", tunnel_id_, to_string(current));
         return;
     }
 
-    // Drain any pending coalesced data before signalling close so receivers
-    // observe every byte we accepted from the IO pool.
-    flush_pending_writes();
+    // Drain pending coalesced data before signalling close so the peer
+    // observes every byte we accepted. If Tox backpressures mid-drain, DEFER
+    // the TUNNEL_CLOSE: emitting it now would let it overtake the still-buffered
+    // DATA, and the peer drops post-close frames as "unknown tunnel" (the
+    // close-before-drain truncation bug). The retry timer sends CLOSE once the
+    // buffer is fully drained — see the timer handler in coalesce_arm_timer_locked.
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        if (!coalesce_try_drain_locked()) {
+            close_pending_ = true;
+            coalesce_arm_timer_locked();
+            util::Logger::debug("Tunnel {} close deferred until coalesce buffer drains",
+                                tunnel_id_);
+            return;
+        }
+    }
 
-    // Send TUNNEL_CLOSE frame
+    emit_close_and_transition();
+}
+
+void TunnelImpl::emit_close_and_transition() {
     auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
     send_frame_to_tox(frame);
     util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Local);
@@ -179,6 +232,14 @@ void TunnelImpl::close() {
     transition_state(State::Disconnecting);
 
     util::Logger::info("Tunnel {} closing", tunnel_id_);
+
+    // The buffer is fully drained and CLOSE has been emitted — it is now safe
+    // for the owner to tear the tunnel down. Firing this only here (rather than
+    // when close() is first requested) is what lets a backpressured tunnel
+    // finish flushing its data before removal, instead of dropping it. The
+    // callback is responsible for deferring the actual teardown (asio::post)
+    // so it never destroys this tunnel mid-call.
+    notify_close_once();
 }
 
 void TunnelImpl::force_close() {
@@ -199,6 +260,11 @@ void TunnelImpl::force_close() {
     }
 
     transition_state(State::Closed);
+    // M-07: force_close() drives a terminal state just like the remote-close /
+    // error paths, so it must fire the close callback too. Otherwise a caller
+    // that uses force_close() directly would bypass manager cleanup and the
+    // active-tunnel gauge decrement. notify_close_once() is idempotent.
+    notify_close_once();
     util::Logger::info("Tunnel {} force closed", tunnel_id_);
 }
 
@@ -295,14 +361,34 @@ void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
         span_cb = on_data_for_tcp_;
     }
 
+    bool accepted = true;
     if (owned_cb) {
-        owned_cb(frame.as_tunnel_data_owned());
+        accepted = owned_cb(frame.as_tunnel_data_owned());
     } else if (span_cb) {
-        span_cb(data);
+        accepted = span_cb(data);
     }
 
-    // Check if we should send ACK
-    maybe_send_ack();
+    // C-03: only ACK what the local TCP side accepted. When it backpressures
+    // (write queue over its limit), withhold the ACK: the peer's send window
+    // fills, it stops sending, and notify_tcp_writable() flushes the deferred
+    // ACK once the socket drains. The received bytes are NOT dropped — the
+    // TcpConnection still enqueues them — so the stream stays intact; we are
+    // only throttling the peer instead of silently ACKing data the socket
+    // couldn't keep up with.
+    if (accepted) {
+        maybe_send_ack();
+    } else {
+        util::Logger::debug("Tunnel {} local TCP backpressured; deferring ACK", tunnel_id_);
+    }
+}
+
+bool TunnelImpl::notify_tcp_writable() {
+    // The local TCP write queue drained below its low-water mark; flush any
+    // ACK we withheld while it was backpressured so the peer's send window
+    // reopens. send_ack() is a no-op (returns true) when nothing is pending;
+    // it returns false if the ACK send itself backpressured, in which case the
+    // TcpConnection keeps its watermark armed and calls us again.
+    return send_ack();
 }
 
 void TunnelImpl::handle_tunnel_close_frame(const ProtocolFrame& /*frame*/) {
@@ -561,17 +647,12 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         zero_copy = static_cast<bool>(on_send_to_tox_owned_);
     }
 
-    // Finding-1 (user-reported, 2026-05-21): a chunk failure mid-stream
-    // is unrecoverable — the bytes are already consumed from the caller
-    // and toxcore lossless gave up on them. The previous code logged
-    // and continued, returning true from this function, so the caller
-    // (on_tcp_data_received) had no way to know the stream was now
-    // broken: TCP stayed in Connected state and the peer would observe
-    // a truncated read. We now break out on first failure, then
-    // transition the tunnel to Error *after* releasing the coalesce
-    // lock so the on_state_change callback (user code) can't deadlock
-    // by re-entering us.
-    bool send_failed = false;
+    // Finding-1 (user-reported, 2026-05-21) + close-before-drain fix
+    // (2026-05-25): a Tox SENDQ-full on the emit path is transient
+    // backpressure, not a fatal error. Rather than dropping the bytes (silent
+    // truncation) or tearing the tunnel down, both branches below RETAIN the
+    // unsent bytes in the coalesce buffer and retry them on the flush timer,
+    // keeping the lossless guarantee intact.
     {
         std::lock_guard<std::mutex> lock(coalesce_mutex_);
 
@@ -579,7 +660,17 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         // each chunk immediately with no coalesce buffer involvement.
         const bool emit_immediate =
             coalesce_max_delay_us_ == 0 || decision.policy == CoalescePolicy::Bypass;
-        if (emit_immediate) {
+        if (emit_immediate && coalesce_pending_locked() > 0) {
+            // FIFO ordering: a prior emit hit Tox backpressure and parked its
+            // remainder in coalesce_buf_ (drained by the retry timer). New data
+            // must queue *behind* that remainder — emitting it directly here
+            // would overtake the buffered bytes and silently reorder a lossless
+            // stream (the bypass/adaptive path under sustained backpressure).
+            // Route through the buffer, which drains full frames in order and
+            // re-arms the timer if Tox is still backpressured.
+            coalesce_append_locked(data);
+            coalesce_arm_timer_locked();
+        } else if (emit_immediate) {
             for (std::size_t offset = 0; offset < data.size();
                  offset += kMaxTcpPayloadPerToxFrame) {
                 const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
@@ -595,20 +686,20 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
                     sent = send_frame_to_tox(frame);
                 }
                 if (!sent) {
-                    // S27 / S29 follow-up: refund-to-floor so the send
-                    // window doesn't leak and can't underflow.
-                    std::size_t cur = send_window_used_.load(std::memory_order_relaxed);
-                    while (true) {
-                        const std::size_t next = cur >= chunk_size ? cur - chunk_size : 0;
-                        if (send_window_used_.compare_exchange_weak(cur, next,
-                                                                    std::memory_order_relaxed)) {
-                            break;
-                        }
-                    }
+                    // Tox SENDQ full (transient backpressure). Do NOT drop or
+                    // tear down the tunnel — retain the unsent remainder in the
+                    // coalesce buffer and retry on the timer, mirroring the
+                    // batched path's lossless backpressure handling. The send
+                    // window stays charged for these bytes so upstream TCP
+                    // reads pause until they drain. (Earlier revisions refunded
+                    // + transitioned to Error here, which truncated the stream
+                    // on a momentarily-full Tox queue.)
+                    const auto remainder = data.subspan(offset);
+                    coalesce_buf_.insert(coalesce_buf_.end(), remainder.begin(), remainder.end());
+                    coalesce_arm_timer_locked();
                     util::Logger::debug(
-                        "Tunnel {} dropped {} bytes (Tox send rejected); refunded send window",
-                        tunnel_id_, chunk_size);
-                    send_failed = true;
+                        "Tunnel {} Tox send backpressured; buffered {} bytes for retry", tunnel_id_,
+                        remainder.size());
                     break;
                 }
             }
@@ -622,14 +713,6 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         }
     }
 
-    if (send_failed) {
-        util::Logger::warn(
-            "Tunnel {} send path broken (toxcore rejected a frame); transitioning to Error",
-            tunnel_id_);
-        transition_state(State::Error);
-        notify_close_once();
-        return false;
-    }
     return true;
 }
 
@@ -666,18 +749,28 @@ void TunnelImpl::maybe_send_ack() {
     }
 }
 
-void TunnelImpl::send_ack() {
+bool TunnelImpl::send_ack() {
     std::size_t bytes_to_ack = bytes_received_since_ack_.exchange(0, std::memory_order_relaxed);
-    if (bytes_to_ack > 0) {
-        // Truncate to uint32_t range
-        uint32_t ack_value = static_cast<uint32_t>(
+    // M-01: a single ACK frame can only carry a uint32_t count. If more than
+    // 4 GiB accumulated since the last ACK, emit multiple frames so the peer's
+    // send window is fully credited instead of permanently leaking the
+    // remainder. On a send failure, restore the still-unacked bytes so a later
+    // flush (next DATA or notify_tcp_writable) retries them, and report the
+    // partial flush so the caller keeps the watermark armed and calls again.
+    while (bytes_to_ack > 0) {
+        const uint32_t ack_value = static_cast<uint32_t>(
             std::min<std::size_t>(bytes_to_ack, std::numeric_limits<uint32_t>::max()));
-
         auto frame = ProtocolFrame::make_tunnel_ack(tunnel_id_, ack_value);
-        send_frame_to_tox(frame);
-
+        if (!send_frame_to_tox(frame)) {
+            bytes_received_since_ack_.fetch_add(bytes_to_ack, std::memory_order_relaxed);
+            util::Logger::debug("Tunnel {} ACK send backpressured; {} bytes still pending",
+                                tunnel_id_, bytes_to_ack);
+            return false;
+        }
+        bytes_to_ack -= ack_value;
         util::Logger::debug("Tunnel {} sent ACK for {} bytes", tunnel_id_, ack_value);
     }
+    return true;
 }
 
 void TunnelImpl::notify_close_once() {
@@ -813,9 +906,13 @@ void TunnelImpl::configure_coalesce(std::uint32_t max_delay_us, std::uint32_t ma
     coalesce_max_bytes_ = clamped;
     coalescer_.configure(clamped, max_delay_us);
     // If coalescing was just disabled, drain whatever's queued so order is
-    // preserved relative to subsequent direct writes.
-    if (coalesce_max_delay_us_ == 0 && !coalesce_buf_.empty()) {
-        coalesce_emit_front_locked(coalesce_buf_.size());
+    // preserved relative to subsequent direct writes. Chunked so an
+    // already-overflowed buffer never produces an oversized frame; any
+    // backpressured remainder stays buffered for the retry timer.
+    if (coalesce_max_delay_us_ == 0 && coalesce_pending_locked() > 0) {
+        if (!coalesce_try_drain_locked()) {
+            coalesce_arm_timer_locked();
+        }
     }
 }
 
@@ -843,26 +940,46 @@ void TunnelImpl::observe_bandwidth_bps(std::int64_t bps) {
 
 void TunnelImpl::flush_pending_writes() {
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
-    if (coalesce_buf_.empty()) {
+    if (coalesce_pending_locked() == 0) {
         return;
     }
-    coalesce_emit_front_locked(coalesce_buf_.size());
+    // Best-effort chunked drain (force_close / explicit flush). On Tox
+    // backpressure the bytes stay buffered: force_close() is tearing the tunnel
+    // down regardless, and the graceful close() path defers via the timer.
+    (void)coalesce_try_drain_locked();
     coalesce_timer_.cancel();
     coalesce_timer_armed_ = false;
 }
 
 void TunnelImpl::coalesce_append_locked(std::span<const uint8_t> data) {
+    // Reclaim the consumed prefix before growing the buffer, but only once it
+    // dominates the live bytes — amortised O(1) per byte, vs the O(n^2) that
+    // erase-from-front-per-frame would cost while draining a large buffer.
+    if (coalesce_consumed_ > 0 && coalesce_consumed_ >= coalesce_pending_locked()) {
+        coalesce_buf_.erase(
+            coalesce_buf_.begin(),
+            coalesce_buf_.begin() + static_cast<std::ptrdiff_t>(coalesce_consumed_));
+        coalesce_consumed_ = 0;
+    }
     coalesce_buf_.insert(coalesce_buf_.end(), data.begin(), data.end());
-    while (coalesce_buf_.size() >= coalesce_max_bytes_) {
-        coalesce_emit_front_locked(coalesce_max_bytes_);
+    while (coalesce_pending_locked() >= coalesce_max_bytes_) {
+        if (!coalesce_emit_front_locked(coalesce_max_bytes_)) {
+            // Tox backpressured: leave the rest buffered and retry on the timer
+            // rather than spin (or drop). The sub-MTU remainder, if any, is
+            // also left for the timer flush.
+            coalesce_arm_timer_locked();
+            return;
+        }
     }
 }
 
-void TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
-    if (bytes == 0 || coalesce_buf_.empty()) {
-        return;
+bool TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
+    const std::size_t pending = coalesce_pending_locked();
+    if (bytes == 0 || pending == 0) {
+        return true;
     }
-    bytes = std::min(bytes, coalesce_buf_.size());
+    bytes = std::min(bytes, pending);
+    const std::uint8_t* front = coalesce_buf_.data() + coalesce_consumed_;
     // Prefer the Wave B zero-copy outbound path when the owned callback is
     // wired. We still need a single payload memcpy here (out of the
     // coalesce_buf_ deque into a freshly allocated frame buffer) because the
@@ -878,40 +995,60 @@ void TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
     }
     bool sent = false;
     if (zero_copy) {
-        auto buf = OwnedFrameBuffer::with_payload(
-            std::span<const std::uint8_t>(coalesce_buf_.data(), bytes));
+        auto buf = OwnedFrameBuffer::with_payload(std::span<const std::uint8_t>(front, bytes));
         util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
         ProtocolFrame::serialize_tunnel_data_in_place(buf, tunnel_id_);
         sent = send_owned_data_to_tox(std::move(buf));
     } else {
-        auto frame = ProtocolFrame::make_tunnel_data(
-            tunnel_id_, std::span<const uint8_t>(coalesce_buf_.data(), bytes));
+        auto frame =
+            ProtocolFrame::make_tunnel_data(tunnel_id_, std::span<const uint8_t>(front, bytes));
         sent = send_frame_to_tox(frame);
     }
     if (!sent) {
-        // S27 / 2026-05-20 follow-up: same window-refund contract as the
-        // immediate emit path. send_data_to_tox charged `bytes` to
-        // send_window_used_ when the data entered the coalesce buffer;
-        // if Tox now refuses the wire frame the budget has to come back
-        // or the tunnel will pause TCP read forever. S29: saturating
-        // CAS — see the matching note in send_data_to_tox.
-        std::size_t cur = send_window_used_.load(std::memory_order_relaxed);
-        while (true) {
-            const std::size_t next = cur >= bytes ? cur - bytes : 0;
-            if (send_window_used_.compare_exchange_weak(cur, next, std::memory_order_relaxed)) {
-                break;
-            }
-        }
-        util::Logger::debug(
-            "Tunnel {} dropped {} coalesced bytes (Tox send rejected); refunded send window",
-            tunnel_id_, bytes);
+        // Tox lossless SENDQ is full (transient transport backpressure). This
+        // is NOT a drop point: a lossless tunnel must never lose bytes to a
+        // momentarily-full send queue. RETAIN the bytes at the front of the
+        // buffer and keep the send window charged so upstream TCP reads pause;
+        // coalesce_try_drain_locked()'s caller re-arms the timer to retry.
+        // (Earlier revisions erased + refunded here, silently truncating any
+        // transfer large/fast enough to outrun the Tox congestion window —
+        // observed as a hard ~85-90 KiB cap with the remainder lost.)
+        util::Logger::debug("Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_,
+                            bytes);
+        return false;
     }
-    coalesce_buf_.erase(coalesce_buf_.begin(),
-                        coalesce_buf_.begin() + static_cast<std::ptrdiff_t>(bytes));
+    // Consume via the offset (O(1)) instead of erase-from-front (O(n)). When
+    // the buffer is fully drained, reset to reclaim it cheaply; otherwise the
+    // prefix is reclaimed lazily in coalesce_append_locked.
+    coalesce_consumed_ += bytes;
+    if (coalesce_consumed_ == coalesce_buf_.size()) {
+        coalesce_buf_.clear();
+        coalesce_consumed_ = 0;
+    }
+    return true;
+}
+
+bool TunnelImpl::coalesce_try_drain_locked() {
+    // Emit full-MTU frames first, then the sub-MTU remainder. Stop at the
+    // first backpressured emit (bytes retained). Never build a frame larger
+    // than one Tox MTU — emitting `coalesce_buf_.size()` directly would, once
+    // backpressure has let the buffer grow past one MTU, exceed the wire
+    // frame limit.
+    while (coalesce_pending_locked() >= coalesce_max_bytes_) {
+        if (!coalesce_emit_front_locked(coalesce_max_bytes_)) {
+            return false;
+        }
+    }
+    if (coalesce_pending_locked() > 0) {
+        if (!coalesce_emit_front_locked(coalesce_pending_locked())) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void TunnelImpl::coalesce_arm_timer_locked() {
-    if (coalesce_buf_.empty() || coalesce_timer_armed_) {
+    if (coalesce_pending_locked() == 0 || coalesce_timer_armed_) {
         return;
     }
     coalesce_timer_armed_ = true;
@@ -931,14 +1068,29 @@ void TunnelImpl::coalesce_arm_timer_locked() {
         if (!self) {
             return;  // Tunnel was destroyed before the timer fired.
         }
-        std::lock_guard<std::mutex> lock(self->coalesce_mutex_);
-        // Reject stale firings (cancel-and-reset races).
-        if (epoch != self->coalesce_timer_epoch_) {
-            return;
+        bool emit_close = false;
+        {
+            std::lock_guard<std::mutex> lock(self->coalesce_mutex_);
+            // Reject stale firings (cancel-and-reset races).
+            if (epoch != self->coalesce_timer_epoch_) {
+                return;
+            }
+            self->coalesce_timer_armed_ = false;
+            const bool drained = self->coalesce_try_drain_locked();
+            if (!drained) {
+                // Still backpressured — keep retrying on the timer.
+                self->coalesce_arm_timer_locked();
+            } else if (self->close_pending_) {
+                // Buffer fully drained and a local close was deferred: it is
+                // now safe to signal TUNNEL_CLOSE without it overtaking data.
+                self->close_pending_ = false;
+                emit_close = true;
+            }
         }
-        self->coalesce_timer_armed_ = false;
-        if (!self->coalesce_buf_.empty()) {
-            self->coalesce_emit_front_locked(self->coalesce_buf_.size());
+        // emit_close_and_transition() sends through the Tox callback, so it
+        // must run without coalesce_mutex_ held.
+        if (emit_close) {
+            self->emit_close_and_transition();
         }
     });
 }

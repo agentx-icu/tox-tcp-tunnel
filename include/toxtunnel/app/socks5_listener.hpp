@@ -136,7 +136,13 @@ using OpenTunnelFn = std::function<void(std::shared_ptr<core::TcpConnection> con
 ///
 /// Protocol detection sniffs the first byte: 0x05 -> SOCKS5, anything else
 /// is tried as HTTP CONNECT. Both flows converge on the same OpenTunnelFn.
-class Socks5Listener {
+///
+/// Must be owned via shared_ptr (M-09): the accept loop captures a weak_ptr to
+/// itself, so a callback already dispatched onto the io_context when the
+/// listener is destroyed gracefully no-ops instead of dereferencing freed
+/// state. `start()` therefore requires the object already be held by a
+/// shared_ptr.
+class Socks5Listener : public std::enable_shared_from_this<Socks5Listener> {
    public:
     Socks5Listener() = default;
     ~Socks5Listener();

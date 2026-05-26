@@ -62,8 +62,13 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_file(
     }
 
     try {
+        // M-05: parse directly on the loaded node rather than re-serialising
+        // via YAML::Dump + from_string. The round trip discarded the original
+        // line/column (YAML Mark) and anchor info, so a malformed rule pointed
+        // at the wrong location (or none). Parsing the node directly keeps the
+        // Marks intact for diagnostics.
         YAML::Node node = YAML::LoadFile(filepath.string());
-        return from_string(YAML::Dump(node));
+        return from_node(node);
     } catch (const YAML::Exception& e) {
         return util::make_unexpected(std::string("Failed to parse rules file: ") + e.what());
     }
@@ -72,7 +77,14 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_file(
 util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_view yaml_content) {
     try {
         YAML::Node node = YAML::Load(std::string(yaml_content));
+        return from_node(node);
+    } catch (const YAML::Exception& e) {
+        return util::make_unexpected(std::string("Failed to parse rules: ") + e.what());
+    }
+}
 
+util::Expected<RulesEngine, std::string> RulesEngine::from_node(const YAML::Node& node) {
+    try {
         RulesEngine engine;
 
         // Handle both array format and object format with 'rules' key
@@ -100,6 +112,18 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_vi
         }
 
         for (const auto& rule_node : rules_node) {
+            // M-05: the node's Mark gives the source line/column. yaml-cpp
+            // reports 0-based positions, so add 1 to match editor line
+            // numbering. Marks are only meaningful when the document was
+            // parsed (not synthesised); guard with is_null().
+            const auto where = [&rule_node]() -> std::string {
+                const YAML::Mark mark = rule_node.Mark();
+                if (mark.is_null()) {
+                    return std::string();
+                }
+                return std::string(" (line ") + std::to_string(mark.line + 1) + ", column " +
+                       std::to_string(mark.column + 1) + ")";
+            };
             try {
                 FriendRule rule = rule_node.as<FriendRule>();
 
@@ -108,14 +132,14 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_vi
                     return util::make_unexpected(
                         std::string("Invalid public key length: expected ") +
                         std::to_string(tox::kPublicKeyHexLen) + ", got " +
-                        std::to_string(rule.friend_pk.length()));
+                        std::to_string(rule.friend_pk.length()) + where());
                 }
 
                 // Validate public key is valid hex
                 auto pk_result = tox::parse_public_key(rule.friend_pk);
                 if (!pk_result) {
                     return util::make_unexpected(std::string("Invalid public key: ") +
-                                                 pk_result.error());
+                                                 pk_result.error() + where());
                 }
                 // C-S-3 (2026-05-20 fix-storm review): canonicalise the
                 // friend_pk to uppercase hex so it compares equal to the
@@ -134,7 +158,7 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_vi
                     for (uint16_t port : target.ports) {
                         if (port == 0) {
                             return util::make_unexpected(
-                                std::string("Invalid port 0 in allow rule"));
+                                std::string("Invalid port 0 in allow rule") + where());
                         }
                     }
                 }
@@ -142,14 +166,15 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_string(std::string_vi
                     for (uint16_t port : target.ports) {
                         if (port == 0) {
                             return util::make_unexpected(
-                                std::string("Invalid port 0 in deny rule"));
+                                std::string("Invalid port 0 in deny rule") + where());
                         }
                     }
                 }
 
                 engine.rules_.push_back(std::move(rule));
             } catch (const YAML::Exception& e) {
-                return util::make_unexpected(std::string("Failed to parse rule: ") + e.what());
+                return util::make_unexpected(std::string("Failed to parse rule: ") + e.what() +
+                                             where());
             }
         }
 
