@@ -473,7 +473,6 @@ std::string InspectServer::render_tunnels_json(const InspectProviders& providers
     if (!first) {
         out += ',';
     }
-    first = false;
     out += "\"tunnels\":[";
 
     if (providers.snapshot) {
