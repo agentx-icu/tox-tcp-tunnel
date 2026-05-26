@@ -318,8 +318,7 @@ TEST_F(KeepaliveTest, DeclaresPeerDeadWhenNoPong) {
     manager->set_on_peer_dead([&dead]() { dead.store(true); });
     // Ping every 1s, declare dead after 1s of silence. No PONGs are ever fed.
     manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/1);
-    EXPECT_TRUE(RunUntil(
-        io_ctx, [&dead] { return dead.load(); }, 5000ms));
+    EXPECT_TRUE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 5000ms));
 }
 
 TEST_F(KeepaliveTest, StaysAliveWhilePongsArrive) {
@@ -348,6 +347,5 @@ TEST_F(KeepaliveTest, SendsPeriodicPingFrames) {
     // Long timeout so the peer is never declared dead during the test; we just
     // want to observe PINGs being emitted on the interval.
     manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/30);
-    EXPECT_TRUE(RunUntil(
-        io_ctx, [&pings] { return pings.load() >= 2; }, 5000ms));
+    EXPECT_TRUE(RunUntil(io_ctx, [&pings] { return pings.load() >= 2; }, 5000ms));
 }

@@ -668,7 +668,7 @@ TEST_F(TunnelDataFlowTest, BackpressuredServerDeliversFullStreamThenClose) {
 //   send window before each drain. This is the sustained-backpressure pattern
 //   a slow transport produces. Reports wall time + throughput so the O(n^2)
 //   coalesce front-erase cost (and any fix) is measurable.
-//   Run with: integration_tests --gtest_also_run_disabled_tests \
+//   Run with: integration_tests --gtest_also_run_disabled_tests
 //             --gtest_filter='*BackpressureDrainThroughput'
 // ============================================================================
 
@@ -730,7 +730,7 @@ TEST_F(TunnelDataFlowTest, DISABLED_BackpressureDrainThroughput) {
 //   sink (so the transport accepts instantly). Pushes a large stream so the
 //   coalesce + frame-build + hand-off hot path can be profiled with
 //   `sample <pid>` while it runs. Reports MiB/s.
-//   Run: integration_tests --gtest_also_run_disabled_tests \
+//   Run: integration_tests --gtest_also_run_disabled_tests
 //        --gtest_filter='*SendPathThroughput'
 // ============================================================================
 
