@@ -608,13 +608,13 @@ rules:
         ports: [22]
 ```
 
-### Tunnel resume (opt-in, partial in v0.4.0)
+### Tunnel resume (opt-in, live in v0.4.x)
 
 ```yaml
 tunnel:
   resume:
-    enabled: false             # opt-in; default off. Wire format ships but the
-                                # live handshake driver lands in v0.4.1.
+    enabled: false             # opt-in; default off. Live in v0.4.x: opcodes
+                                # 0x08 / 0x09 are wire-active only when enabled.
     max_age_seconds: 300
     on_gap: passthrough
 ```

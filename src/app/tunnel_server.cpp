@@ -842,6 +842,11 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
 
     auto server_tunnel = std::make_shared<tunnel::TunnelImpl>(io_context_->get_io_context(),
                                                               tunnel_id, friend_number);
+    // The server's open-handshake lives here in TunnelServer, not in
+    // TunnelImpl::handle_tunnel_open_frame, so set the target explicitly so
+    // `toxtunnel inspect tunnels` can render the real `host:port` instead of
+    // the bare ":0" placeholder.
+    server_tunnel->set_target(target_host, target_port);
     server_tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                       config_.tunnel.coalesce_max_bytes);
     apply_coalesce_and_flow_control(*server_tunnel);
@@ -1155,8 +1160,18 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // if on_disconnect fires synchronously from tcp_conn->close().
     tcp_conn->set_on_disconnect(
         [this, weak_manager, friend_number, tunnel_id](const std::error_code& ec) {
-            util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}", tunnel_id,
-                                friend_number, ec.message());
+            // ec is default-constructed for a clean half-close / EOF teardown.
+            // Calling ec.message() in that case renders the platform's "no
+            // error" string ("Undefined error: 0" on macOS, "Success" on
+            // Linux), which reads as an error in logs even though nothing
+            // went wrong. Switch the wording on whether the code is real.
+            if (ec) {
+                util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}", tunnel_id,
+                                    friend_number, ec.message());
+            } else {
+                util::Logger::debug("TCP closed cleanly for tunnel {} (friend {})", tunnel_id,
+                                    friend_number);
+            }
 
             asio::post(io_context_->get_io_context(), [weak_manager, tunnel_id]() {
                 // Resolve via weak_manager (works whether the manager is live or

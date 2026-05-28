@@ -77,7 +77,7 @@ When maintenance is complete:
    - Windows (Administrator): `toxtunnel.exe reload -c 'C:\ProgramData\ToxTunnel\config.yaml'`
    - Verify the reload landed: grep the log for `config reloaded (rules: N rules)`
    - Existing tunnels keep flowing; new TUNNEL_OPEN frames from the revoked friend are denied immediately
-   - Fallback path if reload isn't available: `sudo systemctl restart toxtunnel@server` (drops all open tunnels)
+   - Fallback path if reload isn't available: `sudo systemctl restart toxtunnel` (drops all open tunnels)
 3. **Revoke DB access** if applicable: `DROP USER contractor_readonly;`
 4. **Review logs**: `grep "contractor-key-prefix" /var/log/toxtunnel/server.log`
 5. **Confirm via inspect**: `toxtunnel inspect tunnels` — the contractor should no longer appear as a friend with open tunnels

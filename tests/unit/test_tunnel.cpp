@@ -118,6 +118,26 @@ TEST_F(TunnelTest, OpenTunnel_StoresTargetInfo) {
     EXPECT_EQ(tunnel.target_port(), 443);
 }
 
+// Regression for the v0.4.4 server-side "target: \":0\"" bug: when TunnelServer
+// constructs a server-role TunnelImpl, the open-handshake lives in
+// TunnelServer rather than in handle_tunnel_open_frame, so target_host_ /
+// target_port_ are never populated from the OPEN payload — `inspect tunnels`
+// then prints the literal ":0". The setter exists for that exact path.
+TEST_F(TunnelTest, SetTarget_PopulatesTargetHostAndPort) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    EXPECT_EQ(tunnel.target_host(), "");
+    EXPECT_EQ(tunnel.target_port(), 0);
+
+    tunnel.set_target("10.0.0.1", 5432);
+    EXPECT_EQ(tunnel.target_host(), "10.0.0.1");
+    EXPECT_EQ(tunnel.target_port(), 5432);
+
+    // Idempotent / overridable.
+    tunnel.set_target("example.com", 22);
+    EXPECT_EQ(tunnel.target_host(), "example.com");
+    EXPECT_EQ(tunnel.target_port(), 22);
+}
+
 TEST_F(TunnelTest, OpenTunnel_FailsIfNotInNoneState) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
     tunnel.set_state(Tunnel::State::Connecting);

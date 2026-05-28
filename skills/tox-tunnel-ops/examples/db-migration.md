@@ -104,7 +104,7 @@ psql -h 127.0.0.1 -p 15432 -U migration_ro -d mydb -c "SELECT count(*) FROM migr
 
 1. **Verify migration results** using the read-only user
 2. **Remove the DBA's rule** from `rules.yaml`
-3. **Restart the server**: `sudo systemctl restart toxtunnel@server`
+3. **Reload the server** (preserves existing tunnels): `sudo systemctl reload toxtunnel` — only restart if a non-reloadable field changed.
 4. **Drop temporary users**:
    ```sql
    DROP USER migration_ro;

@@ -431,10 +431,15 @@ cursor.executemany("INSERT INTO table VALUES (%s)", data)
 
 ### Compression
 
-For large datasets:
+ToxTunnel forwards raw TCP bytes and does **not** add tunnel-level
+compression. To shrink the payload, compress at the application layer
+(the example below uses `zlib`) or enable the database driver's own
+on-the-wire compression (e.g. MySQL's `compress` flag, PostgreSQL's
+`sslcompression` — though deprecated, or use SSH ProxyCommand which
+supports `-C` for compression).
 
 ```python
-# Python with zlib
+# Application-side compression — the tunnel still sees raw bytes
 import zlib
 import psycopg2
 
@@ -444,6 +449,11 @@ def send_compressed_data(conn, data):
         cur.execute("INSERT INTO large_data (compressed_data) VALUES (%s)",
                     (compressed,))
 ```
+
+For bulk-data workloads, also leave `flow_control.mode: bdp` (the
+default since v0.4.1) — it scales the per-tunnel send window with
+observed RTT × bandwidth and outperforms the fixed 256 KiB window for
+high-RTT links typical of Tox.
 
 ### Connection Reuse
 
@@ -511,7 +521,7 @@ ssh remote-server "netstat -tlnp | grep 5432"
 lsof -i :5432
 
 # Enable debug logging
-./build/toxtunnel -m client --server-id ID -d /tmp -v debug
+./build/toxtunnel -m client --server-id ID -d /tmp -l debug
 ```
 
 ### Authentication Failed
@@ -540,7 +550,7 @@ lsof -i :5432
 **Debug flow**:
 ```bash
 1. Monitor ToxTunnel logs on both machines
-2. Check tunnel is connected (tunnel list command if available)
+2. Check tunnel is connected: `toxtunnel inspect tunnels --data-dir <dir>`
 3. Verify target service is accessible locally on remote machine
 4. Test with simpler tools (telnet/nc)
 ```

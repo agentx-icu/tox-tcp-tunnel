@@ -365,12 +365,18 @@ tunnel:
   idle_timeout_seconds: 0          # 0 = disabled (default). >0 closes tunnels
                                     # that have been idle (no TUNNEL_DATA in
                                     # either direction) for this long.
-  reaper_tick_seconds: 30          # how often the reaper scans; only matters
+  reaper_tick_seconds: 10          # how often the reaper scans; only matters
                                     # if idle_timeout_seconds > 0.
 
   keepalive_interval_seconds: 0    # 0 = disabled (default). >0 sends a PING to
                                     # each peer every interval and declares it
                                     # dead after 3× of no PONG.
+
+  # Recommendation: set `idle_timeout_seconds: 60` (or longer) on the SERVER
+  # to reclaim tunnels whose peer abandoned the TCP connection without a
+  # clean close. Otherwise a tunnel can linger in "Disconnecting" state
+  # indefinitely while waiting for the reciprocal close that never arrives —
+  # observable in `toxtunnel inspect tunnels` with a growing `idle_seconds`.
 
   coalesce_max_delay_us: 200       # 0 disables coalescing. Otherwise the
                                     # per-tunnel WriteQueue holds small writes
@@ -384,7 +390,7 @@ tunnel:
 | Field | Default | Reloadable? | Effect |
 |---|---|---|---|
 | `idle_timeout_seconds` | `0` (off) | restart | Idle reaper threshold. When >0 the reaper closes tunnels with no TUNNEL_DATA in either direction for the given duration. |
-| `reaper_tick_seconds` | `30` | restart | Reaper scan period. Lower = faster reclaim, higher = less wake-up overhead. |
+| `reaper_tick_seconds` | `10` | restart | Reaper scan period. Lower = faster reclaim, higher = less wake-up overhead. |
 | `keepalive_interval_seconds` | `0` (off) | restart | Application-level PING/PONG liveness. When >0, each peer is PINGed every interval and declared dead after `3×interval` of no PONG — the server drops that friend's tunnels, the client marks the active server offline so failover promotes a fallback. Catches an app wedged while its toxcore link still looks alive. |
 | `coalesce_max_delay_us` | `200` | restart | Max time a small write is buffered before being emitted. `0` disables coalescing — every write becomes its own TUNNEL_DATA frame, matching pre-v0.3.0 behaviour. |
 | `coalesce_max_bytes` | `1362` | restart | Buffer-size flush threshold. Should be ≤ TUNNEL_DATA payload MTU; higher values are clamped. |
@@ -412,20 +418,21 @@ brief burst. Transitions log at DEBUG and increment
 
 ```yaml
 flow_control:
-  mode: fixed                  # fixed (default; v0.3.0) | bdp
+  mode: bdp                    # bdp (default since v0.4.1) | fixed (v0.3.0 cadence)
   send_window_min_bytes: 65536           # 64 KiB clamp floor (bdp mode)
   send_window_max_bytes: 4194304         # 4 MiB clamp ceiling (bdp mode)
   safety_factor_x100: 150                # 1.5× BDP headroom
   fixed_window_bytes: 262144             # 256 KiB — used in fixed mode
 ```
 
-When `mode: bdp`, the per-tunnel `BdpFlowControl` updates an EWMA of
-RTT (from PING/PONG round-trip) and bandwidth (cumulative-ACK delta)
-and recomputes the target window as `bdp × safety_factor_x100 / 100`
-clamped to `[min, max]`. ACK threshold scales proportionally to keep
-~16 ACKs in flight regardless of window size.
+`mode: bdp` is the default since v0.4.1. The per-tunnel
+`BdpFlowControl` updates an EWMA of RTT (from PING/PONG round-trip)
+and bandwidth (cumulative-ACK delta) and recomputes the target window
+as `bdp × safety_factor_x100 / 100` clamped to `[min, max]`. ACK
+threshold scales proportionally to keep ~16 ACKs in flight regardless
+of window size.
 
-`mode: fixed` preserves the v0.3.0 256 KiB / 16 KiB cadence
+`mode: fixed` opts out and locks the v0.3.0 256 KiB / 16 KiB cadence
 byte-for-byte. Non-reloadable.
 
 ### Tunnel-resume protocol (`tunnel.resume:`) — opt-in
@@ -533,14 +540,14 @@ the next consume + refill cycle.
 ```yaml
 metrics:
   enabled: false                       # default: off
-  listen: "127.0.0.1:9105"             # bind address — loopback recommended
+  listen: "127.0.0.1:9100"             # bind address — loopback recommended
   # path: /metrics                     # optional; default /metrics
 ```
 
 | Field | Default | Reloadable? | Effect |
 |---|---|---|---|
 | `metrics.enabled` | `false` | restart | Master switch. Setting to `true` starts `MetricsServer` at boot. |
-| `metrics.listen` | `127.0.0.1:9105` | restart | HTTP bind. Use a non-loopback bind only if you front-proxy with TLS + auth. |
+| `metrics.listen` | `127.0.0.1:9100` | restart | HTTP bind. Use a non-loopback bind only if you front-proxy with TLS + auth. |
 | `metrics.path` | `/metrics` | restart | URL path. Other paths return `404`. |
 
 The full list of exported series is in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
@@ -558,17 +565,17 @@ surface.
 ```yaml
 inspect:
   enabled: true                        # default: on
-  socket_path: ""                      # empty = <data_dir>/toxtunnel.sock
-                                        # (POSIX) or
-                                        # \\.\pipe\toxtunnel-inspect-<pid> (Windows)
-  socket_mode: 0600                    # POSIX-only; chmod on the socket file
 ```
 
 | Field | Default | Reloadable? | Effect |
 |---|---|---|---|
 | `inspect.enabled` | `true` | restart | Master switch. Set to `false` to disable the IPC listener entirely. |
-| `inspect.socket_path` | `<data_dir>/toxtunnel.sock` | restart | Where to bind. Override only if `data_dir` lives on a filesystem that does not support sockets. |
-| `inspect.socket_mode` | `0600` | restart | POSIX file mode on the socket inode. `0660` is appropriate if you run the daemon as a system user and want a group to peek. |
+
+The socket path is hard-coded by platform — there is no
+`inspect.socket_path` or `inspect.socket_mode` setting. On POSIX the
+listener binds at `<data_dir>/toxtunnel.sock` (mode `0600` per OS umask
+at create time); on Windows it serves `\\.\pipe\toxtunnel-inspect-<pid>`.
+If you need a different path, change `data_dir`.
 
 The IPC wire format (single-line JSON request → single-line JSON reply) and
 the catalogue of `cmd` values live in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
@@ -595,7 +602,10 @@ place, without dropping existing tunnels, when it receives:
 
 `mode`, `data_dir`, the entire `tox.*` block, `server.disclose.*`,
 `client.server_id`, `client.failover.*`, `client.socks5.*`, the entire
-`metrics.*` block, the entire `inspect.*` block, and the `tunnel.*` block.
+`metrics.*` block, the entire `inspect.*` block, the entire `tunnel.*`
+block (including `coalesce_*`, `idle_timeout_seconds`, `reaper_tick_seconds`,
+`keepalive_*`, and `resume.*`), the entire `flow_control.*` block, and
+the entire `watchdog.*` block.
 
 Changing any of those requires a full restart. A reload that touches one of
 them is rejected as a whole — no partial application — and logged at WARN:

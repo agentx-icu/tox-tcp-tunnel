@@ -345,15 +345,36 @@ curl -k https://localhost:PORT
 **Solutions**:
 1. Check your internet connection on both machines
 2. Try different bootstrap nodes
-3. Reduce the MTU if on a slow connection
-4. Consider using compression for large transfers
+3. Make sure `flow_control.mode: bdp` (the default since v0.4.1) is not
+   overridden — `fixed` mode locks the send window to 256 KiB regardless
+   of real bandwidth-delay product. `bdp` mode adapts to the link.
+4. Inspect per-tunnel state with `toxtunnel inspect tunnels` and watch
+   `bytes_in` / `bytes_out`. If they advance in 16 KiB-shaped bursts with
+   long pauses, the toxcore lossless queue is full and back-pressuring the
+   tunnel — usually a sign of a slow TCP relay on the Tox network rather
+   than a tunable.
+5. If most writes are sub-MTU (cookie-shaped requests), try
+   `tunnel.coalesce_mode: adaptive` to let the coalescer pick between
+   bypass / batch per tunnel.
+
+ToxTunnel does **not** apply application-level compression — the tunnel
+forwards raw TCP bytes. Compression is the responsibility of the HTTP
+client/server (gzip, brotli). There is also no MTU tunable; the
+TUNNEL_DATA payload limit is fixed at **1367 bytes** per frame
+(`kMaxTcpPayloadPerToxFrame`), which is the Tox 1373-byte custom-packet
+ceiling minus a 1-byte lossless prefix and the 5-byte tunnel header.
+The default `tunnel.coalesce_max_bytes` of 1362 leaves a small safety
+margin under that ceiling.
 
 ### Connection Drops
 
 **Symptom**: Connections reset after some time
 
 **Solutions**:
-1. Configure keep-alive settings
+1. Set `tunnel.keepalive_interval_seconds` (off by default) — when >0
+   the tunnel exchanges PING/PONG every interval and declares the peer
+   dead after 3× without a PONG, recovering faster than toxcore's own
+   transport timeouts.
 2. Check for firewall restrictions
 3. Verify both ToxTunnel instances stay running
 4. Enable debug logging to investigate

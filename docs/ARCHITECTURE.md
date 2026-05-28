@@ -127,8 +127,9 @@ threads**. All four live entirely on the existing asio I/O pool:
 - `MetricsServer` and `InspectServer` are plain asio acceptors with per-connection strands.
 - `Socks5Listener` shares the pool with the regular forward listeners.
 - SIGHUP is wired through `asio::signal_set` bound to the main `IoContext` on POSIX. On
-  Windows there is no SIGHUP — `ConfigReload` watches a named pipe (configurable via
-  `service.reload_pipe`) on the same pool.
+  Windows there is no SIGHUP — `ConfigReload` watches a named pipe at
+  `\\.\pipe\toxtunnel-reload-<pid>` (path hard-coded by PID, not configurable) on the
+  same pool. The `toxtunnel reload` CLI helper writes one byte to it.
 - `MetricsRegistry` is updated lock-free (atomic increments) from any thread, including
   the Tox thread, without marshalling.
 
@@ -231,7 +232,9 @@ Either trigger calls `ConfigReload::apply()`, which:
 2. Diffs the parsed result against the live `Config`.
 3. **Rejects** the reload (no changes applied) if any non-reloadable field
    changed: `mode`, `data_dir`, `tox.*`, `server.disclose.*`, `client.server_id`,
-   `client.failover.*`, `metrics.*`, `inspect.*`, `client.socks5.*`.
+   `client.failover.*`, `metrics.*`, `inspect.*`, `client.socks5.*`, the entire
+   `tunnel.*` block (`coalesce_*`, `idle_timeout_seconds`, `reaper_tick_seconds`,
+   `keepalive_*`, `resume.*`), `flow_control.*`, and `watchdog.*`.
 4. Otherwise atomically swaps the reloadable subset — `rules_file` contents,
    `client.forwards`, and `logging.level` — under the strand that owns each
    consumer. Existing tunnels are **not** torn down on a successful reload
@@ -396,8 +399,12 @@ tox-tcp-tunnel/
       circular_buffer.hpp
   src/                          # Implementations (mirrors include/)
   tests/
-    unit/                       # Unit tests (232 tests)
-    integration/                # Integration tests (41 tests)
+    unit/                       # Unit tests
+    integration/                # Integration tests
+    packaging/                  # CPack layout tests
+    soak/                       # `ctest -L soak` long-running fixtures
+    chaos/                      # `ctest -L chaos` fault-injection fixtures
+                                # (~535 tests total across all suites)
   third_party/
     c-toxcore/                  # toxcore git submodule
   docs/                         # Documentation

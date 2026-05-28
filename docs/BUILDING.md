@@ -137,9 +137,24 @@ cmake --build build
 ./build/tests/unit_tests
 ./build/tests/integration_tests
 
-# Or via CTest
+# Or via CTest — runs the default suites: unit, integration, packaging
 cd build && ctest --output-on-failure
 ```
+
+### Optional CTest labels
+
+`tests/soak/` and `tests/chaos/` are excluded from the default `ctest` run
+to keep CI fast. Run them explicitly when investigating long-running or
+fault-injection behaviour:
+
+```bash
+cd build && ctest -L soak  --output-on-failure   # long-running fixtures
+cd build && ctest -L chaos --output-on-failure   # fault-injection fixtures
+```
+
+`tests/packaging/` runs as part of the default suite and is what validates
+that a `cpack`-built DEB/RPM/PKG/MSI lays its files down where each
+platform expects them.
 
 The throughput benchmarks are compiled into the integration binary but are
 disabled under normal CTest runs so CI stays quick. Run them explicitly when

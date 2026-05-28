@@ -74,6 +74,12 @@ std::string TunnelImpl::target_host() const {
     return target_host_;
 }
 
+void TunnelImpl::set_target(const std::string& host, std::uint16_t port) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    target_host_ = host;
+    target_port_ = port;
+}
+
 uint16_t TunnelImpl::target_port() const noexcept {
     return target_port_;
 }

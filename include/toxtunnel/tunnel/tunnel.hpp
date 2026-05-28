@@ -291,6 +291,15 @@ class TunnelImpl : public Tunnel {
     /// Get the TCP connection (may be null).
     [[nodiscard]] std::shared_ptr<core::TcpConnection> tcp_connection() const;
 
+    /// Server-side: record the resolved target host/port so `inspect tunnels`
+    /// can render `target` instead of the bare `":0"` placeholder. The client
+    /// side populates these via `open()`; the server constructs the tunnel
+    /// outside the TunnelImpl::handle_tunnel_open_frame path (intentionally —
+    /// the server-role open handshake lives in TunnelServer), so it needs an
+    /// explicit setter. Safe to call at any time; the value is only consumed
+    /// by getters.
+    void set_target(const std::string& host, std::uint16_t port);
+
     // -----------------------------------------------------------------
     // State management
     // -----------------------------------------------------------------

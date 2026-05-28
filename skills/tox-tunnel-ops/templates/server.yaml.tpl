@@ -41,7 +41,12 @@ logging:
 #   coalesce_max_delay_us: 200    # default-on small-write coalescing
 #   coalesce_max_bytes: 1362      # ≤ Tox 1367-byte frame limit
 #   coalesce_mode: fixed          # v0.4: fixed (default) | adaptive | bypass | drain
-#   idle_timeout_seconds: 0       # 0 = disabled; set e.g. 900 to reap idle tunnels
+#   keepalive_interval_seconds: 0 # v0.4: 0=off; >0 sends PING/PONG every Ns,
+#                                 # declares peer dead after 3× of no PONG.
+#   idle_timeout_seconds: 0       # 0 = disabled; SERVER deployments are
+#                                 # encouraged to set this (e.g. 600–1800) to
+#                                 # reap tunnels whose peer abandoned the TCP
+#                                 # connection without a clean close.
 #   reaper_tick_seconds: 10       # reaper wake-up interval
 #   resume:                       # v0.4: tunnel fast-reattach (opt-in)
 #     enabled: false              # opcodes wire-inactive when false
@@ -54,7 +59,7 @@ logging:
 #   deadline_seconds: 30          # std::abort() if heartbeat stalls past this
 #   systemd_notify: true          # sd_notify(WATCHDOG=1) on Linux only
 # flow_control:
-#   mode: fixed                   # fixed (default) | bdp (BDP-aware send window)
+#   mode: bdp                     # bdp (default since v0.4.1) | fixed (v0.3.0 cadence)
 #   send_window_min_bytes: 65536  # 64 KiB clamp floor (bdp mode)
 #   send_window_max_bytes: 4194304   # 4 MiB clamp ceiling (bdp mode)
 #   safety_factor_x100: 150       # 1.5× BDP headroom

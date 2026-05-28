@@ -211,7 +211,7 @@ The `toxtunnel_coalesce_policy_transitions_total` counter ticks on
 every state-machine move. If it climbs fast under steady traffic, the
 EWMA is flapping. Workarounds:
 
-1. Pin the mode: `tunnel.coalesce_mode: fixed` (v0.3.0 behaviour).
+1. Pin the mode: `tunnel.coalesce_mode: fixed` to lock to the v0.3.0 cadence.
 2. For bulk-only workloads pin `bypass`; for trickle-only pin `batch`.
 
 ### Symptom: high BDP link still capped at 256 KiB

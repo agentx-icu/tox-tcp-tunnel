@@ -75,8 +75,13 @@ The `friend` value must be the contractor's 64-character hex public key. They ca
 
 **To revoke access:**
 1. Remove the contractor's entry from `rules.yaml`
-2. Restart the server: `sudo systemctl restart toxtunnel@server` (or kill and restart)
-3. The contractor's tunnels will be denied immediately
+2. **Reload** the server so existing tunnels survive but the next
+   TUNNEL_OPEN from the revoked friend is denied:
+   `sudo systemctl reload toxtunnel` (POSIX, sends SIGHUP) or
+   `toxtunnel reload` (cross-platform; uses the local IPC).
+   Use `sudo systemctl restart toxtunnel` only if the change touched a
+   non-reloadable field.
+3. The contractor's NEW tunnel attempts will be denied immediately.
 
 Also consider:
 - Drop the temporary database user

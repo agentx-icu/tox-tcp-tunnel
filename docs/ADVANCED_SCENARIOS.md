@@ -674,7 +674,7 @@ stack. See [`docs/CONFIGURATION.md`](CONFIGURATION.md) ("Prometheus Metrics
 ```yaml
 metrics:
   enabled: true
-  listen: "127.0.0.1:9105"   # loopback-only — fronted by node_exporter / reverse proxy
+  listen: "127.0.0.1:9100"   # loopback-only — fronted by node_exporter / reverse proxy
 ```
 
 Reload semantics: `metrics.*` is **not** SIGHUP-reloadable. A restart is
@@ -683,7 +683,7 @@ required to flip the listener on or change its bind.
 ### Quick sanity check
 
 ```bash
-curl -s http://127.0.0.1:9105/metrics | head
+curl -s http://127.0.0.1:9100/metrics | head
 # # HELP toxtunnel_tunnels_open Tunnels currently in OPEN state
 # # TYPE toxtunnel_tunnels_open gauge
 # toxtunnel_tunnels_open 4
@@ -700,15 +700,15 @@ scrape_configs:
     scrape_interval: 15s
     static_configs:
       - targets:
-          - homelab.internal:9105
-          - dmz.internal:9105
+          - homelab.internal:9100
+          - dmz.internal:9100
         labels:
           service: toxtunnel
 ```
 
 Run Prometheus itself behind ToxTunnel if the daemon's `metrics.listen` is
 loopback-only — add a `forwards:` mapping on the scraper host pointing at
-`127.0.0.1:9105` on each target.
+`127.0.0.1:9100` on each target.
 
 ### Alertmanager rule examples
 
@@ -829,7 +829,7 @@ sudo journalctl -u toxtunnel -n 5 --no-pager | grep -i reload
 # Reload applied: rules_file=/etc/toxtunnel/rules.yaml (3 allow, 1 deny)
 
 # 4. Confirm via the metrics counter (if metrics.enabled).
-curl -s http://127.0.0.1:9105/metrics | grep toxtunnel_reloads_total
+curl -s http://127.0.0.1:9100/metrics | grep toxtunnel_reloads_total
 # toxtunnel_reloads_total{result="success"} 7
 # toxtunnel_reloads_total{result="rejected"} 0
 ```
@@ -867,15 +867,23 @@ rejects the whole reload. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
 ### Recommended workflow for sensitive rule changes
 
 ```bash
-# Stage the new file alongside, validate it without applying.
+# Stage the new file alongside the live one.
 sudo cp /etc/toxtunnel/rules.yaml /etc/toxtunnel/rules.yaml.next
 sudoedit /etc/toxtunnel/rules.yaml.next
-toxtunnel config check --rules /etc/toxtunnel/rules.yaml.next
 
-# Atomically move it into place, then signal.
+# Atomically move it into place, then signal the daemon to reload.
+# If the new file fails to parse, the daemon logs
+#   `Reload rejected: …`
+# at WARN and keeps running the previous rules — no traffic interruption.
 sudo mv /etc/toxtunnel/rules.yaml.next /etc/toxtunnel/rules.yaml
 sudo systemctl reload toxtunnel
+sudo journalctl -u toxtunnel -n 5 --no-pager   # confirm "Reload applied: …"
 ```
+
+There is no dedicated `toxtunnel config check` subcommand — the
+reload's parse step is the validator, and a rejection is structurally
+identical to a "would not have applied" dry-run because the live config
+is left untouched.
 
 ---
 
