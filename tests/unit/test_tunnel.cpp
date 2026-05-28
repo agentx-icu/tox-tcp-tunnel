@@ -574,7 +574,8 @@ TEST_F(TunnelTest, TcpBackpressureBuffersCurrentChunkUntilAck) {
                                    sent_frames[0].as_tunnel_data().end()),
               first_chunk);
 
-    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, first_chunk.size()));
+    tunnel.handle_frame(
+        ProtocolFrame::make_tunnel_ack(test_tunnel_id, static_cast<uint32_t>(first_chunk.size())));
 
     ASSERT_EQ(sent_frames.size(), 2u);
     EXPECT_EQ(std::vector<uint8_t>(sent_frames[1].as_tunnel_data().begin(),
@@ -614,7 +615,8 @@ TEST_F(TunnelTest, TcpReadEofWaitsForBufferedChunkToFlushBeforeClose) {
     ASSERT_EQ(frame_types.size(), 1u);
     EXPECT_EQ(frame_types[0], FrameType::TUNNEL_DATA);
 
-    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, first_chunk.size()));
+    tunnel.handle_frame(
+        ProtocolFrame::make_tunnel_ack(test_tunnel_id, static_cast<uint32_t>(first_chunk.size())));
 
     ASSERT_EQ(frame_types.size(), 3u);
     EXPECT_EQ(frame_types[1], FrameType::TUNNEL_DATA);
