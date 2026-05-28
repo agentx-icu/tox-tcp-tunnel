@@ -317,11 +317,29 @@ class ToxAdapter {
     // Data transfer
     // -----------------------------------------------------------------
 
+    /// Outcome of a lossless send attempt — split into retryable backpressure
+    /// vs. permanent failure so callers can decide whether to park the frame
+    /// in a retry queue (SENDQ pressure clears in milliseconds) or drop it
+    /// outright (peer disconnected, frame malformed, etc.).
+    enum class LosslessSendOutcome : std::uint8_t {
+        Sent,           ///< Accepted by toxcore.
+        SendqFull,      ///< TOX_ERR_FRIEND_CUSTOM_PACKET_SENDQ — transient.
+        PermanentFail,  ///< Any other error: not connected, invalid, too long.
+    };
+
+    /// Typed variant of `send_lossless_packet` that distinguishes transient
+    /// backpressure from permanent failure. Prefer this for control-frame
+    /// paths that may want to queue-and-retry the SENDQ-full case but bail
+    /// out (and surface the failure to the caller) for permanent errors.
+    [[nodiscard]] LosslessSendOutcome send_lossless_packet_typed(
+        uint32_t friend_number, const uint8_t* data, std::size_t length);
+
     /// Send a custom lossless packet to a friend.
     ///
     /// The first byte of `data` must be in the range [160, 191].
     ///
-    /// @return true on success, false on failure.
+    /// @return true on success, false on any failure (transient or permanent
+    ///         — for the distinction use `send_lossless_packet_typed`).
     [[nodiscard]] bool send_lossless_packet(uint32_t friend_number, const uint8_t* data,
                                             std::size_t length);
 

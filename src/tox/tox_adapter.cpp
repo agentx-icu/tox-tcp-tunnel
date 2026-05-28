@@ -632,10 +632,10 @@ std::vector<FriendInfo> ToxAdapter::get_friend_info_list() const {
 // Data transfer
 // ===========================================================================
 
-bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const uint8_t* data,
-                                      std::size_t length) {
+ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(
+    uint32_t friend_number, const uint8_t* data, std::size_t length) {
     if (!initialized_.load() || !data || length == 0) {
-        return false;
+        return LosslessSendOutcome::PermanentFail;
     }
 
     // Hot data path. The dominant caller is the Tox thread itself (the lossless
@@ -644,26 +644,39 @@ bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const uint8_t* dat
     // promise/future, no allocation. TCP I/O-thread callers marshal a single
     // closure across to the Tox thread and block on a future; that round-trip
     // is the unavoidable cost of toxcore's single-thread requirement.
-    return run_on_tox_thread([&]() -> bool {
+    return run_on_tox_thread([&]() -> LosslessSendOutcome {
+        TOX_ERR_FRIEND_CUSTOM_PACKET err;
         bool ok;
         {
             std::lock_guard<std::mutex> lock(tox_mutex_);
-
-            TOX_ERR_FRIEND_CUSTOM_PACKET err;
             ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
-
-            if (!ok || err != TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
-                util::Logger::debug("Send lossless packet failed for friend {}: error {}",
-                                    friend_number, static_cast<int>(err));
-                return false;
-            }
         }
 
-        // Wake the iterate loop so the packet hits the network now rather than
-        // at the next idle tick. Harmless no-op when already on the Tox thread.
-        wake_cv_.notify_one();
-        return true;
+        if (ok && err == TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
+            // Wake the iterate loop so the packet hits the network now rather
+            // than at the next idle tick. Harmless no-op on the Tox thread.
+            wake_cv_.notify_one();
+            return LosslessSendOutcome::Sent;
+        }
+
+        util::Logger::debug("Send lossless packet failed for friend {}: error {}", friend_number,
+                            static_cast<int>(err));
+        // SENDQ-full is the only error class we want callers to retry: toxcore's
+        // outbound queue is bounded and drains as packets transit. Every other
+        // error (NULL / EMPTY / INVALID / TOO_LONG / FRIEND_NOT_FOUND /
+        // FRIEND_NOT_CONNECTED) is a permanent decision — retrying would just
+        // burn CPU and, in the multi-server failover case, eventually replay
+        // the frame on the *new* server when the old one stays offline.
+        if (err == TOX_ERR_FRIEND_CUSTOM_PACKET_SENDQ) {
+            return LosslessSendOutcome::SendqFull;
+        }
+        return LosslessSendOutcome::PermanentFail;
     });
+}
+
+bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const uint8_t* data,
+                                      std::size_t length) {
+    return send_lossless_packet_typed(friend_number, data, length) == LosslessSendOutcome::Sent;
 }
 
 bool ToxAdapter::send_lossless_packet(uint32_t friend_number, const std::vector<uint8_t>& data) {

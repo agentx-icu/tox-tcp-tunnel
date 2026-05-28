@@ -684,10 +684,10 @@ required to flip the listener on or change its bind.
 
 ```bash
 curl -s http://127.0.0.1:9100/metrics | head
-# # HELP toxtunnel_tunnels_open Tunnels currently in OPEN state
-# # TYPE toxtunnel_tunnels_open gauge
-# toxtunnel_tunnels_open 4
-# # HELP toxtunnel_bytes_in_total Bytes received per direction
+# # HELP toxtunnel_tunnels_active Currently open tunnels.
+# # TYPE toxtunnel_tunnels_active gauge
+# toxtunnel_tunnels_active{role="server"} 4
+# # HELP toxtunnel_bytes_in_total Bytes received from Tox peers.
 # ...
 ```
 
@@ -718,24 +718,30 @@ groups:
   - name: toxtunnel
     rules:
       - alert: ToxTunnelNoFriendsOnline
-        expr: toxtunnel_active_friends == 0
+        expr: toxtunnel_friends_online == 0
         for: 5m
         labels: { severity: page }
         annotations:
           summary: "ToxTunnel has zero peers online for 5m"
 
-      - alert: ToxTunnelReloadsRejected
-        expr: increase(toxtunnel_reloads_total{result="rejected"}[15m]) > 0
+      - alert: ToxTunnelOpenDenied
+        expr: rate(toxtunnel_tunnels_opened_total{result="denied"}[5m]) > 0
+        for: 5m
         labels: { severity: warn }
         annotations:
-          summary: "A SIGHUP / reload attempt was rejected — non-reloadable field changed"
+          summary: "Sustained TUNNEL_OPEN denials — rules.yaml is rejecting peers"
 
-      - alert: ToxTunnelFailoverStorm
-        expr: increase(toxtunnel_failover_switchovers_total[10m]) > 3
+      - alert: ToxTunnelIterateLag
+        expr: toxtunnel_tox_iterate_lag_milliseconds_max > 100
+        for: 5m
         labels: { severity: page }
         annotations:
-          summary: "Active-server switchovers exceeded 3 in 10m — primary is flapping"
+          summary: "Tox thread iterate lag > 100 ms — investigate CPU / I/O"
 ```
+
+There is no `toxtunnel_reloads_total` or `toxtunnel_failover_switchovers_total`
+in v0.4.x; for "did the reload land?" use the daemon log line, and for
+failover events grep for `Failover:` in the journal.
 
 ### Grafana
 
@@ -756,22 +762,16 @@ wrong on a running daemon and you need ground truth without restarting.
 ### Interactive triage
 
 ```bash
-# Who am I and how long have I been up?
+# Process / version / friend / tunnel snapshot
 toxtunnel inspect status
 
-# What tunnels are alive right now?
+# What tunnels are alive right now (id, target, state, bytes, idle)?
 toxtunnel inspect tunnels
-
-# Which friends does the daemon see online?
-toxtunnel inspect friends
-
-# Snapshot of every metrics counter (same numbers /metrics serves,
-# even when metrics.enabled = false).
-toxtunnel inspect metrics
 ```
 
-The CLI pretty-prints by default. Pass `--json` for raw IPC output suitable
-for `jq` / scripts:
+`tunnels` and `status` are the only subactions; for friend / metrics detail
+use `/metrics` (Prometheus) or the daemon log. The CLI pretty-prints by
+default; pass `--json` for raw IPC output suitable for `jq` / scripts:
 
 ```bash
 toxtunnel inspect tunnels --json \
@@ -786,10 +786,10 @@ out from anywhere on the same host without depending on the metrics endpoint:
 ```bash
 # Fail the systemd unit's ExecStartPost if no peers are online after boot.
 SOCK=/var/lib/toxtunnel/toxtunnel.sock
-status=$(printf '{"cmd":"status"}\n' \
+online=$(printf 'GET /status\n' \
   | socat - UNIX-CONNECT:$SOCK \
-  | jq -r '.tunnels_open')
-[ "${status:-0}" -gt 0 ] || exit 1
+  | jq -r '.friends_online')
+[ "${online:-0}" -gt 0 ] || exit 1
 ```
 
 ### When inspect is your only option
@@ -828,11 +828,12 @@ sudo kill -HUP $(pidof toxtunnel)
 sudo journalctl -u toxtunnel -n 5 --no-pager | grep -i reload
 # Reload applied: rules_file=/etc/toxtunnel/rules.yaml (3 allow, 1 deny)
 
-# 4. Confirm via the metrics counter (if metrics.enabled).
-curl -s http://127.0.0.1:9100/metrics | grep toxtunnel_reloads_total
-# toxtunnel_reloads_total{result="success"} 7
-# toxtunnel_reloads_total{result="rejected"} 0
+# 4. Confirm via the running tunnels (existing connections should be intact).
+toxtunnel inspect tunnels
 ```
+
+v0.4.x does not export a dedicated `toxtunnel_reloads_total` counter; the log
+line above is the source of truth for "did the reload land?".
 
 If you accidentally edit a non-reloadable field — say you bump `tox.tcp_port`
 in the same checkpoint — the reload is rejected as a whole:

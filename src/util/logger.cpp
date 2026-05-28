@@ -3,6 +3,7 @@
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <chrono>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -38,6 +39,13 @@ void rebuild_logger_locked() {
 
     g_logger = std::make_shared<spdlog::logger>(g_logger_name, g_sinks.begin(), g_sinks.end());
     g_logger->set_level(level);
+    // Without this, the rotating_file_sink's stdio buffer (BUFSIZ, 4-8 KB) holds
+    // every line written below the threshold until it fills. Operators tailing
+    // the log see stale state for minutes during quiet periods and lose the
+    // last buffered window when the daemon is killed. flush_on(info) keeps the
+    // file roughly in sync with steady-state events; spdlog::flush_every below
+    // catches the trace/debug tail.
+    g_logger->flush_on(spdlog::level::info);
 
     if (!pattern.empty()) {
         g_logger->set_pattern(pattern);
@@ -63,6 +71,12 @@ void Logger::init(std::string_view name) {
     g_sinks.push_back(console_sink);
 
     rebuild_logger_locked();
+
+    // Periodic flush as a fallback for messages below the flush_on threshold
+    // (debug/trace under low traffic). 2s is a compromise between log-tail
+    // freshness and the wasted fsync churn from a tighter cadence.
+    // spdlog::flush_every is global and idempotent on repeated calls.
+    spdlog::flush_every(std::chrono::seconds(2));
 }
 
 void Logger::shutdown() {

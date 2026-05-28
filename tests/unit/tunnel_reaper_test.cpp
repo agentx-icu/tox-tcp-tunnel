@@ -156,7 +156,7 @@ class ReaperTest : public ::testing::Test {
 
     void SetUp() override {
         manager = std::make_shared<TunnelManager>(io_ctx);
-        manager->set_send_handler([](const std::vector<uint8_t>&) { return true; });
+        manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
     }
 
     void TearDown() override { manager.reset(); }
@@ -256,7 +256,7 @@ TEST_F(ReaperTest, TimerFiresPeriodically) {
 TEST_F(ReaperTest, DestructorCancelsCleanly) {
     auto local_io = std::make_unique<asio::io_context>();
     auto mgr = std::make_shared<TunnelManager>(*local_io);
-    mgr->set_send_handler([](const std::vector<uint8_t>&) { return true; });
+    mgr->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     auto t = std::make_shared<TunnelImpl>(*local_io, /*tunnel_id=*/600, /*friend_number=*/1);
     t->set_state(Tunnel::State::Connected);
@@ -303,7 +303,7 @@ class KeepaliveTest : public ::testing::Test {
 
     void SetUp() override {
         manager = std::make_shared<TunnelManager>(io_ctx);
-        manager->set_send_handler([](const std::vector<uint8_t>&) { return true; });
+        manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
     }
     void TearDown() override {
         if (manager) {
@@ -342,7 +342,7 @@ TEST_F(KeepaliveTest, SendsPeriodicPingFrames) {
         if (!f.empty() && f[0] == static_cast<uint8_t>(FrameType::PING)) {
             pings.fetch_add(1);
         }
-        return true;
+        return SendOutcome::Sent;
     });
     // Long timeout so the peer is never declared dead during the test; we just
     // want to observe PINGs being emitted on the interval.

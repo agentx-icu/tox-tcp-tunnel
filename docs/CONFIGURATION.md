@@ -632,6 +632,13 @@ logging:
 Reload" above. `logging.file` is **not** reloadable (it is opened at startup);
 rotate it via `logrotate` + `copytruncate` or your platform equivalent.
 
+The file sink flushes immediately on every `info`/`warn`/`error` line, and
+buffered `debug`/`trace` lines are flushed at least every 2 seconds (via
+spdlog's periodic flush thread). Operators tailing the log will see steady-state
+events with no perceptible lag; you do not need to send `SIGUSR1` or any other
+"flush" signal. The trade-off is one extra syscall per `info` line — negligible
+under any realistic toxtunnel workload.
+
 ## Multiple Port Forwards
 
 Client can forward multiple services:
