@@ -101,7 +101,7 @@ tox:
   tcp_port: 33445
   bootstrap_mode: auto    # auto | lan
 server:
-  rules_file: /path/to/rules.yaml   # optional access control
+  rules_file: /path/to/rules.yaml   # access-control rules; unset = default deny
 
 # v0.3.0 top-level blocks (all opt-in unless noted):
 metrics:
@@ -216,7 +216,10 @@ rules:
 - The friend identity key accepts both `friend` (canonical) and `friend_pk` (alias).
   `friend_public_key` is NOT recognized.
 
-If no `rules_file` is configured, the server allows ALL connections from any friend.
+If no `rules_file` is configured, the server is **default-deny**: it refuses
+friend requests whose public key is absent from the rules and no tunnels can be
+opened. For any real deployment, add at least one rule entry per allowed client
+public key before the first connection attempt.
 
 ### Known-Servers Registry (client side)
 
@@ -292,6 +295,8 @@ Subcommands:
   - `--qr`: render the Tox ID as a terminal QR code (for scanning with a phone)
   - `--color`: use ANSI colors in QR output (requires `--qr`)
   - `-d, --data-dir`: data directory for loading/creating identity
+  - It does **not** read `-c/--config`; when the daemon uses a non-default
+    `data_dir`, pass `toxtunnel print-id --data-dir <data_dir>`.
 - `inspect [tunnels|status]`: connect to a running daemon's local IPC channel and print state
   - `tunnels` (default): table of currently open tunnels (id, friend, target, bytes, age)
   - `status`: process / version / friend / metrics snapshot
@@ -538,7 +543,7 @@ For **rules.yaml** (when access control is needed):
 Numbered step-by-step:
 1. Install toxtunnel (prefer the one-line installer with `--mode {server|client}`; fall back to manual package download; build from source as last resort)
 2. Write config files to disk
-3. Start server, note the Tox ID from output (or use `toxtunnel print-id --qr` to display as QR code)
+3. Start server, note the Tox ID from output (or use `toxtunnel print-id --data-dir <server_data_dir> --qr` to display the same identity as a QR code)
 4. Paste Tox ID into client config (scan QR code with phone to transfer ID between machines)
 5. Start client
 6. Test the connection with a scenario-specific command
@@ -688,7 +693,7 @@ Read on demand:
 8. **Pipe mode for SSH.** Always mention SSH ProxyCommand as an alternative for SSH scenarios. Note: pipe mode is POSIX only and **not supported on Windows** — on Windows, always use the `forwards` port-mapping approach instead.
 9. **Security reminders.** Remind users: Tox ID = identity. Keep `tox_save.dat` backed up. Never share private keys.
 10. **Temporary access hygiene.** For any temporary tunnel, always include revocation steps and suggest a time window.
-11. **Use `print-id` for Tox ID sharing.** When users need to transfer a Tox ID between machines, suggest `toxtunnel print-id --qr` to generate a QR code that can be scanned with a phone camera.
+11. **Use `print-id` for Tox ID sharing.** When users need to transfer a Tox ID between machines, suggest `toxtunnel print-id --data-dir <dir> --qr` to generate a QR code that can be scanned with a phone camera. Do not use `-c` for this subcommand.
 12. **Use `--service` for daemon mode.** When setting up persistent services, use the `--service` flag which integrates with systemd (sd_notify) on Linux and Windows SCM on Windows.
 13. **Template rendering.** When generating configs from templates, perform direct string substitution of `{{VARIABLE}}` placeholders. Conditional sections (`{{#SECTION}}...{{/SECTION}}`) are included when the variable is set; inverted sections (`{{^SECTION}}...{{/SECTION}}`) are included when the variable is NOT set.
 14. **Prefer `toxtunnel inspect` over log tailing for live state.** When diagnosing "is this tunnel actually open?" / "how many bytes have flowed?" / "which server is currently active?", reach for `toxtunnel inspect tunnels` and `toxtunnel inspect status` before suggesting `journalctl -f` / `tail -F`. Logs are still authoritative for *historical* events (denied opens, errors, reload acks).

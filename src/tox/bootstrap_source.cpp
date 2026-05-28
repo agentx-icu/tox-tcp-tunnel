@@ -323,8 +323,14 @@ util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve
 }
 
 util::Expected<std::string, BootstrapFetchError> BootstrapSource::fetch_default_nodes_json() {
+    // H-11 (2026-05-26): popen()/curl cannot be interrupted mid-call, so the
+    // background-refresh worker — which cancel_pending_refreshes() joins during
+    // ToxAdapter::stop() — blocks for the full curl timeout if a refresh is in
+    // flight at shutdown. Keep the timeout short so that join is bounded to a
+    // few seconds. The node list is a few KB of JSON, so 8s is ample on any
+    // working network and fails fast on a dead one (we then fall back to cache).
     static constexpr const char* kCommand =
-        "curl -fsSL --connect-timeout 10 --max-time 20 https://nodes.tox.chat/json";
+        "curl -fsSL --connect-timeout 5 --max-time 8 https://nodes.tox.chat/json";
 
 #if defined(_WIN32)
     FILE* pipe = _popen(kCommand, "r");

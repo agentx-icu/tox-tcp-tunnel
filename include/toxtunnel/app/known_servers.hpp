@@ -119,11 +119,14 @@ class KnownServersStore {
     // Lookup
     // ---------------------------------------------------------------------
 
-    /// Look up by exact 76-char uppercase Tox ID. Returns nullptr if absent.
-    [[nodiscard]] const KnownServer* find_by_tox_id(std::string_view tox_id) const;
+    /// Look up by exact 76-char uppercase Tox ID. Returns a copy so the result
+    /// stays valid after `mu_` is released — a concurrent mutation
+    /// (`upsert`/`record_*`) may reallocate the backing vector and dangle any
+    /// pointer into it. std::nullopt if absent.
+    [[nodiscard]] std::optional<KnownServer> find_by_tox_id(std::string_view tox_id) const;
 
-    /// Look up by alias. Returns nullptr if absent.
-    [[nodiscard]] const KnownServer* find_by_alias(std::string_view alias) const;
+    /// Look up by alias. Returns a copy (see `find_by_tox_id`). std::nullopt if absent.
+    [[nodiscard]] std::optional<KnownServer> find_by_alias(std::string_view alias) const;
 
     /// Resolve a user-supplied identifier into a Tox ID:
     /// - If `id_or_alias` is exactly 76 hex chars, returns it uppercased.
@@ -172,7 +175,12 @@ class KnownServersStore {
 
     /// If `reload()` (or the constructor's initial load) failed, returns the
     /// error string; otherwise std::nullopt.
-    [[nodiscard]] const std::optional<std::string>& last_load_error() const noexcept {
+    [[nodiscard]] std::optional<std::string> last_load_error() const {
+        // Return a copy under mu_: reload() mutates last_load_error_ under the
+        // same lock, so handing back a reference would expose a field that can
+        // be torn mid-read by a concurrent reload (the class documents all
+        // public methods as safe to call concurrently).
+        std::lock_guard<std::mutex> lock(mu_);
         return last_load_error_;
     }
 

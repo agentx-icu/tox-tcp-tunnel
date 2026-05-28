@@ -44,6 +44,11 @@ using DataCallback = std::function<void(const uint8_t* data, std::size_t length)
 /// Called when the connection has been fully closed.
 using DisconnectCallback = std::function<void(const std::error_code&)>;
 
+/// Called when the peer half-closes its send side (TCP read EOF). The socket
+/// remains open for writes so full-duplex protocols can continue receiving
+/// data after they stop sending input.
+using ReadEofCallback = std::function<void()>;
+
 /// Called when an error occurs during an async operation.
 using ErrorCallback = std::function<void(const std::error_code&)>;
 
@@ -145,6 +150,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // resume) remain safe from any thread.
     void set_on_connect(ConnectCallback cb);
     void set_on_data(DataCallback cb);
+    void set_on_read_eof(ReadEofCallback cb);
     void set_on_disconnect(DisconnectCallback cb);
     void set_on_error(ErrorCallback cb);
 
@@ -215,6 +221,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// callback fires once the shutdown is complete.
     void close();
 
+    /// Half-close the socket's write side after queued writes drain. This
+    /// sends TCP EOF to the peer while keeping the read side open.
+    void shutdown_send();
+
     /// Immediately close the socket, discarding pending writes.
     void force_close();
 
@@ -267,6 +277,9 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 
     /// Perform the final socket close and invoke the disconnect callback.
     void do_close(const std::error_code& ec);
+
+    /// Shutdown the TCP send half if requested and all queued writes drained.
+    void maybe_shutdown_send_locked();
 
     /// Notify the error callback, if set.
     void notify_error(const std::error_code& ec);
@@ -329,6 +342,9 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// one is still in flight (S16 in the 2026-05-20 follow-up).
     bool read_in_flight_{false};
 
+    /// True after TCP read EOF. The socket may still be writable.
+    bool read_closed_{false};
+
     /// True once a write enqueue pushed the queue at/above the backpressure
     /// limit; reset (and on_writable_ fired) when the queue drains back below
     /// half the limit. Strand-only. Drives the receiver-side TUNNEL_ACK
@@ -337,6 +353,13 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// catches up, bounding the queue by the peer's send window.
     bool write_hit_watermark_{false};
 
+    /// True once shutdown_send() has been requested. Atomic so write() can
+    /// reject new data from any caller after EOF has been scheduled.
+    std::atomic<bool> send_shutdown_requested_{false};
+
+    /// True after shutdown(shutdown_send) has been issued.
+    bool send_shutdown_done_{false};
+
     // Limits. Atomic so write()'s fast-path pre-check can read it from any
     // thread while set_max_write_buffer_size() runs concurrently (H-10).
     std::atomic<std::size_t> max_write_buffer_size_{kDefaultMaxWriteBufferSize};
@@ -344,6 +367,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // Callbacks
     ConnectCallback on_connect_;
     DataCallback on_data_;
+    ReadEofCallback on_read_eof_;
     DisconnectCallback on_disconnect_;
     ErrorCallback on_error_;
     WritableCallback on_writable_;

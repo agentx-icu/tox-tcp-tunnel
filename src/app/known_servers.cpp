@@ -266,17 +266,18 @@ util::Expected<void, std::string> KnownServersStore::save_locked() const {
     return {};
 }
 
-const KnownServer* KnownServersStore::find_by_tox_id(std::string_view tox_id) const {
+std::optional<KnownServer> KnownServersStore::find_by_tox_id(std::string_view tox_id) const {
     std::lock_guard<std::mutex> lock(mu_);
     const auto upper = to_upper_hex(tox_id);
     auto it = std::find_if(servers_.begin(), servers_.end(),
                            [&](const KnownServer& s) { return s.tox_id == upper; });
-    return it == servers_.end() ? nullptr : &*it;
+    return it == servers_.end() ? std::nullopt : std::optional<KnownServer>(*it);
 }
 
-const KnownServer* KnownServersStore::find_by_alias(std::string_view alias) const {
+std::optional<KnownServer> KnownServersStore::find_by_alias(std::string_view alias) const {
     std::lock_guard<std::mutex> lock(mu_);
-    return find_by_alias_locked(alias);
+    const KnownServer* hit = find_by_alias_locked(alias);
+    return hit == nullptr ? std::nullopt : std::optional<KnownServer>(*hit);
 }
 
 const KnownServer* KnownServersStore::find_by_alias_locked(std::string_view alias) const {

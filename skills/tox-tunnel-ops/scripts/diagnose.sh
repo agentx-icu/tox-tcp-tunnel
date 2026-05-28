@@ -168,7 +168,7 @@ sys.exit(0)
                     fail "rules_file not found: $RULES_FILE"
                 fi
             else
-                warn "No rules_file configured — server allows ALL connections from any friend"
+                warn "No rules_file configured — server is default-deny and will refuse all incoming friend requests/tunnels"
             fi
         fi
     else

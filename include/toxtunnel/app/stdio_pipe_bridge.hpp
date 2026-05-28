@@ -40,7 +40,15 @@ class StdioPipeBridge {
     int output_fd_ = -1;
     std::atomic<bool> running_{false};
     std::thread input_thread_;
+    std::mutex lifecycle_mutex_;
+    // Serializes write_output() callers so their byte streams never interleave
+    // on the output fd. Held across the (possibly blocking) ::write.
     std::mutex output_mutex_;
+    // Guards the descriptor ints (input_fd_ / output_fd_). Held only briefly to
+    // read/swap them — never across a ::read/::write/::close — so
+    // close_descriptors() can interrupt a stalled write_output() by closing the
+    // fd instead of blocking behind output_mutex_ (which would wedge shutdown).
+    std::mutex fd_mutex_;
     InputCallback on_input_;
     ClosedCallback on_closed_;
 };

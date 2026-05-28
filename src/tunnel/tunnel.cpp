@@ -14,6 +14,7 @@ namespace {
 // a 1-byte tox packet prefix and a 5-byte tunnel frame header, leaving 1367
 // bytes for raw TCP payload per frame.
 constexpr std::size_t kMaxTcpPayloadPerToxFrame = 1367;
+constexpr auto kAckRetryDelay = std::chrono::milliseconds(1);
 
 }  // namespace
 
@@ -50,14 +51,17 @@ TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t fr
       friend_number_(friend_number),
       send_window_size_(send_window),
       last_activity_ns_(std::chrono::steady_clock::now().time_since_epoch().count()),
-      coalesce_timer_(io_ctx) {
+      coalesce_timer_(io_ctx),
+      ack_retry_timer_(io_ctx) {
     util::Logger::debug("Tunnel created: id={}, friend={}, window={}", tunnel_id_, friend_number_,
                         send_window_size_);
 }
 
 TunnelImpl::~TunnelImpl() {
-    // Cancel without firing the handler — the timer holds a raw `this`.
+    // Cancel pending timer waits; already-dispatched handlers capture weak_ptr
+    // and bail out if destruction won the race.
     coalesce_timer_.cancel();
+    ack_retry_timer_.cancel();
     util::Logger::debug("Tunnel destroyed: id={}", tunnel_id_);
 }
 
@@ -213,6 +217,7 @@ void TunnelImpl::close() {
         std::lock_guard<std::mutex> lock(coalesce_mutex_);
         if (!coalesce_try_drain_locked()) {
             close_pending_ = true;
+            close_pending_full_ = true;
             coalesce_arm_timer_locked();
             util::Logger::debug("Tunnel {} close deferred until coalesce buffer drains",
                                 tunnel_id_);
@@ -224,9 +229,22 @@ void TunnelImpl::close() {
 }
 
 void TunnelImpl::emit_close_and_transition() {
-    auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
-    send_frame_to_tox(frame);
-    util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Local);
+    bool should_send_close = false;
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        if (!local_close_sent_) {
+            local_close_sent_ = true;
+            local_stream_done_ = true;
+            should_send_close = true;
+        }
+    }
+
+    if (should_send_close) {
+        auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
+        send_frame_to_tox(frame);
+        util::MetricsRegistry::instance().inc_tunnels_closed(
+            util::MetricsRegistry::CloseReason::Local);
+    }
 
     // Transition to Disconnecting state
     transition_state(State::Disconnecting);
@@ -239,6 +257,91 @@ void TunnelImpl::emit_close_and_transition() {
     // finish flushing its data before removal, instead of dropping it. The
     // callback is responsible for deferring the actual teardown (asio::post)
     // so it never destroys this tunnel mid-call.
+    notify_close_once();
+}
+
+void TunnelImpl::emit_local_close_only() {
+    auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
+    send_frame_to_tox(frame);
+    util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Local);
+    transition_state(State::Disconnecting);
+    util::Logger::info("Tunnel {} sent local half-close", tunnel_id_);
+}
+
+bool TunnelImpl::flush_pending_tcp_input() {
+    for (;;) {
+        std::vector<std::uint8_t> chunk;
+        {
+            std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
+            const std::size_t pending = pending_tcp_pending_locked();
+            if (pending == 0) {
+                return true;
+            }
+
+            std::size_t effective_window = send_window_size_;
+            if (flow_control_configured_.load(std::memory_order_acquire)) {
+                effective_window = std::max<std::size_t>(
+                    send_window_size_,
+                    static_cast<std::size_t>(flow_control_.target_window_bytes()));
+            }
+
+            const std::size_t used = send_window_used_.load(std::memory_order_relaxed);
+            if (used >= effective_window) {
+                return false;
+            }
+
+            const std::size_t send_budget = effective_window - used;
+            const std::size_t to_send = std::min(send_budget, pending);
+            const auto first =
+                pending_tcp_input_.begin() + static_cast<std::ptrdiff_t>(pending_tcp_consumed_);
+            chunk.assign(first, first + static_cast<std::ptrdiff_t>(to_send));
+        }
+
+        if (!send_data_to_tox(std::span<const std::uint8_t>(chunk.data(), chunk.size()))) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
+            // Advance the read cursor instead of erasing from the front each
+            // iteration (which shifted every surviving byte — O(n) per chunk,
+            // O(n^2) to drain a large backlog). Compact lazily: clear once fully
+            // drained, otherwise erase the consumed prefix when it reaches at
+            // least half the buffer, keeping the amortised cost O(1). Mirrors
+            // coalesce_buf_/coalesce_consumed_.
+            pending_tcp_consumed_ += chunk.size();
+            if (pending_tcp_consumed_ >= pending_tcp_input_.size()) {
+                pending_tcp_input_.clear();
+                pending_tcp_consumed_ = 0;
+            } else if (pending_tcp_consumed_ >= pending_tcp_pending_locked()) {
+                pending_tcp_input_.erase(pending_tcp_input_.begin(),
+                                         pending_tcp_input_.begin() +
+                                             static_cast<std::ptrdiff_t>(pending_tcp_consumed_));
+                pending_tcp_consumed_ = 0;
+            }
+        }
+    }
+}
+
+void TunnelImpl::maybe_finish_pending_tcp_eof() {
+    bool should_finish = false;
+    {
+        std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
+        if (pending_tcp_eof_ && pending_tcp_pending_locked() == 0) {
+            pending_tcp_eof_ = false;
+            should_finish = true;
+        }
+    }
+
+    if (should_finish) {
+        on_tcp_read_eof();
+    }
+}
+
+void TunnelImpl::finalize_remote_close() {
+    util::MetricsRegistry::instance().inc_tunnels_closed(
+        util::MetricsRegistry::CloseReason::Remote);
+    transition_state(State::Closed);
     notify_close_once();
 }
 
@@ -330,7 +433,8 @@ void TunnelImpl::handle_tunnel_open_frame(const ProtocolFrame& frame) {
 }
 
 void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
-    if (!is_connected()) {
+    const State current = state_.load(std::memory_order_acquire);
+    if (current != State::Connected && current != State::Disconnecting) {
         util::Logger::debug("Tunnel {} ignored TUNNEL_DATA: not connected", tunnel_id_);
         return;
     }
@@ -387,25 +491,44 @@ bool TunnelImpl::notify_tcp_writable() {
     // ACK we withheld while it was backpressured so the peer's send window
     // reopens. send_ack() is a no-op (returns true) when nothing is pending;
     // it returns false if the ACK send itself backpressured, in which case the
-    // TcpConnection keeps its watermark armed and calls us again.
+    // tunnel retry timer keeps trying even if this was the last TCP drain event.
     return send_ack();
 }
 
 void TunnelImpl::handle_tunnel_close_frame(const ProtocolFrame& /*frame*/) {
     util::Logger::info("Tunnel {} received TUNNEL_CLOSE", tunnel_id_);
-    util::MetricsRegistry::instance().inc_tunnels_closed(
-        util::MetricsRegistry::CloseReason::Remote);
 
-    // Close TCP connection
+    std::shared_ptr<core::TcpConnection> conn;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (tcp_conn_) {
-            tcp_conn_->close();
+        conn = tcp_conn_;
+    }
+
+    bool finalize_now = false;
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        remote_close_received_ = true;
+        if (!conn) {
+            local_stream_done_ = true;
+        }
+        if (!coalesce_try_drain_locked()) {
+            remote_close_pending_ = true;
+            coalesce_arm_timer_locked();
+        } else if (local_stream_done_) {
+            finalize_now = true;
         }
     }
 
-    transition_state(State::Closed);
-    notify_close_once();
+    // Peer close is directional: no more TUNNEL_DATA will arrive from the
+    // peer, so send TCP EOF to the local socket. Keep the read side open so
+    // locally-produced bytes (for example SSH stdout) can still flow back.
+    if (conn) {
+        conn->shutdown_send();
+    }
+
+    if (finalize_now) {
+        finalize_remote_close();
+    }
 }
 
 void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
@@ -514,9 +637,11 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
         std::lock_guard<std::mutex> lock(mutex_);
         conn = tcp_conn_;
     }
-    if (conn && acked > 0) {
+    const bool drained_pending_tcp = flush_pending_tcp_input();
+    if (conn && acked > 0 && drained_pending_tcp) {
         conn->resume_read();
     }
+    maybe_finish_pending_tcp_eof();
 }
 
 void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
@@ -564,6 +689,22 @@ void TunnelImpl::on_tcp_data_received(const uint8_t* data, std::size_t length) {
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
+        if (pending_tcp_pending_locked() != 0) {
+            pending_tcp_input_.insert(pending_tcp_input_.end(), data, data + length);
+            std::shared_ptr<core::TcpConnection> conn;
+            {
+                std::lock_guard<std::mutex> conn_lock(mutex_);
+                conn = tcp_conn_;
+            }
+            if (conn) {
+                conn->pause_read();
+            }
+            return;
+        }
+    }
+
     // Forward to Tox; if the send window is full, propagate the backpressure
     // upstream by pausing TCP reads — otherwise the data would be silently
     // dropped (C-18 in the 2026-05-20 review). handle_tunnel_ack_frame
@@ -572,6 +713,10 @@ void TunnelImpl::on_tcp_data_received(const uint8_t* data, std::size_t length) {
     // mutex_ before deref — force_close() resets it from any thread.
     const bool accepted = send_data_to_tox(std::span<const uint8_t>(data, length));
     if (!accepted) {
+        {
+            std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
+            pending_tcp_input_.insert(pending_tcp_input_.end(), data, data + length);
+        }
         std::shared_ptr<core::TcpConnection> conn;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -580,6 +725,54 @@ void TunnelImpl::on_tcp_data_received(const uint8_t* data, std::size_t length) {
         if (conn) {
             conn->pause_read();
         }
+    }
+}
+
+void TunnelImpl::on_tcp_read_eof() {
+    State current = state_.load(std::memory_order_acquire);
+    if (current == State::Connecting) {
+        close();
+        return;
+    }
+    if (current != State::Connected && current != State::Disconnecting) {
+        util::Logger::debug("Tunnel {} TCP EOF ignored: state {}", tunnel_id_, to_string(current));
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
+        if (pending_tcp_pending_locked() != 0) {
+            pending_tcp_eof_ = true;
+            util::Logger::debug("Tunnel {} TCP EOF deferred until pending TCP backlog flushes",
+                                tunnel_id_);
+            return;
+        }
+    }
+
+    bool emit_close = false;
+    bool finalize_now = false;
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        if (!coalesce_try_drain_locked()) {
+            close_pending_ = true;
+            coalesce_arm_timer_locked();
+            util::Logger::debug("Tunnel {} TCP EOF deferred until coalesce buffer drains",
+                                tunnel_id_);
+            return;
+        }
+        if (!local_close_sent_) {
+            local_close_sent_ = true;
+            local_stream_done_ = true;
+            emit_close = true;
+        }
+        finalize_now = remote_close_received_;
+    }
+
+    if (emit_close) {
+        emit_local_close_only();
+    }
+    if (finalize_now) {
+        finalize_remote_close();
     }
 }
 
@@ -603,17 +796,30 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         effective_window = std::max<std::size_t>(
             send_window_size_, static_cast<std::size_t>(flow_control_.target_window_bytes()));
     }
+    // Atomically check-and-reserve the window. A plain load-then-fetch_add
+    // races: on_tcp_data_received (I/O thread) and flush_pending_tcp_input —
+    // reached via handle_tunnel_ack_frame on the Tox thread — can both pass the
+    // guard and then both fetch_add, overcommitting the BDP window by a chunk.
+    // The CAS reserves the bytes only if they still fit under the window value
+    // observed at compare time.
     std::size_t current = send_window_used_.load(std::memory_order_relaxed);
-    if (current + data_size > effective_window) {
-        util::Logger::debug("Tunnel {} send window full ({} + {} > {})", tunnel_id_, current,
-                            data_size, effective_window);
-        return false;
+    for (;;) {
+        if (current + data_size > effective_window) {
+            util::Logger::debug("Tunnel {} send window full ({} + {} > {})", tunnel_id_, current,
+                                data_size, effective_window);
+            return false;
+        }
+        if (send_window_used_.compare_exchange_weak(current, current + data_size,
+                                                    std::memory_order_relaxed)) {
+            break;
+        }
+        // CAS failed: `current` was refreshed with the latest value; re-check.
     }
+    // On a successful CAS `current` still holds the pre-reservation usage.
 
-    // Update window. Mark burst-start when we go 0 -> positive so the next
-    // ACK that drains us back to 0 gives us an RTT sample.
-    std::size_t before = send_window_used_.fetch_add(data_size, std::memory_order_relaxed);
-    if (before == 0) {
+    // Mark burst-start when we go 0 -> positive so the next ACK that drains us
+    // back to 0 gives us an RTT sample.
+    if (current == 0) {
         const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
         burst_start_ns_.store(now_ns, std::memory_order_relaxed);
     }
@@ -750,6 +956,11 @@ void TunnelImpl::maybe_send_ack() {
 }
 
 bool TunnelImpl::send_ack() {
+    const State current = state_.load(std::memory_order_acquire);
+    if (current != State::Connected && current != State::Disconnecting) {
+        return true;
+    }
+
     std::size_t bytes_to_ack = bytes_received_since_ack_.exchange(0, std::memory_order_relaxed);
     // M-01: a single ACK frame can only carry a uint32_t count. If more than
     // 4 GiB accumulated since the last ACK, emit multiple frames so the peer's
@@ -765,12 +976,51 @@ bool TunnelImpl::send_ack() {
             bytes_received_since_ack_.fetch_add(bytes_to_ack, std::memory_order_relaxed);
             util::Logger::debug("Tunnel {} ACK send backpressured; {} bytes still pending",
                                 tunnel_id_, bytes_to_ack);
+            arm_ack_retry_timer();
             return false;
         }
         bytes_to_ack -= ack_value;
         util::Logger::debug("Tunnel {} sent ACK for {} bytes", tunnel_id_, ack_value);
     }
     return true;
+}
+
+void TunnelImpl::arm_ack_retry_timer() {
+    if (bytes_received_since_ack_.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+
+    std::uint64_t epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(ack_retry_mutex_);
+        if (ack_retry_timer_armed_) {
+            return;
+        }
+        ack_retry_timer_armed_ = true;
+        epoch = ++ack_retry_timer_epoch_;
+        ack_retry_timer_.expires_after(kAckRetryDelay);
+    }
+
+    std::weak_ptr<Tunnel> weak = weak_from_this();
+    ack_retry_timer_.async_wait([weak, epoch](const std::error_code& ec) {
+        if (ec) {
+            return;
+        }
+        auto self = std::static_pointer_cast<TunnelImpl>(weak.lock());
+        if (!self) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(self->ack_retry_mutex_);
+            if (epoch != self->ack_retry_timer_epoch_) {
+                return;
+            }
+            self->ack_retry_timer_armed_ = false;
+        }
+
+        (void)self->send_ack();
+    });
 }
 
 void TunnelImpl::notify_close_once() {
@@ -1069,6 +1319,8 @@ void TunnelImpl::coalesce_arm_timer_locked() {
             return;  // Tunnel was destroyed before the timer fired.
         }
         bool emit_close = false;
+        bool emit_full_close = false;
+        bool finalize_after_drain = false;
         {
             std::lock_guard<std::mutex> lock(self->coalesce_mutex_);
             // Reject stale firings (cancel-and-reset races).
@@ -1084,13 +1336,30 @@ void TunnelImpl::coalesce_arm_timer_locked() {
                 // Buffer fully drained and a local close was deferred: it is
                 // now safe to signal TUNNEL_CLOSE without it overtaking data.
                 self->close_pending_ = false;
-                emit_close = true;
+                if (self->close_pending_full_) {
+                    self->close_pending_full_ = false;
+                    emit_full_close = true;
+                } else if (!self->local_close_sent_) {
+                    self->local_close_sent_ = true;
+                    self->local_stream_done_ = true;
+                    emit_close = true;
+                    finalize_after_drain = self->remote_close_received_;
+                }
+            } else if (self->remote_close_pending_) {
+                self->remote_close_pending_ = false;
+                finalize_after_drain = self->local_stream_done_;
             }
         }
         // emit_close_and_transition() sends through the Tox callback, so it
         // must run without coalesce_mutex_ held.
-        if (emit_close) {
+        if (emit_full_close) {
             self->emit_close_and_transition();
+        }
+        if (emit_close) {
+            self->emit_local_close_only();
+        }
+        if (finalize_after_drain) {
+            self->finalize_remote_close();
         }
     });
 }

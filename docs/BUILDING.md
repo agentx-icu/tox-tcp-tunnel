@@ -141,6 +141,22 @@ cmake --build build
 cd build && ctest --output-on-failure
 ```
 
+The throughput benchmarks are compiled into the integration binary but are
+disabled under normal CTest runs so CI stays quick. Run them explicitly when
+touching the tunnel data path:
+
+```bash
+./build/tests/integration_tests --gtest_also_run_disabled_tests \
+    --gtest_filter='TunnelDataFlowTest.*Throughput'
+```
+
+For release candidates or data-path fixes, also run one local end-to-end check:
+start a server and client with separate `data_dir`s, allow the client's
+64-character public key in `rules.yaml`, then exercise SSH and a bulk transfer
+through the forwarded port. Use `toxtunnel print-id --data-dir <dir>` when you
+need the Tox address for a non-default identity; `print-id` does not read
+`-c/--config`.
+
 On Windows with MSVC:
 
 ```powershell

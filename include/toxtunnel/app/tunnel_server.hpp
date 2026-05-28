@@ -139,6 +139,19 @@ class TunnelServer {
     /// after every rules load / reload.
     void sync_rate_limiter();
 
+    /// Apply the friend's effective `rate_limit.max_concurrent_tunnels` to a
+    /// manager's tunnel ceiling (0 => the default 100, else clamped to
+    /// RateLimiter::kAbsoluteTunnelCap). MUST be called without managers_mutex_
+    /// held: it resolves the friend pk via the Tox thread, which itself takes
+    /// managers_mutex_ on the inbound path.
+    void apply_tunnel_cap(tunnel::TunnelManager& manager, uint32_t friend_number);
+
+    /// Re-apply per-friend `rate_limit.max_concurrent_tunnels` to every live and
+    /// held TunnelManager, so a hot-reloaded rules_file takes effect immediately
+    /// instead of only on the next reconnect. setup_tunnel_manager() applies the
+    /// cap to fresh and resurrected managers; this covers the already-connected ones.
+    void reapply_tunnel_caps();
+
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------

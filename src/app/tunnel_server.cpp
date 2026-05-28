@@ -313,6 +313,10 @@ util::Expected<void, std::string> TunnelServer::reload(const Config& new_config)
         rules_engine_ = RulesEngine{};
     }
     sync_rate_limiter();
+    // Per-friend concurrent-tunnel caps live in the (reloadable) rules_file, so
+    // push the new values onto already-connected managers too — not just fresh
+    // ones via setup_tunnel_manager().
+    reapply_tunnel_caps();
 
     if (config_.logging.level != new_config.logging.level) {
         util::Logger::set_level(new_config.logging.level);
@@ -495,6 +499,42 @@ void TunnelServer::sync_rate_limiter() {
     }
 }
 
+void TunnelServer::apply_tunnel_cap(tunnel::TunnelManager& manager, uint32_t friend_number) {
+    const auto spec = rate_limiter_instance().effective_spec(get_friend_pk_hex(friend_number));
+    // 0 => reset to the manager's default ceiling (100) so a removed limit is
+    // honoured; otherwise clamp to the absolute safety cap.
+    const std::size_t cap =
+        spec.max_concurrent_tunnels > 0
+            ? std::min(spec.max_concurrent_tunnels, RateLimiter::kAbsoluteTunnelCap)
+            : 100;
+    manager.set_max_tunnels(cap);
+}
+
+void TunnelServer::reapply_tunnel_caps() {
+    // Snapshot (friend -> manager) under managers_mutex_, then release it before
+    // calling apply_tunnel_cap(): it resolves the friend pk via the Tox thread,
+    // which itself takes managers_mutex_ on the inbound frame path, so resolving
+    // under the lock could deadlock. The shared_ptr snapshot keeps each manager
+    // alive across the unlocked tail. A manager mid-resurrection (in neither map)
+    // is covered by setup_tunnel_manager() applying the cap on reinsertion.
+    std::vector<std::pair<uint32_t, std::shared_ptr<tunnel::TunnelManager>>> snapshot;
+    {
+        std::lock_guard lock(managers_mutex_);
+        snapshot.reserve(managers_.size() + held_managers_.size());
+        for (const auto& [fn, mgr] : managers_) {
+            snapshot.emplace_back(fn, mgr);
+        }
+        for (const auto& [fn, held] : held_managers_) {
+            if (held.manager) {
+                snapshot.emplace_back(fn, held.manager);
+            }
+        }
+    }
+    for (const auto& [fn, mgr] : snapshot) {
+        apply_tunnel_cap(*mgr, fn);
+    }
+}
+
 void TunnelServer::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
     tunnel::CoalesceMode coalesce_mode = tunnel::CoalesceMode::Fixed;
     (void)tunnel::parse_coalesce_mode(config_.tunnel.coalesce_mode, coalesce_mode);
@@ -542,6 +582,11 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
                 });
                 resurrected->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
             }
+            // Re-apply the (possibly hot-reloaded) per-friend cap before the
+            // manager re-enters managers_. During this handoff it is in neither
+            // managers_ nor held_managers_, so a concurrent reapply_tunnel_caps()
+            // would miss it; applying here guarantees it carries the current cap.
+            apply_tunnel_cap(*resurrected, friend_number);
             std::lock_guard lock(managers_mutex_);
             managers_[friend_number] = std::move(resurrected);
             util::Logger::info("Resurrected held tunnel manager for friend {} (resume)",
@@ -551,6 +596,13 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
     }
 
     auto manager = std::make_shared<tunnel::TunnelManager>(io_context_->get_io_context());
+
+    // Enforce the per-friend concurrent-tunnel ceiling
+    // (rate_limit.max_concurrent_tunnels) via the manager's existing max_tunnels_
+    // gate (checked by handle_incoming_open / add_tunnel). It was parsed into
+    // RateLimitSpec but never applied anywhere. Done before managers_mutex_ is
+    // taken below (apply_tunnel_cap marshals to the Tox thread).
+    apply_tunnel_cap(*manager, friend_number);
 
     // Set up the send handler: serialize frame, prepend lossless packet byte,
     // send via ToxAdapter.
@@ -973,6 +1025,24 @@ void TunnelServer::handle_resume_request(uint32_t friend_number,
         return;
     }
 
+    // The held tunnel must still be resumable. A target-TCP drop during the hold
+    // (which now closes the tunnel via weak_manager in wire_tcp_to_tunnel) leaves
+    // it Closed/Error with stale offset counters — resuming would stream onto a
+    // dead socket. Connected and Disconnecting are both still resumable:
+    // Disconnecting is a half-close that still carries data in the peer->server
+    // direction (handle_tunnel_data accepts DATA while Disconnecting), so it must
+    // NOT be declined. Decline only the genuinely dead/incomplete states.
+    if (const auto st = impl->state();
+        st != tunnel::Tunnel::State::Connected && st != tunnel::Tunnel::State::Disconnecting) {
+        send_resume_ack(friend_number, req->prior_tunnel_id, 0, 0,
+                        tunnel::TunnelResumeStatus::TooOld);
+        util::Logger::info(
+            "RESUME_REQUEST friend {} tunnel {}: tunnel not resumable (state={}); declined",
+            friend_number, req->prior_tunnel_id, tunnel::to_string(st));
+        mgr->remove_tunnel(req->prior_tunnel_id);
+        return;
+    }
+
     // Offset reconciliation. A gap means bytes one side sent never reached the
     // other (dropped in the disconnect, or still buffered) — there is no
     // app-level retransmit buffer, so we cannot fill it.
@@ -1056,6 +1126,13 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // Use weak_ptr on the TcpConnection -> TunnelImpl callback edge so the
     // socket callbacks do not form a permanent ownership cycle with the tunnel.
     const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel_impl;
+    // Resolve the owning manager through a weak_ptr captured here rather than a
+    // friend-keyed managers_ lookup inside the callbacks. While a friend is
+    // disconnected its manager is parked in held_managers_ (resume); the same
+    // shared_ptr instance moves between managers_ and held_managers_ and back on
+    // resurrect, so this weak_ptr tracks it across every transition and only
+    // lapses once the resume hold expires and the manager is destroyed.
+    const std::weak_ptr<tunnel::TunnelManager> weak_manager = manager_ptr;
 
     // Associate the TCP connection with the tunnel.
     tunnel_impl->set_tcp_connection(tcp_conn);
@@ -1067,33 +1144,41 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
         }
     });
 
+    tcp_conn->set_on_read_eof([weak_tunnel]() {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->on_tcp_read_eof();
+        }
+    });
+
     // TCP disconnect: close the tunnel gracefully.
     // Uses asio::post to defer cleanup, avoiding re-entrance into managers_mutex_
     // if on_disconnect fires synchronously from tcp_conn->close().
-    tcp_conn->set_on_disconnect([this, friend_number, tunnel_id](const std::error_code& ec) {
-        util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}", tunnel_id,
-                            friend_number, ec.message());
+    tcp_conn->set_on_disconnect(
+        [this, weak_manager, friend_number, tunnel_id](const std::error_code& ec) {
+            util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}", tunnel_id,
+                                friend_number, ec.message());
 
-        asio::post(io_context_->get_io_context(), [this, friend_number, tunnel_id]() {
-            std::shared_ptr<tunnel::Tunnel> tunnel;
-            {
-                std::lock_guard inner_lock(managers_mutex_);
-                auto mgr_it = managers_.find(friend_number);
-                if (mgr_it != managers_.end()) {
-                    tunnel = mgr_it->second->get_tunnel(tunnel_id);
+            asio::post(io_context_->get_io_context(), [weak_manager, tunnel_id]() {
+                // Resolve via weak_manager (works whether the manager is live or
+                // held for resume) instead of managers_.find(friend) — a held
+                // manager is absent from managers_, so a lookup would miss the
+                // target-TCP drop and strand the tunnel in a phantom-Connected
+                // state that a later RESUME_REQUEST would ACK Ok on a dead socket.
+                auto mgr = weak_manager.lock();
+                if (!mgr) {
+                    return;
                 }
-            }
-            // Gracefully close (outside managers_mutex_): this flushes any
-            // buffered / backpressured bytes to the peer *before* emitting
-            // TUNNEL_CLOSE — deferring CLOSE until the coalesce buffer drains —
-            // then fires on_close_, which removes the tunnel. Emitting CLOSE and
-            // removing immediately (the old behaviour) discarded the still-in-
-            // flight data, truncating the transfer when the origin closed first.
-            if (tunnel) {
-                tunnel->close();
-            }
+                // Gracefully close (outside managers_mutex_): this flushes any
+                // buffered / backpressured bytes to the peer *before* emitting
+                // TUNNEL_CLOSE — deferring CLOSE until the coalesce buffer drains —
+                // then fires on_close_, which removes the tunnel. Emitting CLOSE and
+                // removing immediately (the old behaviour) discarded the still-in-
+                // flight data, truncating the transfer when the origin closed first.
+                if (auto tunnel = mgr->get_tunnel(tunnel_id)) {
+                    tunnel->close();
+                }
+            });
         });
-    });
 
     // Tox data -> TCP: set up the callback so tunnel data is written to TCP.
     //
@@ -1122,13 +1207,14 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // peer closed us). Close the local TCP connection and remove the tunnel.
     // The removal is deferred (asio::post) so it never re-enters managers_mutex_
     // or destroys the tunnel from within its own callback.
-    tunnel_impl->set_on_close([this, friend_number, tunnel_id, tcp_conn]() {
+    tunnel_impl->set_on_close([this, weak_manager, tunnel_id, tcp_conn]() {
         tcp_conn->close();
-        asio::post(io_context_->get_io_context(), [this, friend_number, tunnel_id]() {
-            std::lock_guard inner_lock(managers_mutex_);
-            auto mgr_it = managers_.find(friend_number);
-            if (mgr_it != managers_.end()) {
-                mgr_it->second->remove_tunnel(tunnel_id);
+        asio::post(io_context_->get_io_context(), [weak_manager, tunnel_id]() {
+            // Same rationale as on_disconnect: remove via the weak_ptr so a
+            // tunnel closed while its manager is held for resume is still
+            // dropped from that (held) manager rather than leaking.
+            if (auto mgr = weak_manager.lock()) {
+                mgr->remove_tunnel(tunnel_id);
             }
         });
     });

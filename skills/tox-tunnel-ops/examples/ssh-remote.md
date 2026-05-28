@@ -59,7 +59,7 @@ rules:
         ports: [22]
 ```
 
-Note: The `friend` field must be the client's 64-character hex public key (NOT the full 76-char Tox ID). You can find it in the client's startup log. If no rules_file is set, the server allows all connections.
+Note: The `friend` field must be the client's 64-character hex public key (NOT the full 76-char Tox ID). You can find it in the client's startup log. If `rules_file` is unset, the server is default-deny and will refuse the friend request, so this rule is required.
 
 ## Steps
 

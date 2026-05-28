@@ -5,7 +5,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <barrier>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <string>
 #include <vector>
@@ -77,6 +79,58 @@ TEST_F(PipeBridgeTest, MovesInputToTunnelAndTunnelToOutput) {
     ASSERT_EQ(input_closed.wait_for(2s), std::future_status::ready);
 
     bridge.stop();
+}
+
+TEST_F(PipeBridgeTest, ConcurrentStopIsIdempotent) {
+    EXPECT_EXIT(([] {
+                    for (int iter = 0; iter < 64; ++iter) {
+                        int input_pipe[2];
+                        input_pipe[0] = -1;
+                        input_pipe[1] = -1;
+                        int output_pipe[2];
+                        output_pipe[0] = -1;
+                        output_pipe[1] = -1;
+                        if (::pipe(input_pipe) != 0 || ::pipe(output_pipe) != 0) {
+                            std::_Exit(2);
+                        }
+
+                        {
+                            app::StdioPipeBridge bridge(input_pipe[0], output_pipe[1]);
+                            auto started = bridge.start([](std::span<const uint8_t>) {}, [] {});
+                            if (!started.has_value()) {
+                                std::_Exit(3);
+                            }
+
+                            ::close(input_pipe[1]);
+                            input_pipe[1] = -1;
+
+                            std::barrier sync_point(3);
+                            std::thread stopper_a([&] {
+                                sync_point.arrive_and_wait();
+                                bridge.stop();
+                            });
+                            std::thread stopper_b([&] {
+                                sync_point.arrive_and_wait();
+                                bridge.stop();
+                            });
+                            sync_point.arrive_and_wait();
+                            stopper_a.join();
+                            stopper_b.join();
+                        }
+
+                        if (input_pipe[0] >= 0) {
+                            ::close(input_pipe[0]);
+                        }
+                        if (output_pipe[0] >= 0) {
+                            ::close(output_pipe[0]);
+                        }
+                        if (output_pipe[1] >= 0) {
+                            ::close(output_pipe[1]);
+                        }
+                    }
+                    std::_Exit(0);
+                })(),
+                ::testing::ExitedWithCode(0), "");
 }
 
 }  // namespace

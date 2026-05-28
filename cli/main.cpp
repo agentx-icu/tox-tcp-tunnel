@@ -110,7 +110,7 @@ std::string short_tox_id(std::string_view tox_id) {
 
 int cmd_servers_list(const std::filesystem::path& data_dir, bool full_ids) {
     toxtunnel::app::KnownServersStore store(data_dir);
-    if (auto& err = store.last_load_error(); err.has_value()) {
+    if (auto err = store.last_load_error(); err.has_value()) {
         std::cerr << "Warning: " << *err << "\n";
     }
 
@@ -137,7 +137,7 @@ int cmd_servers_list(const std::filesystem::path& data_dir, bool full_ids) {
 
 int cmd_servers_show(const std::filesystem::path& data_dir, const std::string& alias_or_id) {
     toxtunnel::app::KnownServersStore store(data_dir);
-    const auto* entry = store.find_by_alias(alias_or_id);
+    auto entry = store.find_by_alias(alias_or_id);
     if (!entry) {
         const auto resolved = store.resolve_tox_id(alias_or_id);
         entry = store.find_by_tox_id(resolved);
@@ -179,7 +179,7 @@ int cmd_servers_add(const std::filesystem::path& data_dir, const std::string& al
     // survive a re-add. `upsert` does a wholesale replace by design, so the
     // merge has to happen here in the caller.
     toxtunnel::app::KnownServer entry;
-    if (const auto* existing = store.find_by_tox_id(tox_id)) {
+    if (auto existing = store.find_by_tox_id(tox_id)) {
         entry = *existing;
     }
     entry.tox_id = tox_id;

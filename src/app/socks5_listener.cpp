@@ -283,6 +283,12 @@ struct Socks5Session : std::enable_shared_from_this<Socks5Session> {
         auto self = shared_from_this();
         conn->set_on_data(nullptr);
         conn->set_on_disconnect(nullptr);
+        // Also detach the EOF hook the session installed at accept time. Left
+        // wired, a client half-close after handoff would fire it and null
+        // session->conn, so the open_tunnel completion below would see a null
+        // conn and silently skip the SOCKS5 / HTTP CONNECT success reply,
+        // stalling the handshake. The tunnel layer installs its own EOF hook.
+        conn->set_on_read_eof(nullptr);
 
         const auto sniffed_protocol = protocol;
         std::vector<uint8_t> initial_payload = std::move(buffer);
@@ -504,6 +510,7 @@ void Socks5Listener::do_accept() {
             session->buffer.insert(session->buffer.end(), data, data + length);
             try_advance(session);
         });
+        conn->set_on_read_eof([session]() { session->conn.reset(); });
         conn->set_on_disconnect(
             [session](const std::error_code& /*ec*/) { session->conn.reset(); });
         conn->start_read();

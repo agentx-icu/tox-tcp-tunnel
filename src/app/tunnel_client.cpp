@@ -111,7 +111,7 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
 
     // Open the persistent known-servers registry alongside tox_save.dat.
     known_servers_ = std::make_unique<KnownServersStore>(config.data_dir);
-    if (auto& err = known_servers_->last_load_error(); err.has_value()) {
+    if (auto err = known_servers_->last_load_error(); err.has_value()) {
         util::Logger::warn("known_servers.yaml: {} (continuing with empty registry)", *err);
     }
 
@@ -1050,6 +1050,11 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
             tunnel->on_tcp_data_received(data, length);
         }
     });
+    conn->set_on_read_eof([weak_tunnel]() {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->on_tcp_read_eof();
+        }
+    });
     conn->set_on_disconnect([weak_tunnel](const std::error_code& /*ec*/) {
         if (auto tunnel = weak_tunnel.lock()) {
             tunnel->close();
@@ -1194,6 +1199,11 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     conn->set_on_data([weak_tunnel](const uint8_t* data, std::size_t length) {
         if (auto tunnel = weak_tunnel.lock()) {
             tunnel->on_tcp_data_received(data, length);
+        }
+    });
+    conn->set_on_read_eof([weak_tunnel]() {
+        if (auto tunnel = weak_tunnel.lock()) {
+            tunnel->on_tcp_read_eof();
         }
     });
     conn->set_on_disconnect([weak_tunnel](const std::error_code& /*ec*/) {

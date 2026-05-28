@@ -785,7 +785,7 @@ out from anywhere on the same host without depending on the metrics endpoint:
 
 ```bash
 # Fail the systemd unit's ExecStartPost if no peers are online after boot.
-SOCK=/var/lib/toxtunnel/inspect.sock
+SOCK=/var/lib/toxtunnel/toxtunnel.sock
 status=$(printf '{"cmd":"status"}\n' \
   | socat - UNIX-CONNECT:$SOCK \
   | jq -r '.tunnels_open')

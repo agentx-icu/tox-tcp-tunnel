@@ -98,6 +98,10 @@ void TcpConnection::set_on_data(DataCallback cb) {
     on_data_ = std::move(cb);
 }
 
+void TcpConnection::set_on_read_eof(ReadEofCallback cb) {
+    on_read_eof_ = std::move(cb);
+}
+
 void TcpConnection::set_on_disconnect(DisconnectCallback cb) {
     on_disconnect_ = std::move(cb);
 }
@@ -185,6 +189,10 @@ bool TcpConnection::write(const uint8_t* data, std::size_t length) {
         util::Logger::warn("TcpConnection::write called in state {}", to_string(s));
         return false;
     }
+    if (send_shutdown_requested_.load(std::memory_order_acquire)) {
+        util::Logger::debug("TcpConnection::write called after send shutdown requested");
+        return false;
+    }
     if (length == 0) {
         return true;
     }
@@ -214,6 +222,10 @@ bool TcpConnection::write(std::vector<uint8_t> data) {
         util::Logger::warn("TcpConnection::write called in state {}", to_string(s));
         return false;
     }
+    if (send_shutdown_requested_.load(std::memory_order_acquire)) {
+        util::Logger::debug("TcpConnection::write called after send shutdown requested");
+        return false;
+    }
     if (data.empty()) {
         return true;
     }
@@ -235,6 +247,10 @@ bool TcpConnection::write(OwnedBufferView buf) {
     ConnectionState s = state_.load(std::memory_order_acquire);
     if (s != ConnectionState::Connected && s != ConnectionState::Disconnecting) {
         util::Logger::warn("TcpConnection::write(view) called in state {}", to_string(s));
+        return false;
+    }
+    if (send_shutdown_requested_.load(std::memory_order_acquire)) {
+        util::Logger::debug("TcpConnection::write(view) called after send shutdown requested");
         return false;
     }
     if (buf.empty()) {
@@ -275,7 +291,7 @@ void TcpConnection::close() {
     auto self = shared_from_this();
     asio::post(strand_, [this, self]() {
         ConnectionState s = state_.load(std::memory_order_acquire);
-        if (s == ConnectionState::Disconnected || s == ConnectionState::Disconnecting) {
+        if (s == ConnectionState::Disconnected) {
             return;
         }
         util::Logger::debug("TcpConnection: initiating graceful close");
@@ -287,6 +303,17 @@ void TcpConnection::close() {
             do_close(std::error_code{});
         }
         // else: do_write completion will call do_close when the queue drains.
+    });
+}
+
+void TcpConnection::shutdown_send() {
+    send_shutdown_requested_.store(true, std::memory_order_release);
+    auto self = shared_from_this();
+    asio::post(strand_, [this, self]() {
+        if (state_.load(std::memory_order_acquire) == ConnectionState::Disconnected) {
+            return;
+        }
+        maybe_shutdown_send_locked();
     });
 }
 
@@ -392,6 +419,9 @@ void TcpConnection::do_read() {
     if (state_.load(std::memory_order_acquire) != ConnectionState::Connected) {
         return;
     }
+    if (read_closed_) {
+        return;
+    }
     if (read_paused_.load(std::memory_order_acquire)) {
         // Backpressure: skip posting a new read. resume_read() will
         // re-arm the loop when downstream drains.
@@ -408,36 +438,50 @@ void TcpConnection::do_read() {
     auto self = shared_from_this();
     socket_.async_read_some(
         asio::buffer(read_buffer_),
-        asio::bind_executor(
-            strand_, [this, self](const std::error_code& ec, std::size_t bytes_transferred) {
-                read_in_flight_ = false;
-                if (ec) {
-                    if (ec == asio::error::eof || ec == asio::error::connection_reset ||
-                        ec == asio::error::operation_aborted) {
-                        util::Logger::debug("TcpConnection: read ended: {}", ec.message());
-                    } else {
-                        util::Logger::debug("TcpConnection: read error: {}", ec.message());
-                        notify_error(ec);
-                    }
-
-                    if (state_.load(std::memory_order_acquire) == ConnectionState::Connected) {
+        asio::bind_executor(strand_, [this, self](const std::error_code& ec,
+                                                  std::size_t bytes_transferred) {
+            read_in_flight_ = false;
+            if (ec) {
+                if (ec == asio::error::eof) {
+                    util::Logger::debug("TcpConnection: read ended: {}", ec.message());
+                    read_closed_ = true;
+                    if (on_read_eof_) {
+                        on_read_eof_();
+                    } else if (state_.load(std::memory_order_acquire) ==
+                               ConnectionState::Connected) {
                         set_state(ConnectionState::Disconnecting);
                         do_close(ec);
                     }
                     return;
                 }
 
-                if (on_data_ && bytes_transferred > 0) {
-                    on_data_(read_buffer_.data(), bytes_transferred);
+                if (ec == asio::error::connection_reset || ec == asio::error::operation_aborted) {
+                    util::Logger::debug("TcpConnection: read ended: {}", ec.message());
+                } else {
+                    util::Logger::debug("TcpConnection: read error: {}", ec.message());
+                    notify_error(ec);
                 }
 
-                do_read();
-            }));
+                if (state_.load(std::memory_order_acquire) == ConnectionState::Connected) {
+                    set_state(ConnectionState::Disconnecting);
+                    do_close(ec);
+                }
+                return;
+            }
+
+            if (on_data_ && bytes_transferred > 0) {
+                on_data_(read_buffer_.data(), bytes_transferred);
+            }
+
+            do_read();
+        }));
 }
 
 void TcpConnection::do_write() {
     if (write_queue_.empty()) {
         write_in_progress_ = false;
+
+        maybe_shutdown_send_locked();
 
         // If we are disconnecting and all writes have drained, close now.
         if (state_.load(std::memory_order_acquire) == ConnectionState::Disconnecting) {
@@ -513,6 +557,26 @@ void TcpConnection::do_write() {
         }));
 }
 
+void TcpConnection::maybe_shutdown_send_locked() {
+    if (!send_shutdown_requested_.load(std::memory_order_acquire) || send_shutdown_done_ ||
+        write_in_progress_ || !write_queue_.empty()) {
+        return;
+    }
+
+    if (!socket_.is_open()) {
+        return;
+    }
+    std::error_code shutdown_ec;
+    socket_.shutdown(asio::ip::tcp::socket::shutdown_send, shutdown_ec);
+    if (!shutdown_ec || shutdown_ec == asio::error::not_connected) {
+        send_shutdown_done_ = true;
+        util::Logger::debug("TcpConnection: send half shut down");
+    } else {
+        util::Logger::debug("TcpConnection: send half shutdown failed: {}", shutdown_ec.message());
+        notify_error(shutdown_ec);
+    }
+}
+
 void TcpConnection::do_close(const std::error_code& ec) {
     if (state_.load(std::memory_order_acquire) == ConnectionState::Disconnected) {
         return;
@@ -537,6 +601,9 @@ void TcpConnection::do_close(const std::error_code& ec) {
     }
     write_queue_.clear();
     write_in_progress_ = false;
+    read_closed_ = true;
+    send_shutdown_requested_.store(true, std::memory_order_release);
+    send_shutdown_done_ = true;
 
     set_state(ConnectionState::Disconnected);
 

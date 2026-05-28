@@ -27,7 +27,7 @@ tox:
       public_key: "AABBCCDD..."
 
 server:
-  rules_file: /etc/toxtunnel/rules.yaml   # optional access control
+  rules_file: /etc/toxtunnel/rules.yaml   # access-control rules; unset = default deny
   disclose:                              # optional system-info opt-in (all default false)
     hostname: false
     os: false
@@ -259,7 +259,14 @@ Other rules:
 
 ### Default Behavior
 
-If no `rules_file` is configured, the server allows all connections from any friend.
+If no `rules_file` is configured, the server is **default-deny**:
+
+- incoming friend requests whose public key is absent from the rules are refused,
+- no tunnels can be opened,
+- and operators will see a startup warning telling them to configure `server.rules_file`.
+
+In practice, create at least one rule entry per allowed client public key before
+attempting the first connection.
 
 ## Data Directory
 
@@ -290,9 +297,10 @@ toxtunnel servers add <alias> <tox_id>       # register an alias
 toxtunnel servers remove <alias_or_tox_id>   # forget
 ```
 
-Each subcommand accepts `-d/--data-dir DIR` (defaults to the same
-`~/.config/toxtunnel` used by `print-id`) or `-c/--config FILE` (reads
-`data_dir` from the config).
+Each `servers` subcommand accepts `-d/--data-dir DIR` (defaults to
+`~/.config/toxtunnel`) or `-c/--config FILE` (reads `data_dir` from the config).
+The separate `print-id` subcommand does **not** read `-c/--config`; for a
+non-default identity use `toxtunnel print-id --data-dir <data_dir>`.
 
 Once an alias is registered it can be used anywhere a Tox ID is expected
 (`--server-id <alias>`, `client.server_id: <alias>` in YAML). The CLI prints a
@@ -550,7 +558,7 @@ surface.
 ```yaml
 inspect:
   enabled: true                        # default: on
-  socket_path: ""                      # empty = <data_dir>/inspect.sock
+  socket_path: ""                      # empty = <data_dir>/toxtunnel.sock
                                         # (POSIX) or
                                         # \\.\pipe\toxtunnel-inspect-<pid> (Windows)
   socket_mode: 0600                    # POSIX-only; chmod on the socket file
@@ -559,7 +567,7 @@ inspect:
 | Field | Default | Reloadable? | Effect |
 |---|---|---|---|
 | `inspect.enabled` | `true` | restart | Master switch. Set to `false` to disable the IPC listener entirely. |
-| `inspect.socket_path` | `<data_dir>/inspect.sock` | restart | Where to bind. Override only if `data_dir` lives on a filesystem that does not support sockets. |
+| `inspect.socket_path` | `<data_dir>/toxtunnel.sock` | restart | Where to bind. Override only if `data_dir` lives on a filesystem that does not support sockets. |
 | `inspect.socket_mode` | `0600` | restart | POSIX file mode on the socket inode. `0660` is appropriate if you run the daemon as a system user and want a group to peek. |
 
 The IPC wire format (single-line JSON request → single-line JSON reply) and

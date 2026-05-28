@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <asio.hpp>
+#include <chrono>
 
 #include "toxtunnel/tunnel/tunnel.hpp"
 
 using namespace toxtunnel::tunnel;
+using namespace std::chrono_literals;
 
 // ============================================================================
 // Test Fixture
@@ -207,6 +209,8 @@ TEST_F(TunnelTest, HandleFrame_TunnelClose) {
 
     tunnel.handle_frame(ProtocolFrame::make_tunnel_close(test_tunnel_id));
 
+    // A bare TunnelImpl in this unit fixture has no local TcpConnection to
+    // half-close, so the peer CLOSE can complete the tunnel immediately.
     EXPECT_EQ(tunnel.state(), Tunnel::State::Closed);
 }
 
@@ -401,6 +405,82 @@ TEST_F(TunnelTest, Backpressure_SendAckAfterThreshold) {
     EXPECT_TRUE(ack_sent);
 }
 
+TEST_F(TunnelTest, Backpressure_RetriesDeferredAckWhenToxQueueDrains) {
+    auto tunnel = std::make_shared<TunnelImpl>(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel->set_state(Tunnel::State::Connected);
+    tunnel->set_ack_threshold(1);
+    tunnel->set_on_data_for_tcp([](std::span<const uint8_t>) -> bool {
+        return false;  // local TCP accepted the bytes but crossed its high-water mark
+    });
+
+    bool allow_ack_send = false;
+    std::size_t ack_send_attempts = 0;
+    std::size_t acked_bytes = 0;
+    tunnel->set_on_send_to_tox([&](std::span<const uint8_t> data) -> bool {
+        auto frame = ProtocolFrame::deserialize(data);
+        EXPECT_TRUE(frame.has_value()) << frame.error().message();
+        if (!frame || frame.value().type() != FrameType::TUNNEL_ACK) {
+            return true;
+        }
+
+        ++ack_send_attempts;
+        if (!allow_ack_send) {
+            return false;
+        }
+
+        auto ack = frame.value().as_tunnel_ack();
+        EXPECT_TRUE(ack.has_value());
+        if (ack) {
+            acked_bytes += ack->bytes_acked;
+        }
+        return true;
+    });
+
+    const std::vector<uint8_t> payload = {0x01, 0x02, 0x03};
+    tunnel->handle_frame(ProtocolFrame::make_tunnel_data(test_tunnel_id, payload));
+    EXPECT_EQ(ack_send_attempts, 0u);
+
+    EXPECT_FALSE(tunnel->notify_tcp_writable());
+    EXPECT_EQ(ack_send_attempts, 1u);
+    EXPECT_EQ(tunnel->bytes_received(), payload.size());
+
+    allow_ack_send = true;
+    io_ctx.restart();
+    io_ctx.run_for(20ms);
+
+    EXPECT_GE(ack_send_attempts, 2u);
+    EXPECT_EQ(acked_bytes, payload.size());
+}
+
+TEST_F(TunnelTest, Backpressure_DoesNotRetryDeferredAckAfterForceClose) {
+    auto tunnel = std::make_shared<TunnelImpl>(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel->set_state(Tunnel::State::Connected);
+    tunnel->set_ack_threshold(1);
+    tunnel->set_on_data_for_tcp([](std::span<const uint8_t>) -> bool { return false; });
+
+    std::size_t ack_send_attempts = 0;
+    tunnel->set_on_send_to_tox([&](std::span<const uint8_t> data) -> bool {
+        auto frame = ProtocolFrame::deserialize(data);
+        EXPECT_TRUE(frame.has_value()) << frame.error().message();
+        if (frame && frame.value().type() == FrameType::TUNNEL_ACK) {
+            ++ack_send_attempts;
+            return false;
+        }
+        return true;
+    });
+
+    const std::vector<uint8_t> payload = {0x01};
+    tunnel->handle_frame(ProtocolFrame::make_tunnel_data(test_tunnel_id, payload));
+    EXPECT_FALSE(tunnel->notify_tcp_writable());
+    EXPECT_EQ(ack_send_attempts, 1u);
+
+    tunnel->force_close();
+    io_ctx.restart();
+    io_ctx.run_for(20ms);
+
+    EXPECT_EQ(ack_send_attempts, 1u);
+}
+
 // ============================================================================
 // 8. KeepAlive - PING/PONG handling
 // ============================================================================
@@ -466,6 +546,81 @@ TEST_F(TunnelTest, TcpConnection_DataFromTcpSendsToTox) {
     tunnel.on_tcp_data_received(tcp_data.data(), tcp_data.size());
 
     EXPECT_TRUE(data_sent_to_tox);
+}
+
+TEST_F(TunnelTest, TcpBackpressureBuffersCurrentChunkUntilAck) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 8);
+    tunnel.configure_coalesce(0, 1362);
+    tunnel.set_state(Tunnel::State::Connected);
+
+    std::vector<ProtocolFrame> sent_frames;
+    tunnel.set_on_send_to_tox([&sent_frames](std::span<const uint8_t> data) -> bool {
+        auto frame = ProtocolFrame::deserialize(data);
+        EXPECT_TRUE(frame.has_value()) << frame.error().message();
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_DATA) {
+            sent_frames.push_back(frame.value());
+        }
+        return true;
+    });
+
+    const std::vector<uint8_t> first_chunk(8, 0xA1);
+    const std::vector<uint8_t> second_chunk(4, 0xB2);
+
+    tunnel.on_tcp_data_received(first_chunk.data(), first_chunk.size());
+    tunnel.on_tcp_data_received(second_chunk.data(), second_chunk.size());
+
+    ASSERT_EQ(sent_frames.size(), 1u);
+    EXPECT_EQ(std::vector<uint8_t>(sent_frames[0].as_tunnel_data().begin(),
+                                   sent_frames[0].as_tunnel_data().end()),
+              first_chunk);
+
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, first_chunk.size()));
+
+    ASSERT_EQ(sent_frames.size(), 2u);
+    EXPECT_EQ(std::vector<uint8_t>(sent_frames[1].as_tunnel_data().begin(),
+                                   sent_frames[1].as_tunnel_data().end()),
+              second_chunk);
+}
+
+TEST_F(TunnelTest, TcpReadEofWaitsForBufferedChunkToFlushBeforeClose) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 8);
+    tunnel.configure_coalesce(0, 1362);
+    tunnel.set_state(Tunnel::State::Connected);
+
+    std::vector<FrameType> frame_types;
+    std::vector<std::vector<uint8_t>> data_payloads;
+    tunnel.set_on_send_to_tox(
+        [&frame_types, &data_payloads](std::span<const uint8_t> data) -> bool {
+            auto frame = ProtocolFrame::deserialize(data);
+            EXPECT_TRUE(frame.has_value()) << frame.error().message();
+            if (!frame) {
+                return false;
+            }
+            frame_types.push_back(frame.value().type());
+            if (frame.value().type() == FrameType::TUNNEL_DATA) {
+                data_payloads.emplace_back(frame.value().as_tunnel_data().begin(),
+                                           frame.value().as_tunnel_data().end());
+            }
+            return true;
+        });
+
+    const std::vector<uint8_t> first_chunk(8, 0x11);
+    const std::vector<uint8_t> second_chunk(4, 0x22);
+
+    tunnel.on_tcp_data_received(first_chunk.data(), first_chunk.size());
+    tunnel.on_tcp_data_received(second_chunk.data(), second_chunk.size());
+    tunnel.on_tcp_read_eof();
+
+    ASSERT_EQ(frame_types.size(), 1u);
+    EXPECT_EQ(frame_types[0], FrameType::TUNNEL_DATA);
+
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, first_chunk.size()));
+
+    ASSERT_EQ(frame_types.size(), 3u);
+    EXPECT_EQ(frame_types[1], FrameType::TUNNEL_DATA);
+    EXPECT_EQ(data_payloads.size(), 2u);
+    EXPECT_EQ(data_payloads[1], second_chunk);
+    EXPECT_EQ(frame_types[2], FrameType::TUNNEL_CLOSE);
 }
 
 // ============================================================================

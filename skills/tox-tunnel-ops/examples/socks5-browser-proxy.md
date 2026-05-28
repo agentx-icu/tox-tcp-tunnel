@@ -103,7 +103,7 @@ toxtunnel -m client --server-id homelab --socks5 127.0.0.1:1080
 ## Steps
 
 1. Start server: `sudo systemctl start toxtunnel` (or `toxtunnel -m server -c server.yaml`)
-2. Note the server's Tox ID (`toxtunnel print-id` on the server)
+2. Note the server's Tox ID (`toxtunnel print-id --data-dir /etc/toxtunnel/server` on the server, or the ID printed at startup)
 3. Paste into client config, start client: `toxtunnel -m client -c client.yaml`
 4. Wait for `Friend connection status: Connected` in the client log
 5. Point your tool at `127.0.0.1:1080`

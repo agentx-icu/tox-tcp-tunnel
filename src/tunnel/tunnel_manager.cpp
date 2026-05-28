@@ -475,6 +475,12 @@ void TunnelManager::route_frame(const ProtocolFrame& frame) {
             case FrameType::PONG:
                 handle_pong_frame(frame);
                 break;
+            case FrameType::Unknown:
+                // Forward-compat: an unrecognised opcode deserialises to
+                // Unknown. Silently ignore it on the control plane rather than
+                // logging a warn per frame — a newer peer rolling out a new
+                // tunnel_id==0 opcode must not flood an older peer's log.
+                break;
             default:
                 util::Logger::warn("TunnelManager: unexpected control frame type: {}",
                                    to_string(frame.type()));
@@ -542,8 +548,14 @@ bool TunnelManager::handle_incoming_open(const ProtocolFrame& frame) {
             return false;
         }
 
-        // Check if tunnel ID is already in use
-        if (tunnels_.find(tunnel_id) != tunnels_.end()) {
+        // Check if tunnel ID is already in use. Test used_ids_ too, not just
+        // tunnels_: handle_incoming_open reserves the id here but the matching
+        // tunnels_ entry is only inserted later by add_tunnel(). Two TUNNEL_OPENs
+        // for the same id arriving back-to-back would both pass a tunnels_-only
+        // check (the map is still empty for that id) and both reserve it,
+        // producing a brief double-acceptance. The reservation bitmap closes
+        // that window.
+        if (tunnels_.find(tunnel_id) != tunnels_.end() || used_ids_[tunnel_id]) {
             util::Logger::warn("TunnelManager: tunnel {} already exists, rejecting open",
                                tunnel_id);
             ProtocolFrame error_frame = ProtocolFrame::make_tunnel_error(

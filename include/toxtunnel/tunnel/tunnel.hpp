@@ -323,6 +323,12 @@ class TunnelImpl : public Tunnel {
     /// Creates and queues a TUNNEL_DATA frame for sending to Tox.
     void on_tcp_data_received(const uint8_t* data, std::size_t length);
 
+    /// Called when the local TCP peer half-closes its send side. Emits a
+    /// TUNNEL_CLOSE for the local->remote direction after accepted outbound
+    /// bytes drain, but keeps the remote->local direction alive until the peer
+    /// closes too.
+    void on_tcp_read_eof();
+
     /// Send data through the tunnel to the Tox peer.
     ///
     /// @param data  Data to send.
@@ -516,6 +522,22 @@ class TunnelImpl : public Tunnel {
     /// `coalesce_mutex_` held (it sends through the Tox callback).
     void emit_close_and_transition();
 
+    /// Send local TUNNEL_CLOSE without notifying final tunnel closure. Used by
+    /// TCP half-close: the peer may still send data until its own close.
+    void emit_local_close_only();
+
+    /// Flush TCP bytes already read locally but still buffered behind the
+    /// tunnel send window. Returns true when the backlog is now empty.
+    bool flush_pending_tcp_input();
+
+    /// Local TCP EOF can arrive while `pending_tcp_input_` still holds bytes
+    /// waiting for an ACK-driven retry. Finish the half-close once they drain.
+    void maybe_finish_pending_tcp_eof();
+
+    /// Complete a peer-initiated close after any outbound buffered DATA has
+    /// drained. Must be called WITHOUT `coalesce_mutex_` held.
+    void finalize_remote_close();
+
     /// (Re)arm the flush timer if the buffer is non-empty and no timer is
     /// pending. The caller must hold `coalesce_mutex_`.
     void coalesce_arm_timer_locked();
@@ -524,6 +546,12 @@ class TunnelImpl : public Tunnel {
     /// emitted prefix). The caller must hold `coalesce_mutex_`.
     [[nodiscard]] std::size_t coalesce_pending_locked() const noexcept {
         return coalesce_buf_.size() - coalesce_consumed_;
+    }
+
+    /// Live bytes still queued in `pending_tcp_input_` (total minus the
+    /// already-sent prefix). The caller must hold `tcp_backpressure_mutex_`.
+    [[nodiscard]] std::size_t pending_tcp_pending_locked() const noexcept {
+        return pending_tcp_input_.size() - pending_tcp_consumed_;
     }
 
     /// Bump the last-activity timestamp to "now". Called only on TUNNEL_DATA
@@ -540,6 +568,10 @@ class TunnelImpl : public Tunnel {
     /// bytes were acked (nothing left pending), false if a send backpressured
     /// and some remain in `bytes_received_since_ack_` for a later retry.
     bool send_ack();
+
+    /// Retry a deferred ACK after the Tox lossless send queue has had a chance
+    /// to drain. Used when notify_tcp_writable() cannot flush the ACK itself.
+    void arm_ack_retry_timer();
 
     /// Invoke the close callback at most once for terminal states (Closed/Error).
     void notify_close_once();
@@ -597,6 +629,13 @@ class TunnelImpl : public Tunnel {
     // compacted in coalesce_append_locked once the consumed prefix dominates.
     std::size_t coalesce_consumed_{0};
     asio::steady_timer coalesce_timer_;
+    // Receiver-side ACK retry state. This is intentionally separate from the
+    // DATA coalescing timer: an inbound TCP drain can need to retry only ACKs
+    // while the outbound DATA coalesce buffer is empty.
+    asio::steady_timer ack_retry_timer_;
+    mutable std::mutex ack_retry_mutex_;
+    bool ack_retry_timer_armed_{false};
+    std::uint64_t ack_retry_timer_epoch_{0};
     std::uint32_t coalesce_max_delay_us_{kDefaultCoalesceMaxDelayUs};
     std::uint32_t coalesce_max_bytes_{kDefaultCoalesceMaxBytes};
     bool coalesce_timer_armed_{false};
@@ -606,6 +645,34 @@ class TunnelImpl : public Tunnel {
     // otherwise the CLOSE would overtake the still-buffered DATA and the peer
     // would drop the trailing bytes as frames for an "unknown tunnel".
     bool close_pending_{false};
+    // True when the pending local close was a full close() request rather than
+    // a TCP half-close. Full close preserves the historical behavior of firing
+    // on_close_ as soon as local buffered DATA drains and CLOSE is emitted.
+    bool close_pending_full_{false};
+    // Local TUNNEL_CLOSE has been emitted.
+    bool local_close_sent_{false};
+    // The local->remote direction is finished from this endpoint's
+    // perspective. This is normally set with local_close_sent_, and also set
+    // for test/manager-only tunnels that do not own a local TcpConnection.
+    bool local_stream_done_{false};
+    // Peer TUNNEL_CLOSE has been received.
+    bool remote_close_received_{false};
+    // A peer TUNNEL_CLOSE arrived while our outbound coalesce buffer still held
+    // DATA accepted from local TCP. Keep the tunnel alive until those bytes are
+    // handed to Tox; otherwise full-duplex streams such as SSH stdout truncate
+    // when the peer closes first.
+    bool remote_close_pending_{false};
+    // Bytes already read from the local TCP socket but not yet admitted into
+    // the tunnel send window. Retried when ACKs reopen space. Consumed via the
+    // `pending_tcp_consumed_` read cursor and compacted lazily (see
+    // flush_pending_tcp_input) so draining a large backlog stays O(n), not the
+    // O(n^2) that erase-from-front per chunk produced.
+    std::vector<std::uint8_t> pending_tcp_input_;
+    std::size_t pending_tcp_consumed_{0};
+    // Local TCP EOF arrived while `pending_tcp_input_` was non-empty; defer the
+    // directional TUNNEL_CLOSE until those bytes flush.
+    bool pending_tcp_eof_{false};
+    mutable std::mutex tcp_backpressure_mutex_;
 
     // Adaptive coalescer + BDP flow control. Updated on the data path.
     WriteCoalescer coalescer_;

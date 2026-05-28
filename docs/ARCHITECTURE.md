@@ -195,7 +195,7 @@ auth if you do.
 ### `toxtunnel inspect` IPC
 
 `InspectServer` accepts connections on a local Unix-domain socket (POSIX) or
-named pipe (Windows). Default path follows `data_dir/inspect.sock` /
+named pipe (Windows). Default path follows `data_dir/toxtunnel.sock` /
 `\\.\pipe\toxtunnel-inspect-<pid>`. **Default-on, loopback-only by
 construction** — there is no TCP listener and no auth layer because the OS
 permission bits on the socket file are the access control.
@@ -316,6 +316,21 @@ Key properties:
 - The `BdpFlowControl` window resizes between `min_window_bytes` and
   `max_window_bytes` when `flow_control.mode: bdp`; in `fixed` mode
   the v0.3.0 256 KiB / 16 KiB cadence is preserved.
+- When the tunnel send window is full, the currently-read TCP chunk is
+  retained in `pending_tcp_input_`, `TcpConnection::pause_read()` stops
+  further socket reads, and later `TUNNEL_ACK`s retry that backlog before
+  `resume_read()` is posted. This avoids silently dropping the chunk that
+  happened to cross the window boundary.
+- If a deferred `TUNNEL_ACK` itself hits toxcore lossless-send backpressure,
+  the unacked byte count is restored and a short ACK retry timer is armed.
+  This matters when the receiver's TCP queue has already drained: without the
+  timer there may be no later writable callback to reopen the sender's window.
+- TCP close is directional. Local EOF does **not** emit `TUNNEL_CLOSE`
+  until both `pending_tcp_input_` and the coalesce buffer have drained
+  into ordered Tox DATA frames; peer `TUNNEL_CLOSE` maps to
+  `TcpConnection::shutdown_send()` so the local application sees EOF on
+  the receive side while the reverse direction can continue. This is what
+  keeps full-duplex protocols such as SSH / SCP from truncating tail data.
 
 ## Operational Endpoints (v0.4 additions)
 

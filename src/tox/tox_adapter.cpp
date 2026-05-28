@@ -264,11 +264,13 @@ void ToxAdapter::stop() {
     // wake_cv_.wait_for() window before joining.
     wake_cv_.notify_all();
 
-    // H-S-6 (2026-05-20 fix-storm review): signal any in-flight
-    // bootstrap-cache refresh thread to bail out before we tear down
-    // application globals. The thread is detached so we can't join it,
-    // but the cancel flag stops it before its next observation point
-    // (fetch return / parse return / write_cache call).
+    // H-S-6 (2026-05-20) / H-11 (2026-05-26): stop and JOIN any in-flight
+    // bootstrap-cache refresh worker before we tear down application globals.
+    // cancel_pending_refreshes() sets the stop flag (observed at fetch/parse/
+    // write_cache boundaries) and joins the owned worker. The join is bounded
+    // by the curl --max-time in fetch_default_nodes_json (a few seconds): popen
+    // cannot be interrupted mid-fetch, so a refresh fetching at shutdown delays
+    // stop() until that curl returns.
     BootstrapSource::cancel_pending_refreshes();
 
     if (iterate_thread_.joinable()) {

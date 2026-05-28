@@ -1605,10 +1605,6 @@ Node convert<Config>::encode(const Config& rhs) {
         node["metrics"] = rhs.metrics;
     }
     node["tox"] = effective_tox;
-    if (rhs.metrics.enabled || rhs.metrics.listen != MetricsConfig{}.listen ||
-        rhs.metrics.path != MetricsConfig{}.path) {
-        node["metrics"] = rhs.metrics;
-    }
     if (!(rhs.tunnel == toxtunnel::TunnelConfig{})) {
         node["tunnel"] = rhs.tunnel;
     }
@@ -1694,10 +1690,6 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
 
     if (node["tox"]) {
         rhs.tox = node["tox"].as<ToxConfig>();
-    }
-
-    if (node["metrics"]) {
-        rhs.metrics = node["metrics"].as<MetricsConfig>();
     }
 
     if (node["tunnel"]) {

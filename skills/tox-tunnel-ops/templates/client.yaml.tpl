@@ -50,7 +50,7 @@ client:
   # has been registered with `toxtunnel servers add <alias> <tox_id>`. Aliases
   # resolve from <data_dir>/known_servers.yaml at startup.
   # You can find a literal Tox ID in the server's startup log output, or via
-  # `toxtunnel print-id` on the server side.
+  # `toxtunnel print-id --data-dir <server_data_dir>` on the server side.
   server_id: {{SERVER_ID|<PASTE_SERVER_TOX_ID_HERE>}}
   # --- OR use a list for multi-server failover ---
   # The first entry is the preferred primary; remaining entries are tried in

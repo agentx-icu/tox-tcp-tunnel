@@ -55,8 +55,8 @@ TEST_F(KnownServersTest, UpsertAndFindByToxId) {
     EXPECT_TRUE(store.upsert(e));
     EXPECT_EQ(store.size(), 1u);
 
-    const auto* hit = store.find_by_tox_id(kToxIdA);
-    ASSERT_NE(hit, nullptr);
+    auto hit = store.find_by_tox_id(kToxIdA);
+    ASSERT_TRUE(hit.has_value());
     EXPECT_EQ(hit->tox_id, kToxIdA);
     ASSERT_TRUE(hit->alias.has_value());
     EXPECT_EQ(*hit->alias, "alpha");
@@ -69,11 +69,11 @@ TEST_F(KnownServersTest, FindByAlias) {
     e.alias = "alpha";
     ASSERT_TRUE(store.upsert(e));
 
-    const auto* by_alias = store.find_by_alias("alpha");
-    ASSERT_NE(by_alias, nullptr);
+    auto by_alias = store.find_by_alias("alpha");
+    ASSERT_TRUE(by_alias.has_value());
     EXPECT_EQ(by_alias->tox_id, kToxIdA);
 
-    EXPECT_EQ(store.find_by_alias("missing"), nullptr);
+    EXPECT_FALSE(store.find_by_alias("missing").has_value());
 }
 
 TEST_F(KnownServersTest, UpsertReplacesExistingByToxIdAndKeepsOneEntry) {
@@ -88,8 +88,8 @@ TEST_F(KnownServersTest, UpsertReplacesExistingByToxIdAndKeepsOneEntry) {
     ASSERT_TRUE(store.upsert(e));
 
     EXPECT_EQ(store.size(), 1u);
-    const auto* hit = store.find_by_tox_id(kToxIdA);
-    ASSERT_NE(hit, nullptr);
+    auto hit = store.find_by_tox_id(kToxIdA);
+    ASSERT_TRUE(hit.has_value());
     ASSERT_TRUE(hit->alias.has_value());
     EXPECT_EQ(*hit->alias, "renamed");
     EXPECT_EQ(hit->notes, "second pass");
@@ -128,8 +128,8 @@ TEST_F(KnownServersTest, ResolveAcceptsToxIdAndAliasAndUppercases) {
 TEST_F(KnownServersTest, RecordConnectionInsertsAndRefreshes) {
     KnownServersStore store(dir_);
     EXPECT_TRUE(store.record_connection(kToxIdA, KnownConnectionType::Udp));
-    const auto* hit = store.find_by_tox_id(kToxIdA);
-    ASSERT_NE(hit, nullptr);
+    auto hit = store.find_by_tox_id(kToxIdA);
+    ASSERT_TRUE(hit.has_value());
     EXPECT_EQ(hit->last_connection_type, KnownConnectionType::Udp);
     EXPECT_TRUE(hit->first_connected_at.has_value());
     EXPECT_TRUE(hit->last_connected_at.has_value());
@@ -138,7 +138,7 @@ TEST_F(KnownServersTest, RecordConnectionInsertsAndRefreshes) {
     // Subsequent record keeps first_connected_at, updates last_connection_type.
     EXPECT_TRUE(store.record_connection(kToxIdA, KnownConnectionType::Tcp));
     hit = store.find_by_tox_id(kToxIdA);
-    ASSERT_NE(hit, nullptr);
+    ASSERT_TRUE(hit.has_value());
     EXPECT_EQ(*hit->first_connected_at, first);
     EXPECT_EQ(hit->last_connection_type, KnownConnectionType::Tcp);
 }
@@ -149,8 +149,8 @@ TEST_F(KnownServersTest, RecordInfoUpsertsOrUpdates) {
     info.hostname = "nas-01";
     info.os = "Linux";
     EXPECT_TRUE(store.record_info(kToxIdA, info));
-    const auto* hit = store.find_by_tox_id(kToxIdA);
-    ASSERT_NE(hit, nullptr);
+    auto hit = store.find_by_tox_id(kToxIdA);
+    ASSERT_TRUE(hit.has_value());
     ASSERT_TRUE(hit->info.hostname.has_value());
     EXPECT_EQ(*hit->info.hostname, "nas-01");
     EXPECT_TRUE(hit->info.reported_at.has_value());
@@ -176,8 +176,8 @@ TEST_F(KnownServersTest, UpsertReplacesWholesaleByDesign) {
     thin.alias = "renamed";
     ASSERT_TRUE(store.upsert(thin));
 
-    const auto* hit = store.find_by_tox_id(kToxIdA);
-    ASSERT_NE(hit, nullptr);
+    auto hit = store.find_by_tox_id(kToxIdA);
+    ASSERT_TRUE(hit.has_value());
     EXPECT_EQ(*hit->alias, "renamed");
     EXPECT_FALSE(hit->first_connected_at.has_value());
     EXPECT_FALSE(hit->last_connected_at.has_value());
@@ -227,8 +227,8 @@ TEST_F(KnownServersTest, RoundTripPersistsAllFields) {
     KnownServersStore store(dir_);
     EXPECT_FALSE(store.last_load_error().has_value());
     ASSERT_EQ(store.size(), 1u);
-    const auto* hit = store.find_by_alias("alpha");
-    ASSERT_NE(hit, nullptr);
+    auto hit = store.find_by_alias("alpha");
+    ASSERT_TRUE(hit.has_value());
     EXPECT_EQ(hit->tox_id, kToxIdA);
     EXPECT_EQ(hit->last_connection_type, KnownConnectionType::Udp);
     ASSERT_TRUE(hit->info.hostname.has_value());

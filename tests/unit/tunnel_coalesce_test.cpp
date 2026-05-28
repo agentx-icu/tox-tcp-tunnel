@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <asio.hpp>
 #include <chrono>
 #include <numeric>
@@ -357,4 +358,77 @@ TEST_F(TunnelCoalesceTest, CloseDeferredUntilBackpressureDrains) {
     ASSERT_FALSE(captured_.all_frame_types.empty());
     EXPECT_EQ(captured_.all_frame_types.front(), FrameType::TUNNEL_DATA);
     EXPECT_EQ(captured_.all_frame_types.back(), FrameType::TUNNEL_CLOSE);
+}
+
+// ---------------------------------------------------------------------------
+// 10. A peer TUNNEL_CLOSE must not discard outbound bytes we already accepted.
+//     SSH is full-duplex: the client side can close while the server side still
+//     has stdout buffered behind Tox SENDQ backpressure. Even in this
+//     manager-only fixture with no local TcpConnection to half-close, the tunnel
+//     must retry those DATA frames and only notify close after they drain.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, RemoteCloseWaitsForBackpressuredOutboundDrain) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+        if (!allow_send) {
+            return false;
+        }
+        captured_.record(wire);
+        return true;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/1000, /*max_bytes=*/1362);
+
+    std::atomic<bool> close_notified{false};
+    tunnel_->set_on_close([&]() { close_notified.store(true, std::memory_order_release); });
+
+    std::vector<uint8_t> payload(2 * 1362 + 99);
+    std::iota(payload.begin(), payload.end(), uint8_t{0});
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+
+    // Simulate the peer closing while our outbound side is still stuck behind
+    // a full Tox SENDQ. The close callback must be deferred, not fired now.
+    tunnel_->handle_frame(ProtocolFrame::make_tunnel_close(tunnel_->tunnel_id()));
+    run_for(20ms);
+
+    EXPECT_FALSE(close_notified.load(std::memory_order_acquire));
+    EXPECT_TRUE(captured_.all_frame_types.empty());
+
+    // Once Tox accepts packets again, DATA drains before the tunnel notifies
+    // final close. With no local TcpConnection in this fixture, there is no
+    // later TCP EOF to wait for.
+    allow_send = true;
+    run_for(20ms);
+
+    EXPECT_EQ(captured_.concatenated_data(), payload);
+    EXPECT_TRUE(close_notified.load(std::memory_order_acquire));
+    ASSERT_FALSE(captured_.all_frame_types.empty());
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_CLOSE),
+              0);
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Closed);
+}
+
+TEST_F(TunnelCoalesceTest, LocalHalfCloseStillAcceptsPeerDataUntilPeerCloses) {
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    std::vector<uint8_t> received;
+    tunnel_->set_on_data_for_tcp([&](std::span<const uint8_t> data) {
+        received.insert(received.end(), data.begin(), data.end());
+        return true;
+    });
+
+    tunnel_->on_tcp_read_eof();
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Disconnecting);
+
+    const std::vector<uint8_t> payload = {0x10, 0x20, 0x30};
+    tunnel_->handle_frame(ProtocolFrame::make_tunnel_data(tunnel_->tunnel_id(), payload));
+
+    EXPECT_EQ(received, payload);
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_CLOSE),
+              1);
+
+    tunnel_->handle_frame(ProtocolFrame::make_tunnel_close(tunnel_->tunnel_id()));
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Closed);
 }
