@@ -632,8 +632,9 @@ std::vector<FriendInfo> ToxAdapter::get_friend_info_list() const {
 // Data transfer
 // ===========================================================================
 
-ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(
-    uint32_t friend_number, const uint8_t* data, std::size_t length) {
+ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(uint32_t friend_number,
+                                                                       const uint8_t* data,
+                                                                       std::size_t length) {
     if (!initialized_.load() || !data || length == 0) {
         return LosslessSendOutcome::PermanentFail;
     }

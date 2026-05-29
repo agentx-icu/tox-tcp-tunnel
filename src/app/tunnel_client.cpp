@@ -832,8 +832,8 @@ void TunnelClient::start_pipe_mode() {
     tunnel->set_on_send_to_tox_owned(
         [this, manager_ref, tunnel_friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
             const auto wire = buf.wire_view();
-            const bool sent = tox_adapter_->send_lossless_packet(tunnel_friend_number,
-                                                                 wire.data(), wire.size());
+            const bool sent =
+                tox_adapter_->send_lossless_packet(tunnel_friend_number, wire.data(), wire.size());
             if (sent) {
                 manager_ref->record_frame_sent();
                 manager_ref->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);
@@ -1085,8 +1085,8 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     tunnel->set_on_send_to_tox_owned(
         [this, manager_ref, tunnel_friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
             const auto wire = buf.wire_view();
-            const bool sent = tox_adapter_->send_lossless_packet(tunnel_friend_number,
-                                                                 wire.data(), wire.size());
+            const bool sent =
+                tox_adapter_->send_lossless_packet(tunnel_friend_number, wire.data(), wire.size());
             if (sent) {
                 manager_ref->record_frame_sent();
                 // The lossless prefix byte is bookkeeping overhead, not payload.
@@ -1258,8 +1258,8 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     tunnel->set_on_send_to_tox_owned(
         [this, manager_ref, tunnel_friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
             const auto wire = buf.wire_view();
-            const bool sent = tox_adapter_->send_lossless_packet(tunnel_friend_number,
-                                                                 wire.data(), wire.size());
+            const bool sent =
+                tox_adapter_->send_lossless_packet(tunnel_friend_number, wire.data(), wire.size());
             if (sent) {
                 manager_ref->record_frame_sent();
                 manager_ref->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);

@@ -268,8 +268,7 @@ TEST_F(TunnelManagerTest, FrameRouting_HandlesUnknownTunnelId) {
     ProtocolFrame data_frame = ProtocolFrame::make_tunnel_data(999, make_span(data));
 
     // Set up a send handler for error responses
-    manager->set_send_handler(
-        [](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     EXPECT_NO_THROW(manager->route_frame(data_frame));
 }
@@ -292,8 +291,7 @@ TEST_F(TunnelManagerTest, FrameRouting_HandlePingPong) {
     ProtocolFrame pong = ProtocolFrame::make_pong();
 
     // Set up a send handler for pong responses
-    manager->set_send_handler(
-        [](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     // Should not crash, even with no tunnels
     EXPECT_NO_THROW(manager->route_frame(ping));
@@ -324,8 +322,7 @@ TEST_F(TunnelManagerTest, BackpressureTracking_NoBackpressureWhenBelowThreshold)
 
 TEST_F(TunnelManagerTest, CreateTunnel_ReturnsValidId) {
     // Set up send handler so create_tunnel can send TUNNEL_OPEN
-    manager->set_send_handler(
-        [](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     auto id = manager->create_tunnel("localhost", 8080);
     EXPECT_GT(id, 0u);
@@ -334,8 +331,7 @@ TEST_F(TunnelManagerTest, CreateTunnel_ReturnsValidId) {
 }
 
 TEST_F(TunnelManagerTest, CreateTunnel_MultipleCreations) {
-    manager->set_send_handler(
-        [](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     auto id1 = manager->create_tunnel("host1.example.com", 80);
     auto id2 = manager->create_tunnel("host2.example.com", 443);
@@ -516,8 +512,7 @@ TEST_F(TunnelManagerTest, TunnelOpenHandling_RejectsDuplicateTunnelId) {
     manager->add_tunnel(100, create_test_tunnel(100));
 
     // Set up send handler for error response
-    manager->set_send_handler(
-        [](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     ProtocolFrame open_frame = ProtocolFrame::make_tunnel_open(100, "example.com", 443);
     bool accepted = manager->handle_incoming_open(open_frame);
@@ -534,8 +529,7 @@ TEST_F(TunnelManagerTest, TunnelOpenHandling_RespectsMaxTunnels) {
     manager->add_tunnel(2, create_test_tunnel(2));
 
     // Set up send handler for error response
-    manager->set_send_handler(
-        [](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     ProtocolFrame open_frame = ProtocolFrame::make_tunnel_open(3, "example.com", 443);
     bool accepted = manager->handle_incoming_open(open_frame);
@@ -652,12 +646,9 @@ TEST_F(TunnelManagerTest, SendFrame_BackpressuredFramesDrainInOrder) {
     std::array<uint8_t, 3> data_a = {0x01, 0x02, 0x03};
     std::array<uint8_t, 3> data_b = {0x04, 0x05, 0x06};
     std::array<uint8_t, 3> data_c = {0x07, 0x08, 0x09};
-    ASSERT_TRUE(
-        shared_manager->send_frame(ProtocolFrame::make_tunnel_data(1, make_span(data_a))));
-    ASSERT_TRUE(
-        shared_manager->send_frame(ProtocolFrame::make_tunnel_data(2, make_span(data_b))));
-    ASSERT_TRUE(
-        shared_manager->send_frame(ProtocolFrame::make_tunnel_data(3, make_span(data_c))));
+    ASSERT_TRUE(shared_manager->send_frame(ProtocolFrame::make_tunnel_data(1, make_span(data_a))));
+    ASSERT_TRUE(shared_manager->send_frame(ProtocolFrame::make_tunnel_data(2, make_span(data_b))));
+    ASSERT_TRUE(shared_manager->send_frame(ProtocolFrame::make_tunnel_data(3, make_span(data_c))));
 
     // Pump io_ctx until the drain timer has fired enough times to deliver
     // all three frames, or we time out. The retry delay is 20ms; allowing
@@ -698,8 +689,7 @@ TEST_F(TunnelManagerTest, PingPongHandling_PingTriggersPong) {
 }
 
 TEST_F(TunnelManagerTest, PingPongHandling_PongIsHandled) {
-    manager->set_send_handler(
-        [](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
 
     ProtocolFrame pong = ProtocolFrame::make_pong();
     // Should not crash

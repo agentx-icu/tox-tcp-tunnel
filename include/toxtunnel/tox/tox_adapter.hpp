@@ -331,8 +331,9 @@ class ToxAdapter {
     /// backpressure from permanent failure. Prefer this for control-frame
     /// paths that may want to queue-and-retry the SENDQ-full case but bail
     /// out (and surface the failure to the caller) for permanent errors.
-    [[nodiscard]] LosslessSendOutcome send_lossless_packet_typed(
-        uint32_t friend_number, const uint8_t* data, std::size_t length);
+    [[nodiscard]] LosslessSendOutcome send_lossless_packet_typed(uint32_t friend_number,
+                                                                 const uint8_t* data,
+                                                                 std::size_t length);
 
     /// Send a custom lossless packet to a friend.
     ///

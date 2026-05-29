@@ -676,16 +676,14 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     if (pending_outbound_.size() >= kMaxPendingOutbound) {
         pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
-        util::Logger::warn(
-            "TunnelManager::send_frame: pending queue at cap ({}); dropping frame",
-            kMaxPendingOutbound);
+        util::Logger::warn("TunnelManager::send_frame: pending queue at cap ({}); dropping frame",
+                           kMaxPendingOutbound);
         return false;
     }
     pending_outbound_.push_back(std::move(wire));
     pending_enqueued_total_.fetch_add(1, std::memory_order_relaxed);
-    util::Logger::debug(
-        "TunnelManager::send_frame: SENDQ-full, parked frame (queue depth={})",
-        pending_outbound_.size());
+    util::Logger::debug("TunnelManager::send_frame: SENDQ-full, parked frame (queue depth={})",
+                        pending_outbound_.size());
     arm_pending_drain_timer_locked();
     return true;
 }
@@ -694,16 +692,14 @@ bool TunnelManager::queue_outbound_for_retry(std::vector<uint8_t> wire) {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     if (pending_outbound_.size() >= kMaxPendingOutbound) {
         pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
-        util::Logger::warn(
-            "TunnelManager::queue_outbound_for_retry: queue at cap ({}); dropping",
-            kMaxPendingOutbound);
+        util::Logger::warn("TunnelManager::queue_outbound_for_retry: queue at cap ({}); dropping",
+                           kMaxPendingOutbound);
         return false;
     }
     pending_outbound_.push_back(std::move(wire));
     pending_enqueued_total_.fetch_add(1, std::memory_order_relaxed);
-    util::Logger::debug(
-        "TunnelManager::queue_outbound_for_retry: parked frame (queue depth={})",
-        pending_outbound_.size());
+    util::Logger::debug("TunnelManager::queue_outbound_for_retry: parked frame (queue depth={})",
+                        pending_outbound_.size());
     arm_pending_drain_timer_locked();
     return true;
 }
