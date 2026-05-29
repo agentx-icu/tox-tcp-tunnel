@@ -554,7 +554,39 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
 
     // Free up send window. Capture pre- and post- values to detect a
     // window-drain transition (post == 0) that lets us close out an RTT sample.
-    std::size_t acked = payload->bytes_acked;
+    // Clamp the peer-supplied ack to what we have ACTUALLY emitted but not yet
+    // had acked. A malicious peer that ACK-credits bytes we never put on the
+    // wire could otherwise drive send_window_used_ to 0 at will, defeating the
+    // only bound on coalesce_buf_ and OOMing us.
+    //
+    // LOCK-FREE on purpose: the coalesce drain holds coalesce_mutex_ across
+    // send_frame_to_tox, and a synchronous ACK round-trip (test harness, or any
+    // in-process loopback) would re-enter here on the same thread — taking
+    // coalesce_mutex_ would self-deadlock. Correctness without the lock comes
+    // from causality: emit stores total_bytes_emitted_ with release BEFORE the
+    // bytes go on the wire, and the peer can only ACK bytes it received AFTER
+    // that send, so this acquire-load always observes emitted >= the acked
+    // bytes — a legitimate ACK is credited in full; only a forged over-ack is
+    // clamped.
+    std::size_t credited = 0;
+    {
+        const std::uint64_t emitted = total_bytes_emitted_.load(std::memory_order_acquire);
+        std::uint64_t acked_so_far = total_bytes_acked_.load(std::memory_order_relaxed);
+        for (;;) {
+            const std::uint64_t outstanding = emitted > acked_so_far ? emitted - acked_so_far : 0;
+            const std::uint64_t want = std::min<std::uint64_t>(payload->bytes_acked, outstanding);
+            if (want == 0) {
+                break;
+            }
+            if (total_bytes_acked_.compare_exchange_weak(acked_so_far, acked_so_far + want,
+                                                         std::memory_order_relaxed)) {
+                credited = static_cast<std::size_t>(want);
+                break;
+            }
+            // CAS failed: acked_so_far refreshed; recompute against same emitted.
+        }
+    }
+    const std::size_t acked = credited;
     std::size_t current_window = send_window_used_.load(std::memory_order_relaxed);
     std::size_t new_window = current_window;
     while (current_window > 0) {
@@ -886,6 +918,14 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
             for (std::size_t offset = 0; offset < data.size();
                  offset += kMaxTcpPayloadPerToxFrame) {
                 const auto chunk_size = std::min(kMaxTcpPayloadPerToxFrame, data.size() - offset);
+                // Count the chunk as emitted BEFORE handing it to the (inline,
+                // synchronous) send callback: an in-process ACK round-trip can
+                // re-enter handle_tunnel_ack_frame on this very thread before the
+                // send returns, and its acquire-load of total_bytes_emitted_ must
+                // already include this chunk (else a legitimate ACK is
+                // under-credited). Release pairs with that acquire. On send
+                // failure we undo it below — those bytes never reached the wire.
+                total_bytes_emitted_.fetch_add(chunk_size, std::memory_order_release);
                 bool sent = false;
                 if (zero_copy) {
                     auto buf = OwnedFrameBuffer::with_payload(data.subspan(offset, chunk_size));
@@ -906,6 +946,7 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
                     // reads pause until they drain. (Earlier revisions refunded
                     // + transitioned to Error here, which truncated the stream
                     // on a momentarily-full Tox queue.)
+                    total_bytes_emitted_.fetch_sub(chunk_size, std::memory_order_release);
                     const auto remainder = data.subspan(offset);
                     coalesce_buf_.insert(coalesce_buf_.end(), remainder.begin(), remainder.end());
                     coalesce_arm_timer_locked();
@@ -1249,6 +1290,11 @@ bool TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
         std::lock_guard<std::mutex> lock(mutex_);
         zero_copy = static_cast<bool>(on_send_to_tox_owned_);
     }
+    // Count as emitted BEFORE the (inline, synchronous) send callback: a same-
+    // thread ACK round-trip can re-enter handle_tunnel_ack_frame before the send
+    // returns, and its acquire-load of total_bytes_emitted_ must already include
+    // these bytes or a legitimate ACK is under-credited. Undone on failure below.
+    total_bytes_emitted_.fetch_add(bytes, std::memory_order_release);
     bool sent = false;
     if (zero_copy) {
         auto buf = OwnedFrameBuffer::with_payload(std::span<const std::uint8_t>(front, bytes));
@@ -1269,10 +1315,12 @@ bool TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
         // (Earlier revisions erased + refunded here, silently truncating any
         // transfer large/fast enough to outrun the Tox congestion window —
         // observed as a hard ~85-90 KiB cap with the remainder lost.)
+        total_bytes_emitted_.fetch_sub(bytes, std::memory_order_release);
         util::Logger::debug("Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_,
                             bytes);
         return false;
     }
+    // Emitted successfully — the counter bumped above stands.
     // Consume via the offset (O(1)) instead of erase-from-front (O(n)). When
     // the buffer is fully drained, reset to reclaim it cheaply; otherwise the
     // prefix is reclaimed lazily in coalesce_append_locked.

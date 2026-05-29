@@ -142,7 +142,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     // -----------------------------------------------------------------
 
     // NOTE (thread-safety contract, H-10): set_on_connect / set_on_data /
-    // set_on_disconnect / set_on_error / set_on_writable / set_read_buffer_size
+    // set_on_disconnect / set_on_error / set_on_writable / set_on_closed /
+    // set_read_buffer_size
     // are NOT internally synchronized and must be called during setup — before
     // start_read() / async_connect() begin delivering — never concurrently with
     // live I/O. The write-buffer limit (set_max_write_buffer_size) IS atomic and
@@ -153,6 +154,13 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void set_on_read_eof(ReadEofCallback cb);
     void set_on_disconnect(DisconnectCallback cb);
     void set_on_error(ErrorCallback cb);
+
+    /// Owner/lifecycle hook fired exactly once when the connection closes
+    /// (state -> Disconnected, via do_close), on whatever thread closes it.
+    /// Distinct from set_on_disconnect: that slot belongs to the data consumer,
+    /// this one is reserved for the resource owner (e.g. TcpListener wires it to
+    /// decrement its active-connection count). Set during setup, before I/O.
+    void set_on_closed(std::function<void()> cb);
 
     /// Set the low-water-mark callback (see WritableCallback). Fired on the
     /// strand once the write queue drains back below half the configured limit
@@ -371,6 +379,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     DisconnectCallback on_disconnect_;
     ErrorCallback on_error_;
     WritableCallback on_writable_;
+    /// Owner/lifecycle close hook (see set_on_closed). Separate slot from
+    /// on_disconnect_ so the resource owner and the data consumer don't clobber
+    /// each other.
+    std::function<void()> on_closed_;
 };
 
 }  // namespace toxtunnel::core

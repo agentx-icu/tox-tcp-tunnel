@@ -269,6 +269,10 @@ TEST_F(TunnelTest, HandleFrame_Ping) {
 TEST_F(TunnelTest, HandleFrame_TunnelAck) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
     tunnel.set_state(Tunnel::State::Connected);
+    // Emit immediately (bypass) with an accepting sink so the bytes are actually
+    // on the wire: the ACK clamp only credits the window for emitted bytes.
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
+    tunnel.configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
 
     // Send some data first to establish bytes_sent
     (void)tunnel.send_data_to_tox({0x01, 0x02, 0x03});
@@ -373,6 +377,10 @@ TEST_F(TunnelTest, Backpressure_WindowTracksSentBytes) {
 TEST_F(TunnelTest, Backpressure_WindowFreedOnAck) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 1024);
     tunnel.set_state(Tunnel::State::Connected);
+    // Emit immediately so the bytes reach the wire; the ACK clamp credits the
+    // window only for emitted bytes (a peer cannot ack what we never sent).
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
+    tunnel.configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
 
     (void)tunnel.send_data_to_tox({0x01, 0x02, 0x03, 0x04, 0x05});
     EXPECT_EQ(tunnel.send_window_used(), 5u);
@@ -381,6 +389,44 @@ TEST_F(TunnelTest, Backpressure_WindowFreedOnAck) {
     tunnel.handle_frame(frame);
 
     EXPECT_EQ(tunnel.send_window_used(), 0u);
+}
+
+TEST_F(TunnelTest, Backpressure_ForgedAckClampedToEmitted) {
+    // A peer that ACKs more than we actually put on the wire must not
+    // over-credit the send window (forged-ACK OOM defense).
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 1024);
+    tunnel.set_state(Tunnel::State::Connected);
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
+    tunnel.configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    (void)tunnel.send_data_to_tox({0x01, 0x02, 0x03, 0x04, 0x05});  // 5 bytes emitted
+    EXPECT_EQ(tunnel.send_window_used(), 5u);
+    EXPECT_EQ(tunnel.bytes_emitted(), 5u);
+
+    // Forge an ACK far larger than emitted: credited is clamped to 5, so the
+    // window drains to exactly 0 — no underflow, no spurious extra credit.
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 1'000'000));
+    EXPECT_EQ(tunnel.send_window_used(), 0u);
+}
+
+TEST_F(TunnelTest, Backpressure_ForgedAckCannotFreeWindowForUnsentBytes) {
+    // The forged-ACK OOM scenario: Tox SENDQ is full so nothing is emitted and
+    // bytes pile into the coalesce buffer with the window charged. A malicious
+    // peer must NOT free the window by acking bytes that never left this side —
+    // otherwise TCP reads never pause and coalesce_buf_ grows without bound.
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 1024);
+    tunnel.set_state(Tunnel::State::Connected);
+    // Sink rejects every send (persistently full Tox SENDQ).
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return false; });
+    tunnel.configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    (void)tunnel.send_data_to_tox({0x01, 0x02, 0x03, 0x04, 0x05});
+    EXPECT_EQ(tunnel.send_window_used(), 5u);  // charged at accept
+    EXPECT_EQ(tunnel.bytes_emitted(), 0u);     // nothing reached the wire
+
+    // Credited = min(huge, emitted(0) - acked(0)) = 0 -> window stays charged.
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 1'000'000));
+    EXPECT_EQ(tunnel.send_window_used(), 5u);
 }
 
 TEST_F(TunnelTest, Backpressure_ReceiveBufferTracking) {

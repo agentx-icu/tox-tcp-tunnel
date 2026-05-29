@@ -192,14 +192,32 @@ void TunnelServer::start() {
             return managers_.size();
         };
         providers.friend_pk_prefix = [this](uint16_t tunnel_id) -> std::string {
-            std::lock_guard lock(managers_mutex_);
-            for (const auto& [friend_number, manager] : managers_) {
-                if (manager->has_tunnel(tunnel_id)) {
-                    auto hex = get_friend_pk_hex(friend_number);
-                    return hex.size() > 8 ? hex.substr(0, 8) : hex;
+            // Resolve tunnel_id -> friend_number under managers_mutex_, then
+            // RELEASE the lock BEFORE get_friend_pk_hex(). That call marshals to
+            // the Tox thread and blocks on it (ToxAdapter::get_friend_public_key
+            // -> run_on_tox_thread), and the inbound-frame path
+            // (on_lossless_packet) takes managers_mutex_ on the Tox thread — so
+            // holding it here while blocking on that thread deadlocks: the Tox
+            // thread can't drain the marshaled task because it's waiting on the
+            // lock we hold. Same snapshot-then-release discipline as route_frame
+            // / resolve_manager below.
+            uint32_t friend_number = 0;
+            bool found = false;
+            {
+                std::lock_guard lock(managers_mutex_);
+                for (const auto& [fn, manager] : managers_) {
+                    if (manager->has_tunnel(tunnel_id)) {
+                        friend_number = fn;
+                        found = true;
+                        break;
+                    }
                 }
             }
-            return {};
+            if (!found) {
+                return {};
+            }
+            auto hex = get_friend_pk_hex(friend_number);
+            return hex.size() > 8 ? hex.substr(0, 8) : hex;
         };
         providers.snapshot = [this] {
             tunnel::ManagerSnapshot combined;
@@ -582,6 +600,11 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
                 });
                 resurrected->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
             }
+            // Re-arm the maintenance scan (paused while held).
+            resurrected->enable_reaper(config_.tunnel.idle_timeout_seconds,
+                                       config_.tunnel.reaper_tick_seconds);
+            resurrected->enable_half_close_reaper(config_.tunnel.half_close_timeout_seconds,
+                                                  config_.tunnel.reaper_tick_seconds);
             // Re-apply the (possibly hot-reloaded) per-friend cap before the
             // manager re-enters managers_. During this handoff it is in neither
             // managers_ nor held_managers_, so a concurrent reapply_tunnel_caps()
@@ -652,6 +675,14 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
         manager->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
     }
 
+    // Idle reaper (opt-in) + half-close linger cap (on by default). Both no-op
+    // when their timeout is 0. The half-close cap bounds tunnels stuck in
+    // Disconnecting after a one-sided TCP close whose peer never sends the
+    // reciprocal TUNNEL_CLOSE (the v0.4.4 stuck-Disconnecting fd leak).
+    manager->enable_reaper(config_.tunnel.idle_timeout_seconds, config_.tunnel.reaper_tick_seconds);
+    manager->enable_half_close_reaper(config_.tunnel.half_close_timeout_seconds,
+                                      config_.tunnel.reaper_tick_seconds);
+
     std::lock_guard lock(managers_mutex_);
     managers_[friend_number] = std::move(manager);
 }
@@ -668,12 +699,22 @@ void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {
         managers_.erase(it);
     }
 
+    // This manager is leaving the active set (held for resume, or closed below).
+    // Stop its background maintenance immediately, BEFORE the hold/close branch.
+    // The io_context is a thread pool, so a reaper tick on another thread could
+    // otherwise race in during hold setup and force-close a Disconnecting tunnel
+    // that resume wants to preserve. Re-armed on resurrection; harmless on the
+    // close path. (A reap pass already in flight when we get here can still
+    // finish, but it only reaps tunnels already idle past the cap — which is
+    // exactly what the cap is for, so the residual is benign.)
+    mgr->disable_keepalive();  // re-armed on resurrection
+    mgr->disable_reaper();     // re-armed on resurrection
+
     // H-07: if resume is enabled and this manager still has live tunnels, hold
     // it (and its target TCP connections) for up to resume.max_age_seconds so a
     // quick reconnect can reattach. Otherwise close immediately. close_all and
     // the hold bookkeeping run outside managers_mutex_ (H-01 discipline).
     if (config_.tunnel.resume.enabled && !mgr->empty()) {
-        mgr->disable_keepalive();  // re-armed on resurrection
         auto timer = std::make_shared<asio::steady_timer>(io_context_->get_io_context());
         timer->expires_after(std::chrono::seconds(config_.tunnel.resume.max_age_seconds));
         {
@@ -1079,7 +1120,9 @@ void TunnelServer::handle_resume_request(uint32_t friend_number,
     //   client->server gap: client says it sent c_sent, server received s_recv.
     //   server->client gap: server sent s_sent, client received c_recv.
     const uint64_t s_recv = impl->bytes_received();
-    const uint64_t s_sent = impl->bytes_sent();
+    // Emitted (on-the-wire), NOT accepted-from-TCP — see the client side: bytes
+    // still buffered in the coalescer must not count as a transmission gap.
+    const uint64_t s_sent = impl->bytes_emitted();
     const uint64_t c_sent = req->last_local_send_offset;
     const uint64_t c_recv = req->last_local_recv_offset;
     const bool gap = resume_offsets_have_gap(/*local_send=*/s_sent, /*peer_recv=*/c_recv,
