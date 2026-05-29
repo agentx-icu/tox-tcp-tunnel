@@ -75,7 +75,11 @@ else()
 endif()
 gtest_discover_tests(unit_tests
     DISCOVERY_TIMEOUT 60
-    PROPERTIES LABELS "unit"
+    # Per-test wall-clock cap so a hung test fails fast (named in the ctest log)
+    # instead of stalling the whole job until the 6h GitHub limit. Every unit
+    # test finishes in well under a second; the slowest deliberately sleeps a
+    # couple of seconds, so 120s is generous headroom even on a loaded runner.
+    PROPERTIES LABELS "unit" TIMEOUT 120
 )
 
 # Integration tests
@@ -117,7 +121,10 @@ else()
 endif()
 gtest_discover_tests(integration_tests
     DISCOVERY_TIMEOUT 60
-    PROPERTIES LABELS "integration"
+    # Per-test wall-clock cap (see unit_tests above). Integration tests use
+    # bounded 5s future waits, so 120s is ample and turns any hang into a fast,
+    # named failure rather than a 6h job stall.
+    PROPERTIES LABELS "integration" TIMEOUT 120
 )
 
 # Soak tests (long-running). Default `ctest` excludes them via labels;
