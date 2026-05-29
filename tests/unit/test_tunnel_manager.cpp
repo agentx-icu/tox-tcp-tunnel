@@ -652,11 +652,21 @@ TEST_F(TunnelManagerTest, SendFrame_BackpressuredFramesDrainInOrder) {
 
     // Pump io_ctx until the drain timer has fired enough times to deliver
     // all three frames, or we time out. The retry delay is 20ms; allowing
-    // 2 seconds of wall time leaves plenty of headroom on slow CI runners.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    // 3 seconds of wall time leaves plenty of headroom on slow CI runners.
+    //
+    // Use `poll_one` + `restart` rather than `run_for(30ms) + restart`: on
+    // asio's Windows IOCP backend `run_for + restart` in a tight loop was
+    // observed to hang (windows-x86_64 CI runner stalled >35 min on the
+    // unit-tests step). `poll_one` is non-blocking — it dispatches at most
+    // one ready handler and returns — and the explicit `sleep_for` gives
+    // the steady_timer a chance to expire between polls. The `restart()`
+    // call is still needed because `poll_one()` puts the io_context into
+    // the stopped state when no work is ready.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (accepted.size() < 3 && std::chrono::steady_clock::now() < deadline) {
-        io_ctx.run_for(std::chrono::milliseconds(30));
+        io_ctx.poll_one();
         io_ctx.restart();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
     ASSERT_EQ(accepted.size(), 3u) << "all three frames should drain within timeout";
