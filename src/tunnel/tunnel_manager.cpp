@@ -711,9 +711,22 @@ void TunnelManager::arm_pending_drain_timer_locked() {
     if (pending_drain_armed_ || pending_outbound_.empty()) {
         return;
     }
+    // The drain callback captures `weak_from_this()`. When the manager is
+    // not held by a shared_ptr (e.g. test fixtures that allocate via
+    // `std::unique_ptr<TunnelManager>` or stack-construct one), the weak
+    // pointer is empty and the callback would just bail when it eventually
+    // fires. Avoid arming the timer in that case: the outstanding
+    // async_wait would otherwise force the io_context destructor to
+    // service one pending op, which on the Windows IOCP backend was
+    // observed to stall the unit_tests process indefinitely on the
+    // windows-x86_64 CI runner. Production paths always own the manager
+    // via shared_ptr so this branch is purely a test-safety guard.
+    std::weak_ptr<TunnelManager> weak = weak_from_this();
+    if (weak.expired()) {
+        return;
+    }
     pending_drain_armed_ = true;
     pending_drain_timer_.expires_after(kPendingDrainDelay);
-    std::weak_ptr<TunnelManager> weak = weak_from_this();
     pending_drain_timer_.async_wait([weak](const std::error_code& ec) {
         if (ec) {
             return;
