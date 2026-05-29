@@ -160,7 +160,20 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// `disable_reaper()` to stop it.
     void enable_reaper(uint32_t idle_timeout_seconds, uint32_t tick_seconds);
 
-    /// Cancel the reaper timer if one is scheduled.
+    /// Enable the half-close linger cap.
+    ///
+    /// Shares the same maintenance scan/timer as the idle reaper, but is a
+    /// distinct, on-by-default policy: it force-closes any tunnel stuck in the
+    /// Disconnecting state (local half-close sent, peer's reciprocal
+    /// TUNNEL_CLOSE never received) once it has seen no TUNNEL_DATA in either
+    /// direction for `half_close_timeout_seconds`. This bounds the half-open
+    /// TCP fd a wedged peer would otherwise pin forever. Enabling this does
+    /// NOT enable the general idle reaper (that stays gated on
+    /// `enable_reaper`). Calling with `half_close_timeout_seconds == 0` (or
+    /// `tick_seconds == 0`) is a no-op.
+    void enable_half_close_reaper(uint32_t half_close_timeout_seconds, uint32_t tick_seconds);
+
+    /// Cancel the maintenance timer (idle reaper + half-close cap) if scheduled.
     ///
     /// Idempotent and safe to call from the destructor.
     void disable_reaper();
@@ -491,8 +504,13 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// is enabled. Cancelled in disable_reaper() and the destructor.
     asio::steady_timer reaper_timer_;
 
-    /// Idle threshold in nanoseconds. 0 means the reaper is disabled.
+    /// Idle threshold in nanoseconds. 0 means the idle reaper is disabled.
     std::atomic<int64_t> reaper_idle_timeout_ns_{0};
+
+    /// Half-close linger threshold in nanoseconds. 0 means the cap is
+    /// disabled. Applies only to tunnels in the Disconnecting state. Shares
+    /// `reaper_timer_` / the maintenance scan with `reaper_idle_timeout_ns_`.
+    std::atomic<int64_t> reaper_half_close_timeout_ns_{0};
 
     /// Configured tick interval (seconds). Read on the io_ctx thread.
     std::chrono::seconds reaper_tick_{0};

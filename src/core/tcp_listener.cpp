@@ -145,6 +145,16 @@ void TcpListener::do_accept() {
         return;
     }
 
+    // Single in-flight accept. on_connection_closed() and set_max_connections()
+    // both post do_accept(), and the handler re-arms; without this guard those
+    // could stack multiple concurrent async_accept ops, each of which increments
+    // connection_count_ on completion, over-admitting past max_connections_. CAS
+    // so exactly one accept proceeds; released at the top of the handler.
+    bool expected = false;
+    if (!accept_in_flight_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
     // Keep the listener alive across the in-flight async_accept (S19 in
     // the 2026-05-20 follow-up). The caller might erase its owning
     // shared_ptr (e.g. TunnelClient::reload removing a forward rule)
@@ -154,6 +164,9 @@ void TcpListener::do_accept() {
     acceptor_.async_accept([this, self](const asio::error_code& ec,
                                         asio::ip::tcp::socket peer_socket) {
         if (ec) {
+            // No connection was admitted — release the in-flight guard before
+            // returning (stop) or retrying (transient).
+            accept_in_flight_.store(false, std::memory_order_release);
             if (ec == asio::error::operation_aborted) {
                 // Acceptor was closed (stop() was called); do not continue.
                 return;
@@ -164,7 +177,16 @@ void TcpListener::do_accept() {
             return;
         }
 
+        // Increment the active count BEFORE releasing the in-flight guard. The
+        // guard only bounds concurrency to one outstanding async_accept; the
+        // over-admit guarantee also needs any racing do_accept() (posted by
+        // on_connection_closed/set_max_connections onto this multi-threaded
+        // io_context, or the re-arm below) to observe THIS connection in the
+        // count when it re-checks max_connections_. Clearing the guard before
+        // the fetch_add let a queued do_accept read the stale pre-accept count
+        // and arm one accept too many.
         std::size_t new_count = connection_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        accept_in_flight_.store(false, std::memory_order_release);
 
         // Wrap the accepted socket in a TcpConnection.
         auto conn = std::make_shared<TcpConnection>(std::move(peer_socket));
@@ -172,6 +194,19 @@ void TcpListener::do_accept() {
         util::Logger::debug("TcpListener: accepted connection from {} (active: {}/{})",
                             conn->remote_endpoint().address().to_string(), new_count,
                             max_connections_.load(std::memory_order_relaxed));
+
+        // Wire the active-connection decrement to THIS connection's close, so
+        // the count tracks concurrency rather than monotonically climbing.
+        // Uses the owner-reserved on_closed slot (never the consumer's
+        // on_disconnect), set before hand-off so it can't be missed even if the
+        // accept_handler closes the connection immediately (e.g. capacity
+        // reject). weak_ptr so a close racing listener teardown is a no-op.
+        std::weak_ptr<TcpListener> weak_self = shared_from_this();
+        conn->set_on_closed([weak_self]() {
+            if (auto self = weak_self.lock()) {
+                self->on_connection_closed();
+            }
+        });
 
         if (accept_handler_) {
             accept_handler_(std::move(conn));

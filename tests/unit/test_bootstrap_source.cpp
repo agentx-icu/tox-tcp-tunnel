@@ -21,9 +21,22 @@ class BootstrapSourceTest : public ::testing::Test {
                     ("toxtunnel_bootstrap_source_test_" + unique_suffix);
         std::filesystem::remove_all(temp_dir_);
         std::filesystem::create_directories(temp_dir_);
+        // A prior test may have left the RefreshManager disarmed via TearDown;
+        // re-arm so cache-hit cases can spawn their background refresh worker.
+        BootstrapSource::arm_refreshes();
     }
 
-    void TearDown() override { std::filesystem::remove_all(temp_dir_); }
+    void TearDown() override {
+        // Deterministically join any background refresh worker on THIS thread
+        // before the process tears down. Otherwise the worker is joined by the
+        // RefreshManager's static destructor at process exit, and joining a
+        // thread during static destruction deadlocks against the Windows loader
+        // lock — a flaky ~hang that timed out the windows-x86_64 CI job. Joining
+        // here also guarantees the worker isn't still writing the cache when we
+        // delete temp_dir_ below.
+        BootstrapSource::cancel_pending_refreshes();
+        std::filesystem::remove_all(temp_dir_);
+    }
 
     void write_cache(const std::string& json) {
         const auto cache_path = BootstrapSource::cache_file_path(temp_dir_);

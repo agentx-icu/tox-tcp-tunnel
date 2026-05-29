@@ -1194,6 +1194,7 @@ Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs
     node["coalesce_mode"] = rhs.coalesce_mode;
     node["idle_timeout_seconds"] = rhs.idle_timeout_seconds;
     node["reaper_tick_seconds"] = rhs.reaper_tick_seconds;
+    node["half_close_timeout_seconds"] = rhs.half_close_timeout_seconds;
     node["keepalive_interval_seconds"] = rhs.keepalive_interval_seconds;
     if (!(rhs.resume == toxtunnel::TunnelResumeConfig{})) {
         node["resume"] = rhs.resume;
@@ -1219,6 +1220,9 @@ bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::Tunne
     }
     if (node["reaper_tick_seconds"]) {
         rhs.reaper_tick_seconds = node["reaper_tick_seconds"].as<uint32_t>();
+    }
+    if (node["half_close_timeout_seconds"]) {
+        rhs.half_close_timeout_seconds = node["half_close_timeout_seconds"].as<uint32_t>();
     }
     if (node["keepalive_interval_seconds"]) {
         rhs.keepalive_interval_seconds = node["keepalive_interval_seconds"].as<uint32_t>();

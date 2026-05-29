@@ -122,6 +122,18 @@ struct TunnelConfig {
     std::string coalesce_mode = "fixed";
     uint32_t idle_timeout_seconds = 0;
     uint32_t reaper_tick_seconds = 10;
+    /// Half-close linger cap (seconds). After a tunnel does a local half-close
+    /// (TCP read-EOF on one side -> it sends TUNNEL_CLOSE and enters
+    /// Disconnecting), it waits for the peer's reciprocal TUNNEL_CLOSE before
+    /// finalizing. If the peer never sends it (its app reads everything and
+    /// abandons the socket without closing), the tunnel would otherwise linger
+    /// forever holding a half-open TCP fd. After this many seconds with no
+    /// TUNNEL_DATA in either direction, the maintenance scan force-closes such a
+    /// tunnel (analogous to Linux tcp_fin_timeout for orphaned FIN_WAIT_2
+    /// sockets). On by default; 0 disables the cap. Distinct from
+    /// `idle_timeout_seconds`: the general idle reaper stays opt-in (0), while
+    /// this cap applies only to tunnels stuck in Disconnecting.
+    uint32_t half_close_timeout_seconds = 120;
     /// Application-level PING/PONG keepalive interval (seconds). 0 disables it
     /// (the default — toxcore's own connection tracking is relied upon). When
     /// set, each peer is PINGed every interval and declared dead — closing its
@@ -132,6 +144,9 @@ struct TunnelConfig {
     TunnelResumeConfig resume;
 
     [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }
+    [[nodiscard]] bool half_close_reaper_enabled() const noexcept {
+        return half_close_timeout_seconds > 0;
+    }
     [[nodiscard]] bool keepalive_enabled() const noexcept { return keepalive_interval_seconds > 0; }
 
     bool operator==(const TunnelConfig& other) const = default;

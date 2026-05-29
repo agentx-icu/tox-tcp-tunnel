@@ -82,12 +82,36 @@ void TunnelManager::enable_reaper(uint32_t idle_timeout_seconds, uint32_t tick_s
     // is idempotent in the sense that the new expiry replaces the old.
     schedule_reaper_tick();
 
-    util::Logger::info("TunnelManager: reaper enabled (idle={}s, tick={}s)", idle_timeout_seconds,
-                       tick_seconds);
+    util::Logger::info("TunnelManager: idle reaper enabled (idle={}s, tick={}s)",
+                       idle_timeout_seconds, tick_seconds);
+}
+
+void TunnelManager::enable_half_close_reaper(uint32_t half_close_timeout_seconds,
+                                             uint32_t tick_seconds) {
+    if (half_close_timeout_seconds == 0 || tick_seconds == 0) {
+        return;
+    }
+
+    const auto half_close_ns =
+        std::chrono::nanoseconds(std::chrono::seconds(half_close_timeout_seconds)).count();
+    reaper_half_close_timeout_ns_.store(static_cast<int64_t>(half_close_ns),
+                                        std::memory_order_relaxed);
+    reaper_tick_ = std::chrono::seconds(tick_seconds);
+
+    // Shares reaper_timer_ with the idle reaper. Re-arming an already-armed
+    // timer just replaces the expiry — harmless when both policies are enabled
+    // back-to-back at startup.
+    schedule_reaper_tick();
+
+    util::Logger::info("TunnelManager: half-close linger cap enabled (timeout={}s, tick={}s)",
+                       half_close_timeout_seconds, tick_seconds);
 }
 
 void TunnelManager::disable_reaper() {
+    // Disables BOTH maintenance policies (idle reaper + half-close cap) — they
+    // share one timer. Production only calls this at teardown.
     reaper_idle_timeout_ns_.store(0, std::memory_order_relaxed);
+    reaper_half_close_timeout_ns_.store(0, std::memory_order_relaxed);
     if (reaper_active_.exchange(false, std::memory_order_acq_rel)) {
         reaper_timer_.cancel();
     }
@@ -108,15 +132,22 @@ void TunnelManager::schedule_reaper_tick() {
         if (!self) {
             return;  // Manager was destroyed before the timer fired.
         }
-        // Stash & re-read the timeout: disable_reaper() may have raced in.
-        if (self->reaper_idle_timeout_ns_.load(std::memory_order_relaxed) == 0) {
+        // Stash & re-read the timeouts: disable_reaper() may have raced in.
+        // Either maintenance policy keeps the timer alive.
+        const bool maintenance_on =
+            self->reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0 ||
+            self->reaper_half_close_timeout_ns_.load(std::memory_order_relaxed) > 0;
+        if (!maintenance_on) {
             self->reaper_active_.store(false, std::memory_order_release);
             return;
         }
 
         self->reap_idle_tunnels_once();
 
-        if (self->reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0) {
+        const bool still_on =
+            self->reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0 ||
+            self->reaper_half_close_timeout_ns_.load(std::memory_order_relaxed) > 0;
+        if (still_on) {
             self->schedule_reaper_tick();
         } else {
             self->reaper_active_.store(false, std::memory_order_release);
@@ -126,7 +157,8 @@ void TunnelManager::schedule_reaper_tick() {
 
 std::size_t TunnelManager::reap_idle_tunnels_once() {
     const int64_t idle_timeout_ns = reaper_idle_timeout_ns_.load(std::memory_order_relaxed);
-    if (idle_timeout_ns <= 0) {
+    const int64_t half_close_ns = reaper_half_close_timeout_ns_.load(std::memory_order_relaxed);
+    if (idle_timeout_ns <= 0 && half_close_ns <= 0) {
         return 0;
     }
 
@@ -142,10 +174,20 @@ std::size_t TunnelManager::reap_idle_tunnels_once() {
             if (impl == nullptr) {
                 continue;
             }
-            if (impl->state() == Tunnel::State::Connecting) {
+            const Tunnel::State st = impl->state();
+            if (st == Tunnel::State::Connecting) {
                 continue;
             }
-            if (impl->IdleNanos() >= idle_timeout_ns) {
+            const int64_t idle = impl->IdleNanos();
+            // General idle reaper (opt-in): reaps any non-Connecting tunnel.
+            const bool idle_reap = idle_timeout_ns > 0 && idle >= idle_timeout_ns;
+            // Half-close linger cap (on by default): reaps only tunnels stuck in
+            // Disconnecting. IdleNanos (not time-since-Disconnecting) so a still-
+            // active one-way tail transfer keeps the tunnel alive — handle_tunnel
+            // _data_frame accepts DATA in Disconnecting and bumps activity.
+            const bool half_close_reap =
+                half_close_ns > 0 && st == Tunnel::State::Disconnecting && idle >= half_close_ns;
+            if (idle_reap || half_close_reap) {
                 to_close.push_back(id);
             }
         }
@@ -164,8 +206,9 @@ std::size_t TunnelManager::reap_idle_tunnels_once() {
     }
 
     if (closed > 0) {
-        util::Logger::info("TunnelManager: reaper closed {} idle tunnels (timeout={}s)", closed,
-                           idle_timeout_ns / 1'000'000'000);
+        util::Logger::info(
+            "TunnelManager: maintenance closed {} tunnels (idle_timeout={}s, half_close={}s)",
+            closed, idle_timeout_ns / 1'000'000'000, half_close_ns / 1'000'000'000);
     }
     return closed;
 }
@@ -308,6 +351,7 @@ bool TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
     }
 
     TunnelCreatedCallback created_cb;
+    std::shared_ptr<Tunnel> replaced;
 
     {
         std::unique_lock lock(mutex_);
@@ -319,20 +363,40 @@ bool TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
             return false;
         }
 
-        // If a tunnel with this ID already exists, close it first
         auto it = tunnels_.find(tunnel_id);
         if (it != tunnels_.end()) {
+            // Replace path. In production both callers reserve a free id before
+            // calling add_tunnel (server: handle_incoming_open rejects in-use
+            // ids; client: allocate_tunnel_id), so this is defensive. Pull the
+            // old tunnel fully OUT of the map now and DON'T insert the new one
+            // yet: its teardown (below, after unlock) fires on_close_ ->
+            // remove_tunnel(id), and if the replacement were already in the slot
+            // that callback would drop it. With the old tunnel erased and the
+            // new one not yet inserted, that re-entrant remove is a clean no-op.
+            // The id stays reserved in used_ids_ across the swap.
             util::Logger::debug("TunnelManager: replacing existing tunnel {}", tunnel_id);
-            it->second->close();
+            replaced = std::move(it->second);
             tunnels_.erase(it);
         } else {
-            // Mark ID as used
             used_ids_[tunnel_id] = true;
+            tunnels_[tunnel_id] = std::move(tunnel);
+            created_cb = on_tunnel_created_;
         }
+    }
 
+    // Replace path: tear the old tunnel down OUTSIDE the lock (re-entrancy rule,
+    // see remove_tunnel), THEN publish the replacement. force_close() releases
+    // the old socket and drives it terminal without emitting TUNNEL_CLOSE — the
+    // right behaviour for a reused id (a stale close could kill the peer's new
+    // tunnel). force_close lives on TunnelImpl, not the abstract base.
+    if (replaced) {
+        if (auto* impl = dynamic_cast<TunnelImpl*>(replaced.get())) {
+            impl->force_close();
+        } else {
+            replaced->close();
+        }
+        std::unique_lock lock(mutex_);
         tunnels_[tunnel_id] = std::move(tunnel);
-
-        // Copy callbacks to invoke outside the lock
         created_cb = on_tunnel_created_;
     }
 
@@ -347,6 +411,7 @@ bool TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
 
 void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
     TunnelClosedCallback closed_cb;
+    std::shared_ptr<Tunnel> doomed;
 
     {
         std::unique_lock lock(mutex_);
@@ -356,17 +421,39 @@ void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
             return;
         }
 
-        // Close the tunnel
-        it->second->close();
-
-        // Remove from map
+        // Snapshot + erase BEFORE running teardown. The tunnel's on_close_
+        // callback may re-enter remove_tunnel(tunnel_id) synchronously — the
+        // client wires it that way (src/app/tunnel_client.cpp). Erasing first
+        // means that re-entry finds the slot already gone and returns a no-op,
+        // instead of trying to re-lock this non-recursive shared_mutex on the
+        // same thread and deadlocking. This was latent until the idle/half-close
+        // reaper (the only caller that removes a still-live tunnel) was wired in.
+        doomed = std::move(it->second);
         tunnels_.erase(it);
-
-        // Release the ID
         used_ids_[tunnel_id] = false;
 
         // Copy callback to invoke outside the lock
         closed_cb = on_tunnel_closed_;
+    }
+
+    // Teardown OUTSIDE the lock (see above).
+    if (doomed) {
+        // close() is a no-op once a tunnel is past Connected, so a tunnel caught
+        // mid-half-close (Disconnecting, awaiting the peer's reciprocal
+        // TUNNEL_CLOSE) would never release its local TCP fd. force_close()
+        // drives it to Closed, drops the socket, and fires on_close_. A Connected
+        // tunnel keeps the graceful close() (drain pending bytes + emit
+        // TUNNEL_CLOSE). force_close() lives on TunnelImpl, not the abstract
+        // base, so reach it via dynamic_cast (mirrors reap_idle_tunnels_once).
+        if (doomed->state() == Tunnel::State::Disconnecting) {
+            if (auto* impl = dynamic_cast<TunnelImpl*>(doomed.get())) {
+                impl->force_close();
+            } else {
+                doomed->close();
+            }
+        } else {
+            doomed->close();
+        }
     }
 
     util::Logger::debug("TunnelManager: removed tunnel {}", tunnel_id);

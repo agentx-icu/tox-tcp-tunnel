@@ -188,6 +188,16 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     // Create TunnelManager
     tunnel_mgr_ = std::make_shared<tunnel::TunnelManager>(io_ctx_->get_io_context());
 
+    // Idle reaper (opt-in) + half-close linger cap (on by default). Enabled once
+    // for the manager's lifetime — unlike keepalive, this is not connection-state
+    // dependent. The half-close cap bounds a client-side tunnel stuck in
+    // Disconnecting when the server never sends the reciprocal TUNNEL_CLOSE
+    // (mirror of the v0.4.4 stuck-Disconnecting leak). Both no-op when 0.
+    tunnel_mgr_->enable_reaper(config_.tunnel.idle_timeout_seconds,
+                               config_.tunnel.reaper_tick_seconds);
+    tunnel_mgr_->enable_half_close_reaper(config_.tunnel.half_close_timeout_seconds,
+                                          config_.tunnel.reaper_tick_seconds);
+
     // Set up callbacks and handlers
     setup_tox_callbacks();
     setup_tunnel_manager();
@@ -973,7 +983,10 @@ void TunnelClient::send_resume_requests() {
         tunnel::TunnelResumeRequestPayload req;
         req.prior_tunnel_id = id;
         req.last_local_recv_offset = impl->bytes_received();
-        req.last_local_send_offset = impl->bytes_sent();
+        // Emitted (on-the-wire), NOT accepted-from-TCP: bytes still buffered in
+        // the coalescer haven't reached the peer, so reporting bytes_sent() here
+        // would look like a gap and falsely close a recoverable tunnel.
+        req.last_local_send_offset = impl->bytes_emitted();
         req.host = impl->target_host();
         req.target_port = impl->target_port();
 

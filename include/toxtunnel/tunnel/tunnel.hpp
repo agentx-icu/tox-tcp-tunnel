@@ -433,9 +433,20 @@ class TunnelImpl : public Tunnel {
         return total_bytes_received_.load(std::memory_order_relaxed);
     }
 
-    /// Return the number of bytes sent.
+    /// Return the number of bytes accepted from the local TCP side (charged to
+    /// the send window at accept time). NOTE: this counts bytes that may still
+    /// be buffered in the coalescer and not yet on the wire — use
+    /// `bytes_emitted()` for "what the peer could have received".
     [[nodiscard]] std::size_t bytes_sent() const noexcept {
         return total_bytes_sent_.load(std::memory_order_relaxed);
+    }
+
+    /// Return the number of payload bytes actually handed to toxcore (emitted
+    /// on the wire). This is <= bytes_sent() whenever data is buffered under
+    /// backpressure. Used as the resume "send offset" so buffered-but-unsent
+    /// bytes are not mistaken for a transmission gap.
+    [[nodiscard]] std::uint64_t bytes_emitted() const noexcept {
+        return total_bytes_emitted_.load(std::memory_order_acquire);
     }
 
     /// Set the ACK threshold (bytes received before sending ACK).
@@ -619,8 +630,24 @@ class TunnelImpl : public Tunnel {
     /// Total bytes received.
     std::atomic<std::size_t> total_bytes_received_{0};
 
-    /// Total bytes sent.
+    /// Total bytes sent (accepted from local TCP, charged to the send window).
     std::atomic<std::size_t> total_bytes_sent_{0};
+
+    /// Lossless flow accounting (lock-free; do NOT hold coalesce_mutex_ when
+    /// touching these — the ACK handler must stay lock-free because the coalesce
+    /// drain holds coalesce_mutex_ across send_frame_to_tox, and a synchronous
+    /// ACK round-trip would re-enter and self-deadlock).
+    ///  - total_bytes_emitted_: payload bytes actually handed to toxcore.
+    ///    Stored with release at the emit sites.
+    ///  - total_bytes_acked_: cumulative peer-acked bytes, CLAMPED so it can
+    ///    never exceed total_bytes_emitted_ (a peer cannot ACK-credit the send
+    ///    window for bytes we never put on the wire — forged-ACK OOM defense).
+    /// The ACK handler does an acquire-load of emitted; causality (we
+    /// store-release BEFORE sending, the peer can only ACK what it received
+    /// AFTER we sent) guarantees that load sees emitted >= the acked bytes, so
+    /// a legitimate ACK is never under-credited.
+    std::atomic<std::uint64_t> total_bytes_emitted_{0};
+    std::atomic<std::uint64_t> total_bytes_acked_{0};
 
     /// Last activity timestamp as nanoseconds since steady_clock epoch.
     /// Atomic so the reaper thread can sample without taking the tunnel mutex.

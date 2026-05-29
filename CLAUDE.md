@@ -167,7 +167,10 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   non-loopback listen addresses at startup).
 - **Idle tunnel reaper** — `tunnel.idle_timeout_seconds: 0` means disabled by
   default. Setting any positive value enables the reaper, which ticks every
-  `tunnel.reaper_tick_seconds` (default 10).
+  `tunnel.reaper_tick_seconds` (default 10). The reaper is wired into both
+  `TunnelServer` (per-friend manager) and `TunnelClient`; it reaps any
+  non-`Connecting` tunnel idle (no TUNNEL_DATA either direction) past the
+  timeout.
 - **Write coalescing** — on by default with safe values:
   `tunnel.coalesce_max_delay_us = 200`, `tunnel.coalesce_max_bytes = 1362`
   (one Tox-MTU worth). Set delay to 0 to disable.
@@ -222,6 +225,15 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   the client marks the active server offline so failover promotes a fallback.
   Catches an application that is wedged while its toxcore link still looks
   alive (toxcore's own connection tracking covers transport-level death).
+- **Half-close linger cap** — `tunnel.half_close_timeout_seconds: 120` by
+  default (0 disables). After a one-sided TCP close a tunnel sits in
+  `Disconnecting` awaiting the peer's reciprocal `TUNNEL_CLOSE`; if the peer
+  abandons its socket without closing, the tunnel would otherwise pin a
+  half-open fd forever. The cap force-closes any `Disconnecting` tunnel idle
+  past the timeout (analogous to Linux `tcp_fin_timeout`). It shares the
+  reaper's maintenance timer but is a distinct, on-by-default policy — the
+  general idle reaper above stays opt-in. Paused on a resume-hold, re-armed on
+  resurrection.
 
 ## Dependencies
 

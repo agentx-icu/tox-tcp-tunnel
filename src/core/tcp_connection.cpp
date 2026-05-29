@@ -106,6 +106,10 @@ void TcpConnection::set_on_disconnect(DisconnectCallback cb) {
     on_disconnect_ = std::move(cb);
 }
 
+void TcpConnection::set_on_closed(std::function<void()> cb) {
+    on_closed_ = std::move(cb);
+}
+
 void TcpConnection::set_on_error(ErrorCallback cb) {
     on_error_ = std::move(cb);
 }
@@ -609,6 +613,12 @@ void TcpConnection::do_close(const std::error_code& ec) {
 
     if (on_disconnect_) {
         on_disconnect_(ec);
+    }
+    // Owner/lifecycle hook (e.g. TcpListener's active-connection decrement).
+    // Fired after on_disconnect_ and, like it, exactly once per connection
+    // because do_close() short-circuits once state is Disconnected.
+    if (on_closed_) {
+        on_closed_();
     }
 }
 

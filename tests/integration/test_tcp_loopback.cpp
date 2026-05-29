@@ -8,12 +8,14 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 #include "toxtunnel/core/io_context.hpp"
@@ -382,6 +384,78 @@ TEST_F(TcpLoopbackTest, GracefulClose) {
 
     EXPECT_FALSE(server->is_connected());
 
+    listener->stop();
+}
+
+// ===========================================================================
+// 4b. Connection-count decrement (regression)
+//
+// The listener must keep accepting past `max_connections` worth of LIFETIME
+// connections: on_connection_closed decrements the active count when each
+// accepted connection closes. Before the fix the count only ever climbed
+// (on_connection_closed was never wired), so the listener silently wedged
+// after `max_connections` total accepts.
+// ===========================================================================
+
+TEST_F(TcpLoopbackTest, ListenerKeepsAcceptingPastMaxLifetimeConnections) {
+    auto listener = make_listener();
+    listener->set_max_connections(2);
+    const auto port = listener->port();
+
+    std::mutex mu;
+    std::vector<std::shared_ptr<core::TcpConnection>> server_conns;
+    std::atomic<int> accepted{0};
+    listener->start_accept([&](std::shared_ptr<core::TcpConnection> conn) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            server_conns.push_back(std::move(conn));
+        }
+        accepted.fetch_add(1, std::memory_order_release);
+    });
+
+    auto wait_until = [](auto pred) {
+        const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+        while (!pred()) {
+            if (std::chrono::steady_clock::now() > deadline)
+                return false;
+            std::this_thread::sleep_for(5ms);
+        }
+        return true;
+    };
+
+    constexpr int kCycles = 5;  // > max_connections (2)
+    for (int i = 0; i < kCycles; ++i) {
+        auto client = std::make_shared<core::TcpConnection>(io());
+        std::promise<std::error_code> connected;
+        auto cfut = connected.get_future();
+        client->async_connect(loopback(port),
+                              [&connected](const std::error_code& ec) { connected.set_value(ec); });
+        ASSERT_EQ(cfut.wait_for(kTimeout), std::future_status::ready);
+        ASSERT_FALSE(cfut.get());
+
+        // Decisive: before the fix `accepted` wedges at max_connections (2) —
+        // the count never decrements so do_accept stays paused.
+        ASSERT_TRUE(wait_until([&] { return accepted.load(std::memory_order_acquire) >= i + 1; }))
+            << "listener stopped accepting after " << accepted.load() << " lifetime connections";
+
+        // Close the accepted (server-side) connection: do_close fires on_closed
+        // -> on_connection_closed -> decrement. The client conn isn't listener-
+        // owned, so it doesn't affect the count.
+        std::shared_ptr<core::TcpConnection> server;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            server = server_conns.back();
+        }
+        server->close();
+        client->close();
+
+        ASSERT_TRUE(wait_until([&] { return listener->connection_count() == 0; }))
+            << "connection_count did not return to 0 after close (count="
+            << listener->connection_count() << ")";
+    }
+
+    EXPECT_EQ(accepted.load(), kCycles);
+    EXPECT_EQ(listener->connection_count(), 0u);
     listener->stop();
 }
 

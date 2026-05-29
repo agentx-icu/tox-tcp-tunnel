@@ -118,10 +118,13 @@ class TcpListener : public std::enable_shared_from_this<TcpListener> {
     // Connection tracking
     // -----------------------------------------------------------------
 
-    /// Notify the listener that one previously accepted connection has
-    /// been closed.  This decrements the active connection count and may
-    /// resume the accept loop if it was paused due to the connection
-    /// limit.
+    /// Decrement the active connection count and, if the accept loop was
+    /// paused at the limit, resume it.
+    ///
+    /// Wired automatically: `do_accept` installs this on each accepted
+    /// connection's `TcpConnection::set_on_closed` hook, so it fires exactly
+    /// once when that connection closes. Do NOT also call it externally — a
+    /// second decrement per connection would under-count and over-admit.
     void on_connection_closed();
 
     /// Set the maximum number of concurrent connections.
@@ -188,6 +191,13 @@ class TcpListener : public std::enable_shared_from_this<TcpListener> {
     /// Same rationale as `max_connections_`: read from arbitrary threads via
     /// `is_accepting()` and toggled from io thread (`start`/`stop`).
     std::atomic<bool> accepting_{false};
+    /// Guards against more than one outstanding `async_accept`. Both
+    /// `on_connection_closed()` and `set_max_connections()` post `do_accept()`,
+    /// and the accept handler re-arms — without this, concurrent/queued resumes
+    /// could stack multiple in-flight accepts and over-admit past
+    /// `max_connections_`. CAS-acquired in `do_accept`, released at the top of
+    /// the accept handler.
+    std::atomic<bool> accept_in_flight_{false};
 };
 
 }  // namespace toxtunnel::core
