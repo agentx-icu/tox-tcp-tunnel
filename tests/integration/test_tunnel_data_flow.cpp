@@ -45,21 +45,25 @@ class TunnelDataFlowTest : public ::testing::Test {
 
         // Wire send handlers: client -> server, server -> client.
         // The send handler receives serialized frame data.
-        client_mgr_->set_send_handler([this](const std::vector<uint8_t>& data) -> bool {
-            auto frame = tunnel::ProtocolFrame::deserialize(data);
-            if (frame) {
-                server_mgr_->route_frame(frame.value());
-            }
-            return frame.has_value();
-        });
+        client_mgr_->set_send_handler(
+            [this](const std::vector<uint8_t>& data) -> tunnel::SendOutcome {
+                auto frame = tunnel::ProtocolFrame::deserialize(data);
+                if (frame) {
+                    server_mgr_->route_frame(frame.value());
+                    return tunnel::SendOutcome::Sent;
+                }
+                return tunnel::SendOutcome::PermanentFail;
+            });
 
-        server_mgr_->set_send_handler([this](const std::vector<uint8_t>& data) -> bool {
-            auto frame = tunnel::ProtocolFrame::deserialize(data);
-            if (frame) {
-                client_mgr_->route_frame(frame.value());
-            }
-            return frame.has_value();
-        });
+        server_mgr_->set_send_handler(
+            [this](const std::vector<uint8_t>& data) -> tunnel::SendOutcome {
+                auto frame = tunnel::ProtocolFrame::deserialize(data);
+                if (frame) {
+                    client_mgr_->route_frame(frame.value());
+                    return tunnel::SendOutcome::Sent;
+                }
+                return tunnel::SendOutcome::PermanentFail;
+            });
     }
 
     void TearDown() override {

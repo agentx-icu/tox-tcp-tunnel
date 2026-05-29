@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -16,6 +17,17 @@
 #include "toxtunnel/tunnel/tunnel.hpp"
 
 namespace toxtunnel::tunnel {
+
+/// Result of a single attempt to hand a frame to the toxcore lossless send
+/// path. Mirrors `tox::ToxAdapter::LosslessSendOutcome` but is declared at
+/// the tunnel layer so the public manager header doesn't have to pull in
+/// the full toxcore C header. The values stay in sync by construction in
+/// the per-tunnel callbacks (`tunnel_client.cpp` / `tunnel_server.cpp`).
+enum class SendOutcome : std::uint8_t {
+    Sent,           ///< Accepted by toxcore.
+    SendqFull,      ///< Transient backpressure — caller may retry on a timer.
+    PermanentFail,  ///< Caller should drop / roll back. Peer disconnected, etc.
+};
 
 // Forward declarations
 class ProtocolFrame;
@@ -42,7 +54,14 @@ struct ManagerSnapshot {
 };
 
 /// Callback type for sending frames to the Tox peer.
-using SendHandler = std::function<bool(const std::vector<uint8_t>&)>;
+/// Callback that hands an *unprefixed* protocol frame to the transport.
+/// Returns `Sent` on success, `SendqFull` on transient backpressure (the
+/// manager will park the frame and retry on its drain timer), and
+/// `PermanentFail` on any other error (the manager drops the frame and
+/// surfaces the failure to the original caller — for `TUNNEL_OPEN` that
+/// means `TunnelImpl::open()` rolls back to `None`). The handler itself
+/// prepends the 0xA0 lossless prefix before calling toxcore.
+using SendHandler = std::function<SendOutcome(const std::vector<uint8_t>&)>;
 
 /// Callback type for tunnel creation notifications.
 using TunnelCreatedCallback = std::function<void(uint16_t tunnel_id)>;
@@ -286,6 +305,25 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// @return       true if the frame was queued for sending.
     bool send_frame(const ProtocolFrame& frame);
 
+    /// Park an already-serialized frame in the outbound retry queue.
+    /// Use this when a per-tunnel send (TUNNEL_CLOSE, TUNNEL_OPEN, ...) hit
+    /// toxcore SENDQ-full and the caller wants the same drain timer that
+    /// `send_frame` uses to re-send it. The bytes are the *unprefixed*
+    /// frame (matching `send_handler_`'s contract) — the handler prepends
+    /// the 0xA0 lossless byte before handing to toxcore.
+    ///
+    /// @return true if queued (or the queue was already at the cap and the
+    ///         frame was dropped — see logs / pending_dropped_total_).
+    bool queue_outbound_for_retry(std::vector<uint8_t> wire);
+
+    /// Drop every frame currently parked in `pending_outbound_`. Used when
+    /// the queued frames are no longer addressable: failover swapped the
+    /// active server out from under us, or the friend disconnected. Without
+    /// this, the drain timer would eventually deliver stale frames to the
+    /// *new* server (creating ghost tunnels) or wait indefinitely for a
+    /// peer that has already gone away.
+    void clear_pending_outbound();
+
     // -----------------------------------------------------------------
     // Backpressure tracking
     // -----------------------------------------------------------------
@@ -383,6 +421,17 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// Arm `keepalive_timer_` to fire `keepalive_interval_` from now.
     void schedule_keepalive_tick();
 
+    /// Drain pending_outbound_ via send_handler_, FIFO. Re-arms the drain
+    /// timer when send_handler_ reports SENDQ-full so control frames
+    /// (OPEN, OPEN_ACK, CLOSE, ACK, PING) survive a burst-induced toxcore
+    /// queue-full instead of being silently dropped. Public surface stays
+    /// just `send_frame` — this is the recovery path it kicks off.
+    void drain_pending_outbound();
+
+    /// Arm `pending_drain_timer_` to fire after a short delay; idempotent
+    /// while a drain is already pending. Caller must hold `pending_mutex_`.
+    void arm_pending_drain_timer_locked();
+
     // -----------------------------------------------------------------
     // Data members
     // -----------------------------------------------------------------
@@ -452,6 +501,23 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// false from the timer's completion handler. Lets disable_reaper()
     /// distinguish "armed" from "idle" without racing the io_ctx thread.
     std::atomic<bool> reaper_active_{false};
+
+    // ---- Pending outbound retry (toxcore SENDQ-full recovery) ------------
+    /// Control frames (OPEN, OPEN_ACK, CLOSE, ACK, PING/PONG) routed through
+    /// send_frame() that fail with toxcore SENDQ-full are parked here in FIFO
+    /// order and retried on `pending_drain_timer_`. Without this queue, the
+    /// silent OPEN_ACK drop wedges the peer in `Connecting` indefinitely under
+    /// a burst of concurrent tunnel opens. Capped by `kMaxPendingOutbound`
+    /// to bound memory under sustained backpressure.
+    std::deque<std::vector<uint8_t>> pending_outbound_;
+    mutable std::mutex pending_mutex_;
+    asio::steady_timer pending_drain_timer_;
+    bool pending_drain_armed_{false};
+    /// Counter for diagnostics / metrics: total frames that hit the retry path.
+    std::atomic<std::uint64_t> pending_enqueued_total_{0};
+    /// Counter for diagnostics / metrics: frames dropped because the queue
+    /// hit its cap (genuine loss — caller's send_frame returned false).
+    std::atomic<std::uint64_t> pending_dropped_total_{0};
 
     // ---- Keepalive (M-02) ------------------------------------------------
     /// Keepalive timer; armed only while keepalive is enabled.

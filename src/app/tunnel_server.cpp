@@ -607,14 +607,24 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
     // Set up the send handler: serialize frame, prepend lossless packet byte,
     // send via ToxAdapter.
     manager->set_send_handler(
-        [this, friend_number](const std::vector<uint8_t>& frame_data) -> bool {
+        [this, friend_number](const std::vector<uint8_t>& frame_data) -> tunnel::SendOutcome {
             // Prepend the lossless packet prefix byte.
             std::vector<uint8_t> packet;
             packet.reserve(1 + frame_data.size());
             packet.push_back(kLosslessPacketByte);
             packet.insert(packet.end(), frame_data.begin(), frame_data.end());
 
-            return tox_adapter_->send_lossless_packet(friend_number, packet);
+            const auto outcome = tox_adapter_->send_lossless_packet_typed(
+                friend_number, packet.data(), packet.size());
+            switch (outcome) {
+                case tox::ToxAdapter::LosslessSendOutcome::Sent:
+                    return tunnel::SendOutcome::Sent;
+                case tox::ToxAdapter::LosslessSendOutcome::SendqFull:
+                    return tunnel::SendOutcome::SendqFull;
+                case tox::ToxAdapter::LosslessSendOutcome::PermanentFail:
+                    return tunnel::SendOutcome::PermanentFail;
+            }
+            return tunnel::SendOutcome::PermanentFail;
         });
 
     // Set up tunnel created callback for logging.
@@ -853,20 +863,35 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     // Already-serialized frame from TunnelImpl: prepend the lossless prefix
     // byte and send directly. Going via manager_ptr->send_frame would force a
     // deserialize + re-serialize round trip plus a redundant byte copy.
-    server_tunnel->set_on_send_to_tox(
-        [this, manager_ptr, friend_number](std::span<const uint8_t> data) -> bool {
-            std::vector<uint8_t> packet;
-            packet.reserve(1 + data.size());
-            packet.push_back(tunnel::kLosslessPacketByte);
-            packet.insert(packet.end(), data.begin(), data.end());
-            const bool sent =
-                tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size());
-            if (sent) {
-                manager_ptr->record_frame_sent();
-                manager_ptr->record_bytes_sent(data.size());
-            }
-            return sent;
-        });
+    server_tunnel->set_on_send_to_tox([this, manager_ptr,
+                                       friend_number](std::span<const uint8_t> data) -> bool {
+        std::vector<uint8_t> packet;
+        packet.reserve(1 + data.size());
+        packet.push_back(tunnel::kLosslessPacketByte);
+        packet.insert(packet.end(), data.begin(), data.end());
+        const auto outcome =
+            tox_adapter_->send_lossless_packet_typed(friend_number, packet.data(), packet.size());
+        if (outcome == tox::ToxAdapter::LosslessSendOutcome::Sent) {
+            manager_ptr->record_frame_sent();
+            manager_ptr->record_bytes_sent(data.size());
+            return true;
+        }
+        if (outcome == tox::ToxAdapter::LosslessSendOutcome::PermanentFail) {
+            // Friend disconnected, frame malformed, etc. Drop; the
+            // tunnel state machine will catch up via the friend-
+            // disconnect handler that tears all tunnels down.
+            return false;
+        }
+        // SendqFull: park control frames so the drain timer re-sends
+        // them; TUNNEL_DATA falls through to the per-tunnel coalesce
+        // buffer's retry path to avoid double-sending.
+        constexpr std::uint8_t kFrameTypeTunnelData = 0x02;
+        if (!data.empty() && data[0] != kFrameTypeTunnelData) {
+            return manager_ptr->queue_outbound_for_retry(
+                std::vector<uint8_t>(data.begin(), data.end()));
+        }
+        return false;
+    });
     // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
     // lossless prefix + 5-byte tunnel header in the same allocation.
     server_tunnel->set_on_send_to_tox_owned(

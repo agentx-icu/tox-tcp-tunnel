@@ -12,7 +12,11 @@ namespace toxtunnel::tunnel {
 // ===========================================================================
 
 TunnelManager::TunnelManager(asio::io_context& io_ctx)
-    : io_ctx_(io_ctx), used_ids_(65536, false), reaper_timer_(io_ctx), keepalive_timer_(io_ctx) {
+    : io_ctx_(io_ctx),
+      used_ids_(65536, false),
+      reaper_timer_(io_ctx),
+      pending_drain_timer_(io_ctx),
+      keepalive_timer_(io_ctx) {
     // ID 0 is reserved for control frames (PING/PONG)
     used_ids_[0] = true;
 }
@@ -20,6 +24,15 @@ TunnelManager::TunnelManager(asio::io_context& io_ctx)
 TunnelManager::~TunnelManager() {
     disable_reaper();
     disable_keepalive();
+    // Cancel any in-flight pending-drain timer so its handler runs with an
+    // error_code and bails (the handler captures a weak_ptr so this isn't
+    // a UAF risk by itself, but cancelling shrinks the dangling-timer window).
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_drain_armed_ = false;
+        pending_outbound_.clear();
+    }
+    pending_drain_timer_.cancel();
     close_all();
 }
 
@@ -406,12 +419,16 @@ uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
     }
 
     auto wire = open_frame.serialize();
-    if (!handler(wire)) {
+    const auto outcome = handler(wire);
+    if (outcome == SendOutcome::PermanentFail) {
         util::Logger::warn("TunnelManager::create_tunnel: failed to send TUNNEL_OPEN for {}",
                            tunnel_id);
         release_tunnel_id(tunnel_id);
         return 0;
     }
+    // outcome == Sent OR SendqFull: in the SendqFull case the frame is now
+    // in toxcore's local queue but not yet on the wire; the caller treats
+    // both as "open in flight".
 
     util::Logger::info("TunnelManager: created tunnel {} -> {}:{}", tunnel_id, host, port);
 
@@ -585,6 +602,18 @@ bool TunnelManager::handle_incoming_open(const ProtocolFrame& frame) {
     return true;
 }
 
+namespace {
+// Cap on parked-outbound frames per manager. With 1366-byte Tox MTU, 4096
+// frames is ~5 MiB worst case — bounded but generous enough to weather a
+// realistic burst (toxcore's lossless SENDQ is ~1024 packets, so 4× headroom).
+constexpr std::size_t kMaxPendingOutbound = 4096;
+// How long to wait before retrying a SENDQ-full drain. Tuned to be longer
+// than one tox_iterate cycle (~50ms default interval) so the queue has a
+// real chance to drain, but short enough that the OPEN_ACK round-trip
+// budget under stress stays bounded.
+constexpr auto kPendingDrainDelay = std::chrono::milliseconds(20);
+}  // namespace
+
 bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     SendHandler handler;
     {
@@ -598,17 +627,195 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     }
 
     auto wire = frame.serialize();
-    bool success = handler(wire);
 
-    if (success) {
-        record_frame_sent();
-        record_bytes_sent(frame.serialized_size());
-    } else {
-        util::Logger::debug(
-            "TunnelManager::send_frame: send handler returned false (backpressure)");
+    // Best-effort FIFO: if anything is parked in pending_outbound_ already,
+    // this frame queues *behind* it. The strict guarantee only holds for
+    // serial callers; a concurrent send_frame can still slip past a drain
+    // that already popped the only parked entry (it observes empty queue
+    // between pop and handler call). This is acceptable for the frames
+    // that route through send_frame today — PING/PONG and TUNNEL_OPEN_ACK
+    // / TUNNEL_ERROR have no required relative order across tunnels, and
+    // within a tunnel each of those is emitted at most once. Per-tunnel
+    // TUNNEL_DATA / TUNNEL_CLOSE go through the per-tunnel callback path
+    // and never traverse this queue.
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (!pending_outbound_.empty()) {
+            if (pending_outbound_.size() >= kMaxPendingOutbound) {
+                pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
+                util::Logger::warn(
+                    "TunnelManager::send_frame: pending queue at cap ({}); dropping frame",
+                    kMaxPendingOutbound);
+                return false;
+            }
+            pending_outbound_.push_back(std::move(wire));
+            pending_enqueued_total_.fetch_add(1, std::memory_order_relaxed);
+            arm_pending_drain_timer_locked();
+            return true;
+        }
     }
 
-    return success;
+    const SendOutcome outcome = handler(wire);
+
+    if (outcome == SendOutcome::Sent) {
+        record_frame_sent();
+        record_bytes_sent(frame.serialized_size());
+        return true;
+    }
+    if (outcome == SendOutcome::PermanentFail) {
+        // Peer disconnected, frame malformed, etc. Retrying would either burn
+        // CPU or, on the client under multi-server failover, eventually
+        // replay against the wrong server. Surface the failure.
+        return false;
+    }
+
+    // SendqFull. Park the frame and retry on the drain timer instead of
+    // dropping. record_frame_sent / record_bytes_sent fire only after the
+    // parked frame actually goes out (in drain_pending_outbound), so the
+    // stats reflect wire activity.
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (pending_outbound_.size() >= kMaxPendingOutbound) {
+        pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
+        util::Logger::warn("TunnelManager::send_frame: pending queue at cap ({}); dropping frame",
+                           kMaxPendingOutbound);
+        return false;
+    }
+    pending_outbound_.push_back(std::move(wire));
+    pending_enqueued_total_.fetch_add(1, std::memory_order_relaxed);
+    util::Logger::debug("TunnelManager::send_frame: SENDQ-full, parked frame (queue depth={})",
+                        pending_outbound_.size());
+    arm_pending_drain_timer_locked();
+    return true;
+}
+
+bool TunnelManager::queue_outbound_for_retry(std::vector<uint8_t> wire) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (pending_outbound_.size() >= kMaxPendingOutbound) {
+        pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
+        util::Logger::warn("TunnelManager::queue_outbound_for_retry: queue at cap ({}); dropping",
+                           kMaxPendingOutbound);
+        return false;
+    }
+    pending_outbound_.push_back(std::move(wire));
+    pending_enqueued_total_.fetch_add(1, std::memory_order_relaxed);
+    util::Logger::debug("TunnelManager::queue_outbound_for_retry: parked frame (queue depth={})",
+                        pending_outbound_.size());
+    arm_pending_drain_timer_locked();
+    return true;
+}
+
+void TunnelManager::arm_pending_drain_timer_locked() {
+    // Caller holds `pending_mutex_`. Idempotent: a single retry tick is
+    // enough since drain_pending_outbound re-arms itself when the SENDQ
+    // is still full.
+    if (pending_drain_armed_ || pending_outbound_.empty()) {
+        return;
+    }
+    // The drain callback captures `weak_from_this()`. When the manager is
+    // not held by a shared_ptr (e.g. test fixtures that allocate via
+    // `std::unique_ptr<TunnelManager>` or stack-construct one), the weak
+    // pointer is empty and the callback would just bail when it eventually
+    // fires. Avoid arming the timer in that case: the outstanding
+    // async_wait would otherwise force the io_context destructor to
+    // service one pending op, which on the Windows IOCP backend was
+    // observed to stall the unit_tests process indefinitely on the
+    // windows-x86_64 CI runner. Production paths always own the manager
+    // via shared_ptr so this branch is purely a test-safety guard.
+    std::weak_ptr<TunnelManager> weak = weak_from_this();
+    if (weak.expired()) {
+        return;
+    }
+    pending_drain_armed_ = true;
+    pending_drain_timer_.expires_after(kPendingDrainDelay);
+    pending_drain_timer_.async_wait([weak](const std::error_code& ec) {
+        if (ec) {
+            return;
+        }
+        auto self = weak.lock();
+        if (!self) {
+            return;
+        }
+        self->drain_pending_outbound();
+    });
+}
+
+void TunnelManager::drain_pending_outbound() {
+    SendHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(handler_mutex_);
+        handler = send_handler_;
+    }
+    if (!handler) {
+        // Handler was uninstalled between arming and firing — drop the
+        // armed flag so a future send_frame can re-arm if needed.
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_drain_armed_ = false;
+        return;
+    }
+
+    while (true) {
+        std::vector<uint8_t> wire;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            if (pending_outbound_.empty()) {
+                pending_drain_armed_ = false;
+                return;
+            }
+            // Pop AFTER deciding to send; if the send fails we push it back
+            // to the front to preserve FIFO order.
+            wire = std::move(pending_outbound_.front());
+            pending_outbound_.pop_front();
+        }
+
+        const SendOutcome outcome = handler(wire);
+        if (outcome == SendOutcome::Sent) {
+            record_frame_sent();
+            // Use the wire length directly; the parked entry is already
+            // serialized so we don't have access to ProtocolFrame here.
+            record_bytes_sent(wire.size());
+            continue;
+        }
+        if (outcome == SendOutcome::PermanentFail) {
+            // Friend disconnected (or worse) since the frame was parked.
+            // Retrying would either spin forever or, if a switchover races
+            // here, route the frame at the wrong peer. Drop and continue
+            // to the next queued entry — if everything in the queue is in
+            // the same shape we'll drain the whole queue in one tick.
+            pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
+            util::Logger::debug(
+                "TunnelManager::drain_pending_outbound: permanent send failure, dropping frame");
+            continue;
+        }
+
+        // SENDQ still full — push the frame back to the front of the queue
+        // (preserving FIFO order with respect to any frames a concurrent
+        // send_frame() pushed to the back), and re-arm the timer.
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_outbound_.push_front(std::move(wire));
+            pending_drain_armed_ = false;
+            arm_pending_drain_timer_locked();
+        }
+        return;
+    }
+}
+
+void TunnelManager::clear_pending_outbound() {
+    std::size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        dropped = pending_outbound_.size();
+        pending_outbound_.clear();
+        pending_drain_armed_ = false;
+    }
+    // Cancel any outstanding timer so its handler bails on the next firing
+    // (the handler also re-checks `pending_drain_armed_` and the queue, so
+    // a race here just turns into a cheap no-op).
+    pending_drain_timer_.cancel();
+    if (dropped > 0) {
+        pending_dropped_total_.fetch_add(dropped, std::memory_order_relaxed);
+        util::Logger::info("TunnelManager: cleared {} pending outbound frame(s)", dropped);
+    }
 }
 
 // ===========================================================================

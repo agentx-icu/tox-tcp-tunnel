@@ -178,17 +178,17 @@ Exposed series (subject to growth — names are stable once shipped):
 
 | Metric | Type | Description |
 |---|---|---|
-| `toxtunnel_tunnels_open` | gauge | Tunnels currently in OPEN state |
-| `toxtunnel_tunnels_opened_total` | counter | Cumulative tunnels opened |
-| `toxtunnel_tunnels_closed_total{reason}` | counter | Closures, labelled by reason |
-| `toxtunnel_bytes_in_total{direction}` | counter | Bytes received on each direction |
-| `toxtunnel_bytes_out_total{direction}` | counter | Bytes sent on each direction |
-| `toxtunnel_frames_total{type}` | counter | Frames seen, labelled by frame type |
-| `toxtunnel_active_friends` | gauge | Friends currently online |
-| `toxtunnel_reaper_closed_total` | counter | Tunnels closed by the idle reaper |
-| `toxtunnel_reloads_total{result}` | counter | SIGHUP / reload-pipe reloads (success / rejected) |
-| `toxtunnel_failover_switchovers_total` | counter | Active-server changes on the client |
-| `toxtunnel_tox_self_connection_status` | gauge | Toxcore self-connection enum (0=none, 1=TCP, 2=UDP) |
+| `toxtunnel_build_info{version=…}` | gauge | Always-1 series carrying build version label |
+| `toxtunnel_tunnels_active{role=…}` | gauge | Tunnels currently open, split by `role` (server/client) |
+| `toxtunnel_tunnels_opened_total{result=…}` | counter | Open attempts (`ok`/`denied`/`failed`) |
+| `toxtunnel_tunnels_closed_total{reason=…}` | counter | Closes (`local`/`remote`/`timeout`/`error`); reaper-driven closes appear as `reason="timeout"` |
+| `toxtunnel_bytes_in_total` | counter | Bytes received from Tox peers (unlabeled total) |
+| `toxtunnel_bytes_out_total` | counter | Bytes sent to Tox peers (unlabeled total) |
+| `toxtunnel_friends_online` | gauge | Tox friends currently online |
+| `toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max}` | summary | `tox_iterate()` elapsed-time samples |
+
+There is no remote-command channel; the daemon does not export per-frame
+counts or a self-connection-status gauge.
 
 Bind to loopback if you do not want public scraping; reverse-proxy with TLS +
 auth if you do.
@@ -203,21 +203,24 @@ permission bits on the socket file are the access control.
 
 Wire format is intentionally trivial:
 
-1. Client opens the socket, writes one JSON request line terminated by `\n`.
-2. Server replies with one JSON reply line terminated by `\n`, then closes.
+1. Client opens the socket, writes one HTTP-style request line terminated by
+   `\n`. Only two paths are accepted: `GET /tunnels` and `GET /status`.
+2. Server replies with one JSON object on a single line terminated by `\n`,
+   then closes.
 
 ```
-> {"cmd": "tunnels"}
-< {"ok": true, "tunnels": [{"id": 17, "peer": "AA…", "state": "OPEN", "bytes_in": 4096, "bytes_out": 8192, "idle_seconds": 3.2}]}
+> GET /tunnels
+< {"mode":"client","version":"0.4.5","friends_online":1,"tunnels":[{"id":17,"friend_pk_prefix":"AA…","target":"127.0.0.1:22","state":"OPEN","bytes_in":4096,"bytes_out":8192,"idle_seconds":3.2}]}
 
-> {"cmd": "status"}
-< {"ok": true, "mode": "client", "self_tox_id": "…", "uptime_seconds": 1294, "active_server": "primary", "tunnels_open": 4}
+> GET /status
+< {"mode":"client","version":"0.4.5","friends_online":1,"tunnels_active":4,"bytes_in":12345,"bytes_out":67890}
 ```
 
-The CLI subcommands (`toxtunnel inspect tunnels|status|friends|metrics`) are
-thin wrappers that compose the JSON request, write it, and pretty-print the
-reply. Tooling that wants structured output should call the IPC socket
-directly.
+The CLI ships only two subactions — `toxtunnel inspect tunnels` (default) and
+`toxtunnel inspect status` — and they pretty-print the reply. Any other
+subaction string is silently coerced to `tunnels`. Unknown request paths get
+`{"error":"unknown request"}`. Tooling that wants structured output should
+either pass `--json` or speak the socket directly with `socat - UNIX-CONNECT:…`.
 
 ### SIGHUP / reload pipe
 
@@ -328,6 +331,25 @@ Key properties:
   the unacked byte count is restored and a short ACK retry timer is armed.
   This matters when the receiver's TCP queue has already drained: without the
   timer there may be no later writable callback to reopen the sender's window.
+- Control frames routed through `TunnelManager::send_frame` (notably
+  `TUNNEL_OPEN_ACK` on the server side, plus `PING`/`PONG`) get the same
+  treatment via `TunnelManager::pending_outbound_`: on toxcore SENDQ-full,
+  the serialized frame is parked FIFO and a 20 ms drain timer retries until
+  it lands. Without this, a burst of concurrent `TUNNEL_OPEN`s could silently
+  lose `TUNNEL_OPEN_ACK`s and wedge the client peer in `Connecting` forever
+  (the v0.4.5 SENDQ-loss bug). The queue is capped at 4096 frames per
+  manager; exceeding the cap is the only path that surfaces `send_frame` →
+  `false` to the caller.
+- The per-tunnel `on_send_to_tox` callback path (`TUNNEL_OPEN` from a client
+  opening a tunnel, `TUNNEL_CLOSE` emitted by either side after the local
+  TCP socket FIN's) routes through `tox_adapter_->send_lossless_packet`
+  directly — but on SENDQ-full failure it forwards the (non-DATA) frame to
+  `TunnelManager::queue_outbound_for_retry`, the same drain queue described
+  above. `TUNNEL_DATA` frames keep using the per-tunnel coalesce buffer's
+  retry-on-timer mechanism rather than double-queueing into the manager;
+  the frame-type byte at offset 0 is used to discriminate. Without this,
+  a `TUNNEL_CLOSE` lost to SENDQ-full would leave the peer's tunnel hung
+  in `Disconnecting` (the bidirectional-bulk-transfer close-handshake hang).
 - TCP close is directional. Local EOF does **not** emit `TUNNEL_CLOSE`
   until both `pending_tcp_input_` and the coalesce buffer have drained
   into ordered Tox DATA frames; peer `TUNNEL_CLOSE` maps to
@@ -337,12 +359,14 @@ Key properties:
 
 ## Operational Endpoints (v0.4 additions)
 
-- `toxtunnel_outbound_buffer_allocs_total` — outbound `OwnedFrameBuffer`
-  allocations.
+- `toxtunnel_outbound_buffer_{allocs,reuse,overflow}_total` — outbound
+  `OwnedFrameBuffer` accounting.
 - `toxtunnel_coalesce_policy_transitions_total` — state-machine moves
   between adaptive policies.
-- `toxtunnel_tunnel_rtt_microseconds`, `_send_window_bytes`, and
-  `_bandwidth_bytes_per_second` — summaries from `BdpFlowControl`.
+- `toxtunnel_tunnel_rtt_microseconds_{count,sum,max}`,
+  `_send_window_bytes_{count,sum,max}`, and
+  `_bandwidth_bytes_per_second_{count,sum,max}` — summaries from
+  `BdpFlowControl`.
 - `toxtunnel_rate_limit_open_rejected_total`,
   `toxtunnel_rate_limit_bytes_throttled_total` — per-friend rate limiter.
 - `toxtunnel_tox_iterate_lag_ms` — gauge from `ToxWatchdog`; updated on

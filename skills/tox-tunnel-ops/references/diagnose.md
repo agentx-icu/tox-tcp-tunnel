@@ -185,8 +185,9 @@ Tox-thread watchdog fires when `tox_iterate` stalls past
 2. `cat <data_dir>/abort_count` — persistent count across restarts.
 3. `curl 127.0.0.1:9100/metrics | grep watchdog_aborts` — same value
    as the abort file once metrics scrape resumes.
-4. `toxtunnel_tox_iterate_lag_ms` gauge rising over time indicates a
-   slow toxcore but not yet a wedge — a useful early warning.
+4. `toxtunnel_tox_iterate_lag_milliseconds_max` rising over time indicates
+   a slow toxcore but not yet a wedge — a useful early warning. The
+   summary is also exposed as `_count` / `_sum` for rate-style queries.
 
 The watchdog calls `std::abort()` precisely because in-process recovery
 of a wedged toxcore is unsafe. systemd / launchd / Windows SCM
@@ -229,4 +230,47 @@ live handshake driver is partial. With `tunnel.resume.enabled: false`
 (the default) restarts behave exactly as in v0.3.0. Track the v0.4.1
 follow-up at
 `docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
+
+### Symptom: tunnels stuck in `Connecting` or `Disconnecting` after a burst
+
+`toxtunnel inspect tunnels` on the client shows N tunnels frozen in
+`Connecting`, while the server side shows the same IDs as `Connected`
+(or `Disconnecting`). Cause: a control frame (`TUNNEL_OPEN_ACK`,
+`TUNNEL_CLOSE`, `PING`, `PONG`) hit toxcore's lossless SENDQ while it
+was full and got silently dropped. Fixed in v0.4.5+:
+
+- Control frames routed via `TunnelManager::send_frame` (notably the
+  server's `TUNNEL_OPEN_ACK`) are parked in a bounded FIFO retry queue
+  (cap 4096) and re-emitted every 20 ms until SENDQ drains.
+- Control frames sent via the per-tunnel `on_send_to_tox` callback
+  (`TUNNEL_OPEN`, `TUNNEL_CLOSE` from either side) inspect the frame
+  type at offset 0 and, on failure, hand non-DATA frames off to the
+  same retry queue via `queue_outbound_for_retry`. `TUNNEL_DATA`
+  frames keep using the per-tunnel coalesce-buffer retry-on-timer
+  path instead — routing them through the manager queue would double-
+  send. Without the per-tunnel-path fix, a `TUNNEL_CLOSE` lost to
+  SENDQ-full would leave the peer's tunnel hung in `Disconnecting`
+  (the bidirectional bulk-transfer close-handshake hang seen in the
+  v0.4.5 1 MB-echo soak).
+
+If you see a wedge anyway:
+
+1. Grep `journalctl -u toxtunnel | grep 'pending queue at cap'` — the
+   only path that drops a control frame today is overflow at the cap.
+2. Inspect the depth via `toxtunnel inspect status --json` and watch
+   the per-tunnel `BYTES_IN` / `BYTES_OUT` rather than just state — a
+   tunnel with traffic moving is not actually wedged.
+3. Pair with `toxtunnel_tox_iterate_lag_milliseconds_max`: a sustained
+   spike there usually precedes a backpressure pulse.
+
+Operational hardening: set `tunnel.idle_timeout_seconds` to a positive
+value (e.g. `300`–`600`) so the reaper reclaims tunnels that genuinely
+got abandoned. The default of `0` keeps stale tunnels around forever
+— fine for low-traffic deployments, surprising under stress. Under
+sustained *bidirectional* bulk transfer the close handshake can still
+be slow because TUNNEL_DATA frames continuously fill the same shared
+toxcore SENDQ that control frames need; bytes flow correctly but
+close-completion latency grows. Confirm via `inspect tunnels`: an
+idle counter that resets means the tunnel is alive but slow, not
+wedged.
 
