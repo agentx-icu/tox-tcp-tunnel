@@ -90,6 +90,33 @@ TEST(ToxAdapterTest, GetToxIdOnlyReturnsStableIdForSameDirectory) {
     std::filesystem::remove_all(test_dir, ec);
 }
 
+TEST(ToxAdapterTest, RejectsSaveFilenameWithPathComponents) {
+    const auto temp_root = std::filesystem::temp_directory_path();
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto test_dir = temp_root / ("toxtunnel_test_bad_save_name_" + std::to_string(unique));
+    std::error_code ec;
+    std::filesystem::remove_all(test_dir, ec);
+
+    for (const std::string save_filename :
+         {"../tox_save.dat", "nested/tox_save.dat", R"(nested\tox_save.dat)", ".", "..", ""}) {
+        ToxAdapter adapter;
+        ToxAdapterConfig config;
+        config.data_dir = test_dir;
+        config.save_filename = save_filename;
+        config.udp_enabled = false;
+        config.local_discovery_enabled = false;
+        config.bootstrap_mode = BootstrapMode::Lan;
+
+        auto result = adapter.initialize(config);
+        EXPECT_FALSE(result.has_value()) << save_filename;
+        if (!result.has_value()) {
+            EXPECT_NE(result.error().find("plain filename"), std::string::npos);
+        }
+    }
+
+    std::filesystem::remove_all(test_dir, ec);
+}
+
 // Regression: a *directory* left where tox_save.dat (a regular file) is
 // expected must not crash. Previously load_save_data() opened it with
 // ifstream(ios::ate) and used tellg() as the size; on a directory that

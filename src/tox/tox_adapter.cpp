@@ -3,15 +3,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <fstream>
 #include <thread>
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
 #include "toxtunnel/tox/tox_watchdog.hpp"
 #include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/path_security.hpp"
 
 namespace toxtunnel::tox {
+
+util::Expected<std::vector<uint8_t>, std::string> load_tox_data(
+    const std::filesystem::path& filepath);
 
 // ===========================================================================
 // ToxDeleter
@@ -104,6 +107,10 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
     }
 
     config_ = config;
+
+    if (!util::is_plain_filename(config_.save_filename)) {
+        return util::unexpected(std::string("invalid Tox save filename: must be a plain filename"));
+    }
 
     // Ensure the data directory exists.
     if (!config_.data_dir.empty()) {
@@ -992,53 +999,15 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
         return {};
     }
 
-    // Only a *regular file* is a valid save. If a directory (or other
-    // non-regular entry) is left at this path — e.g. a stale/clobbered
-    // data_dir where `tox_save.dat` ended up a directory — it must not be read
-    // as a file: an ifstream opened on a directory can yield a garbage
-    // `tellg()` (observed ~2^63), and sizing a vector from it triggers a
-    // multi-exabyte allocation -> std::bad_alloc -> crash loop on every start.
-    // Treat anything that is not a regular file as "no save data" and start
-    // fresh (matches load_tox_data() in tox_save.cpp, which uses file_size()).
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec) || ec) {
-        std::error_code exist_ec;
-        if (std::filesystem::exists(path, exist_ec)) {
-            util::Logger::warn("Save file path is not a regular file; ignoring it: {}",
-                               path.string());
+    auto loaded = load_tox_data(path);
+    if (!loaded) {
+        if (loaded.error().find("does not exist") == std::string::npos) {
+            util::Logger::warn("Could not load save file: {}", loaded.error());
         }
         return {};
     }
 
-    const std::uintmax_t file_size = std::filesystem::file_size(path, ec);
-    if (ec || file_size == 0) {
-        return {};
-    }
-    // Sanity cap: a Tox save (identity, friends, DHT keys) is at most a few
-    // MiB. Refuse an implausibly large file rather than trust a corrupt size
-    // and attempt a huge allocation.
-    constexpr std::uintmax_t kMaxSaveBytes = 64ULL * 1024 * 1024;  // 64 MiB
-    if (file_size > kMaxSaveBytes) {
-        util::Logger::warn("Save file is implausibly large ({} bytes); ignoring it: {}", file_size,
-                           path.string());
-        return {};
-    }
-
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) {
-        util::Logger::warn("Could not open save file: {}", path.string());
-        return {};
-    }
-
-    std::vector<uint8_t> data(static_cast<std::size_t>(file_size));
-    file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
-
-    if (!file) {
-        util::Logger::warn("Failed to read save file: {}", path.string());
-        return {};
-    }
-
-    return data;
+    return std::move(loaded.value());
 }
 
 bool ToxAdapter::write_save_data() const {
@@ -1088,6 +1057,9 @@ bool ToxAdapter::write_save_data_locked() const {
 
 std::filesystem::path ToxAdapter::save_file_path() const {
     if (config_.data_dir.empty()) {
+        return {};
+    }
+    if (!util::is_plain_filename(config_.save_filename)) {
         return {};
     }
     return config_.data_dir / config_.save_filename;
