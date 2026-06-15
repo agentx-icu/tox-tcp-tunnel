@@ -17,16 +17,6 @@ util::Expected<std::vector<uint8_t>, std::string> load_tox_data(
     const std::filesystem::path& filepath);
 
 // ===========================================================================
-// ToxDeleter
-// ===========================================================================
-
-void ToxDeleter::operator()(Tox* tox) const noexcept {
-    if (tox) {
-        tox_kill(tox);
-    }
-}
-
-// ===========================================================================
 // Helpers (anonymous namespace)
 // ===========================================================================
 
@@ -999,6 +989,9 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
         return {};
     }
 
+    // The data directory is an intentional local configuration path;
+    // save_filename is validated to be a plain filename.
+    // codeql[cpp/path-injection]
     auto loaded = load_tox_data(path);
     if (!loaded) {
         if (loaded.error().find("does not exist") == std::string::npos) {
