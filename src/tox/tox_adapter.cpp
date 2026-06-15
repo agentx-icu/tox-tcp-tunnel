@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <thread>
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
@@ -12,9 +13,6 @@
 #include "toxtunnel/util/path_security.hpp"
 
 namespace toxtunnel::tox {
-
-util::Expected<std::vector<uint8_t>, std::string> load_tox_data(
-    const std::filesystem::path& filepath);
 
 // ===========================================================================
 // Helpers (anonymous namespace)
@@ -985,22 +983,53 @@ void ToxAdapter::dispatch_pending_events() {
 
 std::vector<uint8_t> ToxAdapter::load_save_data() const {
     auto path = save_file_path();
-    if (path.empty()) {
+    if (path.empty() || !std::filesystem::exists(path)) {
         return {};
     }
 
-    // The data directory is an intentional local configuration path;
-    // save_filename is validated to be a plain filename.
+    // Only a regular, reasonably sized Tox save is valid here. This keeps a
+    // directory or corrupt file at tox_save.dat from turning tellg() into a
+    // huge allocation and crashing every startup.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) {
+        util::Logger::warn("Save file path is not a regular file; ignoring it: {}", path.string());
+        return {};
+    }
+
+    const std::uintmax_t file_size = std::filesystem::file_size(path, ec);
+    if (ec || file_size == 0) {
+        return {};
+    }
+
+    constexpr std::uintmax_t kMaxSaveBytes = 64ULL * 1024 * 1024;  // 64 MiB
+    if (file_size > kMaxSaveBytes) {
+        util::Logger::warn("Save file is implausibly large ({} bytes); ignoring it: {}", file_size,
+                           path.string());
+        return {};
+    }
+
     // codeql[cpp/path-injection]
-    auto loaded = load_tox_data(path);
-    if (!loaded) {
-        if (loaded.error().find("does not exist") == std::string::npos) {
-            util::Logger::warn("Could not load save file: {}", loaded.error());
-        }
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        util::Logger::warn("Could not open save file: {}", path.string());
         return {};
     }
 
-    return std::move(loaded.value());
+    auto size = file.tellg();
+    if (size <= 0 || static_cast<std::uintmax_t>(size) != file_size) {
+        return {};
+    }
+
+    std::vector<uint8_t> data(static_cast<std::size_t>(size));
+    file.seekg(0, std::ios::beg);
+    file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+
+    if (!file) {
+        util::Logger::warn("Failed to read save file: {}", path.string());
+        return {};
+    }
+
+    return data;
 }
 
 bool ToxAdapter::write_save_data() const {
