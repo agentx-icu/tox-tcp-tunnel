@@ -982,8 +982,8 @@ void ToxAdapter::dispatch_pending_events() {
 // ===========================================================================
 
 std::vector<uint8_t> ToxAdapter::load_save_data() const {
-    auto path = save_file_path();
-    if (path.empty() || !std::filesystem::exists(path)) {
+    const auto path = save_file_path();
+    if (path.empty()) {
         return {};
     }
 
@@ -991,7 +991,23 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
     // directory or corrupt file at tox_save.dat from turning tellg() into a
     // huge allocation and crashing every startup.
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec) || ec) {
+    const bool exists = std::filesystem::exists(path, ec);
+    if (ec) {
+        util::Logger::warn("Could not inspect save file {}; ignoring it: {}", path.string(),
+                           ec.message());
+        return {};
+    }
+    if (!exists) {
+        return {};
+    }
+
+    const bool is_regular = std::filesystem::is_regular_file(path, ec);
+    if (ec) {
+        util::Logger::warn("Could not inspect save file {}; ignoring it: {}", path.string(),
+                           ec.message());
+        return {};
+    }
+    if (!is_regular) {
         util::Logger::warn("Save file path is not a regular file; ignoring it: {}", path.string());
         return {};
     }
@@ -1008,6 +1024,8 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
         return {};
     }
 
+    // `data_dir` is intentionally operator-selected local storage; save_filename
+    // is validated as a plain filename before this path is constructed.
     // codeql[cpp/path-injection]
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
