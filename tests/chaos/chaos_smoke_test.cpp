@@ -14,9 +14,11 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -32,7 +34,9 @@ namespace {
 // =============================================================================
 
 TEST(ChaosSmoke, NoTornWriteUnderRepeatedOverwrite) {
-    auto path = std::filesystem::temp_directory_path() / "toxtunnel_chaos_smoke.bin";
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto path = std::filesystem::temp_directory_path() /
+                ("toxtunnel_chaos_smoke_" + std::to_string(unique) + ".bin");
     std::filesystem::remove(path);
 
     std::vector<std::uint8_t> p1(4096, 0xCC);
@@ -58,11 +62,13 @@ TEST(ChaosSmoke, NoTornWriteUnderRepeatedOverwrite) {
 
     EXPECT_EQ(writes.load(), 1000);
 
-    std::ifstream in(path, std::ios::binary);
-    std::vector<std::uint8_t> got((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());
-    ASSERT_EQ(got.size(), 4096u);
-    EXPECT_TRUE(got == p1 || got == p2);
+    {
+        std::ifstream in(path, std::ios::binary);
+        std::vector<std::uint8_t> got((std::istreambuf_iterator<char>(in)),
+                                      std::istreambuf_iterator<char>());
+        ASSERT_EQ(got.size(), 4096u);
+        EXPECT_TRUE(got == p1 || got == p2);
+    }
     std::filesystem::remove(path);
 }
 

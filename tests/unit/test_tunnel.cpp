@@ -2,6 +2,7 @@
 
 #include <asio.hpp>
 #include <chrono>
+#include <thread>
 
 #include "toxtunnel/tunnel/tunnel.hpp"
 
@@ -14,6 +15,25 @@ using namespace std::chrono_literals;
 
 class TunnelTest : public ::testing::Test {
    protected:
+    template <typename Predicate>
+    bool pump_until(Predicate predicate,
+                    std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return true;
+            }
+            io_ctx.poll_one();
+            io_ctx.restart();
+            std::this_thread::sleep_for(1ms);
+        }
+        while (io_ctx.poll_one() > 0) {
+            io_ctx.restart();
+        }
+        io_ctx.restart();
+        return predicate();
+    }
+
     asio::io_context io_ctx;
     uint16_t test_tunnel_id = 42;
     uint32_t test_friend_number = 1;
@@ -511,8 +531,8 @@ TEST_F(TunnelTest, Backpressure_RetriesDeferredAckWhenToxQueueDrains) {
     EXPECT_EQ(tunnel->bytes_received(), payload.size());
 
     allow_ack_send = true;
-    io_ctx.restart();
-    io_ctx.run_for(20ms);
+    ASSERT_TRUE(pump_until([&] { return ack_send_attempts >= 2 && acked_bytes == payload.size(); }))
+        << "deferred ACK retry did not drain after Tox queue became writable";
 
     EXPECT_GE(ack_send_attempts, 2u);
     EXPECT_EQ(acked_bytes, payload.size());

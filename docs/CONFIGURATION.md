@@ -180,6 +180,12 @@ In LAN mode ToxTunnel:
 LAN mode requires `tox.udp_enabled: true` and works best when both peers are on the same broadcast
 domain.
 
+LAN mode is also the right choice for **same-host / loopback testing** (server and client on one
+machine): in the default `auto` mode two same-host daemons often never friend (DHT returns each
+peer's NAT-translated public IP and the loopback connect fails without NAT hairpin), whereas LAN
+mode brings the friend online in ~10 s with no internet. See the `tox-tunnel-ops` skill's
+`examples/local-loopback-test.md` for a full single-machine walk-through.
+
 ### Manual Bootstrap Nodes
 
 For air-gapped environments, private networks, or pinned bootstrap daemons:
@@ -216,8 +222,11 @@ Create `rules.yaml`:
 
 ```yaml
 rules:
-  - friend: "AABBCCDD..."               # 64 hex characters (public key only)
-                                        # `friend_pk` is also accepted as an alias
+  - friend: "AABBCCDD..."               # 64 hex characters = the first 64 chars of the
+                                        # client's 76-char Tox ID (the public key; the trailing
+                                        # 12 chars are nospam+checksum). `friend_pk` is also
+                                        # accepted. A wrong length is rejected when the rules file
+                                        # loads. Tip: `toxtunnel print-id --data-dir <client_data_dir>`
     allow:
       - host: "127.0.0.1"
         ports: [22, 80, 443]

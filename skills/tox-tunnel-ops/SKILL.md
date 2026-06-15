@@ -597,6 +597,10 @@ Numbered step-by-step:
   temporary access, SOCKS5 dynamic-destination browsing
   (`socks5-browser-proxy.md`), and Prometheus / Grafana monitoring
   (`prometheus-monitoring.md`)
+- `examples/local-loopback-test.md` — validate the **whole** server↔client↔rules↔forward
+  chain on a **single machine** before deploying to two. Requires `bootstrap_mode: lan`
+  on both peers (default `auto` won't friend two same-host daemons). Covers the proxy
+  `--noproxy` and Redis `ARG_MAX` gotchas. This is the recipe used to validate releases.
 - `references/execute.md` — detailed install, startup, persistence, lifecycle, and
   verification commands by platform
 - `references/diagnose.md` — deep troubleshooting flow, common errors, and diagnosis

@@ -101,6 +101,19 @@ class TunnelDataFlowTest : public ::testing::Test {
     /// Allow pending io_context handlers to execute.
     void poll() { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
 
+    template <typename Predicate>
+    bool wait_until(Predicate predicate,
+                    std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return predicate();
+    }
+
     // -----------------------------------------------------------------------
     // Helper: create a connected tunnel pair
     // -----------------------------------------------------------------------
@@ -304,7 +317,10 @@ TEST_F(TunnelDataFlowTest, TunnelPairDataExchange) {
     // --- Client -> Server ---
     const std::vector<uint8_t> c2s_payload = {0xDE, 0xAD, 0xBE, 0xEF};
     EXPECT_TRUE(client_raw->send_data_to_tox(c2s_payload));
-    poll();
+    ASSERT_TRUE(wait_until([&] {
+        std::lock_guard lock(server_data_mu);
+        return data_at_server == c2s_payload;
+    })) << "client-to-server payload did not arrive";
 
     {
         std::lock_guard lock(server_data_mu);
@@ -314,7 +330,10 @@ TEST_F(TunnelDataFlowTest, TunnelPairDataExchange) {
     // --- Server -> Client ---
     const std::vector<uint8_t> s2c_payload = {0xCA, 0xFE, 0xBA, 0xBE, 0x42};
     EXPECT_TRUE(server_raw->send_data_to_tox(s2c_payload));
-    poll();
+    ASSERT_TRUE(wait_until([&] {
+        std::lock_guard lock(client_data_mu);
+        return data_at_client == s2c_payload;
+    })) << "server-to-client payload did not arrive";
 
     {
         std::lock_guard lock(client_data_mu);

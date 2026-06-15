@@ -988,23 +988,49 @@ void ToxAdapter::dispatch_pending_events() {
 
 std::vector<uint8_t> ToxAdapter::load_save_data() const {
     auto path = save_file_path();
-    if (path.empty() || !std::filesystem::exists(path)) {
+    if (path.empty()) {
         return {};
     }
 
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    // Only a *regular file* is a valid save. If a directory (or other
+    // non-regular entry) is left at this path — e.g. a stale/clobbered
+    // data_dir where `tox_save.dat` ended up a directory — it must not be read
+    // as a file: an ifstream opened on a directory can yield a garbage
+    // `tellg()` (observed ~2^63), and sizing a vector from it triggers a
+    // multi-exabyte allocation -> std::bad_alloc -> crash loop on every start.
+    // Treat anything that is not a regular file as "no save data" and start
+    // fresh (matches load_tox_data() in tox_save.cpp, which uses file_size()).
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) {
+        std::error_code exist_ec;
+        if (std::filesystem::exists(path, exist_ec)) {
+            util::Logger::warn("Save file path is not a regular file; ignoring it: {}",
+                               path.string());
+        }
+        return {};
+    }
+
+    const std::uintmax_t file_size = std::filesystem::file_size(path, ec);
+    if (ec || file_size == 0) {
+        return {};
+    }
+    // Sanity cap: a Tox save (identity, friends, DHT keys) is at most a few
+    // MiB. Refuse an implausibly large file rather than trust a corrupt size
+    // and attempt a huge allocation.
+    constexpr std::uintmax_t kMaxSaveBytes = 64ULL * 1024 * 1024;  // 64 MiB
+    if (file_size > kMaxSaveBytes) {
+        util::Logger::warn("Save file is implausibly large ({} bytes); ignoring it: {}", file_size,
+                           path.string());
+        return {};
+    }
+
+    std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         util::Logger::warn("Could not open save file: {}", path.string());
         return {};
     }
 
-    auto size = file.tellg();
-    if (size <= 0) {
-        return {};
-    }
-
-    std::vector<uint8_t> data(static_cast<std::size_t>(size));
-    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> data(static_cast<std::size_t>(file_size));
     file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
 
     if (!file) {
