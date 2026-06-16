@@ -138,6 +138,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/tunnel/bdp_flow_control.cpp
     src/tox/bootstrap_source.cpp
     src/tox/types.cpp
+    src/tox/tox_ptr.cpp
     src/tox/tox_save.cpp
     src/tox/tox_thread.cpp
     src/tox/tox_connection.cpp

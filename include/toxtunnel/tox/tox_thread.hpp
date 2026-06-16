@@ -255,7 +255,7 @@ class ToxThread {
 
     Config config_;
 
-    /// The Tox instance (owned).  Uses ToxPtr from tox_save.hpp.
+    /// The Tox instance (owned).  Uses ToxPtr from tox_ptr.hpp.
     ToxPtr tox_{nullptr};
 
     /// Tox event-loop thread.

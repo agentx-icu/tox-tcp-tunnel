@@ -501,19 +501,37 @@ ssh tox-remote
 
 ## Testing on a Single Machine
 
-To test locally before deploying:
+To validate the full server + client + rules + forward chain locally before
+deploying to two machines.
+
+> **Use `bootstrap_mode: lan` on both peers.** Two daemons on the *same* host will
+> not reliably become friends in the default `auto` mode (DHT hands back each
+> peer's NAT-translated public IP and the loopback connect fails on routers
+> without NAT hairpin — `friends_online` stays 0 for 10+ minutes). LAN mode uses
+> local discovery: friend online in ~10 s, no internet. Put this in **both**
+> `server.yaml` and `client.yaml`:
+>
+> ```yaml
+> tox: { udp_enabled: true, bootstrap_mode: lan, bootstrap_nodes: [] }
+> ```
 
 ```bash
-# Terminal 1: Start server
-./build/toxtunnel -m server
+# Each daemon needs its OWN data_dir (its own Tox identity).
+toxtunnel print-id --data-dir /tmp/tox-server   # -> server Tox ID (put in client.yaml server_id)
+toxtunnel print-id --data-dir /tmp/tox-client   # -> client Tox ID; first 64 chars = rules friend PK
 
-# Terminal 2: Start client with the config from Step 2
-./build/toxtunnel -c client.yaml -d /tmp/tox-client
+# Terminal 1: server   Terminal 2: client
+./build/toxtunnel -m server -c server.yaml
+./build/toxtunnel -m client -c client.yaml
 
-# Wait for connection, then:
-# Terminal 3: Test SSH
+# Wait for "Server friend 0 is now online" (~10 s), then test the forward:
 ssh -p 2222 localhost
 ```
+
+> Hitting a forwarded HTTP port through `curl` and getting `502`? A system proxy
+> (e.g. Clash in TUN mode) is intercepting loopback — pass `curl --noproxy '*'`.
+> A step-by-step multi-service version (SSH/web/Postgres/Redis) lives in the
+> `tox-tunnel-ops` skill at `examples/local-loopback-test.md`.
 
 ---
 

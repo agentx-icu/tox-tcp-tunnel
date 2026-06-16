@@ -1,13 +1,11 @@
 #pragma once
 
-#include <toxcore/tox.h>
-
 #include <cstdint>
 #include <filesystem>
-#include <memory>
 #include <string>
 #include <vector>
 
+#include "toxtunnel/tox/tox_ptr.hpp"
 #include "toxtunnel/util/expected.hpp"
 
 namespace toxtunnel::tox {
@@ -15,18 +13,6 @@ namespace toxtunnel::tox {
 // ---------------------------------------------------------------------------
 // Tox save-data helpers
 // ---------------------------------------------------------------------------
-
-/// Custom deleter for Tox instances returned by the factory functions.
-struct ToxDeleter {
-    void operator()(Tox* t) const noexcept {
-        if (t) {
-            tox_kill(t);
-        }
-    }
-};
-
-/// Owning smart pointer to a Tox instance.
-using ToxPtr = std::unique_ptr<Tox, ToxDeleter>;
 
 /// Lightweight tag type representing a successful void operation.
 struct Success {};

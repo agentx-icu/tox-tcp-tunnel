@@ -61,9 +61,40 @@ class TunnelCoalesceTest : public ::testing::Test {
     }
 
     // Advance the io_context past the coalesce timer so the delayed flush runs.
+    //
+    // On asio's Windows IOCP backend, run_for() can return without dispatching
+    // an expired steady_timer in this single-threaded test shape. Polling ready
+    // handlers between small sleeps keeps the test deterministic across backends.
     void run_for(std::chrono::microseconds dur) {
+        const auto deadline = std::chrono::steady_clock::now() + dur;
+        while (std::chrono::steady_clock::now() < deadline) {
+            io_ctx_.poll_one();
+            io_ctx_.restart();
+            std::this_thread::sleep_for(1ms);
+        }
+        while (io_ctx_.poll_one() > 0) {
+            io_ctx_.restart();
+        }
         io_ctx_.restart();
-        io_ctx_.run_for(dur);
+    }
+
+    template <typename Predicate>
+    bool wait_until(Predicate predicate,
+                    std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return true;
+            }
+            io_ctx_.poll_one();
+            io_ctx_.restart();
+            std::this_thread::sleep_for(1ms);
+        }
+        while (io_ctx_.poll_one() > 0) {
+            io_ctx_.restart();
+        }
+        io_ctx_.restart();
+        return predicate();
     }
 
     asio::io_context io_ctx_;
@@ -276,7 +307,8 @@ TEST_F(TunnelCoalesceTest, BackpressuredSendRetainsBytesUntilDrained) {
     // Release backpressure; the retry timer must now drain everything, in
     // order, with zero loss.
     allow_send = true;
-    run_for(20ms);
+    ASSERT_TRUE(wait_until([&] { return captured_.concatenated_data() == payload; }))
+        << "backpressured data did not drain after Tox queue became writable";
 
     EXPECT_EQ(captured_.concatenated_data(), payload);
 }
@@ -352,7 +384,10 @@ TEST_F(TunnelCoalesceTest, CloseDeferredUntilBackpressureDrains) {
 
     // Release: the timer drains all DATA first, then emits the deferred CLOSE.
     allow_send = true;
-    run_for(20ms);
+    ASSERT_TRUE(wait_until([&] {
+        return captured_.concatenated_data() == payload && !captured_.all_frame_types.empty() &&
+               captured_.all_frame_types.back() == FrameType::TUNNEL_CLOSE;
+    })) << "deferred close did not wait for backpressured data to drain";
 
     EXPECT_EQ(captured_.concatenated_data(), payload);
     ASSERT_FALSE(captured_.all_frame_types.empty());
@@ -398,7 +433,11 @@ TEST_F(TunnelCoalesceTest, RemoteCloseWaitsForBackpressuredOutboundDrain) {
     // final close. With no local TcpConnection in this fixture, there is no
     // later TCP EOF to wait for.
     allow_send = true;
-    run_for(20ms);
+    ASSERT_TRUE(wait_until([&] {
+        return captured_.concatenated_data() == payload &&
+               close_notified.load(std::memory_order_acquire) &&
+               tunnel_->state() == Tunnel::State::Closed;
+    })) << "remote close notification fired before outbound data drained";
 
     EXPECT_EQ(captured_.concatenated_data(), payload);
     EXPECT_TRUE(close_notified.load(std::memory_order_acquire));

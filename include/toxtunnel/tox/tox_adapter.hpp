@@ -1,7 +1,5 @@
 #pragma once
 
-#include <toxcore/tox.h>
-
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -21,24 +19,13 @@
 #include <vector>
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
+#include "toxtunnel/tox/tox_ptr.hpp"
 #include "toxtunnel/tox/types.hpp"
 #include "toxtunnel/util/expected.hpp"
 
 namespace toxtunnel::tox {
 
 class ToxWatchdog;  // forward declaration
-
-// ---------------------------------------------------------------------------
-// Tox instance RAII deleter
-// ---------------------------------------------------------------------------
-
-/// Custom deleter for Tox pointer, used with std::unique_ptr.
-struct ToxDeleter {
-    void operator()(Tox* tox) const noexcept;
-};
-
-/// Owning smart pointer for a Tox instance.
-using ToxPtr = std::unique_ptr<Tox, ToxDeleter>;
 
 // ---------------------------------------------------------------------------
 // Callback signatures

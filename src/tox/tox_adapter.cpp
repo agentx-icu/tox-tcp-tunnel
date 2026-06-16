@@ -10,18 +10,9 @@
 #include "toxtunnel/tox/tox_watchdog.hpp"
 #include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/path_security.hpp"
 
 namespace toxtunnel::tox {
-
-// ===========================================================================
-// ToxDeleter
-// ===========================================================================
-
-void ToxDeleter::operator()(Tox* tox) const noexcept {
-    if (tox) {
-        tox_kill(tox);
-    }
-}
 
 // ===========================================================================
 // Helpers (anonymous namespace)
@@ -104,6 +95,10 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
     }
 
     config_ = config;
+
+    if (!util::is_plain_filename(config_.save_filename)) {
+        return util::unexpected(std::string("invalid Tox save filename: must be a plain filename"));
+    }
 
     // Ensure the data directory exists.
     if (!config_.data_dir.empty()) {
@@ -987,11 +982,51 @@ void ToxAdapter::dispatch_pending_events() {
 // ===========================================================================
 
 std::vector<uint8_t> ToxAdapter::load_save_data() const {
-    auto path = save_file_path();
-    if (path.empty() || !std::filesystem::exists(path)) {
+    const auto path = save_file_path();
+    if (path.empty()) {
         return {};
     }
 
+    // Only a regular, reasonably sized Tox save is valid here. This keeps a
+    // directory or corrupt file at tox_save.dat from turning tellg() into a
+    // huge allocation and crashing every startup.
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    if (ec) {
+        util::Logger::warn("Could not inspect save file {}; ignoring it: {}", path.string(),
+                           ec.message());
+        return {};
+    }
+    if (!exists) {
+        return {};
+    }
+
+    const bool is_regular = std::filesystem::is_regular_file(path, ec);
+    if (ec) {
+        util::Logger::warn("Could not inspect save file {}; ignoring it: {}", path.string(),
+                           ec.message());
+        return {};
+    }
+    if (!is_regular) {
+        util::Logger::warn("Save file path is not a regular file; ignoring it: {}", path.string());
+        return {};
+    }
+
+    const std::uintmax_t file_size = std::filesystem::file_size(path, ec);
+    if (ec || file_size == 0) {
+        return {};
+    }
+
+    constexpr std::uintmax_t kMaxSaveBytes = 64ULL * 1024 * 1024;  // 64 MiB
+    if (file_size > kMaxSaveBytes) {
+        util::Logger::warn("Save file is implausibly large ({} bytes); ignoring it: {}", file_size,
+                           path.string());
+        return {};
+    }
+
+    // `data_dir` is intentionally operator-selected local storage; save_filename
+    // is validated as a plain filename before this path is constructed.
+    // codeql[cpp/path-injection]
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         util::Logger::warn("Could not open save file: {}", path.string());
@@ -999,7 +1034,7 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
     }
 
     auto size = file.tellg();
-    if (size <= 0) {
+    if (size <= 0 || static_cast<std::uintmax_t>(size) != file_size) {
         return {};
     }
 
@@ -1062,6 +1097,9 @@ bool ToxAdapter::write_save_data_locked() const {
 
 std::filesystem::path ToxAdapter::save_file_path() const {
     if (config_.data_dir.empty()) {
+        return {};
+    }
+    if (!util::is_plain_filename(config_.save_filename)) {
         return {};
     }
     return config_.data_dir / config_.save_filename;

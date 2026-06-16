@@ -100,6 +100,19 @@ class HttpTunnelTest : public ::testing::Test {
     /// Allow pending io_context handlers to execute.
     static void poll() { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
 
+    template <typename Predicate>
+    static bool wait_until(Predicate predicate,
+                           std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return predicate();
+    }
+
     // Simulate HTTP request parsing
     void parse_http_request(const std::vector<uint8_t>& data) {
         std::string request_str(data.begin(), data.end());
@@ -322,10 +335,13 @@ TEST_F(HttpTunnelTest, HttpStreaming) {
 
     // Server side: receive client request
     std::vector<uint8_t> server_received;
-    server_tunnel->set_on_data_for_tcp([&server_received](std::span<const uint8_t> data) {
-        server_received.insert(server_received.end(), data.begin(), data.end());
-        return true;
-    });
+    std::mutex server_mutex;
+    server_tunnel->set_on_data_for_tcp(
+        [&server_received, &server_mutex](std::span<const uint8_t> data) {
+            std::lock_guard lock(server_mutex);
+            server_received.insert(server_received.end(), data.begin(), data.end());
+            return true;
+        });
 
     // Client requests large response
     const std::string request =
@@ -335,10 +351,18 @@ TEST_F(HttpTunnelTest, HttpStreaming) {
     EXPECT_TRUE(
         client_tunnel->send_data_to_tox(std::vector<uint8_t>(request.begin(), request.end())));
 
-    poll();
+    ASSERT_TRUE(wait_until([&] {
+        std::lock_guard lock(server_mutex);
+        std::string server_req_str(server_received.begin(), server_received.end());
+        return server_req_str.find("GET /large-file") != std::string::npos;
+    })) << "server did not receive streaming request";
 
     // Verify server received the request
-    std::string server_req_str(server_received.begin(), server_received.end());
+    std::string server_req_str;
+    {
+        std::lock_guard lock(server_mutex);
+        server_req_str.assign(server_received.begin(), server_received.end());
+    }
     EXPECT_TRUE(server_req_str.find("GET /large-file") != std::string::npos);
 
     // Server sends response in chunks
@@ -358,7 +382,12 @@ TEST_F(HttpTunnelTest, HttpStreaming) {
         poll();
     }
 
-    poll();
+    ASSERT_TRUE(wait_until([&] {
+        std::lock_guard lock(data_mutex);
+        std::string received_string(streamed_data.begin(), streamed_data.end());
+        return received_string.find("Chunk 0") != std::string::npos &&
+               received_string.find("Chunk 4") != std::string::npos;
+    })) << "client did not receive complete streamed response";
 
     // Verify data integrity on client side
     {

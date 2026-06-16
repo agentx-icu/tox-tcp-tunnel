@@ -129,6 +129,8 @@ These layers only apply when the corresponding feature is enabled.
 | `Rules file not found` | Bad `server.rules_file` path | Use an absolute path and verify permissions |
 | Slow transfer speed | Tox TCP relay instead of direct UDP | Check for direct UDP connection in logs and unblock UDP if possible |
 | Periodic disconnects | Unstable Tox friend connectivity | Raise log level and check network stability |
+| Crashes on startup with `std::bad_alloc` (huge `mmap`) | A non-regular file — usually a **directory** — sits at `<data_dir>/tox_save.dat` (or it's corrupt), so the loader read a garbage size | `rm -rf <data_dir>/tox_save.dat` (the daemon recreates a fresh identity). Hardened to fail gracefully in builds after v0.4.7 |
+| Both peers reach DHT but `friends_online` stays 0 **across different machines** | Tox friend-discovery (onion) blocked by the network — a local HTTP/SOCKS proxy or VPN in TUN mode (e.g. Clash) degrades onion routing; a corporate switch usually filters the multicast that `bootstrap_mode: lan` needs | Same LAN allowing multicast → `lan`. Else the path must pass Tox UDP/onion (don't proxy the daemon's traffic), or pin a mutually-reachable bootstrap node. Same-host loopback (`lan`) always works |
 | `Failed to bind port` | Port already in use | Find the conflicting process and pick a different local port |
 | `Permission denied` on `data_dir` | Wrong ownership or permissions | `chmod 700 data_dir` and fix owner |
 | Config parse error | YAML syntax problem | Fix indentation and validate with `python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" config.yaml` |
