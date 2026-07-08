@@ -19,15 +19,15 @@
     latest (default) or vX.Y.Z.
 
 .PARAMETER Repo
-    GitHub owner/repo. Default: anonymoussoft/tox-tcp-tunnel.
+    GitHub owner/repo. Default: agentx-icu/tox-tcp-tunnel.
 
 .EXAMPLE
     # Server install (default mode)
-    irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+    irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex
 
 .EXAMPLE
     # Client install (env var works around `iex` not passing args)
-    $env:TOXTUNNEL_MODE = 'client'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+    $env:TOXTUNNEL_MODE = 'client'; irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex
 
 .EXAMPLE
     # Local file (when not piping from raw.githubusercontent.com)
@@ -51,7 +51,7 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $Mode)    { $Mode    = if ($env:TOXTUNNEL_MODE)    { $env:TOXTUNNEL_MODE }    else { 'server' } }
 if (-not $Version) { $Version = if ($env:TOXTUNNEL_VERSION) { $env:TOXTUNNEL_VERSION } else { 'latest' } }
-if (-not $Repo)    { $Repo    = if ($env:TOXTUNNEL_REPO)    { $env:TOXTUNNEL_REPO }    else { 'anonymoussoft/tox-tcp-tunnel' } }
+if (-not $Repo)    { $Repo    = if ($env:TOXTUNNEL_REPO)    { $env:TOXTUNNEL_REPO }    else { 'agentx-icu/tox-tcp-tunnel' } }
 
 if ($Mode -notin 'server','client') {
     throw "Invalid -Mode: '$Mode' (expected 'server' or 'client')"

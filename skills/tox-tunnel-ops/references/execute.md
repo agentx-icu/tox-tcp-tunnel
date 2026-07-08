@@ -25,14 +25,14 @@ service idled (exit 0) until the user fills in `client.server_id` and sets
 
 ```bash
 # macOS / Linux (DEB / RPM / .pkg auto-detected)
-curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh                       # server
-curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client   # client scaffold
+curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh                       # server
+curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client   # client scaffold
 ```
 
 ```powershell
 # Windows (Administrator PowerShell)
-irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex                                       # server
-$env:TOXTUNNEL_MODE='client'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex         # client scaffold
+irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex                                       # server
+$env:TOXTUNNEL_MODE='client'; irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex         # client scaffold
 ```
 
 Env vars / flags: `TOXTUNNEL_MODE`, `TOXTUNNEL_VERSION`, `TOXTUNNEL_REPO`. The
@@ -51,7 +51,7 @@ newest release.
 
 ```bash
 ARCH=x86_64      # or aarch64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
+wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
 sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
 ```
 
@@ -59,7 +59,7 @@ sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
 
 ```bash
 ARCH=x86_64      # or aarch64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
+wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
 sudo rpm -i "toxtunnel-Linux-${ARCH}-latest.rpm"
 ```
 
@@ -67,14 +67,14 @@ sudo rpm -i "toxtunnel-Linux-${ARCH}-latest.rpm"
 
 ```bash
 ARCH=arm64       # or x86_64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
+wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
 sudo installer -pkg "toxtunnel-Darwin-${ARCH}-latest.pkg" -target /
 ```
 
 #### Windows
 
 Download the MSI from
-`https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
+`https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
 (use `toxtunnel-Windows-ARM64-latest.msi` for ARM) and run it as Administrator.
 
 #### Build from source (only if no package fits)

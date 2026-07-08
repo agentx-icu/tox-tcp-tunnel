@@ -2,13 +2,13 @@
 # One-line installer for tox-tcp-tunnel on macOS and Linux.
 #
 # Quick start:
-#   curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
-#   curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client
+#   curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
+#   curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client
 #
 # Flags / env overrides:
 #   --mode {server|client}        TOXTUNNEL_MODE      (default: server)
 #   --version {latest|vX.Y.Z}     TOXTUNNEL_VERSION   (default: latest)
-#   --repo OWNER/REPO             TOXTUNNEL_REPO      (default: anonymoussoft/tox-tcp-tunnel)
+#   --repo OWNER/REPO             TOXTUNNEL_REPO      (default: agentx-icu/tox-tcp-tunnel)
 #
 # What it does:
 #   1. Downloads the latest .deb/.rpm/.pkg from GitHub Releases
@@ -23,7 +23,7 @@
 
 set -eu
 
-REPO="${TOXTUNNEL_REPO:-anonymoussoft/tox-tcp-tunnel}"
+REPO="${TOXTUNNEL_REPO:-agentx-icu/tox-tcp-tunnel}"
 VERSION="${TOXTUNNEL_VERSION:-latest}"
 MODE="${TOXTUNNEL_MODE:-server}"
 
