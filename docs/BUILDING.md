@@ -6,12 +6,12 @@
 >
 > ```bash
 > # macOS / Linux
-> curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
+> curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
 > ```
 >
 > ```powershell
 > # Windows (Administrator PowerShell)
-> irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+> irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex
 > ```
 >
 > Build from source when you need: a non-released git revision, a custom
@@ -41,7 +41,7 @@ xcode-select --install
 brew install cmake pkg-config libsodium
 
 # Clone and build
-git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
+git clone --recursive https://github.com/agentx-icu/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
@@ -53,7 +53,7 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 sudo apt update
 sudo apt install -y build-essential cmake git pkg-config libsodium-dev
 
-git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
+git clone --recursive https://github.com/agentx-icu/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
@@ -66,7 +66,7 @@ cmake --build build -j$(nproc)
 ```bash
 sudo dnf install -y gcc-c++ cmake git pkgconf-pkg-config libsodium-devel
 
-git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
+git clone --recursive https://github.com/agentx-icu/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 ```bash
 sudo pacman -S --needed base-devel cmake git pkgconf libsodium
 
-git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
+git clone --recursive https://github.com/agentx-icu/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
@@ -102,7 +102,7 @@ cd vcpkg
 Build with vcpkg toolchain:
 
 ```powershell
-git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
+git clone --recursive https://github.com/agentx-icu/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
@@ -117,7 +117,7 @@ cmake --build build --config Release
 pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake \
     mingw-w64-ucrt-x86_64-pkg-config mingw-w64-ucrt-x86_64-libsodium git
 
-git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
+git clone --recursive https://github.com/agentx-icu/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build

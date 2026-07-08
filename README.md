@@ -196,20 +196,20 @@ service.
 
 ```bash
 # Server (default — listens for clients, gets a Tox ID)
-curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh
 
 # Client (writes a client config scaffold; service stays idle until you fill in server_id + flip allow_client_daemon)
-curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client
+curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client
 ```
 
 **Windows** (run PowerShell as Administrator):
 
 ```powershell
 # Server
-irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex
 
 # Client (env var works around `iex` not passing args)
-$env:TOXTUNNEL_MODE = 'client'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex
+$env:TOXTUNNEL_MODE = 'client'; irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex
 ```
 
 The installers respect three env vars / flags: `TOXTUNNEL_MODE` (`server`|`client`),
@@ -223,14 +223,14 @@ Every release publishes both **versioned** assets
 (`toxtunnel-<version>-<System>-<arch>.<ext>`) and a stable **`-latest`** alias
 (`toxtunnel-<System>-<arch>-latest.<ext>`). The commands below use the alias
 via `releases/latest/download/...`, which always serves the newest release.
-For a specific version, browse [GitHub Releases](https://github.com/anonymoussoft/tox-tcp-tunnel/releases)
+For a specific version, browse [GitHub Releases](https://github.com/agentx-icu/tox-tcp-tunnel/releases)
 and use the versioned filename instead.
 
 #### Linux (DEB - Ubuntu/Debian)
 
 ```bash
 ARCH=x86_64   # or aarch64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
+wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
 sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
 ```
 
@@ -256,7 +256,7 @@ sudo systemctl stop toxtunnel      # Stop
 
 ```bash
 ARCH=x86_64   # or aarch64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
+wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
 sudo rpm -i "toxtunnel-Linux-${ARCH}-latest.rpm"
 ```
 
@@ -266,7 +266,7 @@ Service management is the same as the DEB package (systemd).
 
 ```bash
 ARCH=arm64    # or x86_64
-wget "https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
+wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
 sudo installer -pkg "toxtunnel-Darwin-${ARCH}-latest.pkg" -target /
 ```
 
@@ -295,7 +295,7 @@ sudo launchctl kickstart -k system/com.toxtunnel.daemon   # reload after config 
 #### Windows
 
 1. Download the latest MSI from
-   `https://github.com/anonymoussoft/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
+   `https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
    (use `toxtunnel-Windows-ARM64-latest.msi` for ARM)
 2. Run the installer as Administrator
 3. The installer places files in `C:\Program Files\ToxTunnel\`. **In v0.2.0 the MSI does
@@ -343,7 +343,7 @@ brew install cmake pkg-config libsodium
 sudo apt install -y build-essential cmake git pkg-config libsodium-dev
 
 # Clone and build
-git clone --recursive https://github.com/anonymoussoft/tox-tcp-tunnel.git
+git clone --recursive https://github.com/agentx-icu/tox-tcp-tunnel.git
 cd tox-tcp-tunnel
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ```

@@ -7,7 +7,7 @@ metadata:
       bins: ["toxtunnel"]
       env: []
     emoji: "🔒"
-    homepage: "https://github.com/anonymoussoft/tox-tcp-tunnel"
+    homepage: "https://github.com/agentx-icu/tox-tcp-tunnel"
     os: ["darwin", "linux", "win32"]
 ---
 
@@ -15,8 +15,8 @@ metadata:
 You are a ToxTunnel operations specialist. You help users design, deploy, and diagnose TCP tunnels over the Tox P2P network using **tox-tcp-tunnel**.
 
 Project links:
-- GitHub repository: `https://github.com/anonymoussoft/tox-tcp-tunnel`
-- Releases: `https://github.com/anonymoussoft/tox-tcp-tunnel/releases`
+- GitHub repository: `https://github.com/agentx-icu/tox-tcp-tunnel`
+- Releases: `https://github.com/agentx-icu/tox-tcp-tunnel/releases`
 
 ## What This Skill Does
 This skill helps you create **secure, encrypted TCP tunnels** that work behind NATs and firewalls without any central server. Common use cases:
@@ -690,8 +690,8 @@ Read on demand:
    - Windows (package): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **In v0.2.0 the MSI does NOT auto-register the SCM service** (the WiX patch is shelved in `cmake/Packaging.cmake` until the correct CPack-generated component Id is discovered). Workflow: user runs the MSI, creates `C:\ProgramData\ToxTunnel\config.yaml`, then registers the service explicitly: `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'`, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner does all of this automatically (download → install → seed config → start service) based on `--Mode`. Removal: `uninstall-windows-service`.
    - For manual installs, use home-directory paths as before.
 6. **Prefer the one-line installer, then native packages, then source.** Recommend the one-liner first (it auto-detects arch + package format and seeds a mode-appropriate config):
-   - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode {server|client}`
-   - Windows (Administrator PowerShell): `$env:TOXTUNNEL_MODE='{server|client}'; irm https://raw.githubusercontent.com/anonymoussoft/tox-tcp-tunnel/master/scripts/install.ps1 | iex`
+   - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode {server|client}`
+   - Windows (Administrator PowerShell): `$env:TOXTUNNEL_MODE='{server|client}'; irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex`
    Fall back to direct DEB/RPM/.pkg/MSI download from GitHub Releases when the user can't pipe to sh/iex (locked-down environments). Only suggest building from source when no pre-built package exists for the target platform.
 7. **Safe defaults.** `bootstrap_mode: auto` unless confirmed LAN. `log_level: info` unless diagnosing. `tox.tcp_port: 33445` unless blocked.
 8. **Pipe mode for SSH.** Always mention SSH ProxyCommand as an alternative for SSH scenarios. Note: pipe mode is POSIX only and **not supported on Windows** — on Windows, always use the `forwards` port-mapping approach instead.
