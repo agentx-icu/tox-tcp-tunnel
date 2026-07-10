@@ -205,6 +205,11 @@ else()
             -Wno-array-bounds
             -Wno-stringop-overread
             -Wno-stringop-overflow
+            # GCC 13/14 false positive on inlined std::string SSO
+            # deallocation (new_allocator.h "free-nonheap-object" with
+            # nonzero offset); trips make_tunnel_error & friends under
+            # gcc-toolset-14 on manylinux_2_28.
+            -Wno-free-nonheap-object
         )
     endif()
     # Apple Clang 17+ (Xcode 16/26) trips on `operator"" _buf` in asio 1.28's
@@ -235,6 +240,11 @@ else()
             -Wno-array-bounds
             -Wno-stringop-overread
             -Wno-stringop-overflow
+            # GCC 13/14 false positive on inlined std::string SSO
+            # deallocation (new_allocator.h "free-nonheap-object" with
+            # nonzero offset); trips make_tunnel_error & friends under
+            # gcc-toolset-14 on manylinux_2_28.
+            -Wno-free-nonheap-object
         )
     endif()
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
