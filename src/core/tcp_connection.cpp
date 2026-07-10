@@ -190,7 +190,10 @@ void TcpConnection::start_read() {
 bool TcpConnection::write(const uint8_t* data, std::size_t length) {
     ConnectionState s = state_.load(std::memory_order_acquire);
     if (s != ConnectionState::Connected && s != ConnectionState::Disconnecting) {
-        util::Logger::warn("TcpConnection::write called in state {}", to_string(s));
+        // Routine close race: the local socket dropped while peer frames were
+        // still in flight. One line per late frame at warn level flooded the
+        // log (2k+ lines/s when a bulk transfer is aborted mid-flight).
+        util::Logger::debug("TcpConnection::write called in state {}", to_string(s));
         return false;
     }
     if (send_shutdown_requested_.load(std::memory_order_acquire)) {
@@ -223,7 +226,8 @@ bool TcpConnection::write(const uint8_t* data, std::size_t length) {
 bool TcpConnection::write(std::vector<uint8_t> data) {
     ConnectionState s = state_.load(std::memory_order_acquire);
     if (s != ConnectionState::Connected && s != ConnectionState::Disconnecting) {
-        util::Logger::warn("TcpConnection::write called in state {}", to_string(s));
+        // Routine close race — see write(const uint8_t*, size_t).
+        util::Logger::debug("TcpConnection::write called in state {}", to_string(s));
         return false;
     }
     if (send_shutdown_requested_.load(std::memory_order_acquire)) {
@@ -250,7 +254,8 @@ bool TcpConnection::write(std::vector<uint8_t> data) {
 bool TcpConnection::write(OwnedBufferView buf) {
     ConnectionState s = state_.load(std::memory_order_acquire);
     if (s != ConnectionState::Connected && s != ConnectionState::Disconnecting) {
-        util::Logger::warn("TcpConnection::write(view) called in state {}", to_string(s));
+        // Routine close race — see write(const uint8_t*, size_t).
+        util::Logger::debug("TcpConnection::write(view) called in state {}", to_string(s));
         return false;
     }
     if (send_shutdown_requested_.load(std::memory_order_acquire)) {

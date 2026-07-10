@@ -39,6 +39,27 @@ TEST_F(KnownServersTest, EmptyStoreOnFreshDir) {
     EXPECT_FALSE(store.last_load_error().has_value());
 }
 
+// v0.4.8 Linux packages left a *directory* at known_servers.yaml (broken
+// release-toolchain fs::path). Loading through YAML::LoadFile then threw an
+// uncaught std::ios_base::failure and terminated the client on startup. A
+// directory squatter must load as an empty registry, and the first save
+// must self-heal it back to a regular file.
+TEST_F(KnownServersTest, DirectorySquatterLoadsEmptyAndSaveSelfHeals) {
+    const auto squatter = dir_ / "known_servers.yaml";
+    std::filesystem::create_directories(squatter);
+
+    KnownServersStore store(dir_);  // must not throw / terminate
+    EXPECT_TRUE(store.empty());
+
+    KnownServer e;
+    e.tox_id = kToxIdA;
+    EXPECT_TRUE(store.upsert(e));
+    auto saved = store.save();
+    ASSERT_TRUE(saved.has_value()) << saved.error();
+    EXPECT_TRUE(std::filesystem::is_regular_file(squatter))
+        << "first save should replace the empty squatter directory";
+}
+
 TEST_F(KnownServersTest, RejectsInvalidToxIdLength) {
     KnownServersStore store(dir_);
     KnownServer e;

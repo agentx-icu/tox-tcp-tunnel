@@ -62,6 +62,21 @@ prefer linking there rather than duplicating here.
 - Warnings are errors (`-Werror`)
 - C++20
 
+## Mandatory Independent Review (codex)
+
+Every non-trivial change — bug fix, feature, refactor, CI/packaging change —
+MUST get an independent second opinion from OpenAI Codex **before commit/PR**
+(via the `/codex` skill or `codex exec`):
+
+1. Send the complete diff plus a root-cause/intent summary and explicit
+   questions to challenge (not just "review this").
+2. Address every finding, then run a **second pass on the final diff** —
+   code written after the first review (including implementations of
+   codex's own suggestions) is unreviewed until codex has seen it.
+3. Record the verdict and findings-addressed in the PR description.
+
+Exempt: typo/comment/doc-only edits. When in doubt, review.
+
 ## Architecture
 
 ToxTunnel forwards TCP ports through the Tox P2P network with end-to-end encryption.
@@ -210,7 +225,15 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   `<data_dir>/abort_count`.
 - **Atomic writes** — `tox_save.dat` and `known_servers.yaml` go through
   `util::atomic_write_file` (tmp + fsync + rename, plus parent-dir
-  fsync; `F_FULLFSYNC` on macOS for the identity file).
+  fsync; `F_FULLFSYNC` on macOS for the identity file). Parent-dir
+  computation is deliberately **string-based** (`parent_dir_of`), never
+  `fs::path::parent_path()` — the manylinux devtoolset toolchain
+  mis-parses path components (v0.4.8 shipped Linux binaries that created
+  `tox_save.dat` as a directory and lost the identity every restart; the
+  release containers are manylinux_2_28 since v0.4.9 for the same
+  reason). An empty directory squatting on the target is rmdir'd before
+  writing (self-heals 0.4.8-damaged data dirs). A present-but-unreadable
+  save file aborts startup instead of minting a fresh identity.
 - **Tunnel resume** — `tunnel.resume.enabled: false` by default (opcodes
   `0x08 / 0x09` wire-inactive in that mode). When enabled the live
   hold-across-reconnect handshake runs: the server holds a disconnected

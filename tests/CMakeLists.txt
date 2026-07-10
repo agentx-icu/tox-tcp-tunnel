@@ -42,6 +42,7 @@ add_executable(unit_tests
     unit/rate_limiter_test.cpp
     unit/tox_watchdog_test.cpp
     unit/atomic_file_test.cpp
+    unit/path_security_test.cpp
     unit/tunnel_id_allocator_test.cpp
     unit/tunnel_resume_test.cpp
     unit/t8_data_race_test.cpp

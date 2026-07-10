@@ -252,6 +252,16 @@ sudo systemctl status toxtunnel    # Check status
 sudo systemctl stop toxtunnel      # Stop
 ```
 
+> **Getting the service's Tox ID:** the daemon runs as the `toxtunnel` user, so
+> read the ID from the service log (`sudo journalctl -u toxtunnel | grep "Tox ID"`)
+> or run print-id **as the service account**:
+> `sudo -u toxtunnel toxtunnel print-id -d /var/lib/toxtunnel`.
+> Running plain `sudo toxtunnel print-id -d /var/lib/toxtunnel` before the
+> service's first start would create the identity as **root**, which the
+> `toxtunnel` user cannot read — since v0.4.9 the service then refuses to start
+> (instead of silently minting a different identity as older versions did);
+> `chown toxtunnel:toxtunnel /var/lib/toxtunnel/tox_save.dat` fixes it.
+
 #### Linux (RPM - Fedora/RHEL/CentOS)
 
 ```bash
@@ -859,7 +869,7 @@ Pre-built installers are published to GitHub Releases on every version tag (`v*`
 
 Runtime compatibility targets for release artifacts:
 
-- Linux x86_64/aarch64 packages are built against a CentOS 7-era ABI floor (glibc 2.17) and are intended to run on Ubuntu 20.04+, CentOS 7+, and newer derivatives.
+- Linux x86_64/aarch64 packages are built on manylinux_2_28 (glibc 2.28 ABI floor) and are intended to run on Ubuntu 20.04+, Debian 10+, RHEL/Rocky/Alma 8+, and newer derivatives. CentOS 7 (EOL June 2024) is no longer a supported target — its era's build toolchain shipped a broken `std::filesystem` that corrupted identity persistence (v0.4.8).
 - Windows x86_64 release builds target the Windows 7 API baseline while remaining compatible with modern Windows.
 - Windows ARM64 artifacts target modern Windows only (Windows 7 has no ARM64 edition).
 

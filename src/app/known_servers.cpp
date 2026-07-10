@@ -117,12 +117,24 @@ util::Expected<void, std::string> KnownServersStore::load_from_disk_locked() {
         return {};
     }
 
+    // A directory squatting on the path (v0.4.8 Linux-package damage) made
+    // YAML::LoadFile throw std::ios_base::failure — uncaught below, it
+    // *terminated the process* on startup. Treat any non-regular file as an
+    // empty registry; the next save self-heals it via atomic_write_file.
+    if (!std::filesystem::is_regular_file(path_, ec)) {
+        util::Logger::warn("known_servers path is not a regular file; starting empty: {}",
+                           path_.string());
+        return {};
+    }
+
     YAML::Node root;
     try {
         root = YAML::LoadFile(path_.string());
     } catch (const YAML::Exception& e) {
         return util::make_unexpected(std::string("Failed to parse known_servers.yaml: ") +
                                      e.what());
+    } catch (const std::exception& e) {
+        return util::make_unexpected(std::string("Failed to read known_servers.yaml: ") + e.what());
     }
 
     if (!root.IsMap() && !root.IsNull()) {

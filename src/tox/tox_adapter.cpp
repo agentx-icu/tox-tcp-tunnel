@@ -136,8 +136,15 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
         tox_options_set_proxy_port(opts, config_.proxy_port);
     }
 
-    // Try to load existing save data.
-    std::vector<uint8_t> save_data = load_save_data();
+    // Try to load existing save data. A load *error* (present but
+    // unreadable / oversized / I/O failure) aborts startup: continuing would
+    // mint a fresh identity and orphan every client that knows this one.
+    auto load_result = load_save_data();
+    if (!load_result) {
+        tox_options_free(opts);
+        return util::unexpected(load_result.error());
+    }
+    std::vector<uint8_t> save_data = std::move(load_result.value());
     if (!save_data.empty()) {
         tox_options_set_savedata_type(opts, TOX_SAVEDATA_TYPE_TOX_SAVE);
         tox_options_set_savedata_data(opts, save_data.data(), save_data.size());
@@ -214,8 +221,19 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
     // Register toxcore callbacks.
     register_callbacks();
 
-    // Persist the (possibly new) identity.
-    (void)write_save_data();
+    // Persist the (possibly new) identity — and refuse to run if that
+    // fails. An identity that only exists in memory disappears on restart,
+    // orphaning every client that learned it (exactly the v0.4.8 Linux
+    // package failure mode). write_save_data_locked() already logged the
+    // underlying atomic-write error. An empty save path (no data_dir) means
+    // deliberate in-memory operation and is exempt.
+    if (!save_file_path().empty() && !write_save_data()) {
+        tox_.reset();
+        return util::unexpected(std::string("failed to persist the Tox identity to '") +
+                                save_file_path().string() +
+                                "' (see log for the underlying write error); refusing to run "
+                                "with an identity that would not survive a restart");
+    }
 
     initialized_.store(true);
 
@@ -981,10 +999,10 @@ void ToxAdapter::dispatch_pending_events() {
 // Internal: save/load
 // ===========================================================================
 
-std::vector<uint8_t> ToxAdapter::load_save_data() const {
+util::Expected<std::vector<uint8_t>, std::string> ToxAdapter::load_save_data() const {
     const auto path = save_file_path();
     if (path.empty()) {
-        return {};
+        return std::vector<uint8_t>{};
     }
 
     // Only a regular, reasonably sized Tox save is valid here. This keeps a
@@ -993,35 +1011,40 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
     std::error_code ec;
     const bool exists = std::filesystem::exists(path, ec);
     if (ec) {
-        util::Logger::warn("Could not inspect save file {}; ignoring it: {}", path.string(),
-                           ec.message());
-        return {};
+        return util::unexpected("could not inspect save file " + path.string() + ": " +
+                                ec.message());
     }
     if (!exists) {
-        return {};
+        return std::vector<uint8_t>{};
     }
 
     const bool is_regular = std::filesystem::is_regular_file(path, ec);
     if (ec) {
-        util::Logger::warn("Could not inspect save file {}; ignoring it: {}", path.string(),
-                           ec.message());
-        return {};
+        return util::unexpected("could not inspect save file " + path.string() + ": " +
+                                ec.message());
     }
     if (!is_regular) {
+        // Deliberately NOT an error: v0.4.8 Linux packages left an empty
+        // directory here (manylinux fs::path bug); continuing with a fresh
+        // identity lets the next save self-heal via atomic_write_file's
+        // empty-directory removal. A non-empty directory keeps failing the
+        // save with a clear error instead.
         util::Logger::warn("Save file path is not a regular file; ignoring it: {}", path.string());
-        return {};
+        return std::vector<uint8_t>{};
     }
 
     const std::uintmax_t file_size = std::filesystem::file_size(path, ec);
-    if (ec || file_size == 0) {
-        return {};
+    if (ec) {
+        return util::unexpected("could not stat save file " + path.string() + ": " + ec.message());
+    }
+    if (file_size == 0) {
+        return std::vector<uint8_t>{};
     }
 
     constexpr std::uintmax_t kMaxSaveBytes = 64ULL * 1024 * 1024;  // 64 MiB
     if (file_size > kMaxSaveBytes) {
-        util::Logger::warn("Save file is implausibly large ({} bytes); ignoring it: {}", file_size,
-                           path.string());
-        return {};
+        return util::unexpected("save file is implausibly large (" + std::to_string(file_size) +
+                                " bytes); refusing to overwrite it: " + path.string());
     }
 
     // `data_dir` is intentionally operator-selected local storage; save_filename
@@ -1029,13 +1052,21 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
     // codeql[cpp/path-injection]
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        util::Logger::warn("Could not open save file: {}", path.string());
-        return {};
+        // Existing-but-unreadable is the print-id/service-account handoff
+        // trap: the file was created by a different user (root, or an
+        // Administrator on Windows) and the daemon account cannot read it.
+        // Starting with a fresh identity here would silently orphan every
+        // client configured with the old Tox ID — fail loudly instead.
+        return util::unexpected(
+            "save file " + path.string() +
+            " exists but cannot be opened (permission denied?); refusing to create a fresh "
+            "identity. Fix ownership so the daemon account can read it (e.g. chown to the "
+            "service user), or remove the file to intentionally start a new identity");
     }
 
     auto size = file.tellg();
     if (size <= 0 || static_cast<std::uintmax_t>(size) != file_size) {
-        return {};
+        return util::unexpected("could not read save file size: " + path.string());
     }
 
     std::vector<uint8_t> data(static_cast<std::size_t>(size));
@@ -1043,8 +1074,7 @@ std::vector<uint8_t> ToxAdapter::load_save_data() const {
     file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
 
     if (!file) {
-        util::Logger::warn("Failed to read save file: {}", path.string());
-        return {};
+        return util::unexpected("failed to read save file: " + path.string());
     }
 
     return data;

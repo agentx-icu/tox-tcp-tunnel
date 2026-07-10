@@ -34,6 +34,38 @@ namespace {
 // truncated / renamed over each other.
 std::atomic<std::uint64_t> g_tmp_counter{0};
 
+// Compute the parent directory from the raw pathname instead of
+// fs::path::parent_path(). The manylinux2014 release toolchain (devtoolset
+// GCC 10, pre-C++11 COW-string ABI) ships a std::filesystem::path whose
+// component parser is broken: parent_path() can return the path itself and
+// has_parent_path() misfires. In v0.4.8 Linux packages that made
+// create_directories() create the *target file path* as a directory, so
+// tox_save.dat / known_servers.yaml could never be written and the server
+// minted a fresh Tox identity on every restart. String splitting has no
+// such failure mode on any toolchain.
+std::filesystem::path parent_dir_of(const std::filesystem::path& path) {
+    auto native = path.native();
+#if defined(_WIN32)
+    constexpr const wchar_t* kSeps = L"/\\";
+#else
+    constexpr const char* kSeps = "/";
+#endif
+    // Ignore trailing separators so "…/dir/" yields "…" rather than the
+    // target itself (which create_directories would then mkdir).
+    const auto last = native.find_last_not_of(kSeps);
+    if (last == native.npos) {
+        return {};  // path is all separators (a root) — nothing to create
+    }
+    const auto pos = native.find_last_of(kSeps, last);
+    if (pos == native.npos) {
+        return {};  // bare filename — parent is the CWD, nothing to create
+    }
+    if (pos == 0) {
+        return std::filesystem::path(native.substr(0, 1));  // filesystem root
+    }
+    return std::filesystem::path(native.substr(0, pos));
+}
+
 // Build the per-call unique suffix appended after ".tmp.". Form is
 // "<pid>.<thread-id>.<counter>" so it is stable to read in a directory listing
 // yet collision-free across threads and repeated calls.
@@ -147,7 +179,7 @@ Expected<void, std::string> posix_write(const std::filesystem::path& path,
     }
 
     if (opts.fsync_parent_dir) {
-        const auto parent = path.parent_path();
+        const auto parent = parent_dir_of(path);
         if (!parent.empty()) {
             const int dfd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (dfd >= 0) {
@@ -236,16 +268,21 @@ bool build_owner_only_sa(OwnerOnlySa& out) {
     if (!::ConvertSidToStringSidA(user_sid, &sid_str)) {
         return false;
     }
-    // SDDL: owner = user, group = user, protected DACL with one ACE
-    // granting GENERIC_ALL ("GA") to the user SID. "P" prevents
-    // inheritance of less-restrictive parent ACEs.
+    // SDDL: owner = user, group = user, protected DACL granting GENERIC_ALL
+    // ("GA") to the user SID plus LocalSystem ("SY") and Administrators
+    // ("BA"). "P" prevents inheritance of less-restrictive parent ACEs.
+    // SY/BA are included so an identity created by an elevated `print-id`
+    // stays readable by the SCM service (LocalSystem) and vice versa — with
+    // a strict owner-only DACL the service silently minted a fresh identity
+    // because it could not read the admin-created tox_save.dat. Non-admin
+    // local users remain excluded either way.
     std::string sddl = "O:";
     sddl += sid_str;
     sddl += "G:";
     sddl += sid_str;
     sddl += "D:P(A;;GA;;;";
     sddl += sid_str;
-    sddl += ")";
+    sddl += ")(A;;GA;;;SY)(A;;GA;;;BA)";
     ::LocalFree(sid_str);
 
     if (!::ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl.c_str(), SDDL_REVISION_1,
@@ -346,11 +383,29 @@ Expected<void, std::string> windows_write(const std::filesystem::path& path,
 Expected<void, std::string> atomic_write_file(const std::filesystem::path& path,
                                               std::span<const std::uint8_t> contents,
                                               const AtomicFileOptions& options) {
-    if (path.has_parent_path()) {
+    const auto parent = parent_dir_of(path);
+    if (!parent.empty()) {
         std::error_code ec;
-        std::filesystem::create_directories(path.parent_path(), ec);
+        std::filesystem::create_directories(parent, ec);
         if (ec) {
             return make_unexpected(std::string("create_directories: ") + ec.message());
+        }
+    }
+
+    // Self-heal deployments damaged by the v0.4.8 manylinux bug (see
+    // parent_dir_of): those runs left an *empty* directory squatting on the
+    // target path, which would make the rename below fail with EISDIR
+    // forever. rmdir/RemoveDirectory only succeeds on empty directories, so
+    // a directory that actually holds user data is never touched — the
+    // write then fails with a clear error instead.
+    {
+        std::error_code st_ec;
+        if (std::filesystem::is_directory(std::filesystem::symlink_status(path, st_ec))) {
+#if defined(_WIN32)
+            (void)::RemoveDirectoryW(path.c_str());
+#else
+            (void)::rmdir(path.c_str());
+#endif
         }
     }
 #if defined(_WIN32)
