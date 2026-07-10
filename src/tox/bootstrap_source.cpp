@@ -11,7 +11,6 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -163,16 +162,12 @@ util::Expected<std::vector<BootstrapNode>, std::string> load_cached_nodes(
 }
 
 void write_cache(const std::filesystem::path& cache_path, std::string_view json) {
-    std::error_code ec;
-    std::filesystem::create_directories(cache_path.parent_path(), ec);
-    if (ec) {
-        return;
-    }
-
     // Bootstrap cache is best-effort recovery: a corrupted file from a
     // mid-write crash would leave the daemon with no DHT nodes on the next
-    // boot. atomic_write_file removes that failure mode. Parent-dir fsync
-    // off because the cache is not security-critical.
+    // boot. atomic_write_file removes that failure mode (and creates the
+    // parent directory itself — no fs::path decomposition here, which the
+    // manylinux2014 toolchain gets wrong). Parent-dir fsync off because the
+    // cache is not security-critical.
     util::AtomicFileOptions opts{};
     opts.fsync_parent_dir = false;
     opts.use_full_fsync_macos = false;

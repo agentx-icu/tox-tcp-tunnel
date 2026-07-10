@@ -438,8 +438,13 @@ class ToxAdapter {
 
     /// Load save data from disk.
     ///
-    /// @return The loaded bytes, or an empty vector if no file exists.
-    [[nodiscard]] std::vector<uint8_t> load_save_data() const;
+    /// @return The loaded bytes; an empty vector when no usable save exists
+    ///         (missing file, empty file, or a non-regular squatter that the
+    ///         next save will self-heal); or an error when a save file is
+    ///         present but cannot be read (permissions, I/O). The error case
+    ///         must abort startup — silently minting a fresh identity would
+    ///         orphan every client that knows the old Tox ID.
+    [[nodiscard]] util::Expected<std::vector<uint8_t>, std::string> load_save_data() const;
 
     /// Write current Tox state to disk.
     ///

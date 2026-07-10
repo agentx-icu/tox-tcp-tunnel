@@ -152,5 +152,48 @@ TEST(AtomicWriteFileTest, RespectsOwnerOnlyMode) {
 #endif
 }
 
+// v0.4.8 manylinux regression: the broken devtoolset fs::path made
+// atomic_write_file create the *target path* as a directory, after which
+// every save failed with EISDIR forever. The fixed helper must (a) never
+// create the target as a directory, and (b) self-heal an existing *empty*
+// directory squatting on the target (what damaged deployments have on
+// disk), while (c) refusing to touch a non-empty one.
+TEST(AtomicWriteFileTest, SelfHealsEmptyDirectorySquatter) {
+    auto base = std::filesystem::temp_directory_path() / "toxtunnel_atomic_dir_squat";
+    std::filesystem::remove_all(base);
+    auto path = base / "tox_save.dat";
+    std::filesystem::create_directories(path);  // simulate the 0.4.8 damage
+    ASSERT_TRUE(std::filesystem::is_directory(path));
+
+    std::string payload = "identity bytes";
+    auto r = util::atomic_write_file(path, payload);
+    ASSERT_TRUE(r) << r.error();
+    EXPECT_TRUE(std::filesystem::is_regular_file(path));
+    std::string actual;
+    {
+        std::ifstream in(path);
+        actual.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    EXPECT_EQ(actual, payload);
+    std::filesystem::remove_all(base);
+}
+
+TEST(AtomicWriteFileTest, RefusesNonEmptyDirectorySquatter) {
+    auto base = std::filesystem::temp_directory_path() / "toxtunnel_atomic_dir_full";
+    std::filesystem::remove_all(base);
+    auto path = base / "tox_save.dat";
+    std::filesystem::create_directories(path);
+    {
+        std::ofstream out(path / "user_data.txt");
+        out << "precious";
+    }
+
+    auto r = util::atomic_write_file(path, std::string("new identity"));
+    EXPECT_FALSE(r) << "must not replace a directory that holds data";
+    EXPECT_TRUE(std::filesystem::is_directory(path));
+    EXPECT_TRUE(std::filesystem::exists(path / "user_data.txt"));
+    std::filesystem::remove_all(base);
+}
+
 }  // namespace
 }  // namespace toxtunnel::test

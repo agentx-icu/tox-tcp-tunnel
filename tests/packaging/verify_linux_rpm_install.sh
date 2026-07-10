@@ -19,23 +19,31 @@ if ! rpm -qp --scripts "${package_path}" | grep -Fq "systemctl enable --now toxt
     exit 1
 fi
 
-for repo_file in /etc/yum.repos.d/CentOS-*.repo; do
-    if [[ -f "${repo_file}" ]]; then
-        sed -i \
-            -e 's/^mirrorlist=/#mirrorlist=/' \
-            -e 's|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=http://vault.centos.org/7.9.2009|g' \
-            -e 's|^#baseurl=http://mirror.centos.org/altarch/\$releasever|baseurl=http://vault.centos.org/altarch/7.9.2009|g' \
-            "${repo_file}"
-    fi
-done
+# CentOS 7 is EOL: its mirrors moved to vault.centos.org and EPEL 7 to the
+# archive. Only rewire repos when actually running on CentOS 7 (legacy
+# verification); EL8+ images (Rocky/Alma) install straight from their
+# default repos, with EPEL added best-effort for any external deps.
+if grep -qs "CentOS Linux release 7" /etc/centos-release; then
+    for repo_file in /etc/yum.repos.d/CentOS-*.repo; do
+        if [[ -f "${repo_file}" ]]; then
+            sed -i \
+                -e 's/^mirrorlist=/#mirrorlist=/' \
+                -e 's|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=http://vault.centos.org/7.9.2009|g' \
+                -e 's|^#baseurl=http://mirror.centos.org/altarch/\$releasever|baseurl=http://vault.centos.org/altarch/7.9.2009|g' \
+                "${repo_file}"
+        fi
+    done
 
-cat >/etc/yum.repos.d/epel-archive.repo <<'EOF'
+    cat >/etc/yum.repos.d/epel-archive.repo <<'EOF'
 [epel-archive]
 name=EPEL 7 archive - $basearch
 baseurl=https://archive.fedoraproject.org/pub/archive/epel/7/$basearch
 enabled=1
 gpgcheck=0
 EOF
+else
+    yum install -y epel-release || true
+fi
 
 yum clean all
 yum makecache

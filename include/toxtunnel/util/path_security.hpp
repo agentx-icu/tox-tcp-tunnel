@@ -1,7 +1,5 @@
 #pragma once
 
-#include <filesystem>
-#include <string>
 #include <string_view>
 
 namespace toxtunnel::util {
@@ -11,14 +9,16 @@ inline bool is_plain_filename(std::string_view filename) {
         return false;
     }
 
-    if (filename.find('/') != std::string_view::npos ||
-        filename.find('\\') != std::string_view::npos) {
-        return false;
-    }
-
-    const std::filesystem::path path{std::string(filename)};
-    return !path.is_absolute() && !path.has_root_name() && !path.has_parent_path() &&
-           path.filename() == path;
+    // Pure string checks — no std::filesystem::path decomposition. The
+    // manylinux2014 release toolchain (devtoolset GCC 10, COW-string ABI)
+    // mis-parses path components (see parent_dir_of in atomic_file.cpp), so
+    // relying on has_parent_path()/filename() here could reject the default
+    // "tox_save.dat" or accept a traversal. '/' and '\\' cover relative and
+    // absolute separators on every platform; ':' rejects Windows root names
+    // ("C:foo") and ADS ("name:stream").
+    return filename.find('/') == std::string_view::npos &&
+           filename.find('\\') == std::string_view::npos &&
+           filename.find(':') == std::string_view::npos;
 }
 
 }  // namespace toxtunnel::util

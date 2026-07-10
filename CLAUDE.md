@@ -210,7 +210,15 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   `<data_dir>/abort_count`.
 - **Atomic writes** — `tox_save.dat` and `known_servers.yaml` go through
   `util::atomic_write_file` (tmp + fsync + rename, plus parent-dir
-  fsync; `F_FULLFSYNC` on macOS for the identity file).
+  fsync; `F_FULLFSYNC` on macOS for the identity file). Parent-dir
+  computation is deliberately **string-based** (`parent_dir_of`), never
+  `fs::path::parent_path()` — the manylinux devtoolset toolchain
+  mis-parses path components (v0.4.8 shipped Linux binaries that created
+  `tox_save.dat` as a directory and lost the identity every restart; the
+  release containers are manylinux_2_28 since v0.4.9 for the same
+  reason). An empty directory squatting on the target is rmdir'd before
+  writing (self-heals 0.4.8-damaged data dirs). A present-but-unreadable
+  save file aborts startup instead of minting a fresh identity.
 - **Tunnel resume** — `tunnel.resume.enabled: false` by default (opcodes
   `0x08 / 0x09` wire-inactive in that mode). When enabled the live
   hold-across-reconnect handshake runs: the server holds a disconnected

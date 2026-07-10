@@ -124,22 +124,30 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # manylinux_2_28 (AlmaLinux 8, gcc-toolset, C++11 string ABI), NOT
+          # manylinux2014: the CentOS 7 devtoolset toolchain pins the old
+          # COW-string ABI whose std::filesystem::path mis-parses components
+          # (parent_path() returning the full path). v0.4.8 binaries built
+          # there created tox_save.dat as a *directory* and lost the server
+          # identity on every restart. glibc baseline moves 2.17 -> 2.28
+          # (Ubuntu 20.04+/Debian 10+/RHEL 8+; CentOS 7 is EOL and no longer
+          # a supported RPM target).
           - id: linux-x86_64
             runner: ubuntu-24.04
             platform: linux
             generator: "DEB;RPM"
-            container_image: quay.io/pypa/manylinux2014_x86_64
+            container_image: quay.io/pypa/manylinux_2_28_x86_64
             cmake_arch: x86_64
             verify_deb_image: ubuntu:20.04
-            verify_rpm_image: centos:7
+            verify_rpm_image: rockylinux:8
           - id: linux-aarch64
             runner: ubuntu-24.04-arm
             platform: linux
             generator: "DEB;RPM"
-            container_image: quay.io/pypa/manylinux2014_aarch64
+            container_image: quay.io/pypa/manylinux_2_28_aarch64
             cmake_arch: aarch64
             verify_deb_image: arm64v8/ubuntu:20.04
-            verify_rpm_image: arm64v8/centos:7
+            verify_rpm_image: arm64v8/rockylinux:8
           - id: macos-x86_64
             runner: macos-15-intel
             platform: macos
@@ -243,8 +251,11 @@ jobs:
                 export PATH="${toolset_bin}:$PATH"
               fi
               if ! command -v cmake >/dev/null 2>&1; then
-                yum install -y cmake3
-                ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
+                # EL7 ships the package as cmake3, EL8+ as cmake
+                yum install -y cmake3 || yum install -y cmake
+                if command -v cmake3 >/dev/null 2>&1 && ! command -v cmake >/dev/null 2>&1; then
+                  ln -sf "$(command -v cmake3)" /usr/local/bin/cmake
+                fi
               fi
               yum install -y rpm-build pkgconfig
               if ! yum install -y libsodium-devel; then
@@ -329,7 +340,8 @@ jobs:
       - name: Verify Linux ABI and runtime deps
         if: matrix.target.platform == 'linux'
         run: |
-          bash tests/packaging/verify_linux_abi.sh build/toxtunnel 2.17
+          # 2.28 = manylinux_2_28 baseline (Ubuntu 20.04+/Debian 10+/RHEL 8+)
+          bash tests/packaging/verify_linux_abi.sh build/toxtunnel 2.28
 
       - name: Verify Ubuntu 20.04 DEB install
         if: matrix.target.platform == 'linux'
@@ -343,7 +355,7 @@ jobs:
             "${{ matrix.target.verify_deb_image }}" \
             /bin/bash -lc "bash tests/packaging/verify_linux_deb_install.sh \"${deb_package}\" \"${EXPECTED_VERSION}\""
 
-      - name: Verify CentOS 7 RPM install
+      - name: Verify Rocky Linux 8 RPM install
         if: matrix.target.platform == 'linux'
         env:
           EXPECTED_VERSION: ${{ steps.version.outputs.version }}

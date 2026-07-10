@@ -689,8 +689,31 @@ void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
         return;
     }
 
-    util::Logger::error("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
-                        payload->error_code, payload->description);
+    // "Tunnel not found" is the peer's routine reply to frames that crossed
+    // a close on the wire — one arrives per in-flight frame when a transfer
+    // is aborted, so it flooded the log at error level. Log the first one
+    // per tunnel at info; repeats (tunnel already in Error) and anything
+    // arriving during teardown at debug. Real failures keep error. Match on
+    // the description too: code 1 is also used for rules denials
+    // (tunnel_server.cpp), and a policy denial must never be demoted.
+    const State prior_state = state();
+    const bool teardown = prior_state == State::Disconnecting || prior_state == State::Closed ||
+                          prior_state == State::Error;
+    if (payload->error_code == 1 && payload->description == "Tunnel not found") {
+        if (prior_state == State::Error) {
+            util::Logger::debug("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
+                                payload->error_code, payload->description);
+        } else {
+            util::Logger::info("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
+                               payload->error_code, payload->description);
+        }
+    } else if (teardown) {
+        util::Logger::info("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
+                           payload->error_code, payload->description);
+    } else {
+        util::Logger::error("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
+                            payload->error_code, payload->description);
+    }
     util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Error);
 
     transition_state(State::Error);
