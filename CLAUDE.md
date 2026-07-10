@@ -62,6 +62,21 @@ prefer linking there rather than duplicating here.
 - Warnings are errors (`-Werror`)
 - C++20
 
+## Mandatory Independent Review (codex)
+
+Every non-trivial change — bug fix, feature, refactor, CI/packaging change —
+MUST get an independent second opinion from OpenAI Codex **before commit/PR**
+(via the `/codex` skill or `codex exec`):
+
+1. Send the complete diff plus a root-cause/intent summary and explicit
+   questions to challenge (not just "review this").
+2. Address every finding, then run a **second pass on the final diff** —
+   code written after the first review (including implementations of
+   codex's own suggestions) is unreviewed until codex has seen it.
+3. Record the verdict and findings-addressed in the PR description.
+
+Exempt: typo/comment/doc-only edits. When in doubt, review.
+
 ## Architecture
 
 ToxTunnel forwards TCP ports through the Tox P2P network with end-to-end encryption.
