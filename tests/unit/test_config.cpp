@@ -955,6 +955,34 @@ bootstrap_nodes:
     EXPECT_EQ(nodes[0].port, 433);
 }
 
+TEST_F(ConfigTest, Ipv6EnabledDefaultsTrue) {
+    // Defaults must be dual-stack: an IPv4-only DHT bind silently steals the
+    // IPv4 wildcard from other Tox apps on the host
+    // (docs/FIELD_NOTES_SSH_TUNNEL.md #8).
+    EXPECT_TRUE(ToxConfig{}.ipv6_enabled);
+    EXPECT_TRUE(Config::default_client().tox.ipv6_enabled);
+    EXPECT_TRUE(Config::default_server().tox.ipv6_enabled);
+}
+
+TEST_F(ConfigTest, Ipv6EnabledParsesAndRoundTrips) {
+    const char* yaml = R"(
+mode: client
+data_dir: ~/.config/toxtunnel
+tox:
+  ipv6_enabled: false
+)";
+    auto parsed = Config::from_string(yaml);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_FALSE(parsed.value().tox.ipv6_enabled);
+
+    // Round-trip: an explicit false must survive serialize -> parse.
+    std::string out = parsed.value().to_yaml();
+    EXPECT_TRUE(out.find("ipv6_enabled: false") != std::string::npos);
+    auto reparsed = Config::from_string(out);
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error();
+    EXPECT_FALSE(reparsed.value().tox.ipv6_enabled);
+}
+
 TEST_F(ConfigTest, ParseCanonicalServerToxConfig) {
     const char* yaml = R"(
 mode: server

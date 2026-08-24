@@ -160,9 +160,9 @@ cli/main.cpp         # CLI entry (subcommands: print-id, servers, inspect, reloa
                      #            --server-id-fallback flags)
 tests/unit/          # Unit tests
 tests/integration/   # Integration tests
-tests/packaging/     # Package-layout tests (run via ctest)
-tests/soak/          # Long-running soak fixtures (ctest -L soak)
-tests/chaos/         # Chaos / fault-injection fixtures (ctest -L chaos)
+tests/packaging/     # Package-layout verification scripts (run by packaging CI)
+tests/soak/          # Bounded smoke tests (bare ctest or ctest -L soak)
+tests/chaos/         # Bounded fault-injection smoke test (bare ctest or ctest -L chaos)
                      # Total test count: ~525 across all suites.
 third_party/c-toxcore/   # Git submodule — required for build
 cmake/Packaging.cmake    # CPack configuration

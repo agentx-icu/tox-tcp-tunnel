@@ -283,6 +283,25 @@ class TunnelClient {
     /// promotes a new active endpoint when warranted.
     void run_failover_tick();
 
+    /// Periodic "still trying to reach server" heartbeat timer. Armed
+    /// unconditionally at start (unlike failover_timer_, which only arms with
+    /// >1 endpoint), so the single-server case — a client started before its
+    /// server — gets a loud, periodic warn instead of one quiet startup line.
+    /// Owned by io_ctx_; cancelled on stop().
+    std::unique_ptr<asio::steady_timer> connectivity_log_timer_;
+
+    /// How often to emit the offline heartbeat while the active server is
+    /// unreachable. Quiet once online.
+    static constexpr std::chrono::seconds kConnectivityLogInterval{30};
+
+    /// Re-arm the connectivity heartbeat tick. No-op if the io_context is gone
+    /// or the client is shutting down.
+    void schedule_connectivity_log_tick();
+
+    /// Emit one heartbeat: while the active server is offline, log at warn how
+    /// long it has been unreachable and which server we are still trying.
+    void run_connectivity_log_tick();
+
     /// Switch the active endpoint to `new_index`. Logs the transition, tears
     /// down existing tunnels (TUNNEL_CLOSE), and updates server_friend_number_
     /// + the known-servers registry.

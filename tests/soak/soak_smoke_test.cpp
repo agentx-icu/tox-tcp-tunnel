@@ -1,16 +1,9 @@
-// Soak-test infrastructure smoke test.
+// Short, bounded soak-style smoke tests.
 //
-// The real soak fixtures (8h steady-state, 200k ID-exhaustion cycle,
-// reload storm) live alongside this file and are intentionally NOT
-// driven from the default `ctest` run — they consume too much wall
-// clock for fast CI. This smoke test proves the harness compiles and
-// links against `toxtunnel_lib`, runs a 10-second mini-soak using the
-// same helpers, and asserts the standard invariants
-// (no leaked tunnels, allocator wraps correctly).
-//
-// Operators run the full suite via `ctest -L soak`. The release-branch
-// CI is wired separately (see docs/plans/2026-05-15-stability-hardening
-// for the operational policy).
+// These checks are included in the default `ctest` run. The `soak` label also
+// allows running just these checks via `ctest -L soak`. They exercise allocator
+// reuse and a one-second steady-state loop; they are not a long-duration soak
+// suite.
 
 #include <gtest/gtest.h>
 

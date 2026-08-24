@@ -446,6 +446,9 @@ std::string InspectServer::render_status_json(const InspectProviders& providers)
     if (providers.friends_online) {
         append_kv_num(out, "friends_online", providers.friends_online(), first);
     }
+    if (providers.peer_online_seconds) {
+        append_kv_num(out, "peer_online_seconds", providers.peer_online_seconds(), first);
+    }
     if (providers.snapshot) {
         const auto snap = providers.snapshot();
         append_kv_num(out, "tunnels_active", snap.tunnels.size(), first);

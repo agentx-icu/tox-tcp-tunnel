@@ -200,8 +200,9 @@ TEST_F(ZeroCopyReadTest, TunneledBytesArriveIntactAndInOrder) {
 // =============================================================================
 // 2. Buffer lifetime: the payload buffer must survive until the async TCP
 //    write completes. We watch the live-instance counter via SentinelVector:
-//    it must stay >0 after we drop our own reference, until the bytes are
-//    fully written out.
+//    after we drop our own reference, a successful full transfer under ASan
+//    checks for premature release, and the counter must eventually return to
+//    zero once the local write completion releases its final reference.
 // =============================================================================
 
 TEST_F(ZeroCopyReadTest, OwnedBufferOutlivesAsyncWrite) {
@@ -261,26 +262,22 @@ TEST_F(ZeroCopyReadTest, OwnedBufferOutlivesAsyncWrite) {
         payload.reset();
     }
 
-    // Pump the IO loop until the server has read everything. live must stay
-    // strictly positive throughout — if it ever hits 0 before bytes_read
-    // reaches kPayloadSize, the buffer was freed too early.
+    // Wait until the server has read everything. Do not compare `live` with
+    // `bytes_read`: the local async_write may complete and release its buffer
+    // after the kernel accepts the bytes but before the peer's read callback
+    // is scheduled. ASan plus a complete transfer detects premature release
+    // without imposing that invalid cross-endpoint ordering.
     auto deadline = std::chrono::steady_clock::now() + kTimeout;
-    bool ever_zero_before_done = false;
     while (bytes_read.load(std::memory_order_acquire) < kPayloadSize &&
            std::chrono::steady_clock::now() < deadline) {
-        if (live.load(std::memory_order_acquire) == 0) {
-            ever_zero_before_done = true;
-            break;
-        }
         std::this_thread::sleep_for(1ms);
     }
 
-    EXPECT_FALSE(ever_zero_before_done)
-        << "SentinelVector was freed before async_write completed (UAF window)";
     EXPECT_EQ(bytes_read.load(), kPayloadSize);
 
-    // After the write completes the queue should drop its ref → counter
-    // returns to 0. Allow a brief grace period for the completion handler.
+    // The sender's completion handler can be scheduled independently of the
+    // peer read callback. Once it runs, the queue must drop its final ref and
+    // return the counter to 0.
     auto cleanup_deadline = std::chrono::steady_clock::now() + 1s;
     while (live.load() != 0 && std::chrono::steady_clock::now() < cleanup_deadline) {
         std::this_thread::sleep_for(1ms);

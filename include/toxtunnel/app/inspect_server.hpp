@@ -34,6 +34,12 @@ struct InspectProviders {
     /// Returns how many friends are currently online (>= 0).
     std::function<std::size_t()> friends_online;
 
+    /// Optional (client mode): seconds the active server has been continuously
+    /// online, or 0 when offline. Lets `inspect status` answer "is the tunnel
+    /// up, and since when" directly instead of inferring it from lifecycle log
+    /// lines (field notes #6). Unset in server mode — the field is then omitted.
+    std::function<std::size_t()> peer_online_seconds;
+
     /// Returns the friend public-key prefix (first ~8 hex chars) for a given
     /// snapshot tunnel — supplied opaquely so the inspect server does not
     /// need to know the per-friend grouping. May return an empty string.

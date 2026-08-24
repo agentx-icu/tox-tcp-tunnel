@@ -89,6 +89,7 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     tox::ToxAdapterConfig tox_config;
     tox_config.data_dir = config.data_dir;
     tox_config.udp_enabled = tox_cfg.udp_enabled;
+    tox_config.ipv6_enabled = tox_cfg.ipv6_enabled;
     tox_config.bootstrap_mode = tox_cfg.bootstrap_mode;
     tox_config.local_discovery_enabled = tox_cfg.bootstrap_mode == BootstrapMode::Lan;
     tox_config.name = "toxtunnel-client";
@@ -252,6 +253,26 @@ void TunnelClient::start() {
         providers.friends_online = [this]() -> std::size_t {
             return server_online_.load(std::memory_order_acquire) ? 1u : 0u;
         };
+        providers.peer_online_seconds = [this]() -> std::size_t {
+            // Seconds the active server has been continuously online, or 0 when
+            // offline. Snapshot under endpoints_mutex_ to avoid racing with
+            // the friend-status callback / switch_active_endpoint.
+            if (!server_online_.load(std::memory_order_acquire)) {
+                return 0;
+            }
+            std::lock_guard<std::mutex> lock(endpoints_mutex_);
+            if (active_index_ >= endpoints_.size()) {
+                return 0;
+            }
+            const auto& active = endpoints_[active_index_];
+            if (active.online_since == std::chrono::steady_clock::time_point{}) {
+                return 0;
+            }
+            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now() - active.online_since)
+                                  .count();
+            return secs > 0 ? static_cast<std::size_t>(secs) : 0;
+        };
         providers.friend_pk_prefix = [this](uint16_t /*tunnel_id*/) -> std::string {
             // Client mode talks to exactly one server, so every tunnel maps
             // to that single peer; ignore tunnel_id and return the prefix
@@ -276,6 +297,7 @@ void TunnelClient::start() {
 
     schedule_info_refresh();
     schedule_failover_tick();
+    schedule_connectivity_log_tick();
 
     if (config_.client.has_value() && config_.client->socks5.enabled) {
         std::string s5_host;
@@ -353,6 +375,9 @@ void TunnelClient::stop() {
     if (failover_timer_) {
         failover_timer_->cancel();
     }
+    if (connectivity_log_timer_) {
+        connectivity_log_timer_->cancel();
+    }
     if (socks5_listener_) {
         socks5_listener_->stop();
     }
@@ -387,6 +412,7 @@ void TunnelClient::stop() {
     inspect_server_.reset();
     info_refresh_timer_.reset();
     failover_timer_.reset();
+    connectivity_log_timer_.reset();
     socks5_listener_.reset();
     {
         std::lock_guard<std::mutex> lock(pipe_mutex_);
@@ -1655,6 +1681,58 @@ void TunnelClient::schedule_failover_tick() {
         }
         run_failover_tick();
         schedule_failover_tick();
+    });
+}
+
+void TunnelClient::run_connectivity_log_tick() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    // Quiet while online — the heartbeat exists only to make a *stuck* offline
+    // state visible (field notes #3: a client started before its server logged
+    // one line at startup and then went silent).
+    if (server_online_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::string id_prefix;
+    long offline_secs = -1;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        if (active_index_ < endpoints_.size()) {
+            const auto& active = endpoints_[active_index_];
+            const auto& hex = active.tox_id_hex;
+            id_prefix = hex.size() > 8 ? hex.substr(0, 8) : hex;
+            if (active.offline_since != std::chrono::steady_clock::time_point{}) {
+                offline_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::steady_clock::now() - active.offline_since)
+                                   .count();
+            }
+        }
+    }
+
+    if (offline_secs >= 0) {
+        util::Logger::warn("Still trying to reach server {}...; offline for {}s (retrying)",
+                           id_prefix, offline_secs);
+    } else {
+        util::Logger::warn("Still trying to reach server {}... (retrying)", id_prefix);
+    }
+}
+
+void TunnelClient::schedule_connectivity_log_tick() {
+    if (!io_ctx_ || !running_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!connectivity_log_timer_) {
+        connectivity_log_timer_ = std::make_unique<asio::steady_timer>(io_ctx_->get_io_context());
+    }
+    connectivity_log_timer_->expires_after(kConnectivityLogInterval);
+    connectivity_log_timer_->async_wait([this](const asio::error_code& ec) {
+        if (ec || !running_.load(std::memory_order_acquire)) {
+            return;
+        }
+        run_connectivity_log_tick();
+        schedule_connectivity_log_tick();
     });
 }
 

@@ -239,10 +239,13 @@ TEST_F(HttpTunnelTest, BasicHttpRequestResponse) {
     ASSERT_TRUE(server_tunnel);
 
     std::vector<uint8_t> received_request;
-    server_tunnel->set_on_data_for_tcp([&received_request](std::span<const uint8_t> data) {
-        received_request.insert(received_request.end(), data.begin(), data.end());
-        return true;
-    });
+    std::mutex request_mutex;
+    server_tunnel->set_on_data_for_tcp(
+        [&received_request, &request_mutex](std::span<const uint8_t> data) {
+            std::lock_guard lock(request_mutex);
+            received_request.insert(received_request.end(), data.begin(), data.end());
+            return true;
+        });
 
     const std::string http_request =
         "GET /api/test HTTP/1.1\r\n"
@@ -253,11 +256,17 @@ TEST_F(HttpTunnelTest, BasicHttpRequestResponse) {
     EXPECT_TRUE(client_tunnel->send_data_to_tox(
         std::vector<uint8_t>(http_request.begin(), http_request.end())));
 
-    poll();
+    ASSERT_TRUE(wait_until([&] {
+        std::lock_guard lock(request_mutex);
+        return received_request.size() >= http_request.size();
+    })) << "server did not receive complete HTTP request";
 
     // Verify request was received on server
-    ASSERT_FALSE(received_request.empty());
-    std::string received_str(received_request.begin(), received_request.end());
+    std::string received_str;
+    {
+        std::lock_guard lock(request_mutex);
+        received_str.assign(received_request.begin(), received_request.end());
+    }
     EXPECT_TRUE(received_str.find("GET /api/test") != std::string::npos);
 
     // Server responds

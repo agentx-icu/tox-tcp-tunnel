@@ -661,8 +661,12 @@ Once an alias is added, `--server-id` and `client.server_id` will accept it.
 | Flag                 | Description                                     |
 | -------------------- | ----------------------------------------------- |
 | `-d, --data-dir DIR` | Data directory for loading/creating local Tox identity (default: `$HOME/.config/toxtunnel`) |
+| `-c, --config FILE`  | Resolve the data directory from a config file, so the printed ID matches the daemon that uses that config |
 | `--qr`               | Render Tox ID as terminal QR code               |
 | `--color`             | Use ANSI colors in QR output (requires `--qr`)  |
+
+If no identity exists yet at the resolved data directory, `print-id` creates one
+and reports that on stderr (so a freshly-generated key is never a surprise).
 
 ### inspect Subcommand
 

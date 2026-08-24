@@ -86,8 +86,10 @@ struct ToxAdapterConfig {
     /// Whether to enable UDP.
     bool udp_enabled = true;
 
-    /// Whether to enable IPv6.
-    bool ipv6_enabled = false;
+    /// Whether to enable IPv6 (and a dual-stack UDP bind). Defaults to true to
+    /// match toxcore and to avoid silently stealing the IPv4 DHT wildcard from
+    /// other Tox apps on the host (docs/FIELD_NOTES_SSH_TUNNEL.md #8).
+    bool ipv6_enabled = true;
 
     /// Whether to enable toxcore local discovery.
     bool local_discovery_enabled = false;

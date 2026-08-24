@@ -901,9 +901,12 @@ int main(int argc, char* argv[]) {
     bool print_id_color = false;
     bool run_as_service = false;
 
+    std::string print_id_config_path;
     auto* print_id_cmd = app.add_subcommand("print-id", "Print local Tox ID");
     print_id_cmd->add_option("-d,--data-dir", print_id_data_dir,
                              "Data directory for loading/creating local Tox identity");
+    print_id_cmd->add_option("-c,--config", print_id_config_path,
+                             "Config file to resolve the data_dir from (same as the daemon)");
     print_id_cmd->add_flag("--qr", print_id_qr, "Render Tox ID as terminal QR code");
     print_id_cmd->add_flag("--color", print_id_color, "Use ANSI colors with QR output");
 
@@ -1104,11 +1107,30 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::filesystem::path id_data_dir;
-        if (!print_id_data_dir.empty()) {
-            id_data_dir = print_id_data_dir;
-        } else {
-            id_data_dir = Config::default_client().data_dir;
+        // Resolve the data_dir the same way `servers`/`inspect`/`reload` do:
+        // explicit --data-dir wins, else --config's data_dir (either the
+        // subcommand's own -c or the global -c preceding the subcommand), else
+        // the platform default. This fixes the field-note #1 trap where
+        // `toxtunnel -c client.yaml print-id` silently ignored the config and
+        // minted a *second* identity in ~/.config/toxtunnel.
+        const std::string& id_config_path =
+            !print_id_config_path.empty() ? print_id_config_path : config_path;
+        auto resolved_dir = resolve_servers_data_dir(print_id_data_dir, id_config_path);
+        if (!resolved_dir) {
+            return 1;
+        }
+        std::filesystem::path id_data_dir = *resolved_dir;
+
+        // A read-only lookup should not silently create a durable identity.
+        // We still support the documented bootstrap workflow (generate an
+        // identity by pointing print-id at a fresh dir), but announce it so
+        // the user is never surprised by a new key appearing on disk.
+        std::error_code exists_ec;
+        const auto save_path = id_data_dir / "tox_save.dat";
+        const bool had_identity = std::filesystem::is_regular_file(save_path, exists_ec);
+        if (!had_identity) {
+            std::cerr << "No existing Tox identity at " << save_path.string()
+                      << "; creating a new one.\n";
         }
 
         auto tox_id_result = tox::ToxAdapter::get_tox_id_only(id_data_dir);

@@ -425,9 +425,9 @@ tox-tcp-tunnel/
   tests/
     unit/                       # Unit tests
     integration/                # Integration tests
-    packaging/                  # CPack layout tests
-    soak/                       # `ctest -L soak` long-running fixtures
-    chaos/                      # `ctest -L chaos` fault-injection fixtures
+    packaging/                  # CPack layout verification scripts run by CI
+    soak/                       # Bounded smoke tests (`ctest` or `ctest -L soak`)
+    chaos/                      # Bounded smoke test (`ctest` or `ctest -L chaos`)
                                 # (~535 tests total across all suites)
   third_party/
     c-toxcore/                  # toxcore git submodule

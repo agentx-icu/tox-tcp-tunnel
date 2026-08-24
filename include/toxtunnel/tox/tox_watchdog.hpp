@@ -33,7 +33,7 @@ class ToxWatchdog {
     /// implementation flushes spdlog and calls `std::abort()`.
     using AbortHook = std::function<void()>;
 
-    ToxWatchdog() = default;
+    ToxWatchdog();
     ~ToxWatchdog();
 
     ToxWatchdog(const ToxWatchdog&) = delete;
@@ -50,10 +50,13 @@ class ToxWatchdog {
     void set_data_dir(const std::filesystem::path& data_dir);
 
     /// Override the abort hook (tests, custom shutdown). Defaults to flush +
-    /// `std::abort()`.
+    /// `std::abort()`. Observer hooks run on the supplied io_context and may
+    /// call or wait for `stop()`, but must not synchronously destroy this
+    /// object: destruction waits for an in-flight observer hook to return.
     void set_abort_hook(AbortHook hook);
 
-    /// Override the systemd notifier hook (default: send `WATCHDOG=1`).
+    /// Override the systemd notifier hook (default: send `WATCHDOG=1`). The
+    /// observer-hook lifetime constraint documented above also applies here.
     using NotifyHook = std::function<void()>;
     void set_systemd_notify_hook(NotifyHook hook) { systemd_notify_hook_ = std::move(hook); }
 
@@ -96,7 +99,10 @@ class ToxWatchdog {
     }
 
    private:
+    struct ObserverState;
+
     void arm_timer();
+    void arm_timer_locked();
     void persist_abort_count();
     static void default_abort_hook();
 
@@ -109,6 +115,7 @@ class ToxWatchdog {
     asio::io_context* io_ctx_{nullptr};
     std::unique_ptr<asio::steady_timer> timer_;
     std::atomic<bool> running_{false};
+    std::shared_ptr<ObserverState> observer_state_;
 
     std::filesystem::path data_dir_;
     AbortHook abort_hook_;

@@ -61,7 +61,7 @@ class TestTunnel : public Tunnel {
    private:
     State state_{State::None};
     std::size_t buffer_level_{0};
-    int frames_handled_{0};
+    std::atomic<int> frames_handled_{0};
     int close_count_{0};
 };
 

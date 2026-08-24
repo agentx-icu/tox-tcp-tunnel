@@ -138,8 +138,8 @@ gtest_discover_tests(integration_tests
     PROPERTIES LABELS "integration" TIMEOUT 120
 )
 
-# Soak tests (long-running). Default `ctest` excludes them via labels;
-# release-branch CI runs them via `ctest -L soak`.
+# Short, bounded soak smoke tests. A bare `ctest` includes them; the label also
+# allows running only these checks with `ctest -L soak`.
 add_executable(soak_tests
     soak/soak_smoke_test.cpp
 )
@@ -159,8 +159,8 @@ gtest_discover_tests(soak_tests
     PROPERTIES LABELS "soak"
 )
 
-# Chaos tests. Default `ctest` excludes them via labels; nightly CI runs
-# them via `ctest -L chaos`.
+# Short, bounded fault-injection smoke tests. A bare `ctest` includes them; the
+# label also allows running only these checks with `ctest -L chaos`.
 add_executable(chaos_tests
     chaos/chaos_smoke_test.cpp
 )

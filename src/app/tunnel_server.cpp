@@ -81,6 +81,7 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     tox::ToxAdapterConfig tox_config;
     tox_config.data_dir = config_.data_dir;
     tox_config.udp_enabled = tox_cfg.udp_enabled;
+    tox_config.ipv6_enabled = tox_cfg.ipv6_enabled;
     tox_config.tcp_port = tox_cfg.tcp_port;
     tox_config.bootstrap_mode = tox_cfg.bootstrap_mode;
     tox_config.local_discovery_enabled = tox_cfg.bootstrap_mode == BootstrapMode::Lan;
@@ -286,13 +287,16 @@ void TunnelServer::stop() {
         held_managers_.clear();
     }
 
-    // Stop watchdog before Tox so it doesn't trip during shutdown.
+    // Detach and stop the observer before Tox so it cannot trip during
+    // shutdown. An iterate already holding the old atomic raw pointer may
+    // still call heartbeat(), so retain the owner until stop() joins that
+    // thread.
     if (watchdog_) {
         tox_adapter_->set_watchdog(nullptr);
         watchdog_->stop();
-        watchdog_.reset();
     }
     tox_adapter_->stop();
+    watchdog_.reset();
 
     // Phase 2: stop the io_context and join its workers. After this
     // returns, no async callback can run any more.

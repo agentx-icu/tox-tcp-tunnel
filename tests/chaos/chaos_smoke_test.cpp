@@ -1,15 +1,10 @@
-// Chaos-test infrastructure smoke test.
+// Short, bounded fault-injection-style smoke test.
 //
-// Chaos tests inject deliberate failures (network impairment, random
-// kills mid-write, fuzzed protocol input) to surface bugs the
-// deterministic suite cannot. The real fixtures (`chaos_netem_disconnects`,
-// `chaos_save_crash`, `chaos_protocol_fuzzer`) require `CAP_NET_ADMIN`
-// or fuzzing engines and run nightly under `-DTOXTUNNEL_CHAOS=ON`.
-//
-// This smoke test proves the harness compiles and links, exercises the
-// shared `atomic_write_file` under repeated overwrite, and pins the
-// "no torn writes" guarantee. Operators run the full suite via
-// `ctest -L chaos`.
+// This check is included in the default `ctest` run. The `chaos` label also
+// allows running it alone via `ctest -L chaos`. It exercises
+// `atomic_write_file` under repeated concurrent overwrite and pins the
+// "no torn writes" guarantee; it does not require external network-fault or
+// fuzzing infrastructure.
 
 #include <gtest/gtest.h>
 

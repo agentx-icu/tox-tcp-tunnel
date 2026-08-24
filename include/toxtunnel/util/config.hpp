@@ -59,14 +59,23 @@ using BootstrapMode = tox::BootstrapMode;
 
 /// Shared toxcore network configuration.
 struct ToxConfig {
-    bool udp_enabled = true;                             ///< Enable UDP for toxcore
+    bool udp_enabled = true;  ///< Enable UDP for toxcore
+    /// Enable IPv6 (and a dual-stack UDP bind). Defaults to true, matching
+    /// toxcore's own default. A dual-stack bind is not just for IPv6 reach: it
+    /// stops ToxTunnel from silently monopolising the IPv4 wildcard on the DHT
+    /// port. With an IPv4-only bind, a second Tox app's `[::]:33445` bind still
+    /// succeeds (separate pcbs), so its port walk never advances and it goes
+    /// deaf on inbound IPv4 while looking healthy. See
+    /// docs/FIELD_NOTES_SSH_TUNNEL.md #8.
+    bool ipv6_enabled = true;
     uint16_t tcp_port = 33445;                           ///< TCP relay port (server use)
     BootstrapMode bootstrap_mode = BootstrapMode::Auto;  ///< Bootstrap behavior
     std::vector<BootstrapNodeConfig> bootstrap_nodes;    ///< Explicit bootstrap nodes
 
     bool operator==(const ToxConfig& other) const {
-        return udp_enabled == other.udp_enabled && tcp_port == other.tcp_port &&
-               bootstrap_mode == other.bootstrap_mode && bootstrap_nodes == other.bootstrap_nodes;
+        return udp_enabled == other.udp_enabled && ipv6_enabled == other.ipv6_enabled &&
+               tcp_port == other.tcp_port && bootstrap_mode == other.bootstrap_mode &&
+               bootstrap_nodes == other.bootstrap_nodes;
     }
 };
 

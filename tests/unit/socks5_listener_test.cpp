@@ -388,10 +388,13 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesHttpConnectAndInvokesOpenTunnel) {
 }
 
 TEST_F(Socks5ListenerLifecycleTest, HttpConnectReturns502OnTunnelFailure) {
+    std::atomic<bool> reply_cb_ready{false};
     std::function<void(bool)> captured_reply_cb;
-    start_listener(
-        [&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t, std::vector<uint8_t>,
-            std::function<void(bool)> reply_cb) { captured_reply_cb = std::move(reply_cb); });
+    start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
+                       std::vector<uint8_t>, std::function<void(bool)> reply_cb) {
+        captured_reply_cb = std::move(reply_cb);
+        reply_cb_ready.store(true);
+    });
 
     asio::io_context client_io;
     asio::ip::tcp::socket sock(client_io);
@@ -401,9 +404,10 @@ TEST_F(Socks5ListenerLifecycleTest, HttpConnectReturns502OnTunnelFailure) {
     asio::write(sock, asio::buffer(req));
 
     const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (!captured_reply_cb && std::chrono::steady_clock::now() < deadline) {
+    while (!reply_cb_ready.load() && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(5ms);
     }
+    ASSERT_TRUE(reply_cb_ready.load());
     ASSERT_TRUE(captured_reply_cb);
     captured_reply_cb(false);
 

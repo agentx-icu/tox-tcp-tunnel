@@ -137,23 +137,25 @@ cmake --build build
 ./build/tests/unit_tests
 ./build/tests/integration_tests
 
-# Or via CTest — runs the default suites: unit, integration, packaging
+# Or via CTest — runs every registered test, including the bounded soak and
+# fault-injection smoke tests
 cd build && ctest --output-on-failure
 ```
 
-### Optional CTest labels
+### CTest labels
 
-`tests/soak/` and `tests/chaos/` are excluded from the default `ctest` run
-to keep CI fast. Run them explicitly when investigating long-running or
-fault-injection behaviour:
+`tests/soak/` currently contains two short allocator smoke tests, and
+`tests/chaos/` contains one short atomic-write smoke test. A bare `ctest`
+includes all three. Use their labels to run only those checks:
 
 ```bash
-cd build && ctest -L soak  --output-on-failure   # long-running fixtures
-cd build && ctest -L chaos --output-on-failure   # fault-injection fixtures
+cd build && ctest -L soak  --output-on-failure   # two bounded soak smoke tests
+cd build && ctest -L chaos --output-on-failure   # one bounded fault-injection smoke test
 ```
 
-`tests/packaging/` runs as part of the default suite and is what validates
-that a `cpack`-built DEB/RPM/PKG/MSI lays its files down where each
+`tests/packaging/` contains platform-specific verification scripts rather than
+CTest tests. The packaging CI jobs invoke the appropriate script after `cpack`
+to validate that DEB/RPM/PKG/MSI artifacts lay their files down where each
 platform expects them.
 
 The throughput benchmarks are compiled into the integration binary but are
@@ -168,9 +170,9 @@ touching the tunnel data path:
 For release candidates or data-path fixes, also run one local end-to-end check:
 start a server and client with separate `data_dir`s, allow the client's
 64-character public key in `rules.yaml`, then exercise SSH and a bulk transfer
-through the forwarded port. Use `toxtunnel print-id --data-dir <dir>` when you
-need the Tox address for a non-default identity; `print-id` does not read
-`-c/--config`.
+through the forwarded port. Use `toxtunnel print-id --data-dir <dir>` (or
+`toxtunnel print-id -c <config.yaml>` to reuse the daemon's `data_dir`) when you
+need the Tox address for a non-default identity.
 
 On Windows with MSVC:
 

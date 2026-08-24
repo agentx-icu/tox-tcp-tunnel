@@ -221,6 +221,24 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
     // Register toxcore callbacks.
     register_callbacks();
 
+    // Log the actually-bound UDP port so an operator can see which port
+    // toxcore took (it walks 33445..33545 if the default is busy). Without
+    // this an operator has no way to know the port, which makes the DHT-port
+    // collision in docs/FIELD_NOTES_SSH_TUNNEL.md #8 invisible. Safe to call
+    // directly: the dedicated Tox iterate thread has not been started yet, so
+    // this init context is the only thread touching tox_.
+    if (config_.udp_enabled) {
+        Tox_Err_Get_Port port_err;
+        uint16_t udp_port = tox_self_get_udp_port(tox_.get(), &port_err);
+        if (port_err == TOX_ERR_GET_PORT_OK) {
+            util::Logger::info("Tox UDP socket bound to port {} (IPv6 {})", udp_port,
+                               config_.ipv6_enabled ? "enabled" : "disabled");
+        } else {
+            util::Logger::warn(
+                "Could not determine bound Tox UDP port (udp_enabled but no UDP socket?)");
+        }
+    }
+
     // Persist the (possibly new) identity — and refuse to run if that
     // fails. An identity that only exists in memory disappears on restart,
     // orphaning every client that learned it (exactly the v0.4.8 Linux
@@ -332,6 +350,10 @@ std::size_t ToxAdapter::bootstrap() {
         bootstrap_nodes = resolved.value();
         if (config_.bootstrap_mode == BootstrapMode::Lan && bootstrap_nodes.empty()) {
             util::Logger::info("LAN bootstrap mode enabled; relying on local discovery");
+            util::Logger::warn(
+                "LAN bootstrap only discovers peers on the local network; a peer behind NAT "
+                "or on a different network will never become reachable. Use "
+                "'bootstrap_mode: auto' for DHT/NAT traversal across networks.");
         } else if (config_.bootstrap_mode == BootstrapMode::Auto &&
                    config_.bootstrap_nodes.empty()) {
             util::Logger::info("Loaded {} bootstrap node(s) from {}", bootstrap_nodes.size(),

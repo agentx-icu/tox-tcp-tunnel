@@ -1,7 +1,9 @@
 #include "toxtunnel/tox/tox_watchdog.hpp"
 
+#include <condition_variable>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 #include "toxtunnel/util/atomic_file.hpp"
@@ -11,8 +13,24 @@
 
 namespace toxtunnel::tox {
 
+struct ToxWatchdog::ObserverState {
+    std::mutex mutex;
+    std::condition_variable callbacks_drained;
+    ToxWatchdog* owner{nullptr};
+    std::size_t callbacks_in_flight{0};
+    std::uint64_t generation{0};
+};
+
+ToxWatchdog::ToxWatchdog() : observer_state_(std::make_shared<ObserverState>()) {
+    observer_state_->owner = this;
+}
+
 ToxWatchdog::~ToxWatchdog() {
     stop();
+    std::unique_lock lock(observer_state_->mutex);
+    observer_state_->callbacks_drained.wait(
+        lock, [state = observer_state_] { return state->callbacks_in_flight == 0; });
+    observer_state_->owner = nullptr;
 }
 
 void ToxWatchdog::configure(std::chrono::seconds deadline, bool enabled) {
@@ -38,19 +56,30 @@ void ToxWatchdog::start(asio::io_context& io_ctx) {
     if (running_.exchange(true)) {
         return;
     }
+
+    std::lock_guard lock(observer_state_->mutex);
+    // A concurrent stop() may have won after the exchange above but before
+    // this thread acquired the observer lock.
+    if (!running_.load()) {
+        return;
+    }
+    ++observer_state_->generation;
     io_ctx_ = &io_ctx;
     timer_ = std::make_unique<asio::steady_timer>(io_ctx);
     // Seed the heartbeat so the very first observer tick doesn't fire on a
     // pristine state (last_heartbeat_ns == 0).
     last_heartbeat_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                              std::memory_order_release);
-    arm_timer();
+    arm_timer_locked();
 }
 
 void ToxWatchdog::stop() {
     if (!running_.exchange(false)) {
         return;
     }
+
+    std::lock_guard lock(observer_state_->mutex);
+    ++observer_state_->generation;
     if (timer_) {
         try {
             timer_->cancel();
@@ -93,16 +122,33 @@ std::int64_t ToxWatchdog::check_once() noexcept {
 }
 
 void ToxWatchdog::arm_timer() {
+    std::lock_guard lock(observer_state_->mutex);
+    arm_timer_locked();
+}
+
+void ToxWatchdog::arm_timer_locked() {
     if (!timer_ || !running_.load()) {
         return;
     }
     timer_->expires_after(std::chrono::seconds(1));
-    timer_->async_wait([this](const asio::error_code& ec) {
-        if (ec || !running_.load()) {
+    const auto generation = observer_state_->generation;
+    timer_->async_wait([state = observer_state_, generation](const asio::error_code& ec) {
+        std::unique_lock lock(state->mutex);
+        auto* owner = state->owner;
+        if (ec || owner == nullptr || state->generation != generation || !owner->running_.load()) {
             return;
         }
-        check_once();
-        arm_timer();
+
+        ++state->callbacks_in_flight;
+        lock.unlock();
+        owner->check_once();
+
+        lock.lock();
+        --state->callbacks_in_flight;
+        state->callbacks_drained.notify_all();
+        if (state->owner == owner && state->generation == generation && owner->running_.load()) {
+            owner->arm_timer_locked();
+        }
     });
 }
 

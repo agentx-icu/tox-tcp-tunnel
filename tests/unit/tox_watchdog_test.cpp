@@ -13,6 +13,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 #include "toxtunnel/core/io_context.hpp"
@@ -142,6 +144,114 @@ TEST(ToxWatchdogTest, ObserverTimerRunsOnIoContext) {
     // (heartbeat is fresh, hook may or may not have run depending on timing).
     EXPECT_GE(ticks.load(), 0);
     EXPECT_GT(wd.heartbeat_count(), 0u);
+}
+
+TEST(ToxWatchdogTest, ObserverHookCanWaitForStopOnAnotherThread) {
+    core::IoContext io(/*threads=*/1);
+    io.run();
+
+    tox::ToxWatchdog wd;
+    wd.configure(30s, /*enabled=*/true);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool hook_entered = false;
+    bool stop_completed = false;
+    bool hook_timed_out = false;
+    wd.set_systemd_notify_hook([&] {
+        std::unique_lock lock(mutex);
+        hook_entered = true;
+        cv.notify_all();
+        if (!cv.wait_for(lock, 2s, [&] { return stop_completed; })) {
+            hook_timed_out = true;
+        }
+    });
+    wd.start(io.get_io_context());
+
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, 3s, [&] { return hook_entered; }));
+    }
+
+    std::thread stopper([&] {
+        wd.stop();
+        {
+            std::lock_guard lock(mutex);
+            stop_completed = true;
+        }
+        cv.notify_all();
+    });
+    stopper.join();
+    io.stop();
+
+    EXPECT_FALSE(hook_timed_out);
+}
+
+TEST(ToxWatchdogTest, StopStartKeepsNewCycleTimerWhenPriorHookReturns) {
+    core::IoContext io(/*threads=*/1);
+    io.run();
+
+    tox::ToxWatchdog wd;
+    wd.configure(30s, /*enabled=*/true);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    int ticks = 0;
+    bool first_hook_entered = false;
+    bool release_first_hook = false;
+    wd.set_systemd_notify_hook([&] {
+        std::unique_lock lock(mutex);
+        ++ticks;
+        cv.notify_all();
+        if (ticks == 1) {
+            first_hook_entered = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release_first_hook; });
+        }
+    });
+    wd.start(io.get_io_context());
+
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, 2s, [&] { return first_hook_entered; }));
+    }
+
+    // Start a new observer cycle while the old cycle's hook is still in
+    // flight, then keep it blocked until the new cycle's timer has expired.
+    // When the old hook returns it must not re-arm (and thereby postpone) the
+    // new cycle's already-expired timer.
+    wd.stop();
+    wd.start(io.get_io_context());
+
+    asio::io_context clock_io;
+    asio::steady_timer elapsed_timer(clock_io, 1200ms);
+    bool new_timer_expired = false;
+    elapsed_timer.async_wait([&](const asio::error_code& ec) {
+        if (!ec) {
+            std::lock_guard lock(mutex);
+            new_timer_expired = true;
+            cv.notify_all();
+        }
+    });
+    std::thread clock_thread([&] { clock_io.run(); });
+    {
+        std::unique_lock lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, 2s, [&] { return new_timer_expired; }));
+    }
+    clock_thread.join();
+
+    {
+        std::lock_guard lock(mutex);
+        release_first_hook = true;
+    }
+    cv.notify_all();
+    {
+        std::unique_lock lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, 500ms, [&] { return ticks >= 2; }));
+    }
+
+    wd.stop();
+    io.stop();
 }
 
 }  // namespace

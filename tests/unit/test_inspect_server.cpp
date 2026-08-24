@@ -126,6 +126,24 @@ TEST(InspectServerJson, StatusContainsExpectedFields) {
     EXPECT_NE(json.find("\"bytes_out\":5678"), std::string::npos) << json;
 }
 
+TEST(InspectServerJson, StatusIncludesPeerOnlineSecondsWhenProvided) {
+    // field notes #6: the client health surface exposes how long the active
+    // server has been online, so "is the tunnel up, and since when" is a direct
+    // query rather than an inference from lifecycle log lines.
+    auto providers = make_providers_with_one_tunnel();
+    providers.peer_online_seconds = []() -> std::size_t { return 42; };
+    const auto json = InspectServer::render_status_json(providers);
+    EXPECT_NE(json.find("\"peer_online_seconds\":42"), std::string::npos) << json;
+}
+
+TEST(InspectServerJson, StatusOmitsPeerOnlineSecondsWhenProviderUnset) {
+    // Server mode leaves the provider unset — the key must not appear.
+    auto providers = make_providers_with_one_tunnel();
+    providers.peer_online_seconds = nullptr;
+    const auto json = InspectServer::render_status_json(providers);
+    EXPECT_EQ(json.find("peer_online_seconds"), std::string::npos) << json;
+}
+
 TEST(InspectServerJson, ErrorRendersWellFormedObject) {
     const auto json = InspectServer::render_error_json("bad request");
     EXPECT_EQ(json, std::string("{\"error\":\"bad request\"}"));

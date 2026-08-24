@@ -308,8 +308,11 @@ toxtunnel servers remove <alias_or_tox_id>   # forget
 
 Each `servers` subcommand accepts `-d/--data-dir DIR` (defaults to
 `~/.config/toxtunnel`) or `-c/--config FILE` (reads `data_dir` from the config).
-The separate `print-id` subcommand does **not** read `-c/--config`; for a
-non-default identity use `toxtunnel print-id --data-dir <data_dir>`.
+The `print-id` subcommand accepts the same two flags: `toxtunnel print-id
+-c <daemon.yaml>` prints the identity from the config's `data_dir` (so it always
+matches the daemon), and `toxtunnel print-id --data-dir <data_dir>` targets a
+directory directly. When no identity exists yet at the resolved directory,
+`print-id` creates one and says so on stderr.
 
 Once an alias is registered it can be used anywhere a Tox ID is expected
 (`--server-id <alias>`, `client.server_id: <alias>` in YAML). The CLI prints a

@@ -716,6 +716,7 @@ std::string Config::to_yaml() const {
 
     out << YAML::Key << "tox" << YAML::Value << YAML::BeginMap;
     out << YAML::Key << "udp_enabled" << YAML::Value << effective_tox.udp_enabled;
+    out << YAML::Key << "ipv6_enabled" << YAML::Value << effective_tox.ipv6_enabled;
     out << YAML::Key << "tcp_port" << YAML::Value << effective_tox.tcp_port;
     out << YAML::Key << "bootstrap_mode" << YAML::Value
         << bootstrap_mode_to_string(effective_tox.bootstrap_mode);
@@ -1009,6 +1010,7 @@ bool convert<BootstrapMode>::decode(const Node& node, BootstrapMode& rhs) {
 Node convert<ToxConfig>::encode(const ToxConfig& rhs) {
     Node node;
     node["udp_enabled"] = rhs.udp_enabled;
+    node["ipv6_enabled"] = rhs.ipv6_enabled;
     node["tcp_port"] = rhs.tcp_port;
     node["bootstrap_mode"] = rhs.bootstrap_mode;
     if (!rhs.bootstrap_nodes.empty()) {
@@ -1024,6 +1026,9 @@ bool convert<ToxConfig>::decode(const Node& node, ToxConfig& rhs) {
 
     if (node["udp_enabled"]) {
         rhs.udp_enabled = node["udp_enabled"].as<bool>();
+    }
+    if (node["ipv6_enabled"]) {
+        rhs.ipv6_enabled = node["ipv6_enabled"].as<bool>();
     }
     if (node["tcp_port"]) {
         rhs.tcp_port = node["tcp_port"].as<uint16_t>();
