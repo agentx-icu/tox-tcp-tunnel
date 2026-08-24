@@ -342,10 +342,14 @@ TEST_F(ZeroCopyReadTest, ConcurrentTunnelsDoNotCrossContaminate) {
         // Match the just-connected client to the corresponding accepted
         // server side (FIFO by accept order).
         auto deadline = std::chrono::steady_clock::now() + kTimeout;
-        while (true) {
-            std::lock_guard<std::mutex> lock(accept_mu);
-            if (static_cast<int>(accepted.size()) > t) {
-                entry->server = accepted[t];
+        while (!entry->server) {
+            {
+                std::lock_guard<std::mutex> lock(accept_mu);
+                if (static_cast<int>(accepted.size()) > t) {
+                    entry->server = accepted[t];
+                }
+            }
+            if (entry->server) {
                 break;
             }
             if (std::chrono::steady_clock::now() > deadline) {
