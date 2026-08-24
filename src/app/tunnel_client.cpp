@@ -1696,7 +1696,7 @@ void TunnelClient::run_connectivity_log_tick() {
     }
 
     std::string id_prefix;
-    long offline_secs = -1;
+    std::chrono::seconds::rep offline_secs = -1;
     {
         std::lock_guard<std::mutex> lock(endpoints_mutex_);
         if (active_index_ < endpoints_.size()) {
