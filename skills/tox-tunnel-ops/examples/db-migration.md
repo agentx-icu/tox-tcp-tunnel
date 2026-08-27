@@ -52,6 +52,11 @@ rules:
         ports: [5432]
 ```
 
+> The `friend` value is the **first 64 hex characters** of that peer's 76-char Tox ID
+> (from its `Client Tox ID: …` startup log line, or `toxtunnel print-id -c client.yaml`),
+> not the whole ID. A wrong length is rejected when the rules file loads
+> (`Invalid public key length: expected 64`).
+
 ## Client Config (DBA's workstation)
 
 ```yaml
@@ -95,7 +100,12 @@ psql -h 127.0.0.1 -p 15432 -U migration_ro -d mydb -c "SELECT count(*) FROM migr
 
 - Tox tunnels have limited throughput compared to direct network connections
 - For large data transfers (>1 GB), consider:
-  - Tox may use TCP relay if direct UDP is not established — check logs for `Direct UDP connection`
+  - Tox may use a TCP relay if direct UDP is not established. Check which one you
+    got: `last_connection_type` in `<data_dir>/known_servers.yaml` (or
+    `toxtunnel servers list`) — `udp` is direct, `tcp` is a relay and caps bulk
+    throughput at roughly 5–10 KB/s. The log line
+    `Self connection status: connected (UDP|TCP)` describes this daemon's DHT
+    link, not the per-friend path.
   - Compress data before transfer: `pg_dump ... | gzip | ...`
   - Run during off-peak hours to minimize contention
   - For very large migrations, consider a VPN or direct connection instead

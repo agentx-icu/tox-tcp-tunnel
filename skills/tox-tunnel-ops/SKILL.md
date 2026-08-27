@@ -72,7 +72,19 @@ App → localhost:LOCAL_PORT              target_host:target_port ← App
 Binary framing over Tox lossless custom packets:
 - Header: `[type:1][tunnel_id:2][length:2]`
 - Frame types: TUNNEL_OPEN, TUNNEL_DATA, TUNNEL_CLOSE, TUNNEL_ACK, TUNNEL_ERROR, PING, PONG
-- Flow control: 256 KiB send window, 16 KiB ACK threshold
+- Flow control: 256 KiB seed send window, 16 KiB ACK threshold; `flow_control.mode: bdp`
+  (default since v0.4.1) resizes the window between 64 KiB and 4 MiB from RTT × bandwidth
+- Throughput depends entirely on the Tox transport, and the gap is three orders of
+  magnitude. Measured cross-machine (macOS ↔ Windows on one LAN, 20 MB transfers,
+  SHA256-verified):
+  - **direct UDP** (`last_connection_type: udp`): **2.9–9.5 MB/s**, i.e. 11–37 % of the
+    raw 25.9 MB/s link
+  - **TCP relay** (`last_connection_type: tcp`): **3–10 KB/s** — fine for SSH keystrokes
+    and DB queries, unusable for bulk copies or RDP
+  Always check which one you got before blaming the tunnel: `toxtunnel servers list` or
+  `last_connection_type` in `<data_dir>/known_servers.yaml`. The daemon's own
+  `Self connection status: connected (TCP|UDP)` line refers to its **DHT** link, not the
+  friend link, and routinely says TCP while the friend path is UDP
 
 ### Operational Limits
 
@@ -121,7 +133,8 @@ tunnel:
     max_age_seconds: 300            # entries older than this dropped on load
     on_gap: passthrough             # passthrough (default) | close
 
-# v0.4 stability blocks (all defaults preserve v0.3.0 semantics):
+# v0.4 stability blocks. Defaults preserve v0.3.0 semantics EXCEPT
+# flow_control.mode, which defaults to `bdp` since v0.4.1:
 watchdog:
   enabled: true                     # in-process tox-thread wedge detector
   deadline_seconds: 30              # std::abort() after this much heartbeat silence; min 5s
@@ -275,6 +288,7 @@ toxtunnel servers add   <alias> <tox_id> [--notes "..."]        # register alias
 toxtunnel servers remove <alias_or_id>                          # forget a server
 toxtunnel inspect [tunnels|status] [--json] [-d DIR | -c CONFIG]  # live introspection via local IPC
 toxtunnel reload [-d DIR | -c CONFIG]                           # trigger hot-reload (Windows-friendly SIGHUP)
+toxtunnel config check -c FILE [--strict]                       # validate a config + list ignored/unknown keys
 ```
 
 Key flags:
@@ -295,18 +309,30 @@ Subcommands:
   - `--qr`: render the Tox ID as a terminal QR code (for scanning with a phone)
   - `--color`: use ANSI colors in QR output (requires `--qr`)
   - `-d, --data-dir`: data directory for loading/creating identity
-  - It does **not** read `-c/--config`; when the daemon uses a non-default
-    `data_dir`, pass `toxtunnel print-id --data-dir <data_dir>`.
+  - `-c/--config` resolves `data_dir` from the daemon's config (v0.4.10+), so
+    `toxtunnel print-id -c server.yaml` prints the same identity the daemon uses;
+    `-d` still overrides.
 - `inspect [tunnels|status]`: connect to a running daemon's local IPC channel and print state
   - `tunnels` (default): table of currently open tunnels (id, friend, target, bytes, age)
   - `status`: process / version / friend / metrics snapshot
   - `--json`: emit raw JSON for piping into `jq` / dashboards
-  - `-d` or `-c` resolves the daemon's `data_dir` (where the Unix socket / pidfile lives)
+  - `-d` or `-c` resolves the daemon's `data_dir` (where the Unix socket / `toxtunnel.pid` lives)
+  - Windows: the pipe is `\\.\pipe\toxtunnel-<pid>`; a service daemon (LocalSystem) only
+    admits SYSTEM/Administrators, so run from an elevated prompt. Pre-v0.4.11 daemons
+    wrote no pid file — set `TOXTUNNEL_INSPECT_PID=<pid>` (pid is in the daemon log line
+    `Inspect IPC listening at \\.\pipe\toxtunnel-<pid>`)
 - `reload`: trigger a hot-reload of the **reloadable subset** of config on the running daemon
   - Reloadable: `server.rules_file` contents, `client.forwards`, `logging.level`
   - **NOT** reloadable: Tox identity, `tox.*`, listen addresses, mode, `data_dir`
-  - POSIX equivalent: `kill -HUP $(cat <data_dir>/toxtunnel.pid)`
-  - Windows equivalent: writes `RELOAD\n` to `\\.\pipe\toxtunnel-reload-<pid>`
+  - Finds the daemon via `<data_dir>/toxtunnel.pid` (written by the daemon since
+    v0.4.11; older daemons need `TOXTUNNEL_RELOAD_PID=<pid>`)
+  - POSIX: sends `SIGHUP` to that pid (equivalent: `kill -HUP $(cat <data_dir>/toxtunnel.pid)`)
+  - Windows: writes `RELOAD\n` to `\\.\pipe\toxtunnel-reload-<pid>`; run from an
+    **elevated** prompt when the daemon is the LocalSystem service
+  - Confirm in the daemon log: `config reloaded (rules: N rules)` (server) or
+    `config reloaded (forwards: +A -B)` (client). A client reload that adds a
+    forward whose local port is busy logs `reload applied with warnings: …` —
+    everything else IS live, and the next reload retries that forward
 
 ---
 
@@ -353,7 +379,8 @@ Analyze the user's message and route to the appropriate mode:
 | "Production redundancy", "my homelab dies sometimes", "two servers, prefer primary" | **Multi-server failover** (`server_id` list + `client.failover`) | Primary-preference: client switches back to entry 0 after `prefer_primary_grace_seconds` of stable uptime |
 | "See live tunnel state without log diving", "what's open right now", "how many bytes" | **`toxtunnel inspect`** | Local IPC only; `--json` for machine consumption |
 | "Close zombie tunnels", "free old connections" | **Idle reaper** (`tunnel.idle_timeout_seconds`) | 0 = disabled (default); typical setting: 600–1800 |
-| "A friend is DoSing me with TUNNEL_OPENs", "throttle one friend's bandwidth", "anti-abuse" | **Per-friend rate limit** (`rate_limit_defaults` + per-rule `rate_limit`) | v0.4. Modes: `off | report | enforce`. Hot-reloadable via the rules file. Start with `mode: report` to size limits against real traffic. |
+| "A friend is DoSing me with TUNNEL_OPENs", "cap how many tunnels one friend can hold", "anti-abuse" | **Per-friend rate limit** (`rate_limit_defaults` + per-rule `rate_limit`) | v0.4. Covers **connection setup only**: `open_per_sec` / `open_burst` (TUNNEL_OPEN rate) and `max_concurrent_tunnels`. Modes: `off \| report \| enforce`; a per-rule block overrides the defaults field by field. Hot-reloadable via the rules file, but a reload refills every bucket and zeroes the rejection counts. Start with `mode: report` to size limits against real traffic. |
+| "Throttle a friend's bandwidth", "cap MB/s per friend", "shape traffic" | **Not supported — do not route here** | `bytes_per_sec` / `bytes_burst` parse and warn but do nothing: the byte buckets are never consulted on the data path, so they shape no traffic and `toxtunnel_rate_limit_bytes_throttled_total` stays at 0. Say so plainly and point at an OS-level shaper (`tc`, pf) on the tunnel endpoint instead. |
 | "An SSH session shouldn't drop when I restart the server", "fast reattach across maintenance" | **Tunnel resume** (`tunnel.resume.enabled: true`) | v0.4 opt-in. Live handshake: server holds the friend's tunnels for `resume.max_age_seconds`, client re-sends `TUNNEL_RESUME_REQUEST` per surviving tunnel and reconciles byte offsets. Gap behaviour configurable via `resume.on_gap` (`close` / `passthrough`). Live-reconnect only; cannot survive a process restart. |
 | "Bulk transfer is slow", "throughput-tune", "high BDP link" | **Adaptive coalescing** (`tunnel.coalesce_mode: adaptive`) + **BDP flow control** (`flow_control.mode: bdp`) | v0.4. `flow_control.mode: bdp` is the default since v0.4.1 — verify it isn't overridden to `fixed`. `tunnel.coalesce_mode` is still `fixed` by default; flip to `adaptive` on bulk-heavy deployments. |
 | "Daemon went silent without exiting", "tunnels stop but RSS flat", "detect a wedge" | **Watchdog metrics** (`toxtunnel_tox_iterate_lag_milliseconds_max`, `toxtunnel_watchdog_aborts_total`) | v0.4. The watchdog is on by default; alert when the `_max` gauge rises sustained (> 100 ms is the conventional trip) or when the abort counter ticks. |
@@ -394,7 +421,7 @@ Pre-filled fields:
 
 Output must include:
 - Rules scoped to the contractor's friend public key
-- Revocation steps (remove the rule entry + restart server)
+- Revocation steps (remove the rule entry + `toxtunnel reload` — no restart needed)
 - Suggested access window (e.g., "remove rule after maintenance is done")
 - Recommend read-only accounts for DB scenarios
 
@@ -472,7 +499,7 @@ Pre-filled fields:
 Output must include:
 - All N server installs (typically use the same config skeleton with different Tox identities and rules)
 - A client config showing the **list form** of `server_id` (or `--server-id-fallback ID2 ID3` on the CLI)
-- Verification: tail the client log for `Failover: switching active server ... -> ...` lines, or run `toxtunnel inspect status --json | jq .active_server`
+- Verification: tail the client log for `Failover: switching active server <A>... -> <B>... (friend N)` lines — one per switch, in either direction. `inspect status` reports `friends_online` / `peer_online_seconds` but not which server is active
 - Caveat: each fallback is a full Tox friend on the client side; the client allow-lists all of them, and ONE will be active at a time
 
 ### Template: Observability Setup (Prometheus + Grafana)
@@ -551,7 +578,10 @@ Numbered step-by-step:
 #### 4. Verification & Rollback
 
 - How to verify the tunnel is working (scenario-specific test command)
-- How to check Tox friend connection status (log line: `Friend connection status: Connected`)
+- How to check Tox friend connection status. Exact log lines: the client logs
+  `Server friend N is now online` (and `Still trying to reach server …; offline
+  for Ns` until then); the server logs `Friend N (pk=…) connected`. Or ask the
+  daemon: `toxtunnel inspect status --json | jq .friends_online`
 - How to stop and clean up
 - How to remove temporary access (if applicable)
 - How to revoke a specific friend's access
@@ -687,19 +717,19 @@ Read on demand:
 5. **OS-aware.** Detect or ask the user's OS and tailor paths, commands, and service management:
    - macOS (package): `binary: /usr/local/bin/toxtunnel`; example config at `/usr/local/share/toxtunnel/config.yaml.example`. The pkg postinstall **automatically** seeds `/usr/local/etc/toxtunnel/config.yaml` from the example, installs `com.toxtunnel.daemon.plist` into `/Library/LaunchDaemons/`, and runs `launchctl bootstrap`. The daemon then honours `service.allow_client_daemon` / `service.auto_start` and exits 0 cleanly when gated off.
    - Linux (package): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data: /var/lib/toxtunnel`, service: `toxtunnel.service` (`Type=notify`, `RemainAfterExit=yes`). The postinst seeds the config from the example and runs `systemctl enable --now`. Server installs come up online; client installs idle (`active (exited)`) until the user fills in `client.server_id` and sets `service.allow_client_daemon: true`.
-   - Windows (package): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **In v0.2.0 the MSI does NOT auto-register the SCM service** (the WiX patch is shelved in `cmake/Packaging.cmake` until the correct CPack-generated component Id is discovered). Workflow: user runs the MSI, creates `C:\ProgramData\ToxTunnel\config.yaml`, then registers the service explicitly: `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'`, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner does all of this automatically (download → install → seed config → start service) based on `--Mode`. Removal: `uninstall-windows-service`.
+   - Windows (package): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **The MSI does NOT auto-register the SCM service** (the WiX patch is shelved in `cmake/Packaging.cmake` until the correct CPack-generated component Id is discovered). Workflow: user runs the MSI, creates `C:\ProgramData\ToxTunnel\config.yaml`, then registers the service explicitly: `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'`, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner does all of this automatically (download → install → seed config → start service) based on `--Mode`. Removal: `uninstall-windows-service`. Upgrading in place (`msiexec /i new.msi /qn`) keeps the config, `data\` and the registered service; stop the service first and start it again afterwards. **Do not launch a second daemon from an SSH session** (`Start-Process` inside `ssh win "..."`): Win32-OpenSSH tears the session's job object down when the command returns and the daemon dies silently (no log line). Use the service, a Scheduled Task, or `Invoke-CimMethod -ClassName Win32_Process -MethodName Create`.
    - For manual installs, use home-directory paths as before.
 6. **Prefer the one-line installer, then native packages, then source.** Recommend the one-liner first (it auto-detects arch + package format and seeds a mode-appropriate config):
    - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode {server|client}`
    - Windows (Administrator PowerShell): `$env:TOXTUNNEL_MODE='{server|client}'; irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex`
    Fall back to direct DEB/RPM/.pkg/MSI download from GitHub Releases when the user can't pipe to sh/iex (locked-down environments). Only suggest building from source when no pre-built package exists for the target platform.
-7. **Safe defaults.** `bootstrap_mode: auto` unless confirmed LAN. `log_level: info` unless diagnosing. `tox.tcp_port: 33445` unless blocked.
+7. **Safe defaults.** `tox.bootstrap_mode: auto` unless confirmed LAN. `logging.level: info` unless diagnosing (there is no `log_level` key — the CLI flag is `-l/--log-level`). `tox.tcp_port: 33445` unless blocked.
 8. **Pipe mode for SSH.** Always mention SSH ProxyCommand as an alternative for SSH scenarios. Note: pipe mode is POSIX only and **not supported on Windows** — on Windows, always use the `forwards` port-mapping approach instead.
 9. **Security reminders.** Remind users: Tox ID = identity. Keep `tox_save.dat` backed up. Never share private keys.
 10. **Temporary access hygiene.** For any temporary tunnel, always include revocation steps and suggest a time window.
-11. **Use `print-id` for Tox ID sharing.** When users need to transfer a Tox ID between machines, suggest `toxtunnel print-id --data-dir <dir> --qr` to generate a QR code that can be scanned with a phone camera. Do not use `-c` for this subcommand.
+11. **Use `print-id` for Tox ID sharing.** When users need to transfer a Tox ID between machines, suggest `toxtunnel print-id -c <daemon config> --qr` (or `--data-dir <dir> --qr`) to generate a QR code that can be scanned with a phone camera. Passing the daemon's config guarantees the printed ID is the one the daemon actually uses.
 12. **Use `--service` for daemon mode.** When setting up persistent services, use the `--service` flag which integrates with systemd (sd_notify) on Linux and Windows SCM on Windows.
 13. **Template rendering.** When generating configs from templates, perform direct string substitution of `{{VARIABLE}}` placeholders. Conditional sections (`{{#SECTION}}...{{/SECTION}}`) are included when the variable is set; inverted sections (`{{^SECTION}}...{{/SECTION}}`) are included when the variable is NOT set.
-14. **Prefer `toxtunnel inspect` over log tailing for live state.** When diagnosing "is this tunnel actually open?" / "how many bytes have flowed?" / "which server is currently active?", reach for `toxtunnel inspect tunnels` and `toxtunnel inspect status` before suggesting `journalctl -f` / `tail -F`. Logs are still authoritative for *historical* events (denied opens, errors, reload acks).
-15. **Hot-reload boundary.** Only `server.rules_file` contents, `client.forwards`, and `logging.level` are reloadable. Tox identity, listen ports, mode, and `data_dir` changes still require a restart. If a user asks "can I change X without restart?", check that list first and say "no" honestly when X is outside it.
+14. **Prefer `toxtunnel inspect` over log tailing for live state.** When diagnosing "is this tunnel actually open?" or "how many bytes have flowed?", reach for `toxtunnel inspect tunnels` / `inspect status` before suggesting `journalctl -f` / `tail -F`. `status` carries only `mode`, `version`, `friends_online`, `peer_online_seconds` (client), `tunnels_active`, `bytes_in`, `bytes_out` — for *which server is active* under failover, and for historical events (denied opens, errors, reload acks), the log is the only source.
+15. **Hot-reload boundary.** Only `server.rules_file` contents, `client.forwards`, and `logging.level` are reloadable; anything else makes the daemon reject the entire reload and keep the old config. If a user asks "can I change X without restart?", check that list first and say "no" honestly when X is outside it. Also be honest about the blast radius of a rules reload: it affects **new** tunnel opens only — already-open tunnels keep flowing even for a friend you just revoked.
 16. **SOCKS5 vs `forwards` choice.** Recommend SOCKS5 when the destination set is *dynamic* (browsing, ad-hoc curl, multi-host debugging). Recommend explicit `forwards` when the destination set is *static* and known (SSH to one host, one DB) — static forwards integrate better with launchers, systemd socket activation, and tools that don't speak SOCKS.

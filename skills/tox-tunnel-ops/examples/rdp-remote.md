@@ -69,6 +69,11 @@ rules:
         ports: [3389]              # or [5900] for VNC
 ```
 
+> The `friend` value is the **first 64 hex characters** of that peer's 76-char Tox ID
+> (from its `Client Tox ID: …` startup log line, or `toxtunnel print-id -c client.yaml`),
+> not the whole ID. A wrong length is rejected when the rules file loads
+> (`Invalid public key length: expected 64`).
+
 ## Steps
 
 1. Ensure RDP is enabled on the Windows machine (Settings → System → Remote Desktop)
@@ -108,7 +113,10 @@ vncviewer 127.0.0.1:15900
 - RDP and VNC are bandwidth-heavy protocols. Performance depends on:
   - Whether Tox establishes a **direct UDP connection** (best) or uses a **TCP relay** (slower)
   - Network latency between the two machines
-- Check logs for `Direct UDP connection` to confirm direct connectivity
+- Confirm which path you got with `toxtunnel servers list` (or
+  `last_connection_type` in `known_servers.yaml`): `udp` = direct, `tcp` = Tox
+  relay. RDP over a relay (~5–10 KB/s) is effectively unusable for a desktop
+  session — expect to need direct UDP.
 - For better performance over slow links:
   - RDP: reduce color depth, disable visual effects, enable compression
   - VNC: use Tight or ZRLE encoding, reduce resolution

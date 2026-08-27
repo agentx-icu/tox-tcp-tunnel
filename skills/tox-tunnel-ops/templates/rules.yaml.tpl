@@ -10,7 +10,9 @@
 #   3. Check allow rules
 #   4. No match → default deny
 #
-# Host patterns: "*" wildcard supported (e.g., "*.example.com", "192.168.*.*")
+# Host patterns: a single "*" wildcard (one prefix + one suffix) is supported,
+# e.g. "*.example.com", "192.168.*". Multi-segment patterns like
+# "192.168.*.*" will NOT match — use "192.168.*".
 # Ports: list specific ports, or use empty list [] to mean "all ports"
 #
 # Template variables:
@@ -23,26 +25,28 @@
 #   server:
 #     rules_file: rules.yaml
 #
-# v0.4: anti-DoS rate-limit defaults (apply to every friend without a
-# per-friend `rate_limit:` block). Uncomment to enable. Start with
-# `mode: report` to size the limits against real traffic, then flip to
-# `mode: enforce`.
+# v0.4: anti-DoS rate-limit defaults — the baseline for every friend.
+# Uncomment to enable. Start with `mode: report` to size the limits against
+# real traffic, then flip to `mode: enforce`.
 #
 # rate_limit_defaults:
 #   mode: enforce
 #   open_per_sec: 10
 #   open_burst: 50
-#   bytes_per_sec: 10485760     # 10 MiB/s steady-state
-#   bytes_burst: 33554432       # 32 MiB allowed burst
 #   max_concurrent_tunnels: 100
+#
+# NOT IMPLEMENTED: `bytes_per_sec` and `bytes_burst` are still accepted by the
+# parser but the data path never consults them, so they throttle nothing and
+# toxtunnel_rate_limit_bytes_throttled_total stays at 0. The daemon logs a
+# warning if you set them. Do not use them to cap bandwidth.
 
 rules:
 {{#RULES}}
   - friend: "{{FRIEND_PK}}"    # {{FRIEND_LABEL}}
-    # v0.4: optional per-friend rate-limit override (additive over defaults).
+    # v0.4: optional per-friend rate-limit override. Only the fields you name
+    # are overridden; everything else (mode included) is inherited from
+    # rate_limit_defaults above.
     # rate_limit:
-    #   mode: enforce
-    #   bytes_per_sec: 104857600
     #   max_concurrent_tunnels: 200
     allow:
 {{#ALLOW}}

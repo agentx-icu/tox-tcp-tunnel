@@ -58,6 +58,11 @@ rules:
         ports: [3000]
 ```
 
+> The `friend` value is the **first 64 hex characters** of that peer's 76-char Tox ID
+> (from its `Client Tox ID: …` startup log line, or `toxtunnel print-id -c client.yaml`),
+> not the whole ID. A wrong length is rejected when the rules file loads
+> (`Invalid public key length: expected 64`).
+
 ## Multiple Web Services
 
 Forward several services at once:

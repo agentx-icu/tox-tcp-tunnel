@@ -72,6 +72,11 @@ rules:
         ports: [22, 80, 443]
 ```
 
+> The `friend` value is the **first 64 hex characters** of that peer's 76-char Tox ID
+> (from its `Client Tox ID: …` startup log line, or `toxtunnel print-id -c client.yaml`),
+> not the whole ID. A wrong length is rejected when the rules file loads
+> (`Invalid public key length: expected 64`).
+
 Even though the *client* can dial any host:port via SOCKS5, the server denies
 anything not in this list and the SOCKS5 listener returns reply code 0x02
 ("connection not allowed by ruleset").
@@ -105,7 +110,8 @@ toxtunnel -m client --server-id homelab --socks5 127.0.0.1:1080
 1. Start server: `sudo systemctl start toxtunnel` (or `toxtunnel -m server -c server.yaml`)
 2. Note the server's Tox ID (`toxtunnel print-id --data-dir /etc/toxtunnel/server` on the server, or the ID printed at startup)
 3. Paste into client config, start client: `toxtunnel -m client -c client.yaml`
-4. Wait for `Friend connection status: Connected` in the client log
+4. Wait for `Server friend 0 is now online` in the client log (on a Tox relay
+   path this can take minutes, not seconds)
 5. Point your tool at `127.0.0.1:1080`
 
 ## Using It
@@ -173,9 +179,11 @@ No client restart needed — the next SOCKS5 CONNECT picks up the new rules.
 ```bash
 # Stop the listener
 sudo systemctl stop toxtunnel               # service install
-# or: kill $(pgrep -f 'toxtunnel.*client')  # direct process
+# or: kill "$(cat <client data_dir>/toxtunnel.pid)"   # direct process
+# (avoid `pkill -f toxtunnel…` — it also matches the shell that runs it)
 ```
 
-Or simply set `client.socks5.enabled: false` and reload — but reloading
-listen-address changes requires a restart, so flipping `enabled` cleanly is
-restart-only.
+Turning the listener off is **restart-only**: `client.socks5` is outside the
+reloadable subset, so editing it and sending SIGHUP makes the daemon reject the
+whole reload (`field 'client.socks5' requires a restart`) and keep serving the
+old config. Set `client.socks5.enabled: false` and restart the client.

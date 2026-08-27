@@ -94,7 +94,9 @@ case "$SERVICE" in
         ;;
     http)
         if command -v curl &>/dev/null; then
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://127.0.0.1:$LOCAL_PORT/" 2>/dev/null || echo "000")
+            # --noproxy: a system HTTP proxy (Clash/mihomo TUN, corporate proxy) would
+            # otherwise intercept the loopback request and answer 502 for it.
+            HTTP_CODE=$(curl --noproxy '*' -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://127.0.0.1:$LOCAL_PORT/" 2>/dev/null || echo "000")
             if [ "$HTTP_CODE" != "000" ]; then
                 info "HTTP response code: $HTTP_CODE"
             else
@@ -104,7 +106,7 @@ case "$SERVICE" in
             warn "curl not available — cannot test HTTP"
         fi
         echo ""
-        echo "     Test: curl http://127.0.0.1:$LOCAL_PORT/"
+        echo "     Test: curl --noproxy '*' http://127.0.0.1:$LOCAL_PORT/"
         ;;
     postgres)
         if command -v psql &>/dev/null; then
@@ -147,14 +149,28 @@ case "$SERVICE" in
         echo "     Test: redis-cli -h 127.0.0.1 -p $LOCAL_PORT ping"
         ;;
     mongo)
+        # Every other DB branch actually probes the service; this one used to
+        # only print a suggestion, so `verify.sh <port> mongo` could never
+        # report a pass or a failure.
         if command -v mongosh &>/dev/null; then
-            echo "     Test: mongosh --host 127.0.0.1 --port $LOCAL_PORT"
+            if mongosh --host 127.0.0.1 --port "$LOCAL_PORT" --quiet \
+                   --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | grep -q 1; then
+                info "MongoDB responded to ping"
+            else
+                warn "MongoDB did not respond to ping (may need credentials or TLS)"
+            fi
         elif command -v mongo &>/dev/null; then
-            echo "     Test: mongo --host 127.0.0.1 --port $LOCAL_PORT"
+            if mongo --host 127.0.0.1 --port "$LOCAL_PORT" --quiet \
+                   --eval 'db.runCommand({ping:1}).ok' 2>/dev/null | grep -q 1; then
+                info "MongoDB responded to ping"
+            else
+                warn "MongoDB did not respond to ping (may need credentials or TLS)"
+            fi
         else
-            warn "mongosh/mongo not available"
-            echo "     Install mongosh and run: mongosh --host 127.0.0.1 --port $LOCAL_PORT"
+            warn "mongosh/mongo not available — cannot probe MongoDB"
         fi
+        echo ""
+        echo "     Test: mongosh --host 127.0.0.1 --port $LOCAL_PORT"
         ;;
     rdp)
         info "RDP verification: TCP connection succeeded"

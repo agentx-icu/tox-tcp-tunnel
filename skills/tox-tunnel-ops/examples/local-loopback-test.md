@@ -41,12 +41,18 @@ host client  --127.0.0.1:<fwd>-->  toxtunnel client --Tox(lan)--> toxtunnel serv
 
 ## Configs
 
+> **If another toxtunnel server already runs on this host, set `tox.tcp_port`
+> explicitly on the new one.** The Tox **UDP** port walks to the next free port
+> automatically; the Tox **TCP relay** port does not, and server mode rejects
+> `tcp_port: 0`. Without it startup dies with
+> `failed to create Tox instance: could not bind Tox TCP relay port 33445 …`.
+
 `server.yaml`:
 ```yaml
 mode: server
 data_dir: /tmp/tt-server
 logging: { level: info, file: /tmp/tt-server.log }
-tox: { udp_enabled: true, bootstrap_mode: lan, bootstrap_nodes: [] }
+tox: { udp_enabled: true, bootstrap_mode: lan, bootstrap_nodes: [], tcp_port: 33500 }
 server: { rules_file: /tmp/tt-rules.yaml }
 inspect: { enabled: true }
 ```

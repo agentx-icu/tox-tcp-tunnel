@@ -105,7 +105,7 @@ netstat -an | findstr :PORT   # Windows
 - macOS (manual/source build): `data_dir: ~/Library/Application Support/toxtunnel/` or `~/.config/toxtunnel/`, service: launchd user agent
 - Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data_dir: /var/lib/toxtunnel`, service: `toxtunnel.service` (Type=notify, `RemainAfterExit=yes`, enabled and started by postinst).
 - Linux (manual): `data_dir: ~/.config/toxtunnel/`, service: custom systemd unit
-- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **In v0.2.0 the MSI does NOT auto-register the SCM service** — the WiX patch is shelved (`cmake/Packaging.cmake` has the rationale). The user creates `C:\ProgramData\ToxTunnel\config.yaml`, then runs `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'` from an Administrator PowerShell, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner does all of this automatically.
+- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **The MSI does NOT auto-register the SCM service** — the WiX patch is shelved (`cmake/Packaging.cmake` has the rationale). The user creates `C:\ProgramData\ToxTunnel\config.yaml`, then runs `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'` from an Administrator PowerShell, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner does all of this automatically.
 - Windows (manual): `data_dir: %APPDATA%\toxtunnel\`, service: NSSM or Task Scheduler
 
 ## Step 1: Write Config Files
@@ -168,9 +168,12 @@ sudo launchctl print system/com.toxtunnel.daemon | head
 
 ### Windows MSI
 
-**In v0.2.0 the MSI does NOT auto-register the SCM service** (the WiX patch is
+**The MSI does NOT auto-register the SCM service** (the WiX patch is
 shelved — see `cmake/Packaging.cmake` for context). Workflow: install MSI →
 create config → register the service with the bundled subcommand → start it.
+An in-place upgrade (`msiexec /i toxtunnel-<new>.msi /qn /norestart`) keeps
+`config.yaml`, `data\` and the registered service; `Stop-Service ToxTunnel`
+before and `Start-Service ToxTunnel` after.
 
 ```powershell
 mkdir 'C:\ProgramData\ToxTunnel' -Force
@@ -188,6 +191,13 @@ sc stop ToxTunnel
 > The one-line installer `scripts/install.ps1` automates all of the above. Use
 > it unless the user explicitly needs the manual flow. Remove the service with
 > `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' uninstall-windows-service`.
+>
+> `install-windows-service` also configures SCM recovery actions (restart after
+> 10 s / 30 s / 60 s, with `fFailureActionsOnNonCrashFailures` set so a clean
+> exit reporting an error counts). That is what makes Windows retry a startup
+> that failed for a transient reason — e.g. a restart racing the previous
+> instance for the data-directory lock — the way systemd's `Restart=on-failure`
+> and launchd's `KeepAlive` already do. Check it with `sc qfailure ToxTunnel`.
 
 ### Manual source-build service templates
 
@@ -278,7 +288,9 @@ nssm start ToxTunnel-MODE
 ```bash
 # Direct process
 toxtunnel -m server -c server.yaml &
-kill $(pgrep -f "toxtunnel.*server")
+kill "$(cat <data_dir>/toxtunnel.pid)"      # pid file written by the daemon (v0.4.11+)
+# or: pkill -x toxtunnel   — never `pkill -f toxtunnel…`: -f also matches the
+#     shell / CI step / SSH wrapper whose command line mentions toxtunnel
 
 # systemd
 sudo systemctl start toxtunnel
@@ -416,18 +428,21 @@ Verify failover behavior:
 journalctl -u toxtunnel -f | grep -E 'Failover|active server'
 
 # Or query the running daemon directly
-toxtunnel inspect status --json | jq '.active_server, .friends'
+toxtunnel inspect status --json | jq '.friends_online, .peer_online_seconds'
+# (there is no .active_server field — the active server appears only in the
+#  `Failover: switching active server …` log line)
 ```
 
 ### Live inspection (`toxtunnel inspect`)
 
 The daemon serves a local IPC channel — Unix socket on POSIX
 (`<data_dir>/toxtunnel.sock`), named pipe on Windows
-(`\\.\pipe\toxtunnel-inspect-<pid>`). Inspection is read-only and
-strictly local — never network-exposed.
+(`\\.\pipe\toxtunnel-<pid>`, with the pid published in
+`<data_dir>\toxtunnel.pid`). Inspection is read-only and strictly local —
+never network-exposed.
 
 ```bash
-# Table of currently open tunnels (id, role, friend, target, bytes, age)
+# Table of currently open tunnels: ID TARGET STATE BYTES_IN BYTES_OUT IDLE_S PEER
 toxtunnel inspect tunnels
 
 # Process / version / friend / metrics snapshot
@@ -451,16 +466,19 @@ require a full restart.
 
 ```bash
 # POSIX (Linux/macOS): SIGHUP, either form works
-toxtunnel reload                            # cross-platform, finds pid via data_dir
-toxtunnel reload -c /etc/toxtunnel/server.yaml
+toxtunnel reload -c /etc/toxtunnel/server.yaml   # reads <data_dir>/toxtunnel.pid, sends SIGHUP
 kill -HUP $(cat /var/lib/toxtunnel/toxtunnel.pid)
-kill -HUP $(pgrep -f 'toxtunnel.*server')
+sudo systemctl reload toxtunnel                  # packaged install
 ```
 
 ```powershell
 # Windows: writes RELOAD\n to \\.\pipe\toxtunnel-reload-<pid>
+# (pid from <data_dir>\toxtunnel.pid; use an elevated prompt for the service)
 toxtunnel.exe reload -c 'C:\ProgramData\ToxTunnel\config.yaml'
 ```
+
+Daemons older than v0.4.11 wrote no pid file: set `TOXTUNNEL_RELOAD_PID=<pid>`
+(the pid is in the startup log line `Inspect IPC listening at ...toxtunnel-<pid>`).
 
 Confirm the reload landed by tailing the log for one of:
 
@@ -574,11 +592,11 @@ tunnel:
                                 # only after one release of soak
 ```
 
-### BDP flow control (opt-in)
+### BDP flow control (default since v0.4.1)
 
 ```yaml
 flow_control:
-  mode: bdp                    # default fixed; bdp scales window from RTT × bps
+  mode: bdp                    # default; `fixed` locks the v0.3.0 256 KiB window
   send_window_min_bytes: 65536
   send_window_max_bytes: 4194304
   safety_factor_x100: 150
@@ -594,14 +612,16 @@ rate_limit_defaults:
   mode: report                 # start shadow; flip to enforce once tuned
   open_per_sec: 10
   open_burst: 50
-  bytes_per_sec: 10485760
-  bytes_burst: 33554432
   max_concurrent_tunnels: 100
+  # bytes_per_sec / bytes_burst are NOT implemented — the keys parse and the
+  # daemon warns at load, but no byte throttling happens. Do not rely on them.
 
 rules:
   - friend: "...64hex..."
     rate_limit:
-      bytes_per_sec: 104857600
+      # A per-friend block OVERRIDES ONLY the fields it names; everything else
+      # is inherited from rate_limit_defaults above (including `mode`). An
+      # explicit 0 means "no limit for this friend on that field".
       max_concurrent_tunnels: 200
     allow:
       - host: "127.0.0.1"

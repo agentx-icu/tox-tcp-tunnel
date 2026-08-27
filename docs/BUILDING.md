@@ -158,6 +158,14 @@ CTest tests. The packaging CI jobs invoke the appropriate script after `cpack`
 to validate that DEB/RPM/PKG/MSI artifacts lay their files down where each
 platform expects them.
 
+The DEB script runs locally — build a package with `cpack -G DEB` and point
+`verify_linux_deb_install.sh` at it inside a clean `ubuntu:24.04` container.
+The RPM script does **not**: it installs the package, and only a
+release-built (manylinux_2_28) RPM is installable on EL8+. A locally built RPM
+fails on glibc/libsodium ABI before reaching any assertion. Inspect a local RPM
+with `rpm -qpl` / `rpm -qp --scripts` / `rpm2cpio` instead; the DEB path covers
+the same layout assertions.
+
 The throughput benchmarks are compiled into the integration binary but are
 disabled under normal CTest runs so CI stays quick. Run them explicitly when
 touching the tunnel data path:
