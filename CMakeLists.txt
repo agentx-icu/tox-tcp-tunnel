@@ -162,6 +162,8 @@ target_sources(toxtunnel_lib PRIVATE
     src/util/qr_code.cpp
     src/util/system_info.cpp
     src/util/systemd_notify.cpp
+    src/util/pid_file.cpp
+    src/util/config_diagnostics.cpp
     src/util/windows_service.cpp
 )
 target_include_directories(toxtunnel_lib PUBLIC
