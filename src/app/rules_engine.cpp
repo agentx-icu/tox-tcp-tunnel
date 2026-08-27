@@ -41,6 +41,24 @@ class RulesErrorCategory : public std::error_category {
 
 const RulesErrorCategory g_rules_error_category{};
 
+/// Warn that `bytes_per_sec` / `bytes_burst` are accepted but inert.
+///
+/// The byte token buckets exist in `RateLimiter` but nothing on the data path
+/// consumes them (`try_consume_bytes` has no production caller), so a
+/// configured byte limit silently does nothing. This is a warning, not a
+/// parse error, on purpose: the shipped documentation and the ops template
+/// both advertised these keys, so existing rules files contain them and
+/// upgrading must not refuse to start.
+void warn_byte_limits_unimplemented(const std::string& where) {
+    util::Logger::warn(
+        "rules: {} sets bytes_per_sec/bytes_burst, but byte rate limiting is "
+        "NOT implemented — the data path never consults the byte buckets, so "
+        "this setting has no effect and "
+        "toxtunnel_rate_limit_bytes_throttled_total will stay at 0. "
+        "open_per_sec/open_burst/max_concurrent_tunnels are unaffected.",
+        where);
+}
+
 }  // namespace
 
 const std::error_category& rules_error_category() noexcept {
@@ -101,6 +119,9 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_node(const YAML::Node
             // (but still surface rate_limit_defaults if present)
             if (node.IsMap() && node["rate_limit_defaults"]) {
                 engine.rate_limit_defaults_ = node["rate_limit_defaults"].as<RateLimitSpec>();
+                if (engine.rate_limit_defaults_.has_byte_limits()) {
+                    warn_byte_limits_unimplemented("rate_limit_defaults");
+                }
             }
             return engine;
         }
@@ -109,6 +130,9 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_node(const YAML::Node
         // is a map (sequence-rooted documents don't carry sibling fields).
         if (node.IsMap() && node["rate_limit_defaults"]) {
             engine.rate_limit_defaults_ = node["rate_limit_defaults"].as<RateLimitSpec>();
+            if (engine.rate_limit_defaults_.has_byte_limits()) {
+                warn_byte_limits_unimplemented("rate_limit_defaults");
+            }
         }
 
         for (const auto& rule_node : rules_node) {
@@ -169,6 +193,11 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_node(const YAML::Node
                                 std::string("Invalid port 0 in deny rule") + where());
                         }
                     }
+                }
+
+                if (rule.rate_limit.has_byte_limits()) {
+                    warn_byte_limits_unimplemented("friend " + rule.friend_pk.substr(0, 8) + "..." +
+                                                   where());
                 }
 
                 engine.rules_.push_back(std::move(rule));
@@ -606,7 +635,7 @@ bool convert<FriendRule>::decode(const Node& node, FriendRule& rhs) {
     }
 
     if (node["rate_limit"]) {
-        rhs.rate_limit = node["rate_limit"].as<toxtunnel::RateLimitSpec>();
+        rhs.rate_limit = node["rate_limit"].as<toxtunnel::RateLimitOverride>();
     }
 
     return true;
@@ -615,6 +644,53 @@ bool convert<FriendRule>::decode(const Node& node, FriendRule& rhs) {
 // ---------------------------------------------------------------------------
 // RateLimitSpec
 // ---------------------------------------------------------------------------
+
+Node convert<toxtunnel::RateLimitOverride>::encode(const toxtunnel::RateLimitOverride& rhs) {
+    Node node;
+    if (rhs.mode)
+        node["mode"] = std::string(toxtunnel::to_string(*rhs.mode));
+    if (rhs.open_per_sec)
+        node["open_per_sec"] = *rhs.open_per_sec;
+    if (rhs.open_burst)
+        node["open_burst"] = *rhs.open_burst;
+    if (rhs.bytes_per_sec)
+        node["bytes_per_sec"] = *rhs.bytes_per_sec;
+    if (rhs.bytes_burst)
+        node["bytes_burst"] = *rhs.bytes_burst;
+    if (rhs.max_concurrent_tunnels)
+        node["max_concurrent_tunnels"] = *rhs.max_concurrent_tunnels;
+    return node;
+}
+
+bool convert<toxtunnel::RateLimitOverride>::decode(const Node& node,
+                                                   toxtunnel::RateLimitOverride& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    // Absent keys stay disengaged: they inherit from `rate_limit_defaults`
+    // at merge time. In particular an omitted `mode` does NOT mean `off`, and
+    // an omitted `open_per_sec` does NOT mean "unlimited" — writing one field
+    // must not switch the rest of the defaults off.
+    if (node["mode"]) {
+        toxtunnel::RateLimitMode mode{};
+        if (!toxtunnel::parse_rate_limit_mode(node["mode"].as<std::string>(), mode)) {
+            return false;
+        }
+        rhs.mode = mode;
+    }
+    if (node["open_per_sec"])
+        rhs.open_per_sec = node["open_per_sec"].as<std::uint32_t>();
+    if (node["open_burst"])
+        rhs.open_burst = node["open_burst"].as<std::uint32_t>();
+    if (node["bytes_per_sec"])
+        rhs.bytes_per_sec = node["bytes_per_sec"].as<std::uint64_t>();
+    if (node["bytes_burst"])
+        rhs.bytes_burst = node["bytes_burst"].as<std::uint64_t>();
+    if (node["max_concurrent_tunnels"]) {
+        rhs.max_concurrent_tunnels = node["max_concurrent_tunnels"].as<std::uint32_t>();
+    }
+    return true;
+}
 
 Node convert<toxtunnel::RateLimitSpec>::encode(const toxtunnel::RateLimitSpec& rhs) {
     Node node;
@@ -636,15 +712,26 @@ bool convert<toxtunnel::RateLimitSpec>::decode(const Node& node, toxtunnel::Rate
     if (!node.IsMap()) {
         return false;
     }
+    // Reaching this decoder means the document really does contain a
+    // `rate_limit_defaults:` block. Record that, because the decoded *values*
+    // cannot express it: `mode: off` with no counters is byte-for-byte the
+    // same spec as "no defaults block at all", and `RateLimitOverride::
+    // merged_onto` has to treat those two cases oppositely (inherit the
+    // explicit `off` vs. fall back to Enforce). A `return false` further down
+    // makes yaml-cpp throw and the caller discard `rhs` entirely, so flagging
+    // it up front cannot leak provenance onto a spec anyone observes.
+    rhs.defaults_present = true;
     if (node["mode"]) {
         const auto s = node["mode"].as<std::string>();
         if (!toxtunnel::parse_rate_limit_mode(s, rhs.mode)) {
             return false;
         }
     } else {
-        // Mode defaults to enforce if any limit values are present and no
-        // explicit mode is set; this matches the design doc default of
-        // "tighten by default once configured".
+        // This decoder is only reached for the top-level
+        // `rate_limit_defaults:` block, which has nothing to inherit a mode
+        // from — so an omitted mode means "tighten by default once
+        // configured". Per-friend blocks decode as `RateLimitOverride`, where
+        // an omitted mode stays disengaged and inherits these defaults.
         rhs.mode = toxtunnel::RateLimitMode::Enforce;
     }
     if (node["open_per_sec"])

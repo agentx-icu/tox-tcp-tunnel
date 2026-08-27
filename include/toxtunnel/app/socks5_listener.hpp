@@ -121,15 +121,62 @@ struct HttpConnectResult {
 ///     on `conn` (pipelined past the handshake) and were buffered by the
 ///     listener. Naive clients that send e.g. a TLS ClientHello immediately
 ///     after `CONNECT host:port` without waiting for `200 OK` land here.
-///   - Invoke `on_tunnel_state` exactly once: `true` once the tunnel reaches
-///     Connected (so the listener can write the protocol-specific success
-///     reply), or `false` on any pre-connected error.
+///   - Invoke `on_tunnel_state` exactly once: `TunnelOpenOutcome::Connected`
+///     once the tunnel reaches Connected (so the listener can write the
+///     protocol-specific success reply), or the matching failure outcome on
+///     any pre-connected error.
 ///
 /// Encapsulating the wiring behind a callback keeps Socks5Listener free of
 /// TunnelClient dependencies and trivially testable.
+
+/// Why the tunnel open ended, carried back so the listener can answer with the
+/// right SOCKS5 reply code instead of a blanket failure. A server-side rules
+/// denial in particular must surface as SOCKS5 0x02 ("connection not allowed
+/// by ruleset") — that is the code operators are told to look for when
+/// `rules.yaml` is the thing rejecting a destination.
+enum class TunnelOpenOutcome : std::uint8_t {
+    Connected,    ///< tunnel reached Connected
+    Denied,       ///< server rules rejected the destination (TUNNEL_ERROR code 1)
+    Unreachable,  ///< server could not resolve / route to the destination (code 2)
+    Refused,      ///< server's TCP connect was actively refused (code 3, "refused")
+    Failed,       ///< anything else (client offline, no tunnel ids, unknown error)
+};
+
 using OpenTunnelFn = std::function<void(std::shared_ptr<core::TcpConnection> conn, std::string host,
                                         uint16_t port, std::vector<uint8_t> initial_payload,
-                                        std::function<void(bool)> on_tunnel_state)>;
+                                        std::function<void(TunnelOpenOutcome)> on_tunnel_state)>;
+
+/// Map an open outcome onto the SOCKS5 reply byte (RFC 1928 §6).
+[[nodiscard]] constexpr uint8_t socks5_reply_for(TunnelOpenOutcome outcome) noexcept {
+    switch (outcome) {
+        case TunnelOpenOutcome::Connected:
+            return socks5::kReplySuccess;
+        case TunnelOpenOutcome::Denied:
+            return socks5::kReplyConnNotAllowed;
+        case TunnelOpenOutcome::Unreachable:
+            return socks5::kReplyHostUnreachable;
+        case TunnelOpenOutcome::Refused:
+            return socks5::kReplyConnRefused;
+        case TunnelOpenOutcome::Failed:
+            break;
+    }
+    return socks5::kReplyGeneralFailure;
+}
+
+/// Map an open outcome onto the HTTP CONNECT status line.
+[[nodiscard]] constexpr const char* http_status_for(TunnelOpenOutcome outcome) noexcept {
+    switch (outcome) {
+        case TunnelOpenOutcome::Connected:
+            return "200 Connection Established";
+        case TunnelOpenOutcome::Denied:
+            return "403 Forbidden";
+        case TunnelOpenOutcome::Unreachable:
+        case TunnelOpenOutcome::Refused:
+        case TunnelOpenOutcome::Failed:
+            break;
+    }
+    return "502 Bad Gateway";
+}
 
 /// Listener that accepts SOCKS5 or HTTP CONNECT requests and forwards each
 /// accepted connection to the TunnelClient via the supplied OpenTunnelFn.

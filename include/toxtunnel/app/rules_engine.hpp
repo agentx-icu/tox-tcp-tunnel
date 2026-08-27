@@ -44,9 +44,11 @@ struct FriendRule {
     std::string friend_pk;          ///< Friend's hex-encoded public key (64 chars)
     std::vector<TargetSpec> allow;  ///< Targets this friend is allowed to access
     std::vector<TargetSpec> deny;   ///< Targets this friend is denied from accessing
-    /// Per-friend rate-limit override. Empty / default means "use the
-    /// top-level `rate_limit_defaults`" or no limit at all.
-    RateLimitSpec rate_limit{};
+    /// Per-friend `rate_limit:` block, sparse: only the fields the operator
+    /// wrote are engaged, and each one overrides the matching
+    /// `rate_limit_defaults` field. An empty block inherits the defaults
+    /// wholesale.
+    RateLimitOverride rate_limit{};
 
     bool operator==(const FriendRule& other) const {
         return friend_pk == other.friend_pk && allow == other.allow && deny == other.deny &&
@@ -133,10 +135,26 @@ class RulesEngine {
 
     /// Top-level `rate_limit_defaults:` block parsed from the rules file.
     /// Used by the `RateLimiter` when a friend has no explicit override.
+    ///
+    /// `spec.defaults_present` records whether the key was actually written:
+    /// a returned spec that is `empty()` but `defaults_present` means "the
+    /// operator explicitly configured rate limiting off", which the per-friend
+    /// merge must honour instead of falling back to `Enforce`.
     [[nodiscard]] const RateLimitSpec& rate_limit_defaults() const noexcept {
         return rate_limit_defaults_;
     }
-    void set_rate_limit_defaults(const RateLimitSpec& spec) { rate_limit_defaults_ = spec; }
+    /// Programmatic equivalent of writing a `rate_limit_defaults:` block, so
+    /// it stamps `defaults_present` regardless of what the caller passed:
+    /// calling this at all *is* the statement that defaults are configured.
+    /// Without the stamp, `set_rate_limit_defaults({.mode = Off})` would stay
+    /// indistinguishable from "no defaults" and per-friend blocks would be
+    /// force-enabled again — the same class of bug this flag exists to kill.
+    /// The genuinely-absent case is the default-constructed member, i.e. never
+    /// calling this.
+    void set_rate_limit_defaults(const RateLimitSpec& spec) {
+        rate_limit_defaults_ = spec;
+        rate_limit_defaults_.defaults_present = true;
+    }
 
     /// Serialize rules to YAML.
     [[nodiscard]] std::string to_yaml() const;
@@ -238,6 +256,12 @@ template <>
 struct convert<toxtunnel::RateLimitSpec> {
     static Node encode(const toxtunnel::RateLimitSpec& rhs);
     static bool decode(const Node& node, toxtunnel::RateLimitSpec& rhs);
+};
+
+template <>
+struct convert<toxtunnel::RateLimitOverride> {
+    static Node encode(const toxtunnel::RateLimitOverride& rhs);
+    static bool decode(const Node& node, toxtunnel::RateLimitOverride& rhs);
 };
 
 }  // namespace YAML

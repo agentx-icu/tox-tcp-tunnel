@@ -297,8 +297,13 @@ PSECURITY_DESCRIPTOR build_current_user_sd() {
     if (!ConvertSidToStringSidA(user->User.Sid, &sid_str)) {
         return nullptr;
     }
-    // D: discretionary ACL, single ACE granting full access to current user.
-    std::string sddl = std::string("D:(A;;GA;;;") + sid_str + ")";
+    // Discretionary ACL: full access for the daemon's own user, plus SYSTEM and
+    // the local Administrators group. The latter two matter for service
+    // installs (LocalSystem on Windows SCM): without them an administrator
+    // running `toxtunnel inspect` from an elevated prompt gets ACCESS_DENIED
+    // even with the right pid. Non-admin, non-owner users still cannot open
+    // the pipe.
+    std::string sddl = std::string("D:(A;;GA;;;") + sid_str + ")(A;;GA;;;SY)(A;;GA;;;BA)";
     LocalFree(sid_str);
     PSECURITY_DESCRIPTOR sd = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl.c_str(), SDDL_REVISION_1, &sd,

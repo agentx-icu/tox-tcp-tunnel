@@ -56,8 +56,10 @@ struct InspectProviders {
 /// process is detected and unlinked at bind time — refusing to start on
 /// EADDRINUSE would brick the daemon on a crash-restart cycle.
 ///
-/// Windows: a per-pid named pipe `\\.\pipe\toxtunnel-<pid>` with a
-/// current-user DACL. Per-pid naming is deliberate: it sidesteps the cleanup
+/// Windows: a per-pid named pipe `\\.\pipe\toxtunnel-<pid>` whose DACL admits
+/// the daemon's own user, SYSTEM, and local Administrators (so an elevated
+/// operator can inspect a LocalSystem service). The pid is discoverable via
+/// `<data_dir>/toxtunnel.pid`. Per-pid naming is deliberate: it sidesteps the cleanup
 /// race that bites Unix sockets (the previous instance's pipe vanishes when
 /// the process exits) and keeps multiple daemons on one host from colliding.
 ///

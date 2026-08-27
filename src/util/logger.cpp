@@ -57,6 +57,76 @@ void rebuild_logger_locked() {
 }  // anonymous namespace
 
 // =========================================================================
+// LogThrottle
+// =========================================================================
+
+bool LogThrottle::allow_impl(std::int64_t gate_now, Decision& decision) noexcept {
+    total_.fetch_add(1, std::memory_order_relaxed);
+
+    std::int64_t next = next_emit_ns_.load(std::memory_order_relaxed);
+    if (gate_now < next) {
+        suppressed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Re-read the clock before claiming the slot.
+    //
+    // WHY: `gate_now` was sampled before the load above, and nothing stops the
+    // scheduler from parking this thread in between for longer than one whole
+    // interval. Deriving the next deadline from that stale reading would push
+    // `next_emit_ns_` to an instant that is *already in the past*, so the very
+    // next call would be admitted too and the site emits two lines back to
+    // back. The extra clock read only ever happens on the candidate-admission
+    // path (at most once per interval per thread, and never on the suppressed
+    // path this class exists to keep cheap), so it costs nothing measurable.
+    // It also makes `window_ms` describe when the line was actually emitted
+    // rather than when the caller happened to look at the clock.
+    const std::int64_t emit_at = now_ns();
+
+    // Claim the emission slot. Only the thread that swings `next_emit_ns_`
+    // forward gets to log; concurrent losers count themselves as suppressed.
+    // A CAS is cheaper than any lock and keeps the "one line per interval"
+    // guarantee exact even when several threads share one call site.
+    if (!next_emit_ns_.compare_exchange_strong(
+            next, emit_at + interval_ns_, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        suppressed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    decision.suppressed = suppressed_.exchange(0, std::memory_order_relaxed);
+    decision.window_ms = record_emission(emit_at);
+    return true;
+}
+
+std::uint64_t LogThrottle::record_emission(std::int64_t emit_ns) noexcept {
+    // Winning the slot CAS and publishing the timestamp are two separate steps,
+    // and a winner can be descheduled between them. By the time it resumes, a
+    // *later* window's winner may already have published a newer timestamp. A
+    // plain `exchange` would then rewind `last_emit_ns_` to the older value and
+    // the next window would measure itself against a stale anchor.
+    //
+    // Defence 1 — keep the field monotonic. A relaxed CAS still reads the
+    // latest value in this atomic's modification order, so the loop cannot
+    // "miss" a newer publication and cannot install an older one.
+    std::int64_t last = last_emit_ns_.load(std::memory_order_relaxed);
+    while (last < emit_ns &&
+           !last_emit_ns_.compare_exchange_weak(last, emit_ns, std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
+    }
+
+    // Defence 2 — saturate the subtraction. Monotonicity protects future
+    // readers, but the late winner above is itself holding a `last` that is
+    // *newer* than its own `emit_ns`; `emit_ns - last` is negative there, and
+    // widening that to std::uint64_t printed the notorious
+    // `[+3 suppressed in 18446744073709551615ms]`. Both defences are one
+    // comparison each and each covers a case the other does not, so keep both.
+    if (last == 0 || last >= emit_ns) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>((emit_ns - last) / 1000000);
+}
+
+// =========================================================================
 // Initialisation & configuration
 // =========================================================================
 
@@ -142,6 +212,22 @@ std::shared_ptr<spdlog::logger> Logger::get() {
 // =========================================================================
 // Helpers
 // =========================================================================
+
+void Logger::emit_throttled(spdlog::level::level_enum level, const LogThrottle::Decision& decision,
+                            const std::string& message) {
+    auto logger = get();
+    if (!logger->should_log(level)) {
+        return;
+    }
+    if (decision.suppressed == 0) {
+        logger->log(level, "{}", message);
+        return;
+    }
+    // The tally is the whole point of throttling rather than demoting: the
+    // operator still learns the burst happened *and* how big it was.
+    logger->log(level, "{} [+{} suppressed in {}ms]", message, decision.suppressed,
+                decision.window_ms);
+}
 
 spdlog::level::level_enum Logger::to_spdlog_level(LogLevel level) {
     return static_cast<spdlog::level::level_enum>(static_cast<int>(level));

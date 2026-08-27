@@ -23,6 +23,60 @@ bool parse_rate_limit_mode(std::string_view s, RateLimitMode& out) noexcept {
     return false;
 }
 
+RateLimitSpec RateLimitOverride::merged_onto(const RateLimitSpec& base) const noexcept {
+    RateLimitSpec out = base;
+    if (open_per_sec) {
+        out.open_per_sec = *open_per_sec;
+    }
+    if (open_burst) {
+        out.open_burst = *open_burst;
+    }
+    if (bytes_per_sec) {
+        out.bytes_per_sec = *bytes_per_sec;
+    }
+    if (bytes_burst) {
+        out.bytes_burst = *bytes_burst;
+    }
+    if (max_concurrent_tunnels) {
+        out.max_concurrent_tunnels = *max_concurrent_tunnels;
+    }
+    if (mode) {
+        out.mode = *mode;
+        return out;
+    }
+    // No explicit per-friend mode: inherit the base's mode (already copied by
+    // `out = base`). The fallback below only applies when there is genuinely
+    // nothing to inherit from.
+    //
+    // "Nothing to inherit" means BOTH: the rules file carried no
+    // `rate_limit_defaults:` block (`defaults_present`), and the base has no
+    // configured values either (`empty()`). Testing `empty()` alone was a
+    // release blocker: `rate_limit_defaults: {mode: off}` is `empty()` by
+    // value, so an operator who had explicitly *disabled* rate limiting saw
+    // every friend with a per-friend block flipped to `Enforce` — the exact
+    // opposite of what they wrote. `defaults_present` is what tells the two
+    // cases apart.
+    //
+    // With no defaults block at all we keep the pre-merge rule "configuring a
+    // limit turns it on", otherwise a rules file whose only rate-limit config
+    // is a per-friend block would resolve to mode Off and silently do nothing.
+    if (!base.defaults_present && base.empty() && !out.empty()) {
+        out.mode = RateLimitMode::Enforce;
+    }
+    return out;
+}
+
+RateLimitOverride RateLimitOverride::from_spec(const RateLimitSpec& spec) {
+    RateLimitOverride out;
+    out.mode = spec.mode;
+    out.open_per_sec = spec.open_per_sec;
+    out.open_burst = spec.open_burst;
+    out.bytes_per_sec = spec.bytes_per_sec;
+    out.bytes_burst = spec.bytes_burst;
+    out.max_concurrent_tunnels = spec.max_concurrent_tunnels;
+    return out;
+}
+
 std::string RateLimiter::normalise_key(std::string_view friend_pk) {
     std::string out(friend_pk);
     std::transform(out.begin(), out.end(), out.begin(),
@@ -30,9 +84,33 @@ std::string RateLimiter::normalise_key(std::string_view friend_pk) {
     return out;
 }
 
+void RateLimiter::apply_spec(Bucket& b, const RateLimitSpec& spec) {
+    b.spec = spec;
+    // Loosening takes effect immediately; tightening is observed lazily on the
+    // next consume + refill cycle, except that a bucket already holding more
+    // than the new capacity is clamped down so a shrunken burst cannot be
+    // spent all at once.
+    if (b.open_tokens.load(std::memory_order_relaxed) >
+        static_cast<std::int64_t>(spec.open_burst)) {
+        b.open_tokens.store(static_cast<std::int64_t>(spec.open_burst), std::memory_order_relaxed);
+    }
+    if (b.bytes_tokens.load(std::memory_order_relaxed) >
+        static_cast<std::int64_t>(spec.bytes_burst)) {
+        b.bytes_tokens.store(static_cast<std::int64_t>(spec.bytes_burst),
+                             std::memory_order_relaxed);
+    }
+}
+
 void RateLimiter::set_default_spec(const RateLimitSpec& spec) {
     std::lock_guard<std::mutex> lock(mu_);
     default_spec_ = spec;
+    // An override only says what it changes, so every live bucket's effective
+    // spec has to be recomputed against the new defaults — including buckets
+    // with no override, which were seeded from the previous defaults.
+    for (auto& entry : buckets_) {
+        Bucket& b = *entry.second;
+        apply_spec(b, b.override_spec.merged_onto(default_spec_));
+    }
 }
 
 void RateLimiter::clear_all_friend_specs() {
@@ -40,37 +118,57 @@ void RateLimiter::clear_all_friend_specs() {
     buckets_.clear();
 }
 
-void RateLimiter::set_friend_spec(std::string_view friend_pk, const RateLimitSpec& spec) {
-    const auto key = normalise_key(friend_pk);
+void RateLimiter::replace_all(const RateLimitSpec& defaults,
+                              const std::vector<FriendOverride>& overrides) {
     std::lock_guard<std::mutex> lock(mu_);
-    if (spec.empty()) {
+    // Order matters even inside the lock: the buckets must be gone before
+    // `default_spec_` moves, otherwise the loop in `set_default_spec` would
+    // re-merge overrides that are about to be thrown away anyway. Doing the
+    // clear first also means every `install_friend_spec_locked` below takes the
+    // create path, i.e. seeds a full bucket — the token reset the three-call
+    // sequence produced, preserved verbatim.
+    buckets_.clear();
+    default_spec_ = defaults;
+    for (const auto& [friend_pk, override_spec] : overrides) {
+        install_friend_spec_locked(normalise_key(friend_pk), override_spec);
+    }
+}
+
+void RateLimiter::install_friend_spec_locked(const std::string& key,
+                                             const RateLimitOverride& override_spec) {
+    if (override_spec.empty()) {
         buckets_.erase(key);
         return;
     }
+    const RateLimitSpec resolved = override_spec.merged_onto(default_spec_);
     auto it = buckets_.find(key);
     if (it == buckets_.end()) {
         auto bucket = std::make_unique<Bucket>();
-        bucket->spec = spec;
-        bucket->open_tokens.store(spec.open_burst, std::memory_order_relaxed);
-        bucket->bytes_tokens.store(static_cast<std::int64_t>(spec.bytes_burst),
+        bucket->override_spec = override_spec;
+        bucket->spec = resolved;
+        bucket->open_tokens.store(resolved.open_burst, std::memory_order_relaxed);
+        bucket->bytes_tokens.store(static_cast<std::int64_t>(resolved.bytes_burst),
                                    std::memory_order_relaxed);
         buckets_[key] = std::move(bucket);
-    } else {
-        // Loosening takes effect immediately; tightening is observed lazily
-        // on the next consume + refill cycle. Match the design doc.
-        it->second->spec = spec;
-        // Cap the current bucket to the new burst if it shrank.
-        if (it->second->open_tokens.load(std::memory_order_relaxed) >
-            static_cast<std::int64_t>(spec.open_burst)) {
-            it->second->open_tokens.store(static_cast<std::int64_t>(spec.open_burst),
-                                          std::memory_order_relaxed);
-        }
-        if (it->second->bytes_tokens.load(std::memory_order_relaxed) >
-            static_cast<std::int64_t>(spec.bytes_burst)) {
-            it->second->bytes_tokens.store(static_cast<std::int64_t>(spec.bytes_burst),
-                                           std::memory_order_relaxed);
-        }
+        return;
     }
+    it->second->override_spec = override_spec;
+    apply_spec(*it->second, resolved);
+}
+
+void RateLimiter::set_friend_spec(std::string_view friend_pk,
+                                  const RateLimitOverride& override_spec) {
+    const auto key = normalise_key(friend_pk);
+    std::lock_guard<std::mutex> lock(mu_);
+    install_friend_spec_locked(key, override_spec);
+}
+
+void RateLimiter::set_friend_spec(std::string_view friend_pk, const RateLimitSpec& spec) {
+    if (spec.empty()) {
+        set_friend_spec(friend_pk, RateLimitOverride{});
+        return;
+    }
+    set_friend_spec(friend_pk, RateLimitOverride::from_spec(spec));
 }
 
 RateLimitSpec RateLimiter::effective_spec(std::string_view friend_pk) const {

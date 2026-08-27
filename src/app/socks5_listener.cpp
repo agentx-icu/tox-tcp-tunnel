@@ -295,24 +295,22 @@ struct Socks5Session : std::enable_shared_from_this<Socks5Session> {
         buffer.clear();
 
         open_tunnel(std::move(self_conn), std::move(host), port, std::move(initial_payload),
-                    [self, sniffed_protocol](bool connected) {
+                    [self, sniffed_protocol](TunnelOpenOutcome outcome) {
                         // Reply with the protocol-appropriate success/failure
                         // line once the tunnel layer reports back. The session
                         // is otherwise inert at this point.
                         if (!self->conn) {
                             return;
                         }
+                        const bool connected = outcome == TunnelOpenOutcome::Connected;
                         if (sniffed_protocol == Protocol::Socks5) {
-                            self->send_reply(encode_socks5_reply(
-                                connected ? socks5::kReplySuccess : socks5::kReplyHostUnreachable));
+                            self->send_reply(encode_socks5_reply(socks5_reply_for(outcome)));
                             if (!connected) {
                                 self->conn->close();
                             }
                         } else if (sniffed_protocol == Protocol::HttpConnect) {
-                            if (connected) {
-                                self->send_http_reply("200 Connection Established");
-                            } else {
-                                self->send_http_reply("502 Bad Gateway");
+                            self->send_http_reply(http_status_for(outcome));
+                            if (!connected) {
                                 self->conn->close();
                             }
                         }
@@ -446,7 +444,27 @@ std::string Socks5Listener::start(asio::io_context& io_ctx, const std::string& h
         acceptor_.reset();
         return "acceptor.open: " + ec.message();
     }
+    // See the note in core/tcp_listener.cpp: on Windows SO_REUSEADDR would let
+    // another process bind this loopback port and intercept SOCKS5 traffic.
+    // Fail closed — a SOCKS5 listener that came up WITHOUT the exclusivity
+    // guarantee is exactly the hijack we are protecting against, so do not fall
+    // through to bind() (which would clear `ec` on success and hide it).
+#if defined(_WIN32)
+    int exclusive = 1;
+    if (::setsockopt(acceptor_->native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                     reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) != 0) {
+        const auto opt_ec =
+            asio::error_code(::WSAGetLastError(), asio::error::get_system_category());
+        acceptor_.reset();
+        return "acceptor.set_option(SO_EXCLUSIVEADDRUSE): " + opt_ec.message();
+    }
+#else
     acceptor_->set_option(asio::socket_base::reuse_address(true), ec);
+    if (ec) {
+        acceptor_.reset();
+        return "acceptor.set_option(reuse_address): " + ec.message();
+    }
+#endif
     acceptor_->bind(endpoint, ec);
     if (ec) {
         acceptor_.reset();
