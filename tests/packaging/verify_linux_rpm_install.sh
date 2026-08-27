@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
+#
+# Installs an RPM and verifies the installed layout. This is a *release*
+# check, not a general-purpose local one: it only works against an RPM built
+# the way releases build them (manylinux_2_28, so the glibc/libsodium ABI
+# matches EL8+). An RPM built on, say, Ubuntu is uninstallable on rockylinux:9
+# ("nothing provides libc.so.6(GLIBC_2.38)") and Fedora ships a different
+# libsodium soname, so running this on a locally-built package will fail for
+# reasons that have nothing to do with the package layout.
+#
+# To check a locally-built RPM without installing it, inspect the payload
+# instead: `rpm -qpl pkg.rpm`, `rpm -qp --scripts pkg.rpm`, `rpm2cpio pkg.rpm |
+# cpio -idmv`. The DEB path (verify_linux_deb_install.sh) does run locally on
+# ubuntu:24.04 and covers the same assertions.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
     echo "usage: $0 <package-path> <expected-version>" >&2
+    echo "note: requires a release-built (manylinux_2_28) RPM on an EL8+ host" >&2
     exit 2
 fi
 
@@ -68,6 +82,11 @@ fi
 
 if ! grep -Fxq "RemainAfterExit=yes" "${unit_path}"; then
     echo "expected ${unit_path} to declare RemainAfterExit=yes (so policy-gated exit 0 shows as active(exited), not inactive(dead))" >&2
+    exit 1
+fi
+
+if ! grep -Fxq "ExecReload=/bin/kill -HUP \$MAINPID" "${unit_path}"; then
+    echo "expected ${unit_path} to declare ExecReload so 'systemctl reload toxtunnel' delivers SIGHUP" >&2
     exit 1
 fi
 

@@ -99,17 +99,25 @@ class TunnelDataFlowTest : public ::testing::Test {
     }
 
     /// Allow pending io_context handlers to execute.
+    // A fixed sleep is not a synchronisation primitive: on Windows
+    // sleep_for(50ms) is not "at least the work is done", it is just a
+    // differently-wrong guess (measured on a Windows 11 ARM64 VM,
+    // sleep_for(1ms) actually costs 27-69 ms, and asio timers inherit the same
+    // ~15.6 ms system tick). Tests that slept and then asserted were flaky
+    // there and passed in isolation. Prefer wait_until() with a real
+    // condition; poll() remains only for the few spots that genuinely have
+    // nothing to wait for.
     void poll() { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
 
     template <typename Predicate>
     bool wait_until(Predicate predicate,
-                    std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
+                    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline) {
             if (predicate()) {
                 return true;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::this_thread::yield();
         }
         return predicate();
     }
@@ -488,7 +496,27 @@ TEST_F(TunnelDataFlowTest, MultipleTunnelsOnSameManager) {
         EXPECT_TRUE(pairs[i]->server->send_data_to_tox(s2c));
     }
 
-    poll();
+    // Wait for delivery on every tunnel rather than sleeping a fixed 50 ms:
+    // each payload crosses the coalescer, whose flush timer resolution is
+    // platform-dependent (see the note on poll() above).
+    ASSERT_TRUE(wait_until([&] {
+        for (std::size_t i = 0; i < kNumTunnels; ++i) {
+            const auto tag = static_cast<uint8_t>(i + 1);
+            {
+                std::lock_guard lock(pairs[i]->server_mu);
+                if (pairs[i]->server_received != std::vector<uint8_t>{tag, 0xAA}) {
+                    return false;
+                }
+            }
+            {
+                std::lock_guard lock(pairs[i]->client_mu);
+                if (pairs[i]->client_received != std::vector<uint8_t>{tag, 0xBB}) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    })) << "not every tunnel delivered its payload within the deadline";
 
     // Verify each tunnel received exactly its own data.
     for (std::size_t i = 0; i < kNumTunnels; ++i) {

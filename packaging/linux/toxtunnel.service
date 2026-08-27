@@ -10,6 +10,12 @@ Group=toxtunnel
 StateDirectory=toxtunnel
 StateDirectoryMode=0750
 ExecStart=/usr/bin/toxtunnel -c /etc/toxtunnel/config.yaml --service
+# The daemon hot-reloads the reloadable subset (server.rules_file contents,
+# client.forwards, logging.level) on SIGHUP, so wire `systemctl reload` to it —
+# without ExecReload systemd answers "Job type reload is not applicable", which
+# is what every doc telling operators to run `systemctl reload toxtunnel`
+# assumed worked.
+ExecReload=/bin/kill -HUP $MAINPID
 # When the daemon exits 0 because the service policy gates it off (client +
 # allow_client_daemon=false, server + auto_start=false, or config missing under
 # --service soft-fail), keep the unit shown as `active (exited)` instead of
