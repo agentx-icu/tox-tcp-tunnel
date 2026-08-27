@@ -5,11 +5,17 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "toxtunnel/app/tunnel_server.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
@@ -707,4 +713,663 @@ TEST_F(TunnelManagerTest, PingPongHandling_PongIsHandled) {
 
     // Frame should be counted
     EXPECT_EQ(manager->frames_received(), 1u);
+}
+
+// ============================================================================
+// 14. CloseAllLocal — "no further send is authorised" contract
+//
+// close_all_local() tears down a manager whose peer has already moved on to a
+// new session. Tunnel ids are recycled per friend, so ANY frame this session
+// emits can hit the winner's identically-numbered tunnel. Local resources
+// (target TCP sockets, tunnel ids, on_tunnel_closed bookkeeping) are still
+// released.
+//
+// Note what is NOT claimed. The goal was once "zero outbound frames", and these
+// tests were written against it. Teardown cannot deliver that: reaching it
+// meant waiting for in-flight sends, and that wait deadlocked against
+// coalesce_mutex_. What holds now is that no send can be AUTHORISED once the
+// gate closes; a send authorised microseconds earlier may still land. See
+// TunnelManager::close_all_local() for the full residual.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Shared io_context pump helpers.
+//
+// These used to exist twice — here (file-local, sleep-driven) and as fixture
+// methods in tunnel_coalesce_test.cpp (no-sleep). One implementation now, with
+// external linkage, declared where the other translation unit needs it; both
+// files link into the same unit_tests binary. They live in this file rather
+// than a new header because tests/CMakeLists.txt enumerates its sources
+// explicitly and adding files to it is out of scope for this change.
+//
+// `poll` (not `run_for`) because `run_for + restart` in a tight loop was
+// observed to hang on asio's Windows IOCP backend.
+//
+// NEVER sleep in the pump loop — that is the surviving implementation's key
+// property. std::this_thread::sleep_for(1ms) costs 1.1 ms on Linux and 1.4 ms
+// on macOS, but 27-69 ms on Windows (default system timer resolution ~15.6 ms,
+// worse in a VM). A sleep-driven loop with a 20 ms budget therefore got ~20
+// iterations on Unix but ONE on Windows, which is exactly why the coalesce
+// tests were flaky there and passed in isolation. yield() keeps the loop
+// responsive on every platform, and poll() drains every ready handler per turn
+// rather than one.
+// ---------------------------------------------------------------------------
+namespace toxtunnel::test_support {
+
+/// Pump `io_ctx` until `pred` holds or `deadline` elapses.
+bool PumpUntil(asio::io_context& io_ctx, const std::function<bool()>& pred,
+               std::chrono::milliseconds deadline) {
+    const auto until = std::chrono::steady_clock::now() + deadline;
+    while (std::chrono::steady_clock::now() < until) {
+        if (pred()) {
+            return true;
+        }
+        if (io_ctx.poll() == 0) {
+            std::this_thread::yield();
+        }
+        io_ctx.restart();
+    }
+    io_ctx.poll();
+    io_ctx.restart();
+    return pred();
+}
+
+/// Pump `io_ctx` for `duration`, unconditionally. Used to prove that something
+/// does NOT happen (no PING, no drain) over a window of several timer ticks.
+void PumpFor(asio::io_context& io_ctx, std::chrono::milliseconds duration) {
+    const auto until = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < until) {
+        if (io_ctx.poll() == 0) {
+            std::this_thread::yield();
+        }
+        io_ctx.restart();
+    }
+    io_ctx.poll();
+    io_ctx.restart();
+}
+
+}  // namespace toxtunnel::test_support
+
+namespace {
+
+using toxtunnel::test_support::PumpFor;
+
+/// Thin wrapper so the many call sites below keep their 2 s default deadline
+/// and can pass a bare lambda.
+template <typename Pred>
+bool PumpUntil(asio::io_context& io_ctx, Pred pred,
+               std::chrono::milliseconds deadline = std::chrono::milliseconds(2000)) {
+    return toxtunnel::test_support::PumpUntil(io_ctx, std::function<bool()>(std::move(pred)),
+                                              deadline);
+}
+
+}  // namespace
+
+// The regression this pins: muting used to be done per-tunnel, leaving the
+// manager-level retry queue untouched. Frames already parked in
+// pending_outbound_ (TUNNEL_CLOSE / OPEN_ACK that hit toxcore SENDQ-full) kept
+// their appointment with the drain timer and went out on the wire *after*
+// close_all_local() had "silenced" the session.
+TEST_F(TunnelManagerTest, CloseAllLocal_DropsParkedFramesInsteadOfDrainingThem) {
+    // shared_ptr: the drain timer's handler captures weak_from_this().
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    std::atomic<int> sends{0};
+    std::atomic<bool> accept{false};
+    shared_manager->set_send_handler([&sends, &accept](const std::vector<uint8_t>&) {
+        sends.fetch_add(1, std::memory_order_relaxed);
+        return accept.load(std::memory_order_relaxed) ? SendOutcome::Sent : SendOutcome::SendqFull;
+    });
+
+    // Park two frames: the first is attempted once (SENDQ-full) and parked, the
+    // second queues behind it without an attempt.
+    std::array<uint8_t, 3> data = {0x01, 0x02, 0x03};
+    ASSERT_TRUE(shared_manager->send_frame(ProtocolFrame::make_tunnel_data(1, make_span(data))));
+    ASSERT_TRUE(shared_manager->send_frame(ProtocolFrame::make_tunnel_data(2, make_span(data))));
+    ASSERT_EQ(sends.load(), 1) << "second frame should queue behind the parked one";
+
+    // Abandon the session. From here the handler must never be called again,
+    // even though the SENDQ is now (as far as the manager knows) drainable.
+    shared_manager->close_all_local();
+    accept.store(true, std::memory_order_relaxed);
+    EXPECT_TRUE(shared_manager->outbound_muted());
+
+    // The drain delay is 20ms; 300ms is ~15 ticks' worth of opportunity.
+    PumpFor(io_ctx, std::chrono::milliseconds(300));
+    EXPECT_EQ(sends.load(), 1) << "parked frames must be dropped, not drained, after "
+                                  "close_all_local()";
+
+    // And nothing new may be admitted either.
+    EXPECT_FALSE(shared_manager->send_frame(ProtocolFrame::make_tunnel_data(3, make_span(data))));
+    EXPECT_FALSE(shared_manager->queue_outbound_for_retry({0x01, 0x02}));
+    PumpFor(io_ctx, std::chrono::milliseconds(100));
+    EXPECT_EQ(sends.load(), 1);
+}
+
+// A PING emitted after the session was abandoned is exactly the "closes the
+// winner's tunnel" hazard in miniature — it is addressed at a peer that is now
+// talking to a different manager. close_all_local() must stop the keepalive
+// chain, not merely mute one tunnel at a time.
+TEST_F(TunnelManagerTest, CloseAllLocal_StopsKeepalivePings) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    std::atomic<int> pings{0};
+    shared_manager->set_send_handler([&pings](const std::vector<uint8_t>& wire) {
+        if (!wire.empty() && wire[0] == static_cast<uint8_t>(FrameType::PING)) {
+            pings.fetch_add(1, std::memory_order_relaxed);
+        }
+        return SendOutcome::Sent;
+    });
+
+    // Long timeout so the peer is never declared dead; we only want the pings.
+    shared_manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/30);
+    ASSERT_TRUE(PumpUntil(
+        io_ctx, [&pings] { return pings.load() >= 1; }, std::chrono::milliseconds(5000)))
+        << "keepalive should emit at least one PING before we abandon the session";
+
+    shared_manager->close_all_local();
+    const int at_abandon = pings.load();
+
+    // Two full intervals of opportunity.
+    PumpFor(io_ctx, std::chrono::milliseconds(2400));
+    EXPECT_EQ(pings.load(), at_abandon) << "an abandoned manager must not keep pinging";
+}
+
+// The other half of the contract: local state really is released.
+TEST_F(TunnelManagerTest, CloseAllLocal_ClosesTunnelsAndReleasesIds) {
+    auto t1 = create_test_tunnel(1);
+    auto t2 = create_test_tunnel(2);
+    ASSERT_TRUE(manager->add_tunnel(1, t1));
+    ASSERT_TRUE(manager->add_tunnel(2, t2));
+
+    std::atomic<int> closed_notifications{0};
+    manager->set_on_tunnel_closed(
+        [&closed_notifications](uint16_t) { closed_notifications.fetch_add(1); });
+
+    manager->close_all_local();
+
+    EXPECT_EQ(manager->tunnel_count(), 0u);
+    EXPECT_EQ(t1->close_count(), 1);
+    EXPECT_EQ(t2->close_count(), 1);
+    // Ids back in the pool: allocation restarts at 1.
+    EXPECT_EQ(manager->allocate_tunnel_id().value(), 1u);
+    // on_tunnel_closed is posted, not called inline (H-01: no re-entrancy under
+    // the manager lock).
+    EXPECT_TRUE(PumpUntil(io_ctx, [&closed_notifications] {
+        return closed_notifications.load() == 2;
+    })) << "every closed tunnel must still be reported to the owner";
+}
+
+// A tunnel caught mid-half-close (Disconnecting) is where the old
+// implementation leaked: it delegated to close_all(), whose plain close() is a
+// documented no-op in that state, so the target TCP fd was never released and
+// the tunnel never reached a terminal state. close_all_local() must force it
+// down without itself emitting a teardown frame. That is what the frame count
+// below checks — teardown authorises no send of its own. It is NOT the broader
+// "nothing of this session reaches the wire": no concurrent sender exists here,
+// and a send authorised just before the gate closed would still land (see
+// TunnelManager::close_all_local()).
+TEST_F(TunnelManagerTest, CloseAllLocal_ForceClosesHalfClosedTunnelWithoutEmitting) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    auto connected = std::make_shared<TunnelImpl>(io_ctx, /*tunnel_id=*/1, /*friend_number=*/0);
+    auto half_closed = std::make_shared<TunnelImpl>(io_ctx, /*tunnel_id=*/2, /*friend_number=*/0);
+
+    std::atomic<int> tox_frames{0};
+    auto counting_send = [&tox_frames](std::span<const uint8_t>) {
+        tox_frames.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+    connected->set_on_send_to_tox(counting_send);
+    half_closed->set_on_send_to_tox(counting_send);
+    connected->set_state(Tunnel::State::Connected);
+    half_closed->set_state(Tunnel::State::Disconnecting);
+
+    ASSERT_TRUE(shared_manager->add_tunnel(1, connected));
+    ASSERT_TRUE(shared_manager->add_tunnel(2, half_closed));
+
+    shared_manager->close_all_local();
+
+    EXPECT_EQ(connected->state(), Tunnel::State::Closed);
+    EXPECT_EQ(half_closed->state(), Tunnel::State::Closed)
+        << "a Disconnecting tunnel must be forced down, not left pinning its fd";
+    EXPECT_EQ(tox_frames.load(), 0)
+        << "teardown itself must not emit TUNNEL_CLOSE / TUNNEL_ERROR for an abandoned session";
+    EXPECT_EQ(shared_manager->tunnel_count(), 0u);
+}
+
+// ============================================================================
+// 15. Keepalive generation gate
+//
+// disable_keepalive() used to be cancel-only. asio's cancel() cannot stop a
+// handler that is already dispatched, and that handler unconditionally sent a
+// PING and then called schedule_keepalive_tick(), which set keepalive_active_
+// back to true — resurrecting a chain that had just been stopped.
+// ============================================================================
+
+// Deterministic reproduction: disable from *inside* the send handler, i.e. at
+// the exact point the old code was about to re-arm. Without the epoch gate the
+// tick re-arms and keeps pinging forever.
+TEST_F(TunnelManagerTest, DisableKeepalive_FromInsideSendHandler_DoesNotReArm) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    std::atomic<int> pings{0};
+    shared_manager->set_send_handler([&pings, weak = std::weak_ptr<TunnelManager>(shared_manager)](
+                                         const std::vector<uint8_t>& wire) {
+        if (!wire.empty() && wire[0] == static_cast<uint8_t>(FrameType::PING)) {
+            pings.fetch_add(1, std::memory_order_relaxed);
+            // Runs on the io thread, synchronously inside the keepalive
+            // tick, one statement before the old code's re-arm.
+            if (auto self = weak.lock()) {
+                self->disable_keepalive();
+            }
+        }
+        return SendOutcome::Sent;
+    });
+
+    shared_manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/30);
+    ASSERT_TRUE(
+        PumpUntil(io_ctx, [&pings] { return pings.load() >= 1; }, std::chrono::milliseconds(5000)));
+
+    // Three further intervals of opportunity to re-arm.
+    PumpFor(io_ctx, std::chrono::milliseconds(3200));
+    EXPECT_EQ(pings.load(), 1) << "a disabled keepalive tick must not re-arm itself";
+}
+
+// The plain case: disable between ticks stays disabled.
+TEST_F(TunnelManagerTest, DisableKeepalive_StopsFurtherPings) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    std::atomic<int> pings{0};
+    shared_manager->set_send_handler([&pings](const std::vector<uint8_t>& wire) {
+        if (!wire.empty() && wire[0] == static_cast<uint8_t>(FrameType::PING)) {
+            pings.fetch_add(1, std::memory_order_relaxed);
+        }
+        return SendOutcome::Sent;
+    });
+
+    shared_manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/30);
+    ASSERT_TRUE(
+        PumpUntil(io_ctx, [&pings] { return pings.load() >= 1; }, std::chrono::milliseconds(5000)));
+
+    shared_manager->disable_keepalive();
+    const int at_disable = pings.load();
+    PumpFor(io_ctx, std::chrono::milliseconds(2400));
+    EXPECT_EQ(pings.load(), at_disable);
+}
+
+// ============================================================================
+// 15b. Timer state transitions are atomic (H-1, 3rd review)
+//
+// The epoch gate alone was not enough. The tick handler used to *check* the
+// generation and then call an unconditional schedule_*_tick(), two separate
+// steps. A handler preempted between them — while disable_*() + enable_*() ran,
+// which is exactly the resume pause/resurrect sequence — came back and armed
+// the timer for its own retired generation. `expires_after` cancels the pending
+// wait, so the freshly installed chain died with operation_aborted and the
+// stale wait was refused at the entry gate: ZERO live chains, silently.
+//
+// The interleaving cannot be produced from outside (the preemption point is
+// inside an asio completion handler), so these tests drive the transition
+// through the same function the handler calls: rearm_*_after_tick(). That
+// function is exactly "everything the handler does from its last generation
+// check through the arm" — the span the preemption falls inside. Before the
+// fix that span was an unconditional schedule_*_tick(); calling it with a
+// retired epoch reproduces the bug and both tests below fail (verified by
+// temporarily restoring the old shape).
+// ============================================================================
+
+TEST_F(TunnelManagerTest, StaleKeepaliveRearm_DoesNotClobberTheLiveChain) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    std::atomic<int> pings{0};
+    shared_manager->set_send_handler([&pings](const std::vector<uint8_t>& wire) {
+        if (!wire.empty() && wire[0] == static_cast<uint8_t>(FrameType::PING)) {
+            pings.fetch_add(1, std::memory_order_relaxed);
+        }
+        return SendOutcome::Sent;
+    });
+
+    // Generation 1 is armed; imagine its tick has just been dispatched and has
+    // passed its last epoch check.
+    shared_manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/30);
+    const std::uint64_t stale_epoch = shared_manager->keepalive_epoch();
+
+    // The pause/resurrect sequence runs while that tick is suspended.
+    shared_manager->disable_keepalive();
+    shared_manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/30);
+    ASSERT_NE(shared_manager->keepalive_epoch(), stale_epoch);
+
+    // The suspended tick now resumes and performs its re-arm.
+    shared_manager->rearm_keepalive_after_tick(stale_epoch);
+
+    // The live chain must be untouched. Before the fix this hung at zero: the
+    // stale re-arm had cancelled generation 2's wait and installed its own,
+    // which the entry gate then refused.
+    EXPECT_TRUE(PumpUntil(
+        io_ctx, [&pings] { return pings.load() >= 1; }, std::chrono::milliseconds(5000)))
+        << "a retired tick's re-arm must not cancel the live keepalive chain";
+}
+
+TEST_F(TunnelManagerTest, StaleReaperRearm_DoesNotClobberTheLiveChain) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    // A tunnel the maintenance scan is allowed to reap: any non-Connecting
+    // TunnelImpl idle past the timeout qualifies.
+    auto victim = std::make_shared<TunnelImpl>(io_ctx, /*tunnel_id=*/1, /*friend_number=*/0);
+    victim->set_on_send_to_tox([](std::span<const uint8_t>) { return true; });
+    victim->set_state(Tunnel::State::Connected);
+    ASSERT_TRUE(shared_manager->add_tunnel(1, victim));
+
+    shared_manager->enable_reaper(/*idle_timeout_seconds=*/1, /*tick_seconds=*/1);
+    const std::uint64_t stale_epoch = shared_manager->reaper_epoch();
+
+    shared_manager->disable_reaper();
+    shared_manager->enable_reaper(/*idle_timeout_seconds=*/1, /*tick_seconds=*/1);
+    ASSERT_NE(shared_manager->reaper_epoch(), stale_epoch);
+
+    shared_manager->rearm_reaper_after_tick(stale_epoch);
+
+    // The surviving chain must still tick and reap. Before the fix the stale
+    // re-arm cancelled it and nothing ever ran the scan.
+    EXPECT_TRUE(PumpUntil(
+        io_ctx, [&shared_manager] { return shared_manager->tunnel_count() == 0; },
+        std::chrono::milliseconds(6000)))
+        << "a retired tick's re-arm must not cancel the live maintenance chain";
+}
+
+// ============================================================================
+// 15c. Outbound send gate (H-2, 3rd review)
+//
+// A mute latch alone could not stop a stale frame: every send path copies its
+// callback out from under a lock and invokes it AFTER the unlock (it must — a
+// Tox send re-enters the manager, and holding a lock across it deadlocks;
+// H-01). A sender could therefore copy the callback *after* the latch was set
+// and deliver its frame, and one stale TUNNEL_CLOSE is enough to close the
+// winner's identically-numbered tunnel (ids are recycled per friend).
+//
+// The fix is a snapshot: gate-test and callback-copy in one critical section.
+// That bounds snapshot ACQUISITION only. The stronger form — close_all_local()
+// blocking until every pre-gate snapshot was released — was withdrawn because
+// it deadlocked against coalesce_mutex_, so a send authorised just before the
+// gate closed may still land. These tests therefore pin the post-return state
+// (no NEW send can be authorised), not the absence of a running one. See
+// TunnelManager::close_all_local() for the full residual.
+// ============================================================================
+
+namespace {
+
+/// A send callback that parks inside itself until the test releases it, so the
+/// test can hold a send running across close_all_local().
+struct BlockingSend {
+    std::atomic<bool> entered{false};  ///< Set once the callback has been entered.
+    std::atomic<bool> release{false};  ///< Test sets this to let the callback finish.
+    std::atomic<int> invocations{0};
+
+    void run() {
+        invocations.fetch_add(1, std::memory_order_relaxed);
+        entered.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+
+    void wait_until_entered() {
+        while (!entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+};
+
+}  // namespace
+
+TEST_F(TunnelManagerTest, CloseAllLocal_FencesAnInFlightManagerSend) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    BlockingSend blocking;
+    shared_manager->set_send_handler([&blocking](const std::vector<uint8_t>&) {
+        blocking.run();
+        return SendOutcome::Sent;
+    });
+
+    // A sender that is *already inside* the handler — i.e. one that copied the
+    // handler before the session was abandoned.
+    std::thread sender(
+        [&shared_manager] { shared_manager->send_frame(ProtocolFrame::make_ping()); });
+    blocking.wait_until_entered();
+
+    // Let it finish only after close_all_local() has had time to observe it.
+    std::thread releaser([&blocking] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        blocking.release.store(true, std::memory_order_release);
+    });
+
+    shared_manager->close_all_local();
+
+    // The contract is deliberately NOT "nothing is in flight on return".
+    // Waiting for in-flight sends deadlocked (see close_all_local()'s docs).
+    // What IS guaranteed — and is what protects the winning session — is that
+    // no send can acquire a handler SNAPSHOT once the gate is closed. Note the
+    // assertion below is about the post-return state, not about this
+    // already-entered send: a pre-gate snapshot may still land, so counting
+    // invocations across close_all_local() would prove nothing.
+    releaser.join();
+    sender.join();
+
+    // No new post-gate send can be authorised.
+    const int baseline_invocations = blocking.invocations.load();
+    EXPECT_FALSE(shared_manager->send_frame(ProtocolFrame::make_ping()));
+    PumpFor(io_ctx, std::chrono::milliseconds(100));
+    EXPECT_EQ(blocking.invocations.load(), baseline_invocations);
+}
+
+TEST_F(TunnelManagerTest, CloseAllLocal_FencesAnInFlightTunnelSend) {
+    auto shared_manager = std::make_shared<TunnelManager>(io_ctx);
+
+    // The per-tunnel path bypasses the manager entirely (Tunnel::on_send_to_tox
+    // goes straight into ToxAdapter), so the manager's own latch cannot cover
+    // it — this is the leak the review measured as "one frame per concurrently
+    // sending tunnel".
+    auto tunnel = std::make_shared<TunnelImpl>(io_ctx, /*tunnel_id=*/1, /*friend_number=*/0);
+    BlockingSend blocking;
+    tunnel->set_on_send_to_tox([&blocking](std::span<const uint8_t>) {
+        blocking.run();
+        return true;
+    });
+    tunnel->set_state(Tunnel::State::Connected);
+    ASSERT_TRUE(shared_manager->add_tunnel(1, tunnel));
+
+    std::thread sender([&tunnel] { tunnel->send_error(3, "in flight"); });
+    blocking.wait_until_entered();
+
+    std::thread releaser([&blocking] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        blocking.release.store(true, std::memory_order_release);
+    });
+
+    shared_manager->close_all_local();
+
+    // As above: sends authorised before the gate closed are NOT waited for
+    // (that deadlocks). The guarantee under test is that the per-tunnel gate is
+    // closed afterwards, so the send path that bypasses the manager entirely
+    // cannot acquire another callback snapshot.
+
+    releaser.join();
+    sender.join();
+
+    // The gate holds afterwards: a send that starts from here can no longer
+    // acquire a callback, so it never reaches the peer. (A send that acquired
+    // one before the gate closed is not covered — that is the documented
+    // residual, and the count is sampled after the running one has finished so
+    // it cannot be confused with it.)
+    const int baseline_invocations = blocking.invocations.load();
+    EXPECT_TRUE(tunnel->outbound_gate_closed());
+    tunnel->send_error(3, "after the fence");
+    EXPECT_EQ(blocking.invocations.load(), baseline_invocations)
+        << "a send begun after the outbound gate closed must not reach the peer";
+}
+
+// Regression: a send callback that abandons its own session must not deadlock.
+//
+// The coalesced data path invokes the Tox send callback while holding the
+// tunnel's `coalesce_mutex_`. If that callback tears the session down —
+// close_all_local() -> force_close() -> flush_pending_writes() — the flush
+// re-takes that same non-recursive mutex on the same thread and the process
+// wedges. force_close() takes its local-abandon path (no flush) once the
+// outbound gate is closed, which is exactly the state close_all_local()
+// establishes before it force-closes anything.
+//
+// This test hangs forever on a regression, so it runs the teardown on its own
+// thread and fails on a deadline rather than taking the suite down with it.
+TEST_F(TunnelManagerTest, CloseAllLocalFromInsideSendCallbackDoesNotDeadlock) {
+    // Everything the victim thread touches lives on the heap behind one
+    // shared_ptr, and the thread holds its own copy. That matters only on
+    // failure: a deadlocked thread cannot be joined, and detaching it while it
+    // still references stack objects would turn a clean test failure into
+    // undefined behaviour when this frame unwinds. On timeout we leak `state`
+    // into a function-local static instead, so the wedged thread keeps a valid
+    // manager, tunnel and io_context for as long as the process lives.
+    struct Fixture {
+        asio::io_context io;
+        std::shared_ptr<TunnelManager> manager{std::make_shared<TunnelManager>(io)};
+        std::shared_ptr<TunnelImpl> tunnel{
+            std::make_shared<TunnelImpl>(io, /*tunnel_id=*/1, /*friend_number=*/0)};
+        std::atomic<bool> torn_down{false};
+        std::promise<void> done;
+    };
+    auto state = std::make_shared<Fixture>();
+
+    // max_delay_us == 0 emits inline, so the callback below runs underneath
+    // coalesce_mutex_ — the whole point of the reproduction.
+    state->tunnel->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    state->tunnel->set_on_send_to_tox([state](std::span<const uint8_t>) {
+        // Abandon the session from inside the send. No production caller does
+        // this today: close_all_local()'s only production call site is the
+        // resurrection-loser path (tunnel_server.cpp, resume), which runs on
+        // the inbound strand, EXTERNAL to any send callback. The re-entrant
+        // shape is constructed deliberately here to prove the guard holds if a
+        // future caller ever does take that route.
+        if (!state->torn_down.exchange(true)) {
+            state->manager->close_all_local();
+        }
+        return true;
+    });
+    state->tunnel->set_state(Tunnel::State::Connected);
+    ASSERT_TRUE(state->manager->add_tunnel(1, state->tunnel));
+
+    auto done_future = state->done.get_future();
+    std::thread victim([state] {
+        (void)state->tunnel->send_data_to_tox(std::vector<uint8_t>{1, 2, 3, 4});
+        state->done.set_value();
+    });
+
+    const auto status = done_future.wait_for(std::chrono::seconds(10));
+    EXPECT_EQ(status, std::future_status::ready)
+        << "send callback -> close_all_local() -> force_close() self-deadlocked on "
+           "coalesce_mutex_";
+    if (status == std::future_status::ready) {
+        victim.join();
+        EXPECT_TRUE(state->torn_down.load());
+        EXPECT_TRUE(state->manager->outbound_muted());
+    } else {
+        // Deadlocked: joining would hang the suite too. Keep the thread's state
+        // alive forever and let the remaining tests run.
+        static std::vector<std::shared_ptr<Fixture>> leaked_on_deadlock;
+        leaked_on_deadlock.push_back(state);
+        victim.detach();
+    }
+}
+
+// ============================================================================
+// Friend pre-seeding from the access rules
+//
+// The server's only path into the Tox friend list used to be
+// on_friend_request(), which refuses any key not already in rules.yaml. A client
+// that connected before its key was added therefore deadlocked permanently: it
+// had already persisted the server, so toxcore never re-sent the friend request.
+// preseed_friends_from_rules() closes the hole; friend_keys_to_preseed() is its
+// pure set-difference core.
+// ============================================================================
+
+namespace {
+
+// Valid 64-char hex public keys (content is arbitrary, shape is what matters).
+constexpr const char* kPkA = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+constexpr const char* kPkB = "FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210";
+constexpr const char* kPkC = "AAAABBBBCCCCDDDDEEEEFFFF00001111AAAABBBBCCCCDDDDEEEEFFFF00002222";
+
+}  // namespace
+
+TEST(FriendPreseedTest, AddsEveryRuleKeyWhenFriendListIsEmpty) {
+    // First-ever startup: nothing in tox_save.dat yet.
+    auto missing = toxtunnel::app::detail::friend_keys_to_preseed({kPkA, kPkB}, {});
+    ASSERT_EQ(missing.size(), 2u);
+    EXPECT_THAT(missing, ::testing::UnorderedElementsAre(kPkA, kPkB));
+}
+
+TEST(FriendPreseedTest, SkipsKeysAlreadyInTheFriendList) {
+    // Idempotence: this is what makes it safe to call on every reload, and what
+    // keeps add_friend_norequest() (which fsyncs tox_save.dat) from running and
+    // logging a duplicate-add failure on every SIGHUP.
+    auto missing = toxtunnel::app::detail::friend_keys_to_preseed({kPkA, kPkB}, {kPkA});
+    ASSERT_EQ(missing.size(), 1u);
+    EXPECT_EQ(missing[0], kPkB);
+}
+
+TEST(FriendPreseedTest, NothingToDoWhenEveryRuleKeyIsAlreadyAFriend) {
+    EXPECT_TRUE(toxtunnel::app::detail::friend_keys_to_preseed({kPkA, kPkB}, {kPkB, kPkA}).empty());
+}
+
+TEST(FriendPreseedTest, OnlyNewlyAddedRuleKeyIsSeededOnReload) {
+    // The regression scenario, in the shape reload() sees it: the operator adds
+    // the client's key to rules.yaml while the daemon is up. Exactly that key
+    // must be handed to add_friend_norequest().
+    auto missing = toxtunnel::app::detail::friend_keys_to_preseed({kPkA, kPkB, kPkC}, {kPkA, kPkB});
+    ASSERT_EQ(missing.size(), 1u);
+    EXPECT_EQ(missing[0], kPkC);
+}
+
+TEST(FriendPreseedTest, ComparesKeysCaseInsensitively) {
+    // RulesEngine canonicalises to uppercase and tox::bytes_to_hex emits
+    // uppercase, but a lowercase key reaching either side must not be mistaken
+    // for a new friend and re-added on every reload.
+    std::string lower_a(kPkA);
+    for (auto& c : lower_a) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    EXPECT_TRUE(toxtunnel::app::detail::friend_keys_to_preseed({lower_a}, {kPkA}).empty());
+
+    // And the emitted key is canonical uppercase, ready for parse_public_key().
+    auto missing = toxtunnel::app::detail::friend_keys_to_preseed({lower_a}, {});
+    ASSERT_EQ(missing.size(), 1u);
+    EXPECT_EQ(missing[0], kPkA);
+}
+
+TEST(FriendPreseedTest, DeduplicatesRepeatedRuleKeys) {
+    // Two rules for the same friend must not produce two add attempts (the
+    // second would fail with "friend request already sent" and log a warning).
+    auto missing = toxtunnel::app::detail::friend_keys_to_preseed({kPkA, kPkA, kPkB}, {});
+    ASSERT_EQ(missing.size(), 2u);
+    EXPECT_THAT(missing, ::testing::UnorderedElementsAre(kPkA, kPkB));
+}
+
+TEST(FriendPreseedTest, DropsMalformedKeys) {
+    // Nothing here may reach tox_friend_add_norequest(), which reads a fixed
+    // 32-byte buffer from the pointer it is given.
+    const std::vector<std::string> bad = {
+        "",
+        "not-hex",
+        "0123456789ABCDEF",                                                  // too short
+        std::string(kPkA) + "00",                                            // too long
+        "ZZ23456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",  // bad nibbles
+    };
+    EXPECT_TRUE(toxtunnel::app::detail::friend_keys_to_preseed(bad, {}).empty());
+
+    // A malformed entry must not suppress the valid ones alongside it.
+    std::vector<std::string> mixed = bad;
+    mixed.push_back(kPkC);
+    auto missing = toxtunnel::app::detail::friend_keys_to_preseed(mixed, {});
+    ASSERT_EQ(missing.size(), 1u);
+    EXPECT_EQ(missing[0], kPkC);
 }
