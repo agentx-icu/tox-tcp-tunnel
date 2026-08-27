@@ -10,6 +10,7 @@
 #include "toxtunnel/tox/tox_watchdog.hpp"
 #include "toxtunnel/util/atomic_file.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/metrics.hpp"
 #include "toxtunnel/util/path_security.hpp"
 
 namespace toxtunnel::tox {
@@ -169,7 +170,14 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
                 msg += "memory allocation failed";
                 break;
             case TOX_ERR_NEW_PORT_ALLOC:
-                msg += "could not bind to port";
+                // The single most common startup failure on a host that already
+                // runs a toxtunnel: the UDP port walks to the next free one,
+                // the Tox TCP relay port does not. Say which port and which
+                // config key, because "could not bind to port" sent three
+                // separate people hunting the wrong thing.
+                msg += "could not bind Tox TCP relay port " + std::to_string(config_.tcp_port) +
+                       " (set tox.tcp_port to a free port; unlike the UDP port it does not "
+                       "auto-select)";
                 break;
             case TOX_ERR_NEW_PROXY_BAD_TYPE:
                 msg += "bad proxy type";
@@ -695,8 +703,31 @@ ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(uint32_t 
             return LosslessSendOutcome::Sent;
         }
 
-        util::Logger::debug("Send lossless packet failed for friend {}: error {}", friend_number,
-                            static_cast<int>(err));
+        // Rate-limited: a friend going offline turns this into a retry-loop
+        // flood (measured: 952 lines / 20 s, ~48 Hz, from a loop that retries
+        // with no backoff). Kept at debug rather than demoted to trace so the
+        // failure is still visible at the level operators actually run, but
+        // capped at one line per second — the suffix on that line carries how
+        // many identical failures were folded into it.
+        //
+        // Bucketed by (friend, error code) rather than one throttle for the
+        // whole site: those two fields are exactly what distinguishes one
+        // failure from another here, and a single bucket let the loudest pair
+        // eat the entire budget. With one offline friend spinning at ~48 Hz, a
+        // *second* friend's first FRIEND_NOT_CONNECTED — or the same friend's
+        // transition from SENDQ (transient, retried) to NOT_CONNECTED
+        // (permanent, gives up) — was folded into a `[+N suppressed]` tally and
+        // never printed, which is the one correlation an operator reads this
+        // line to find. 64 buckets: the key space is friends × the 7 distinct
+        // TOX_ERR_FRIEND_CUSTOM_PACKET values, and in practice only a couple of
+        // error codes ever fire, so a server with a few dozen friends still
+        // spreads thinly; a collision merely restores the old shared-budget
+        // behaviour for that one pair. Cost is ~2.5 KiB of static atomics.
+        static util::KeyedLogThrottle<64> send_fail_throttle{std::chrono::seconds(1)};
+        util::Logger::debug_throttled(
+            send_fail_throttle.for_key(util::log_key(friend_number, static_cast<uint32_t>(err))),
+            "Send lossless packet failed for friend {}: error {}", friend_number,
+            static_cast<int>(err));
         // SENDQ-full is the only error class we want callers to retry: toxcore's
         // outbound queue is bounded and drains as packets transit. Every other
         // error (NULL / EMPTY / INVALID / TOO_LONG / FRIEND_NOT_FOUND /
@@ -875,12 +906,23 @@ void ToxAdapter::run_loop() {
         uint32_t interval;
         {
             std::lock_guard<std::mutex> lock(tox_mutex_);
+            const auto iterate_start = std::chrono::steady_clock::now();
             tox_iterate(tox_.get(), this);
             // Watchdog heartbeat: bumped immediately on return so a hang
             // inside `tox_iterate` is detected by the main-thread observer.
             if (auto* wd = watchdog_.load(std::memory_order_acquire)) {
                 wd->heartbeat();
             }
+            // Feed the iterate-lag summary. This observation used to live only
+            // in ToxThread::run_loop(), a class nothing ever instantiates, so
+            // toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max} were
+            // permanently 0 — and the alert rule documented in
+            // docs/ADVANCED_SCENARIOS.md (`..._max > 100`) could never fire.
+            // This is the loop that actually runs.
+            util::MetricsRegistry::instance().observe_iterate_lag_ms(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          iterate_start)
+                    .count());
             interval = tox_iteration_interval(tox_.get());
         }
 
