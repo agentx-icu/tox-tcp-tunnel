@@ -17,8 +17,14 @@ TcpListener::TcpListener(asio::io_context& io, std::uint16_t port) : acceptor_(i
 
 TcpListener::TcpListener(asio::io_context& io, const std::string& address, std::uint16_t port)
     : acceptor_(io), port_(port) {
-    asio::ip::tcp::endpoint endpoint(asio::ip::make_address(address), port);
-    setup_acceptor(endpoint);
+    asio::error_code ec;
+    const auto addr = asio::ip::make_address(address, ec);
+    if (ec) {
+        bind_error_ = ec;
+        util::Logger::error("TcpListener: invalid listen address '{}': {}", address, ec.message());
+        return;
+    }
+    setup_acceptor(asio::ip::tcp::endpoint(addr, port));
 }
 
 TcpListener::~TcpListener() {
@@ -31,6 +37,11 @@ TcpListener::~TcpListener() {
 
 void TcpListener::start_accept(AcceptHandler handler) {
     if (accepting_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!is_bound()) {
+        util::Logger::warn("TcpListener: not accepting on port {} (bind failed: {})", port_,
+                           bind_error_.message());
         return;
     }
 
@@ -121,13 +132,51 @@ asio::ip::tcp::endpoint TcpListener::local_endpoint() const {
 // ===========================================================================
 
 void TcpListener::setup_acceptor(const asio::ip::tcp::endpoint& endpoint) {
-    acceptor_.open(endpoint.protocol());
-    acceptor_.set_option(asio::socket_base::reuse_address(true));
-    acceptor_.bind(endpoint);
-    acceptor_.listen(asio::socket_base::max_listen_connections);
+    // Non-throwing throughout: "local port already in use" is the single most
+    // common operator mistake (two daemons, or the port taken by another
+    // process), and it used to escape the constructor as an uncaught
+    // std::system_error — std::terminate at startup, and worse, terminate from
+    // inside an asio handler when a SIGHUP reload added a busy forward port.
+    // Now it is recorded and reported by the caller.
+    asio::error_code ec;
+    acceptor_.open(endpoint.protocol(), ec);
+    if (!ec) {
+        // Windows' SO_REUSEADDR is NOT POSIX's: it lets a *different* process bind a
+        // port we are already listening on and silently steal part of the incoming
+        // connections. SO_EXCLUSIVEADDRUSE is Microsoft's documented server-side
+        // equivalent of POSIX "fail if the port is busy" — without it, a second
+        // toxtunnel configured with the same local port binds successfully on Windows
+        // and the two processes split traffic unpredictably.
+#if defined(_WIN32)
+        int exclusive = 1;
+        if (::setsockopt(acceptor_.native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                         reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) != 0) {
+            ec = asio::error_code(::WSAGetLastError(), asio::error::get_system_category());
+        }
+#else
+        acceptor_.set_option(asio::socket_base::reuse_address(true), ec);
+#endif
+    }
+    if (!ec) {
+        acceptor_.bind(endpoint, ec);
+    }
+    if (!ec) {
+        acceptor_.listen(asio::socket_base::max_listen_connections, ec);
+    }
+    if (ec) {
+        bind_error_ = ec;
+        util::Logger::error("TcpListener: failed to bind {}:{}: {}", endpoint.address().to_string(),
+                            endpoint.port(), ec.message());
+        asio::error_code ignored;
+        acceptor_.close(ignored);
+        return;
+    }
 
     // Update the port in case 0 was specified (OS-assigned).
-    port_ = acceptor_.local_endpoint().port();
+    const auto local = acceptor_.local_endpoint(ec);
+    if (!ec) {
+        port_ = local.port();
+    }
 
     util::Logger::debug("TcpListener: bound to {}:{}", endpoint.address().to_string(), port_);
 }
