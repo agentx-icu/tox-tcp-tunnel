@@ -1243,3 +1243,279 @@ server: {}
     ASSERT_TRUE(result.has_value()) << result.error();
     EXPECT_EQ(result.value().data_dir, "~someuser/data");
 }
+
+// ---------------------------------------------------------------------------
+// Parser-effect tests: keys that reach the live Config
+//
+// `config_diagnostics` only proves a key is *spelled* correctly; it says
+// nothing about whether the parser reads it. `inspect` and
+// `client.fallback_server_ids` were both allowlisted there while
+// `convert<Config>::decode` ignored them, so the documented settings were
+// silently dropped. These tests assert the parsed Config actually carries the
+// value, which is the property the allowlist tests cannot see.
+// ---------------------------------------------------------------------------
+
+TEST_F(ConfigTest, InspectDefaultsToEnabledWhenBlockAbsent) {
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_TRUE(result.value().inspect.enabled);
+}
+
+TEST_F(ConfigTest, ParseInspectDisabled) {
+    // The documented way to keep a host from opening the local IPC socket.
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+inspect:
+  enabled: false
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_FALSE(result.value().inspect.enabled);
+}
+
+TEST_F(ConfigTest, ParseInspectExplicitlyEnabled) {
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+inspect:
+  enabled: true
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_TRUE(result.value().inspect.enabled);
+}
+
+TEST_F(ConfigTest, ParseInspectScalarShorthand) {
+    // convert<InspectConfig>::decode also accepts the bare-bool spelling.
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+inspect: false
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_FALSE(result.value().inspect.enabled);
+}
+
+TEST_F(ConfigTest, RoundTripInspectDisabled) {
+    Config original = Config::default_server();
+    original.data_dir = "/inspect/round/trip";
+    original.inspect.enabled = false;
+
+    const std::string yaml = original.to_yaml();
+    EXPECT_TRUE(yaml.find("inspect:") != std::string::npos) << yaml;
+
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_FALSE(result.value().inspect.enabled);
+}
+
+TEST_F(ConfigTest, DefaultInspectIsOmittedFromEncodedYaml) {
+    // Same conditional-emit policy `to_yaml()` applies to `metrics`: a default
+    // block is noise in a generated file. Its absence must still decode to
+    // enabled. (Not `watchdog` — `to_yaml()` is a hand-rolled emitter separate
+    // from convert<Config>::encode and never emits watchdog/tunnel/flow_control
+    // at all. That duplication is pre-existing follow-up debt.)
+    Config original = Config::default_server();
+    const std::string yaml = original.to_yaml();
+    EXPECT_TRUE(yaml.find("inspect:") == std::string::npos) << yaml;
+
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_TRUE(result.value().inspect.enabled);
+}
+
+TEST_F(ConfigTest, ParseFallbackServerIdsKeyNested) {
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+client:
+  server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+  fallback_server_ids:
+    - 1111111111111111111111111111111111111111111111111111111111111111111111111111
+    - 2222222222222222222222222222222222222222222222222222222222222222222222222222
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().client.has_value());
+    const auto& client = *result.value().client;
+    EXPECT_EQ(client.server_id,
+              "0000000000000000000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_EQ(client.fallback_server_ids.size(), 2u);
+    EXPECT_EQ(client.fallback_server_ids[0],
+              "1111111111111111111111111111111111111111111111111111111111111111111111111111");
+    EXPECT_EQ(client.fallback_server_ids[1],
+              "2222222222222222222222222222222222222222222222222222222222222222222222222222");
+    // all_server_ids() is what TunnelClient's failover state machine walks.
+    EXPECT_EQ(client.all_server_ids().size(), 3u);
+}
+
+TEST_F(ConfigTest, ParseFallbackServerIdsKeyFlatLayout) {
+    // The legacy flat layout reads client keys straight off the root node.
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+fallback_server_ids:
+  - 1111111111111111111111111111111111111111111111111111111111111111111111111111
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().client.has_value());
+    ASSERT_EQ(result.value().client->fallback_server_ids.size(), 1u);
+    EXPECT_EQ(result.value().client->fallback_server_ids[0],
+              "1111111111111111111111111111111111111111111111111111111111111111111111111111");
+}
+
+TEST_F(ConfigTest, FallbackServerIdsKeyAppendsToServerIdListForm) {
+    // Both spellings are documented; mixing them accumulates rather than one
+    // silently winning. A genuine duplicate is then validate()'s to reject.
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+client:
+  server_id:
+    - 0000000000000000000000000000000000000000000000000000000000000000000000000000
+    - 1111111111111111111111111111111111111111111111111111111111111111111111111111
+  fallback_server_ids:
+    - 2222222222222222222222222222222222222222222222222222222222222222222222222222
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().client.has_value());
+    const auto& client = *result.value().client;
+    EXPECT_EQ(client.server_id,
+              "0000000000000000000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_EQ(client.fallback_server_ids.size(), 2u);
+    EXPECT_EQ(client.fallback_server_ids[0],
+              "1111111111111111111111111111111111111111111111111111111111111111111111111111");
+    EXPECT_EQ(client.fallback_server_ids[1],
+              "2222222222222222222222222222222222222222222222222222222222222222222222222222");
+}
+
+// A non-sequence `fallback_server_ids` used to be dropped on the floor: the
+// decoder tested `IsSequence()` and did nothing otherwise, so a scalar parsed,
+// passed `config check --strict` with exit 0 and "valid (client mode)", and the
+// daemon started with no fallback at all. Silently ignoring a key the operator
+// wrote is the worst of the available behaviours — these pin the two shapes we
+// accept and the one we reject.
+TEST_F(ConfigTest, ParseFallbackServerIdsScalarShorthand) {
+    // Mirrors `server_id`, which has always taken either a scalar or a list.
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+client:
+  server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+  fallback_server_ids: 1111111111111111111111111111111111111111111111111111111111111111111111111111
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().client.has_value());
+    const auto& client = *result.value().client;
+    ASSERT_EQ(client.fallback_server_ids.size(), 1u)
+        << "a scalar fallback must not be silently discarded";
+    EXPECT_EQ(client.fallback_server_ids[0],
+              "1111111111111111111111111111111111111111111111111111111111111111111111111111");
+    EXPECT_EQ(client.all_server_ids().size(), 2u);
+}
+
+TEST_F(ConfigTest, ParseFallbackServerIdsEmptyKeyIsEmptyList) {
+    // An explicit-but-valueless key is "no fallbacks", not a parse error.
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+client:
+  server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+  fallback_server_ids:
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().client.has_value());
+    EXPECT_TRUE(result.value().client->fallback_server_ids.empty());
+}
+
+TEST_F(ConfigTest, ParseFallbackServerIdsMapIsRejected) {
+    // A map cannot be read as a tox id. It must surface as a parse failure
+    // rather than being quietly ignored the way it was before.
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+client:
+  server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+  fallback_server_ids:
+    some_key: 1111111111111111111111111111111111111111111111111111111111111111111111111111
+)";
+    auto result = Config::from_string(yaml);
+    EXPECT_FALSE(result.has_value()) << "a map-valued fallback_server_ids must not parse as valid";
+}
+
+// convert<ClientConfig> is a public specialisation with no in-tree caller
+// today. It is tested directly because the standalone and Config-embedded
+// decoders drifting apart is precisely how fallback_server_ids came to be
+// unreadable in one of them.
+TEST_F(ConfigTest, StandaloneClientConfigDecoderReadsFallbackKey) {
+    const YAML::Node node = YAML::Load(R"(
+server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+fallback_server_ids:
+  - 1111111111111111111111111111111111111111111111111111111111111111111111111111
+)");
+    const auto client = node.as<ClientConfig>();
+    EXPECT_EQ(client.server_id,
+              "0000000000000000000000000000000000000000000000000000000000000000000000000000");
+    ASSERT_EQ(client.fallback_server_ids.size(), 1u);
+    EXPECT_EQ(client.fallback_server_ids[0],
+              "1111111111111111111111111111111111111111111111111111111111111111111111111111");
+}
+
+TEST_F(ConfigTest, StandaloneClientConfigDecoderTakesScalarFallback) {
+    const YAML::Node node = YAML::Load(R"(
+server_id: 0000000000000000000000000000000000000000000000000000000000000000000000000000
+fallback_server_ids: 1111111111111111111111111111111111111111111111111111111111111111111111111111
+)");
+    const auto client = node.as<ClientConfig>();
+    ASSERT_EQ(client.fallback_server_ids.size(), 1u);
+    EXPECT_EQ(client.fallback_server_ids[0],
+              "1111111111111111111111111111111111111111111111111111111111111111111111111111");
+}
+
+TEST_F(ConfigTest, ParseServerIdSequencePopulatesFallbacks) {
+    // Pre-existing path, pinned so the fallback_server_ids fix cannot regress it.
+    const char* yaml = R"(
+mode: client
+data_dir: /tmp/data
+client:
+  server_id:
+    - 0000000000000000000000000000000000000000000000000000000000000000000000000000
+    - 1111111111111111111111111111111111111111111111111111111111111111111111111111
+)";
+    auto result = Config::from_string(yaml);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().client.has_value());
+    ASSERT_EQ(result.value().client->fallback_server_ids.size(), 1u);
+    EXPECT_EQ(result.value().client->fallback_server_ids[0],
+              "1111111111111111111111111111111111111111111111111111111111111111111111111111");
+}
+
+TEST_F(ConfigTest, RoundTripFallbackServerIds) {
+    // encode() folds the fallbacks into the list form of `server_id`; decode
+    // must give them back unchanged.
+    Config original = Config::default_client();
+    original.data_dir = "/fallback/round/trip";
+    original.client->server_id =
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000";
+    original.client->fallback_server_ids = {
+        "1111111111111111111111111111111111111111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222222222222222222222222222222222222222"};
+
+    auto result = Config::from_string(original.to_yaml());
+    ASSERT_TRUE(result.has_value()) << result.error();
+    ASSERT_TRUE(result.value().client.has_value());
+    EXPECT_EQ(result.value().client->server_id, original.client->server_id);
+    EXPECT_EQ(result.value().client->fallback_server_ids, original.client->fallback_server_ids);
+}
