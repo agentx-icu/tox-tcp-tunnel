@@ -26,8 +26,7 @@
 | `TunnelManager`     | Manages multiple concurrent tunnels per friend connection        |
 | `Tunnel`            | State machine for a single bidirectional tunnel                  |
 | `ProtocolFrame`     | Binary frame serialization/deserialization                       |
-| `ToxAdapter`        | High-level wrapper for the toxcore C API                         |
-| `ToxThread`         | **Unused.** Compiled but never instantiated; the toxcore event loop lives in `ToxAdapter`. Kept in-tree pending a decision to delete or adopt it — do not add to it, and do not assume anything registered there runs. |
+| `ToxAdapter`        | High-level wrapper for the toxcore C API. Owns the one dedicated Tox thread and its `tox_iterate` loop — all new Tox-thread work belongs here. |
 | `RulesEngine`       | Per-friend access control (allow/deny rules)                     |
 | `KnownServersStore` | Client-only YAML-backed registry of previously-connected servers (`<data_dir>/known_servers.yaml`); provides alias resolution for `--server-id` and `client.server_id`. |
 | `SystemInfo`        | Server-side platform probes gated by `ServerInfoDisclose` policy (hostname / os / arch / uptime / version). Used to build `INFO_REPLY` payloads. |
@@ -492,7 +491,6 @@ tox-tcp-tunnel/
       types.hpp
       tox_adapter.hpp
       tox_connection.hpp
-      tox_thread.hpp
       tox_save.hpp
       bootstrap_source.hpp
     tunnel/                     # Tunnel protocol

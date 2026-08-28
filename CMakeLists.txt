@@ -140,7 +140,6 @@ target_sources(toxtunnel_lib PRIVATE
     src/tox/types.cpp
     src/tox/tox_ptr.cpp
     src/tox/tox_save.cpp
-    src/tox/tox_thread.cpp
     src/tox/tox_connection.cpp
     src/tox/tox_adapter.cpp
     src/tox/tox_watchdog.cpp

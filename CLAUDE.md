@@ -97,7 +97,7 @@ than expanding this section.
 |-------|------------|
 | Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter`, `TunnelResumeStore` |
 | TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
-| Tox | `ToxAdapter` (owns the iterate thread), `ToxConnection`, `ToxWatchdog`. NOTE: `ToxThread` is compiled but **nothing instantiates it** — the live loop is `ToxAdapter`'s. Wire new tox-thread work into `ToxAdapter`, not `ToxThread`. |
+| Tox | `ToxAdapter` (owns the iterate thread), `ToxConnection`, `ToxWatchdog`. NOTE: `ToxAdapter` owns the **only** Tox event loop — wire all new tox-thread work into it. |
 | Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame`, `OwnedFrameBuffer`, `WriteCoalescer`, `BdpFlowControl`, `TunnelIdAllocator` |
 | Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger`, `atomic_write_file`, `PidFileGuard` |
 

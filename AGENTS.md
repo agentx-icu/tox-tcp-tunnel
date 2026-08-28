@@ -82,7 +82,7 @@ than expanding this section.
 |-------|------------|
 | Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter`, `TunnelResumeStore` |
 | TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
-| Tox | `ToxAdapter`, `ToxConnection`, `ToxThread`, `ToxWatchdog` |
+| Tox | `ToxAdapter` (owns the only Tox event loop), `ToxConnection`, `ToxWatchdog` |
 | Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame`, `OwnedFrameBuffer`, `WriteCoalescer`, `BdpFlowControl`, `TunnelIdAllocator` |
 | Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger`, `atomic_write_file` |
 
@@ -97,7 +97,7 @@ between primary and fallback Tox IDs. `InspectServer` accepts local IPC
 
 - **I/O thread pool** — async TCP via asio; `MetricsServer`, `InspectServer`,
   and `Socks5Listener` all run on this same `IoContext` (no new threads)
-- **Dedicated Tox thread** — all toxcore API calls funnel through one thread; **toxcore is not thread-safe**, so cross-thread calls must marshal through `ToxThread`
+- **Dedicated Tox thread** — all toxcore API calls funnel through one thread; **toxcore is not thread-safe**, so cross-thread calls must marshal through `ToxAdapter` (`run_on_tox_thread`)
 - **Main thread** — signal handling (`SIGHUP` triggers `config_reload`) and orchestration
 - **Windows reload pipe thread** — Windows lacks `SIGHUP`; a small dedicated
   thread serves `\\.\pipe\toxtunnel-reload-<pid>` and posts reload onto the
