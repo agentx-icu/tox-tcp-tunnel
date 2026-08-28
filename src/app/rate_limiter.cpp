@@ -7,6 +7,24 @@
 
 namespace toxtunnel {
 
+namespace {
+
+constexpr std::int64_t kNanosPerSec = 1'000'000'000LL;
+
+}  // namespace
+
+RateLimitSpec normalise_byte_budgets(RateLimitSpec spec) noexcept {
+    spec.bytes_per_sec = std::min(spec.bytes_per_sec, kMaxByteBudget);
+    spec.bytes_burst = std::min(spec.bytes_burst, kMaxByteBudget);
+    // Only an *engaged* burst gets the floor: `bytes_burst: 0` is the operator
+    // saying "no byte limiting", and raising that to 64 KiB would switch the
+    // feature on for someone who explicitly switched it off.
+    if (spec.bytes_burst != 0) {
+        spec.bytes_burst = std::max(spec.bytes_burst, kMinActiveByteBurst);
+    }
+    return spec;
+}
+
 bool parse_rate_limit_mode(std::string_view s, RateLimitMode& out) noexcept {
     if (s == "off") {
         out = RateLimitMode::Off;
@@ -101,15 +119,38 @@ void RateLimiter::apply_spec(Bucket& b, const RateLimitSpec& spec) {
     }
 }
 
+void RateLimiter::set_clock(NowNanosFn now) {
+    std::lock_guard<std::mutex> lock(mu_);
+    clock_ = std::move(now);
+    // A cursor holds a timestamp from the *previous* clock. Leaving it in place
+    // would make the first refill under the new clock measure the distance
+    // between two unrelated epochs and saturate every bucket.
+    for (auto& entry : buckets_) {
+        entry.second->open_refill_ns.store(0, std::memory_order_relaxed);
+        entry.second->bytes_refill_ns.store(0, std::memory_order_relaxed);
+    }
+}
+
+std::int64_t RateLimiter::now_nanos() const {
+    if (clock_) {
+        return clock_();
+    }
+    // duration_cast, not .count(): steady_clock's period is implementation
+    // defined, and the refill maths treats these values as nanoseconds.
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 void RateLimiter::set_default_spec(const RateLimitSpec& spec) {
     std::lock_guard<std::mutex> lock(mu_);
-    default_spec_ = spec;
+    default_spec_ = normalise_byte_budgets(spec);
     // An override only says what it changes, so every live bucket's effective
     // spec has to be recomputed against the new defaults — including buckets
     // with no override, which were seeded from the previous defaults.
     for (auto& entry : buckets_) {
         Bucket& b = *entry.second;
-        apply_spec(b, b.override_spec.merged_onto(default_spec_));
+        apply_spec(b, normalise_byte_budgets(b.override_spec.merged_onto(default_spec_)));
     }
 }
 
@@ -128,7 +169,7 @@ void RateLimiter::replace_all(const RateLimitSpec& defaults,
     // create path, i.e. seeds a full bucket — the token reset the three-call
     // sequence produced, preserved verbatim.
     buckets_.clear();
-    default_spec_ = defaults;
+    default_spec_ = normalise_byte_budgets(defaults);
     for (const auto& [friend_pk, override_spec] : overrides) {
         install_friend_spec_locked(normalise_key(friend_pk), override_spec);
     }
@@ -140,7 +181,7 @@ void RateLimiter::install_friend_spec_locked(const std::string& key,
         buckets_.erase(key);
         return;
     }
-    const RateLimitSpec resolved = override_spec.merged_onto(default_spec_);
+    const RateLimitSpec resolved = normalise_byte_budgets(override_spec.merged_onto(default_spec_));
     auto it = buckets_.find(key);
     if (it == buckets_.end()) {
         auto bucket = std::make_unique<Bucket>();
@@ -200,63 +241,84 @@ RateLimiter::Bucket* RateLimiter::find_bucket(const std::string& key) const {
     return it == buckets_.end() ? nullptr : it->second.get();
 }
 
-void RateLimiter::refill(Bucket& b) const {
-    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto prev = b.last_refill_ns.exchange(now_ns, std::memory_order_relaxed);
+void RateLimiter::refill_one(std::atomic<std::int64_t>& tokens,
+                             std::atomic<std::int64_t>& cursor_ns, std::int64_t per_sec,
+                             std::int64_t burst, std::int64_t now_ns) {
+    const auto prev = cursor_ns.load(std::memory_order_relaxed);
     if (prev == 0) {
+        // First touch: start measuring from here. A bucket is created full, so
+        // there is nothing to accrue yet.
+        cursor_ns.store(now_ns, std::memory_order_relaxed);
         return;
     }
-    const auto elapsed_ns = now_ns - prev;
-    if (elapsed_ns <= 0) {
+    if (per_sec <= 0 || burst <= 0) {
+        // Unconfigured bucket: keep the cursor fresh so enabling the limit
+        // later does not credit the whole disabled period in one go.
+        cursor_ns.store(now_ns, std::memory_order_relaxed);
         return;
     }
-    // Compute integer refill amounts. Tokens are scaled to the bucket's burst
-    // cap so the bucket never exceeds capacity.
-    //
-    // S25 / H-4 (2026-05-20 review): `per_sec * elapsed_ns` overflows int64
-    // for any bucket that's been idle long enough (per_sec up to 2^32-1,
-    // elapsed_ns unbounded). The old code wrapped to a negative `add` and
-    // starved the friend permanently.
-    //
-    // CI-pedantic-fix follow-up (2026-05-21): the first fix used __int128
-    // which MSVC doesn't have. Replace with the observation that once a
-    // bucket has been idle for `burst / per_sec` seconds it's already
-    // saturated at `burst` regardless of any more elapsed time — so we
-    // can short-circuit and skip the dangerous multiplication entirely.
-    // `burst * 1e9` is safe (burst is at most uint32_t -> 4.3e9 * 1e9 =
-    // 4.3e18 < INT64_MAX). Below that idle threshold, `per_sec *
-    // elapsed_ns` is itself bounded by `burst * 1e9` and therefore safe
-    // too.
-    const auto compute_add = [](std::int64_t per_sec_val, std::int64_t elapsed,
-                                std::int64_t burst) -> std::int64_t {
-        if (per_sec_val <= 0 || elapsed <= 0 || burst <= 0) {
-            return 0;
-        }
-        const std::int64_t ns_to_full = (burst * 1'000'000'000LL) / per_sec_val;
-        if (elapsed >= ns_to_full) {
-            return burst;
-        }
-        return (per_sec_val * elapsed) / 1'000'000'000LL;
-    };
+    const std::int64_t elapsed = now_ns - prev;
+    if (elapsed <= 0) {
+        return;
+    }
 
-    if (b.spec.open_per_sec > 0 && b.spec.open_burst > 0) {
-        const std::int64_t add = compute_add(b.spec.open_per_sec, elapsed_ns, b.spec.open_burst);
-        if (add > 0) {
-            auto cur = b.open_tokens.load(std::memory_order_relaxed);
-            auto next =
-                std::min<std::int64_t>(cur + add, static_cast<std::int64_t>(b.spec.open_burst));
-            b.open_tokens.store(next, std::memory_order_relaxed);
-        }
+    // S25 / H-4 (2026-05-20 review): `per_sec * elapsed` overflows int64 for a
+    // bucket that has been idle long enough, wrapping to a negative refill that
+    // starved the friend permanently. `__int128` fixed it but MSVC lacks it
+    // (CI-pedantic follow-up, 2026-05-21), so instead: once a bucket has been
+    // idle for `burst / per_sec` seconds it is saturated regardless of any
+    // further elapsed time, which lets us skip the dangerous multiplication.
+    // `burst * 1e9` fits because burst is bounded — uint32 on the OPEN bucket,
+    // `kMaxByteBudget` on the byte bucket. Below that threshold `per_sec *
+    // elapsed` is itself bounded by `burst * 1e9` and equally safe.
+    const std::int64_t ns_to_full = (burst * kNanosPerSec) / per_sec;
+    if (elapsed >= ns_to_full) {
+        tokens.store(burst, std::memory_order_relaxed);
+        cursor_ns.store(now_ns, std::memory_order_relaxed);
+        return;
     }
-    if (b.spec.bytes_per_sec > 0 && b.spec.bytes_burst > 0) {
-        const std::int64_t add = compute_add(b.spec.bytes_per_sec, elapsed_ns, b.spec.bytes_burst);
-        if (add > 0) {
-            auto cur = b.bytes_tokens.load(std::memory_order_relaxed);
-            auto next =
-                std::min<std::int64_t>(cur + add, static_cast<std::int64_t>(b.spec.bytes_burst));
-            b.bytes_tokens.store(next, std::memory_order_relaxed);
-        }
+
+    const std::int64_t cur = tokens.load(std::memory_order_relaxed);
+    if (cur >= burst) {
+        // Already at capacity, so this interval earned nothing that the bucket
+        // could hold: spend it rather than bank it. This test has to come
+        // BEFORE the sub-token check below — otherwise a full bucket quietly
+        // banks every fractional interval, and the moment it is drained that
+        // credit pays out a token early.
+        cursor_ns.store(now_ns, std::memory_order_relaxed);
+        return;
     }
+
+    const std::int64_t add = (per_sec * elapsed) / kNanosPerSec;
+    if (add <= 0) {
+        // Less than one whole token has accrued and the bucket has room for it.
+        // Leave the cursor where it is so this interval is credited on a later
+        // call: stamping it to `now` here is what made a fast poller (one
+        // TUNNEL_DATA frame every few hundred microseconds) accrue zero tokens
+        // forever.
+        return;
+    }
+    const std::int64_t next = std::min<std::int64_t>(cur + add, burst);
+    tokens.store(next, std::memory_order_relaxed);
+    if (next == burst) {
+        // Filled up: the part of `add` that overflowed capacity is gone, so the
+        // time that earned it goes with it. Same reasoning as the saturation
+        // test above, for the interval that crosses the brim.
+        cursor_ns.store(now_ns, std::memory_order_relaxed);
+        return;
+    }
+    // Advance by the time those tokens cost, not to `now`, so the sub-token
+    // remainder survives. Floor division keeps the result <= elapsed, so the
+    // cursor can never overtake the clock.
+    cursor_ns.store(prev + (add * kNanosPerSec) / per_sec, std::memory_order_relaxed);
+}
+
+void RateLimiter::refill(Bucket& b) const {
+    const auto now_ns = now_nanos();
+    refill_one(b.open_tokens, b.open_refill_ns, static_cast<std::int64_t>(b.spec.open_per_sec),
+               static_cast<std::int64_t>(b.spec.open_burst), now_ns);
+    refill_one(b.bytes_tokens, b.bytes_refill_ns, static_cast<std::int64_t>(b.spec.bytes_per_sec),
+               static_cast<std::int64_t>(b.spec.bytes_burst), now_ns);
 }
 
 bool RateLimiter::try_consume_open(std::string_view friend_pk) {
@@ -288,6 +350,14 @@ bool RateLimiter::try_consume_open(std::string_view friend_pk) {
 }
 
 bool RateLimiter::try_consume_bytes(std::string_view friend_pk, std::size_t bytes) {
+    std::chrono::nanoseconds ignored{};
+    return try_consume_bytes(friend_pk, bytes, ignored);
+}
+
+bool RateLimiter::try_consume_bytes(std::string_view friend_pk, std::size_t bytes,
+                                    std::chrono::nanoseconds& retry_after,
+                                    ThrottleAccounting accounting) {
+    retry_after = std::chrono::nanoseconds::zero();
     const auto key = normalise_key(friend_pk);
     std::lock_guard<std::mutex> lock(mu_);
     auto& b = get_or_create_bucket(key);
@@ -297,7 +367,16 @@ bool RateLimiter::try_consume_bytes(std::string_view friend_pk, std::size_t byte
         return true;
     }
 
-    const auto need = static_cast<std::int64_t>(bytes);
+    // Charge at most the whole capacity. A request the bucket can never hold
+    // would otherwise be refused on every retry — a livelock dressed up as a
+    // rate limit. `kMinActiveByteBurst` keeps this unreachable for real frames.
+    //
+    // Clamp in the UNSIGNED domain first: `bytes` is a size_t, and casting a
+    // value above INT64_MAX to int64 before the min() is implementation-defined
+    // and can land on a negative `need`, which would sail past the `cur < need`
+    // test and then *credit* the bucket on the subtraction below.
+    const auto need =
+        static_cast<std::int64_t>(std::min(static_cast<std::uint64_t>(bytes), b.spec.bytes_burst));
     auto cur = b.bytes_tokens.load(std::memory_order_relaxed);
     if (cur < need) {
         // M-03: Report mode is count-only. It increments the metric so
@@ -308,17 +387,42 @@ bool RateLimiter::try_consume_bytes(std::string_view friend_pk, std::size_t byte
         // on the bytes path, which made the two paths' bucket semantics
         // diverge (and could leave the bucket permanently negative under a
         // sustained over-budget flow).
-        b.bytes_throttled.fetch_add(1, std::memory_order_relaxed);
-        util::MetricsRegistry::instance().inc_rate_limit_bytes_throttled();
+        //
+        // A `Silent` caller is re-offering a payload it already counted (its
+        // retry timer fired), so it must not tick the counter again — see
+        // ThrottleAccounting.
+        if (accounting == ThrottleAccounting::Count) {
+            b.bytes_throttled.fetch_add(1, std::memory_order_relaxed);
+            util::MetricsRegistry::instance().inc_rate_limit_bytes_throttled();
+        }
         if (b.spec.mode == RateLimitMode::Report) {
             // Drain whatever is available (clamp to zero) and allow.
             b.bytes_tokens.store(cur > 0 ? 0 : cur, std::memory_order_relaxed);
             return true;
         }
+        // Enforce: tell the caller when the shortfall will have accrued so its
+        // retry is a single scheduled wake-up rather than a poll. Rounded up,
+        // and floored at 1 ns, because a zero would make the caller re-ask
+        // immediately and spin.
+        const std::int64_t deficit = need - std::max<std::int64_t>(cur, 0);
+        const auto per_sec = static_cast<std::int64_t>(b.spec.bytes_per_sec);
+        const std::int64_t wait_ns = (deficit * kNanosPerSec + per_sec - 1) / per_sec;
+        retry_after = std::chrono::nanoseconds(std::max<std::int64_t>(wait_ns, 1));
         return false;
     }
     b.bytes_tokens.store(cur - need, std::memory_order_relaxed);
     return true;
+}
+
+void RateLimiter::note_bytes_throttled(std::string_view friend_pk) {
+    const auto key = normalise_key(friend_pk);
+    std::lock_guard<std::mutex> lock(mu_);
+    auto& b = get_or_create_bucket(key);
+    if (b.spec.mode == RateLimitMode::Off || b.spec.bytes_per_sec == 0 || b.spec.bytes_burst == 0) {
+        return;
+    }
+    b.bytes_throttled.fetch_add(1, std::memory_order_relaxed);
+    util::MetricsRegistry::instance().inc_rate_limit_bytes_throttled();
 }
 
 RateLimiter::State RateLimiter::state(std::string_view friend_pk) const {

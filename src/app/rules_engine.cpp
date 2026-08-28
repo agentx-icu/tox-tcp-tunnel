@@ -41,24 +41,6 @@ class RulesErrorCategory : public std::error_category {
 
 const RulesErrorCategory g_rules_error_category{};
 
-/// Warn that `bytes_per_sec` / `bytes_burst` are accepted but inert.
-///
-/// The byte token buckets exist in `RateLimiter` but nothing on the data path
-/// consumes them (`try_consume_bytes` has no production caller), so a
-/// configured byte limit silently does nothing. This is a warning, not a
-/// parse error, on purpose: the shipped documentation and the ops template
-/// both advertised these keys, so existing rules files contain them and
-/// upgrading must not refuse to start.
-void warn_byte_limits_unimplemented(const std::string& where) {
-    util::Logger::warn(
-        "rules: {} sets bytes_per_sec/bytes_burst, but byte rate limiting is "
-        "NOT implemented — the data path never consults the byte buckets, so "
-        "this setting has no effect and "
-        "toxtunnel_rate_limit_bytes_throttled_total will stay at 0. "
-        "open_per_sec/open_burst/max_concurrent_tunnels are unaffected.",
-        where);
-}
-
 }  // namespace
 
 const std::error_category& rules_error_category() noexcept {
@@ -119,9 +101,6 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_node(const YAML::Node
             // (but still surface rate_limit_defaults if present)
             if (node.IsMap() && node["rate_limit_defaults"]) {
                 engine.rate_limit_defaults_ = node["rate_limit_defaults"].as<RateLimitSpec>();
-                if (engine.rate_limit_defaults_.has_byte_limits()) {
-                    warn_byte_limits_unimplemented("rate_limit_defaults");
-                }
             }
             return engine;
         }
@@ -130,9 +109,6 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_node(const YAML::Node
         // is a map (sequence-rooted documents don't carry sibling fields).
         if (node.IsMap() && node["rate_limit_defaults"]) {
             engine.rate_limit_defaults_ = node["rate_limit_defaults"].as<RateLimitSpec>();
-            if (engine.rate_limit_defaults_.has_byte_limits()) {
-                warn_byte_limits_unimplemented("rate_limit_defaults");
-            }
         }
 
         for (const auto& rule_node : rules_node) {
@@ -195,9 +171,19 @@ util::Expected<RulesEngine, std::string> RulesEngine::from_node(const YAML::Node
                     }
                 }
 
-                if (rule.rate_limit.has_byte_limits()) {
-                    warn_byte_limits_unimplemented("friend " + rule.friend_pk.substr(0, 8) + "..." +
-                                                   where());
+                // A friend that names `bytes_per_sec` but leaves `bytes_burst`
+                // at zero gets no limiting at all — a bucket with a refill rate
+                // and no capacity holds nothing. That is the same contract as
+                // open_per_sec/open_burst, but it reads as "I configured a byte
+                // limit", so say so rather than letting it fail silently.
+                if (rule.rate_limit.bytes_per_sec.value_or(0) != 0 &&
+                    rule.rate_limit.bytes_burst.has_value() && *rule.rate_limit.bytes_burst == 0) {
+                    util::Logger::warn(
+                        "rules: friend {}... sets bytes_per_sec with bytes_burst: 0, which "
+                        "disables byte rate limiting for that friend (a bucket needs a "
+                        "capacity to hold tokens). Remove the bytes_burst line to inherit "
+                        "the default, or give it a non-zero value.{}",
+                        rule.friend_pk.substr(0, 8), where());
                 }
 
                 engine.rules_.push_back(std::move(rule));

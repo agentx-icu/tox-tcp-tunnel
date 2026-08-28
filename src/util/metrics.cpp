@@ -458,13 +458,17 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_rate_limit_open_rejected_total counter\n"
            "toxtunnel_rate_limit_open_rejected_total "
         << rate_limit_open_rejected() << "\n";
-    // The HELP text is deliberately blunt: byte rate limiting is parsed and
-    // bucketed but never consulted on the data path (`try_consume_bytes` has
-    // no production caller), so this counter cannot move in a shipped daemon.
-    // Describing it as "times the bucket went into deny" led operators to
-    // alert on a metric that is structurally pinned at 0.
-    out << "# HELP toxtunnel_rate_limit_bytes_throttled_total Always 0: byte rate limiting is "
-           "not wired into the data path; the byte buckets exist but nothing consumes them.\n"
+    // Counts frames, not bytes and not retries: exactly one increment per
+    // inbound TUNNEL_DATA frame that found the friend's byte bucket short, on
+    // the first judgement. A deferred frame is re-offered every time its retry
+    // timer fires, and those re-offers are accounted `Silent` precisely so this
+    // counter tracks traffic rather than the retry cadence. Under `enforce` the
+    // frame was deferred and later replayed (never dropped); under `report` it
+    // was passed straight through, which is what makes this the dial operators
+    // watch while sizing a limit before switching it on.
+    out << "# HELP toxtunnel_rate_limit_bytes_throttled_total Inbound TUNNEL_DATA frames that "
+           "exceeded a friend's bytes_per_sec budget; deferred and replayed under enforce, "
+           "passed through under report.\n"
            "# TYPE toxtunnel_rate_limit_bytes_throttled_total counter\n"
            "toxtunnel_rate_limit_bytes_throttled_total "
         << rate_limit_bytes_throttled() << "\n";

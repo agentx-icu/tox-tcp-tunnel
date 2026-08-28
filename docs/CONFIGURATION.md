@@ -544,7 +544,7 @@ caught by `WatchdogSec` if the systemd unit declares one.
 
 Anti-DoS layer. Default behaviour is "no limiting" (v0.3.0
 semantics). When configured, `RateLimiter` runs before `RulesEngine`
-on the TUNNEL_OPEN path.
+on the TUNNEL_OPEN path, and on the inbound TUNNEL_DATA path.
 
 ```yaml
 # Top-level defaults — the baseline for every friend.
@@ -552,6 +552,8 @@ rate_limit_defaults:
   mode: enforce              # off (default) | report | enforce
   open_per_sec: 10
   open_burst: 50
+  bytes_per_sec: 1048576     # inbound TUNNEL_DATA payload, bytes/sec
+  bytes_burst: 4194304
   max_concurrent_tunnels: 100
 
 rules:
@@ -565,11 +567,15 @@ rules:
 
 Modes:
 
-- `off` — no limiting, no counters.
-- `report` — counters tick on rejection but the request is allowed
-  through. Shadow mode for tuning the limits against real traffic.
+- `off` — no limiting, no counters, no accounting.
+- `report` — counters tick when a request or a frame is over budget,
+  but nothing is refused or delayed. Shadow mode for tuning the limits
+  against real traffic before switching them on. Switching a friend from
+  `enforce` to `report` by reload releases anything already deferred for
+  it immediately, in order.
 - `enforce` — over-budget OPENs receive `TUNNEL_ERROR` with reason
-  code 3 (`Rate limit exceeded`).
+  code 3 (`Rate limit exceeded`); over-budget TUNNEL_DATA is deferred
+  and replayed (see below).
 
 ### Override merging
 
@@ -597,21 +603,98 @@ there is nothing to inherit, and a configured limit is meant to apply.
 > limiting off entirely. Rules files that worked around this by
 > repeating every field in each friend block remain correct.
 
-### `bytes_per_sec` / `bytes_burst` are not implemented
+### `bytes_per_sec` / `bytes_burst`
 
-These two keys parse and validate, and the token buckets behind them
-refill correctly, but **nothing on the data path consumes them**:
-TUNNEL_DATA is forwarded without consulting the byte budget. A
-configured byte limit does not shape traffic, and
-`toxtunnel_rate_limit_bytes_throttled_total` stays at 0. The rules
-loader logs a warning naming the offending block.
+A token bucket over the **payload of inbound TUNNEL_DATA frames** — the
+bytes a friend pushes *at* this server, per friend, summed across all of
+that friend's tunnels. This is the same direction `open_per_sec` guards:
+a server's rules describe what a peer may do to it. Traffic the server
+sends back is not metered by this key.
 
-They are accepted rather than rejected so that existing rules files —
-earlier revisions of this document and the ops template both showed
-them — keep loading after an upgrade. Use `open_per_sec` /
-`open_burst` / `max_concurrent_tunnels` for real limiting; enforcing a
-byte rate needs read-side backpressure on the tunnel data path, which
-has not been built.
+> Earlier releases parsed these keys and did nothing with them. If you
+> are upgrading from one of those, a rules file that already sets a byte
+> budget will start shaping traffic on restart — check the value is one
+> you actually want before rolling it out.
+
+**What `enforce` does when a friend is over budget.** It does not drop
+the frame. A tunnel carries TCP semantics, and dropping a TUNNEL_DATA
+frame punches a hole in a lossless byte stream that neither end can
+detect or repair. Instead the server **defers** the frame: it goes into a
+per-friend FIFO and is replayed, in arrival order, as the bucket refills.
+Every byte the peer sent is delivered; it just arrives later.
+
+Deferral is what makes the throttle propagate rather than accumulate. A
+deferred frame is never handed to its tunnel, so no `TUNNEL_ACK` is
+generated for it, so the peer's send window fills and the peer stops
+sending — the backpressure reaches the origin TCP socket the same way the
+existing slow-target path works. The deferral queue is therefore bounded
+by flow control, not by hope.
+
+Ordering is preserved for every tunnel-lifecycle frame: `TUNNEL_OPEN`,
+`TUNNEL_DATA`, `TUNNEL_CLOSE`, `TUNNEL_ERROR` and the resume opcodes all
+queue behind deferred data, because a `TUNNEL_CLOSE` that overtook it
+would tear the tunnel down and strand the bytes still waiting. `PING` /
+`PONG` (the keepalive channel — delaying it would let a healthy peer be
+declared dead), `TUNNEL_ACK` (send-window credit for the *opposite*
+direction) and `INFO_REQUEST` / `INFO_REPLY` bypass the queue.
+
+**Two rails bound deferral, and both fail open.** Deferral cannot be
+unbounded, and when a bound is reached the server releases the backlog
+early — in order, losing nothing — rather than dropping bytes or
+disconnecting the peer. The configured rate is briefly exceeded, which is
+logged at `warn`. The rails are:
+
+- **32 MiB of deferred bytes per friend.** A memory bound, not an
+  accusation: a friend with a large `max_concurrent_tunnels` can reach it
+  with entirely well-behaved traffic, so the server does not treat it as
+  misbehaviour. If you see this in the log regularly, either
+  `bytes_per_sec` is far below what the peer is offering, or the peer is
+  not honouring flow control.
+- **A release deadline**, computed per frame from its own tunnel's
+  remaining reaper slack: `tunnel.idle_timeout_seconds` or
+  `tunnel.half_close_timeout_seconds` (whichever is tighter, when
+  enabled), minus how long that tunnel has already been idle, minus
+  reaper-tick margin. Capped at 60 s, and 60 s flat when neither reaper
+  is enabled. This one is a correctness bound: the reapers judge a tunnel
+  by when it last saw TUNNEL_DATA, and a parked frame has not reached its
+  tunnel yet — so without it, deferral could let the reaper close the
+  very tunnel the queued bytes belong to. It is per frame rather than per
+  queue because a tunnel that was *already* nearly idle when its frame
+  arrived can afford almost no wait; the queue releases at the earliest
+  deadline any frame in it asked for.
+
+The consequence worth stating plainly: **a receiver-side deferral cannot
+hold an average rate against a peer that ignores flow control.** Against
+such a peer the throttle degrades to bursts capped by the memory rail.
+It is a budget for cooperative peers, not a defence against a hostile
+one; `max_concurrent_tunnels` and `open_per_sec` are the anti-DoS knobs.
+
+**What to expect in the metric.**
+`toxtunnel_rate_limit_bytes_throttled_total` counts *frames that found
+the bucket short* — one increment per frame, on first judgement, not per
+retry and not per byte:
+
+- `mode: report` — the counter rises while traffic is completely
+  unaffected. This is the number to watch when sizing a limit: a budget
+  that never moves it is not binding, one that moves it constantly is
+  tighter than the link.
+- `mode: enforce` — the counter rises and those frames were deferred.
+  A steadily climbing counter is the throttle working, not an error.
+  Expect throughput for that friend to settle at `bytes_per_sec` after
+  the initial `bytes_burst`, unless a rail above is being hit.
+- `mode: off` — the counter never moves for that friend; nothing is even
+  accounted.
+
+**Both fields must be non-zero for the bucket to engage**, exactly as
+with `open_per_sec` / `open_burst`: a refill rate with no capacity holds
+no tokens. `bytes_burst: 0` is the way to exempt a friend. A non-zero
+`bytes_burst` is raised to 65535 if it is smaller — a bucket cannot admit
+an item bigger than its capacity, and a maximum-size TUNNEL_DATA frame
+would otherwise be deferred forever. Both fields are also clamped to 1
+GB/s, which is three orders of magnitude past what a Tox tunnel carries;
+the clamp exists so the refill arithmetic cannot overflow. `toxtunnel
+inspect` and `effective_spec` report the clamped values, i.e. what is
+actually enforced.
 
 ### Reloading rate limits resets every token bucket
 
@@ -641,6 +724,11 @@ Operational consequences, in order of how much they matter:
   is not a defence against an adversary who also controls reloads.
 - **Per-friend rejection counts in `toxtunnel inspect` restart at 0.**
   Treat them as "since the last reload", not "since start".
+- **Byte buckets refill too**, so a friend that was being throttled gets
+  a fresh `bytes_burst` on every reload. Anything already deferred is
+  still replayed in order — the reload changes the budget, never the
+  queue — and adding or removing a byte budget takes effect on live
+  connections without waiting for a reconnect.
 - **Prometheus counters are unaffected.**
   `toxtunnel_rate_limit_open_rejected_total` and its siblings live in
   `MetricsRegistry`, not in the buckets, so they stay monotonic across

@@ -67,6 +67,147 @@ std::vector<std::string> friend_keys_to_preseed(
     return missing;
 }
 
+bool frame_bypasses_byte_throttle(tunnel::FrameType type) noexcept {
+    switch (type) {
+        case tunnel::FrameType::PING:
+        case tunnel::FrameType::PONG:
+        case tunnel::FrameType::TUNNEL_ACK:
+        case tunnel::FrameType::INFO_REQUEST:
+        case tunnel::FrameType::INFO_REPLY:
+        case tunnel::FrameType::Unknown:
+            return true;
+        default:
+            // TUNNEL_OPEN / DATA / CLOSE / ERROR and the resume opcodes are all
+            // tunnel-lifecycle frames whose order relative to DATA is load
+            // bearing; they queue.
+            return false;
+    }
+}
+
+std::int64_t InboundByteThrottle::now_nanos() const {
+    if (clock_) {
+        return clock_();
+    }
+    // duration_cast, not .count(): steady_clock's period is implementation
+    // defined, and these values are mixed with nanosecond budgets.
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+InboundByteThrottle::Admission InboundByteThrottle::admit(std::span<const std::uint8_t> packet,
+                                                          tunnel::FrameType type,
+                                                          std::size_t data_bytes,
+                                                          std::chrono::nanoseconds max_wait) {
+    if (frame_bypasses_byte_throttle(type)) {
+        return Admission::Dispatch;
+    }
+    if (backlog_.empty()) {
+        // Nothing deferred, so ordering imposes nothing: a frame that carries
+        // no metered payload, or a friend with no budget, goes straight
+        // through without ever touching the limiter's mutex.
+        if (!active_ || data_bytes == 0) {
+            return Admission::Dispatch;
+        }
+        std::chrono::nanoseconds wait{};
+        if (limiter_->try_consume_bytes(friend_pk_, data_bytes, wait)) {
+            return Admission::Dispatch;
+        }
+        retry_after_ = wait;
+    } else if (active_ && data_bytes > 0) {
+        // Queued behind an existing backlog: this frame never reached the
+        // bucket (the head is what is short), but the budget is why it waits,
+        // so it is counted here. Otherwise the throttle counter would report a
+        // 400-frame congestion episode as a single frame.
+        limiter_->note_bytes_throttled(friend_pk_);
+    }
+    // Either this frame is over budget, or something ahead of it is. Both mean
+    // the same thing: it goes to the back of the queue, because letting it past
+    // would reorder the friend's stream. It is enqueued even when that crosses
+    // the memory rail — overshooting by one packet is nothing next to dropping
+    // it, and the rail's job is to trigger the release below, not to refuse.
+    backlog_bytes_ += packet.size();
+    backlog_.push_back(
+        Deferred{std::vector<std::uint8_t>(packet.begin(), packet.end()), data_bytes});
+    const std::int64_t now = now_nanos();
+    const std::int64_t deadline = now + std::max<std::int64_t>(max_wait.count(), 0);
+    if (release_deadline_ns_ == 0 || deadline < release_deadline_ns_) {
+        release_deadline_ns_ = deadline;
+    }
+    if (backlog_bytes_ > max_backlog_bytes_) {
+        releasing_ = true;
+        return Admission::Release;
+    }
+    if (release_deadline_ns_ <= now) {
+        // This frame's tunnel is already at (or past) the point where waiting
+        // risks the reaper. Do not hand it to the retry timer — that timer is
+        // scheduled from the refill rate and would happily sleep. Tell the
+        // caller to drain now.
+        releasing_ = true;
+        deadline_release_notice_ = true;
+        return Admission::Release;
+    }
+    return Admission::Parked;
+}
+
+std::chrono::nanoseconds InboundByteThrottle::time_until_release() const {
+    if (backlog_.empty() || release_deadline_ns_ == 0) {
+        return std::chrono::nanoseconds::max();
+    }
+    return std::chrono::nanoseconds(std::max<std::int64_t>(release_deadline_ns_ - now_nanos(), 0));
+}
+
+bool InboundByteThrottle::take_deadline_release_notice() noexcept {
+    const bool notice = deadline_release_notice_;
+    deadline_release_notice_ = false;
+    return notice;
+}
+
+bool InboundByteThrottle::next_ready(std::vector<std::uint8_t>& out) {
+    if (backlog_.empty()) {
+        releasing_ = false;
+        release_deadline_ns_ = 0;
+        return false;
+    }
+    Deferred& front = backlog_.front();
+    if (!releasing_ && release_deadline_ns_ != 0 && now_nanos() >= release_deadline_ns_) {
+        // Some queued frame's tunnel is now close enough to its reaper deadline
+        // that waiting any longer risks the reaper closing it — and a tunnel
+        // closed underneath queued bytes is exactly the silent loss this whole
+        // mechanism exists to prevent. Give up on the budget for this backlog.
+        releasing_ = true;
+        deadline_release_notice_ = true;
+    }
+    if (!releasing_ && active_ && front.data_bytes > 0) {
+        std::chrono::nanoseconds wait{};
+        // Silent: this payload was counted when it was first judged in
+        // `admit()`. Counting each retry would make the throttle metric
+        // measure the retry cadence instead of the traffic.
+        if (!limiter_->try_consume_bytes(friend_pk_, front.data_bytes, wait,
+                                         RateLimiter::ThrottleAccounting::Silent)) {
+            retry_after_ = wait;
+            return false;
+        }
+    }
+    out = std::move(front.packet);
+    backlog_bytes_ -= out.size();
+    backlog_.pop_front();
+    retry_after_ = std::chrono::nanoseconds::zero();
+    if (backlog_.empty()) {
+        releasing_ = false;
+        release_deadline_ns_ = 0;
+    }
+    return true;
+}
+
+void InboundByteThrottle::clear() noexcept {
+    backlog_.clear();
+    backlog_bytes_ = 0;
+    releasing_ = false;
+    release_deadline_ns_ = 0;
+    retry_after_ = std::chrono::nanoseconds::zero();
+}
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -372,6 +513,9 @@ void TunnelServer::stop() {
     // have all been drained.
     inspect_server_.reset();
     metrics_server_.reset();
+    // Same phase for the throttle slots: they own steady_timers on the (now
+    // stopped and joined) io_context, so no handler can be mid-flight.
+    inbound_.clear();
 
     running_.store(false, std::memory_order_release);
     util::Logger::info("TunnelServer stopped");
@@ -401,6 +545,12 @@ util::Expected<void, std::string> TunnelServer::reload(const Config& new_config)
         rules_engine_ = RulesEngine{};
     }
     sync_rate_limiter();
+    // Byte budgets are reloadable too, and the per-friend "is this friend
+    // metered?" flag is strand-confined state, so the refresh has to be posted
+    // rather than done here on the signal thread.
+    if (inbound_strand_) {
+        asio::post(*inbound_strand_, [this]() { refresh_inbound_throttles(); });
+    }
     // Per-friend concurrent-tunnel caps live in the (reloadable) rules_file, so
     // push the new values onto already-connected managers too — not just fresh
     // ones via setup_tunnel_manager().
@@ -534,6 +684,56 @@ void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* dat
 
     auto& frame = frame_result.value();
 
+    // Per-friend inbound byte budget (`rate_limit.bytes_per_sec`). The gate
+    // either lets the frame through, parks it in arrival order until the bucket
+    // refills, or reports that the friend has buried us in deferred bytes. It
+    // takes no lock, so it cannot interact with the manager/tunnel locking
+    // discipline below.
+    if (auto it = inbound_.find(friend_number); it != inbound_.end()) {
+        const std::size_t data_bytes =
+            frame.type() == tunnel::FrameType::TUNNEL_DATA ? frame.as_tunnel_data().size() : 0;
+        // The deadline only matters for a frame that can actually be parked, so
+        // pay for the tunnel lookup inside inbound_deferral_budget() only then.
+        // Everything else — an unmetered friend, a report-mode one (which never
+        // defers), a bypassing control frame, or a non-DATA frame with nothing
+        // queued ahead of it — takes the default and never touches
+        // managers_mutex_ on the data path.
+        const bool may_park = it->second.enforcing &&
+                              !detail::frame_bypasses_byte_throttle(frame.type()) &&
+                              (data_bytes > 0 || !it->second.throttle.empty());
+        const auto max_wait =
+            may_park ? inbound_deferral_budget(friend_number, frame.tunnel_id())
+                     : std::chrono::nanoseconds(detail::InboundByteThrottle::kDefaultMaxDeferral);
+        switch (it->second.throttle.admit(std::span<const uint8_t>(data, length), frame.type(),
+                                          data_bytes, max_wait)) {
+            case detail::InboundByteThrottle::Admission::Dispatch:
+                break;
+            case detail::InboundByteThrottle::Admission::Parked:
+                arm_inbound_retry(friend_number);
+                return;
+            case detail::InboundByteThrottle::Admission::Release:
+                // Either rail can produce Release. The deadline one is
+                // announced by drain_inbound_backlog() through the notice;
+                // report the memory one here, where the backlog size still
+                // means something.
+                if (!it->second.throttle.deadline_release_pending()) {
+                    util::Logger::warn(
+                        "Friend {} reached the inbound throttle backlog rail ({} bytes "
+                        "deferred); releasing the backlog now — its byte budget will be "
+                        "exceeded for this burst. The stream is intact; raise bytes_per_sec, "
+                        "or check whether the peer is honouring flow control.",
+                        friend_number, it->second.throttle.backlog_bytes());
+                }
+                drain_inbound_backlog(friend_number);
+                return;
+        }
+    }
+
+    dispatch_inbound_frame(friend_number, frame);
+}
+
+void TunnelServer::dispatch_inbound_frame(uint32_t friend_number,
+                                          const tunnel::ProtocolFrame& frame) {
     // Handle INFO_REQUEST as a per-friend control frame outside the TunnelManager
     // (it is not bound to a tunnel_id). Reply with an INFO_REPLY whose payload
     // is filtered by `server.disclose.*`. Always reply — even with an empty
@@ -600,6 +800,175 @@ void TunnelServer::on_self_connection(bool connected) {
         util::Logger::info("Connected to Tox DHT");
     } else {
         util::Logger::warn("Disconnected from Tox DHT");
+    }
+}
+
+void TunnelServer::drain_inbound_backlog(uint32_t friend_number) {
+    auto it = inbound_.find(friend_number);
+    if (it == inbound_.end()) {
+        return;
+    }
+
+    // Collect first, dispatch second. `dispatch_inbound_frame` re-enters the
+    // manager and can run arbitrary tunnel callbacks; taking every packet the
+    // budget allows *before* any of that means no reference into `inbound_` is
+    // held across a call that might one day touch the map.
+    std::vector<std::vector<std::uint8_t>> ready;
+    std::vector<std::uint8_t> packet;
+    while (it->second.throttle.next_ready(packet)) {
+        ready.push_back(std::move(packet));
+    }
+    // Read the notice, not `releasing()`: the pop that empties the queue clears
+    // the latch, so by now `releasing()` is false again and a single-frame
+    // release would go unreported. (The memory rail logs at its own call site,
+    // where the backlog size is still meaningful.)
+    if (it->second.throttle.take_deadline_release_notice()) {
+        util::Logger::warn(
+            "Friend {}: a deferred frame reached its release deadline (its tunnel would soon "
+            "be reaped as idle); releasing {} deferred frame(s) now — the byte budget is "
+            "exceeded for this burst, but the stream stays intact.",
+            friend_number, ready.size());
+    }
+
+    for (const auto& p : ready) {
+        if (p.size() < 2) {
+            continue;
+        }
+        auto parsed = tunnel::ProtocolFrame::deserialize(
+            std::span<const uint8_t>(p.data() + 1, p.size() - 1));
+        if (!parsed) {
+            // Cannot happen: the packet decoded once already, on arrival.
+            util::Logger::warn("Deferred frame from friend {} failed to re-deserialize",
+                               friend_number);
+            continue;
+        }
+        dispatch_inbound_frame(friend_number, parsed.value());
+    }
+
+    // Re-find: the loop above ran unlocked callbacks, and the entry could in
+    // principle be gone (a teardown posted onto this same strand cannot
+    // interleave, but a future direct caller could).
+    if (auto entry = inbound_.find(friend_number); entry != inbound_.end()) {
+        entry->second.retry_armed = false;
+        arm_inbound_retry(friend_number);
+    }
+}
+
+void TunnelServer::arm_inbound_retry(uint32_t friend_number) {
+    auto it = inbound_.find(friend_number);
+    if (it == inbound_.end() || it->second.retry_armed || it->second.throttle.empty()) {
+        return;
+    }
+    auto& entry = it->second;
+
+    // Floor: sub-millisecond timers are not honoured on every platform (the
+    // Windows tick is ~15.6 ms), and a shorter wait would just re-ask for a
+    // token that has not accrued. Ceiling: re-check at least once a second so a
+    // budget loosened by a hot reload is picked up promptly instead of after a
+    // wait computed under the old, tighter rate.
+    constexpr auto kMinRetry = std::chrono::milliseconds(1);
+    constexpr auto kMaxRetry = std::chrono::milliseconds(1000);
+    // Never sleep past the release deadline. `retry_after()` only knows when
+    // the BUDGET will be ready; the deadline is when a queued frame's tunnel
+    // stops being safe to keep waiting on, and that is the harder constraint.
+    // Cap before rounding: `time_until_release()` is `nanoseconds::max()` when
+    // no deadline is set, and adding to that overflows.
+    const auto capped =
+        std::min({std::chrono::duration_cast<std::chrono::nanoseconds>(kMaxRetry),
+                  entry.throttle.retry_after(), entry.throttle.time_until_release()});
+    const auto wait = std::clamp(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     capped + std::chrono::nanoseconds(999'999)),
+                                 kMinRetry, kMaxRetry);
+
+    entry.retry_armed = true;
+    entry.retry_timer->expires_after(wait);
+    entry.retry_timer->async_wait(asio::bind_executor(
+        *inbound_strand_,
+        [this, friend_number, timer = entry.retry_timer](const asio::error_code& ec) {
+            // `timer` is captured for lifetime only: teardown erases the map
+            // entry (and with it the map's shared_ptr) while this wait is
+            // still pending, and the handler must not run against a freed
+            // timer.
+            (void)timer;
+            if (ec) {
+                return;  // cancelled by teardown; the backlog went with it
+            }
+            drain_inbound_backlog(friend_number);
+        }));
+}
+
+std::chrono::nanoseconds TunnelServer::inbound_deferral_budget(uint32_t friend_number,
+                                                               uint16_t tunnel_id) const {
+    // Ceiling regardless of reapers: a stream running minutes behind is
+    // indistinguishable from a hung one, so deferral is bounded even when
+    // nothing would reap the tunnel.
+    auto budget = std::chrono::nanoseconds(detail::InboundByteThrottle::kDefaultMaxDeferral);
+
+    // The reapers judge a tunnel by how long it has gone without TUNNEL_DATA,
+    // and a deferred frame has not reached its tunnel — so the safe wait is not
+    // a property of the queue but of THIS tunnel, which may already have been
+    // sitting idle when the frame arrived. Ask it.
+    std::uint32_t tightest_timeout = 0;
+    for (const std::uint32_t timeout :
+         {config_.tunnel.idle_timeout_seconds, config_.tunnel.half_close_timeout_seconds}) {
+        if (timeout > 0 && (tightest_timeout == 0 || timeout < tightest_timeout)) {
+            tightest_timeout = timeout;
+        }
+    }
+    if (tightest_timeout == 0) {
+        return budget;  // no reaper armed; nothing can close the tunnel under us
+    }
+
+    // H-01: copy the manager out under the lock, query outside it.
+    std::shared_ptr<tunnel::TunnelManager> mgr;
+    {
+        std::lock_guard lock(managers_mutex_);
+        auto it = managers_.find(friend_number);
+        if (it != managers_.end()) {
+            mgr = it->second;
+        }
+    }
+    std::shared_ptr<tunnel::Tunnel> tunnel = mgr ? mgr->get_tunnel(tunnel_id) : nullptr;
+    auto* impl = dynamic_cast<tunnel::TunnelImpl*>(tunnel.get());
+
+    // Slack = what the reaper still allows, minus its tick (it samples, so it
+    // can act up to one tick late) and minus the same again as drain margin.
+    // An unknown tunnel gets the minimum: the frame is about to be dropped by
+    // routing anyway, and holding it helps nobody.
+    const auto timeout_ns = std::chrono::nanoseconds(std::chrono::seconds(tightest_timeout));
+    const auto tick_ns =
+        std::chrono::nanoseconds(std::chrono::seconds(config_.tunnel.reaper_tick_seconds));
+    const auto idle_ns = impl != nullptr ? std::chrono::nanoseconds(impl->IdleNanos())
+                                         : std::chrono::nanoseconds::zero();
+    const auto slack =
+        impl != nullptr ? timeout_ns - idle_ns - 2 * tick_ns : std::chrono::nanoseconds::zero();
+    budget = std::min(budget, slack);
+    // Never negative, and never zero: a zero budget releases on the very next
+    // drain, which is the intended behaviour for an at-risk tunnel, but the
+    // deadline arithmetic reads better with a floor than with a sentinel.
+    return std::max(budget, std::chrono::nanoseconds::zero());
+}
+
+void TunnelServer::refresh_inbound_throttles() {
+    auto& limiter = rate_limiter_instance();
+    for (auto& [friend_number, entry] : inbound_) {
+        const auto spec = limiter.effective_spec(entry.pk_hex);
+        const bool active = spec.byte_limiting_engaged();
+        entry.enforcing = active && spec.mode == RateLimitMode::Enforce;
+        if (active != entry.throttle.active()) {
+            entry.throttle.set_active(active);
+            util::Logger::info("Inbound byte throttle {} for friend {}",
+                               active ? "engaged" : "disengaged", friend_number);
+        }
+        // Drain unconditionally, whether or not `active` moved. The reload may
+        // have loosened the budget or switched the friend from `enforce` to
+        // `report` — both leave `active` true while meaning "stop delaying
+        // this" — and the pending retry timer was scheduled under the OLD
+        // rate. The drain re-consults the limiter, so the new spec applies at
+        // once, and it drains in order, so nothing is reordered.
+        if (!entry.throttle.empty()) {
+            drain_inbound_backlog(friend_number);
+        }
     }
 }
 
@@ -761,6 +1130,28 @@ void TunnelServer::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
 // ---------------------------------------------------------------------------
 
 void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view pk_hex) {
+    // Install (or refresh) this friend's inbound byte-throttle slot before any
+    // frame can be routed to it. Done for every connect event, KeepExisting
+    // included: an unpaired `connected` still means the spec should be
+    // re-evaluated, and try_emplace leaves an existing backlog alone.
+    {
+        auto [it, inserted] = inbound_.try_emplace(
+            friend_number,
+            FriendInbound{detail::InboundByteThrottle(rate_limiter_instance(), std::string(pk_hex)),
+                          std::string(pk_hex),
+                          std::make_shared<asio::steady_timer>(io_context_->get_io_context()),
+                          false, false});
+        (void)inserted;
+        const auto spec = rate_limiter_instance().effective_spec(it->second.pk_hex);
+        it->second.throttle.set_active(spec.byte_limiting_engaged());
+        it->second.enforcing = spec.byte_limiting_engaged() && spec.mode == RateLimitMode::Enforce;
+        if (it->second.throttle.active()) {
+            util::Logger::info(
+                "Inbound byte throttle engaged for friend {} (rate_limit.bytes_per_sec)",
+                friend_number);
+        }
+    }
+
     // Classify the event against both maps under one lock so the decision and
     // the state it was taken on cannot drift apart.
     detail::ConnectedManagerAction action;
@@ -943,6 +1334,18 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view
 }
 
 void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {
+    // Drop the friend's throttle slot: cancel its retry timer and discard any
+    // deferred packets. Those bytes belong to a session the peer has left, and
+    // they were never acknowledged — so on a resume the client still counts
+    // them as in-flight and `resume_offsets_have_gap()` reports the hole rather
+    // than the stream quietly missing a chunk.
+    if (auto it = inbound_.find(friend_number); it != inbound_.end()) {
+        if (it->second.retry_timer) {
+            it->second.retry_timer->cancel();
+        }
+        inbound_.erase(it);
+    }
+
     // The live -> held transition must be ATOMIC with respect to
     // setup_tunnel_manager(). Doing the erase in one critical section and the
     // hold insertion in a later one leaves a window in which the friend appears

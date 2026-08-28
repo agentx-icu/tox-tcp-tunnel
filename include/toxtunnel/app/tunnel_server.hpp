@@ -2,21 +2,26 @@
 
 #include <asio.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "toxtunnel/app/inspect_server.hpp"
+#include "toxtunnel/app/rate_limiter.hpp"
 #include "toxtunnel/app/rules_engine.hpp"
 #include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tox/tox_adapter.hpp"
 #include "toxtunnel/tox/tox_watchdog.hpp"
+#include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
 #include "toxtunnel/util/config.hpp"
 #include "toxtunnel/util/metrics.hpp"
@@ -90,6 +95,193 @@ enum class ConnectedManagerAction {
 [[nodiscard]] std::vector<std::string> friend_keys_to_preseed(
     const std::vector<std::string>& rule_public_keys,
     const std::vector<std::string>& existing_friend_public_keys);
+
+/// True for inbound frame types that must NOT queue behind a friend's
+/// byte-throttle backlog.
+///
+/// The throttle preserves per-friend arrival order, because a TUNNEL_CLOSE that
+/// overtook deferred TUNNEL_DATA would tear the tunnel down and strand those
+/// bytes — silent truncation, the exact failure the deferral exists to avoid.
+/// Three frame classes are exempt because they carry no stream position and
+/// delaying them causes real harm:
+///  * PING / PONG — the liveness channel. Held behind a throttled stream, the
+///    keepalive would declare a perfectly healthy peer dead and tear down every
+///    tunnel it has, losing far more than the throttle ever saved.
+///  * TUNNEL_ACK — send-window credit for the *opposite* direction. Deferring
+///    it would throttle server->client traffic as collateral of a
+///    client->server limit.
+///  * INFO_REQUEST / INFO_REPLY and unrecognised opcodes — per-friend control
+///    with no tunnel ordering to preserve.
+[[nodiscard]] bool frame_bypasses_byte_throttle(tunnel::FrameType type) noexcept;
+
+/// Order-preserving admission gate for one friend's inbound TUNNEL_DATA bytes.
+///
+/// This is the mechanism that makes `rate_limit.bytes_per_sec` real. A tunnel
+/// carries TCP semantics, so an over-budget frame can neither be dropped (that
+/// corrupts a lossless stream) nor waited on in place (that would block the
+/// shared Tox thread and the inbound strand). Instead the frame is parked in a
+/// FIFO and replayed once the bucket refills.
+///
+/// The queue is self-limiting, which is why deferral is safe: a parked frame is
+/// never handed to its tunnel, so no TUNNEL_ACK is generated for it, so the
+/// peer's send window fills and the peer stops sending. The throttle therefore
+/// propagates all the way back to the origin TCP socket instead of being
+/// absorbed here — the same receiver-side backpressure the C-03 slow-target
+/// path already relies on.
+///
+/// TWO RAILS BOUND HOW FAR DEFERRAL CAN GO, and both of them FAIL OPEN — they
+/// release the backlog early rather than dropping it or killing the peer,
+/// because "the configured rate was briefly exceeded" is a far better outcome
+/// than either a corrupted stream or a disconnected friend:
+///
+///  * `max_backlog_bytes` bounds memory, for a peer that ignores flow control
+///    and keeps sending past its unacknowledged window. It is deliberately NOT
+///    treated as proof of misbehaviour: a friend with a high
+///    `max_concurrent_tunnels` can reach it legitimately (200 tunnels x a
+///    256 KiB seed window is already 50 MiB), so closing its tunnels on the
+///    strength of this number would punish ordinary traffic.
+///  * A per-frame **release deadline** bounds how long a frame may sit. This
+///    one is not a nicety: the idle reaper and the half-close linger cap judge
+///    a tunnel by when it last saw TUNNEL_DATA, and a parked frame has not
+///    reached its tunnel, so deferring makes an actively-receiving tunnel look
+///    idle. The reaper would then close it and release its id — and the replay
+///    would deliver bytes to a tunnel that no longer exists, or worse, to a
+///    recycled id.
+///
+///    The deadline is supplied per frame by the caller (see
+///    `TunnelServer::inbound_deferral_budget`), because "how long is safe" is a
+///    property of the frame's TUNNEL, not of the queue: a tunnel that was
+///    ALREADY nearly idle when the frame arrived can afford almost no wait,
+///    while a busy one can afford the full budget. The throttle keeps the
+///    EARLIEST deadline any queued frame asked for and releases the whole
+///    backlog at that point — a frame near the back of the queue is exactly the
+///    one whose tunnel may be closest to being reaped, so taking the minimum
+///    (rather than judging by the head) is what makes the bound sound.
+///
+/// NOT thread-safe by design: `TunnelServer` owns one per friend and touches it
+/// exclusively from `inbound_strand_` handlers, so it needs no lock of its own
+/// and — crucially for H-01 — holds none while the caller re-enters the manager
+/// to dispatch.
+class InboundByteThrottle {
+   public:
+    /// Memory rail on deferred bytes per friend. See the class comment: this
+    /// bounds the queue, it does not accuse the peer of anything.
+    static constexpr std::size_t kDefaultMaxBacklogBytes = 32u * 1024u * 1024u;
+
+    /// Fallback deferral ceiling used when no reaper timeout is configured to
+    /// derive one from. Generous — nothing forces a release at this point
+    /// except the principle that an unboundedly lagging stream is worse than a
+    /// briefly unenforced budget.
+    static constexpr std::chrono::seconds kDefaultMaxDeferral{60};
+
+    enum class Admission : std::uint8_t {
+        Dispatch,  ///< Within budget (or exempt): route this packet now.
+        Parked,    ///< Deferred in arrival order; arm a timer for `retry_after()`.
+        /// Deferred, AND a rail was hit: the caller must drain immediately
+        /// instead of waiting. The drain ignores the budget until the backlog
+        /// is empty, so ordering and loss-freedom both hold.
+        Release,
+    };
+
+    InboundByteThrottle(RateLimiter& limiter, std::string friend_pk,
+                        std::size_t max_backlog_bytes = kDefaultMaxBacklogBytes)
+        : limiter_(&limiter),
+          friend_pk_(std::move(friend_pk)),
+          max_backlog_bytes_(max_backlog_bytes) {}
+
+    /// Whether this friend's effective spec engages a byte budget. Recomputed
+    /// on connect and after every rules reload, so the (overwhelmingly common)
+    /// unlimited friend never touches the limiter's mutex on the data path.
+    void set_active(bool active) noexcept { active_ = active; }
+    [[nodiscard]] bool active() const noexcept { return active_; }
+
+    /// Override the monotonic clock (nanoseconds) used for release deadlines,
+    /// so tests can assert the deadline rail without sleeping.
+    void set_clock(std::function<std::int64_t()> now) { clock_ = std::move(now); }
+
+    /// Decide what to do with one inbound packet.
+    ///
+    /// @param packet      The whole lossless packet, prefix byte included, so a
+    ///                    replay goes through the same decode as a live one.
+    ///                    Copied only when the packet is actually parked.
+    /// @param type        The decoded frame type.
+    /// @param data_bytes  TUNNEL_DATA payload size, 0 for every other type.
+    /// @param max_wait    Longest this packet may safely be deferred — the
+    ///                    caller's judgement of when its tunnel becomes
+    ///                    reapable. Tightens the queue's release deadline; see
+    ///                    the class comment.
+    [[nodiscard]] Admission admit(std::span<const std::uint8_t> packet, tunnel::FrameType type,
+                                  std::size_t data_bytes,
+                                  std::chrono::nanoseconds max_wait = kDefaultMaxDeferral);
+
+    /// Move the next packet out of the backlog if its bytes now fit the budget
+    /// (or if a rail has forced the backlog open). Returns false when the
+    /// backlog is empty or its head is still short — in the latter case
+    /// `retry_after()` has been refreshed.
+    [[nodiscard]] bool next_ready(std::vector<std::uint8_t>& out);
+
+    [[nodiscard]] std::chrono::nanoseconds retry_after() const noexcept { return retry_after_; }
+    [[nodiscard]] bool empty() const noexcept { return backlog_.empty(); }
+    [[nodiscard]] std::size_t backlog_bytes() const noexcept { return backlog_bytes_; }
+    [[nodiscard]] std::size_t backlog_frames() const noexcept { return backlog_.size(); }
+    /// True while a rail has forced the backlog open. Cleared once it drains.
+    [[nodiscard]] bool releasing() const noexcept { return releasing_; }
+
+    /// Time left before the release deadline, or `nanoseconds::max()` when the
+    /// queue is empty. The caller's retry timer MUST NOT sleep past this — a
+    /// timer scheduled purely from `retry_after()` (which only knows about the
+    /// refill rate) would happily wait a second while a tunnel whose deadline
+    /// is 50 ms away gets reaped.
+    [[nodiscard]] std::chrono::nanoseconds time_until_release() const;
+
+    /// True once since the deadline rail last latched; reading it clears the
+    /// notice. The caller logs from this rather than from `releasing()`,
+    /// because a drain that empties the queue clears the latch before it
+    /// returns — so by the time the caller looks, `releasing()` is false again
+    /// and the release would go unreported.
+    [[nodiscard]] bool take_deadline_release_notice() noexcept;
+
+    /// Non-consuming peek at the same notice, so the caller can tell which rail
+    /// produced an `Admission::Release` before it drains.
+    [[nodiscard]] bool deadline_release_pending() const noexcept {
+        return deadline_release_notice_;
+    }
+
+    /// Drop the backlog. Used when the friend goes away: the packets belong to
+    /// a session the peer has abandoned. Bytes discarded here are NOT lost
+    /// silently — they were never acknowledged, so the peer still counts them
+    /// as unsent, and tunnel resume's offset reconciliation reports the gap.
+    void clear() noexcept;
+
+   private:
+    struct Deferred {
+        std::vector<std::uint8_t> packet;
+        std::size_t data_bytes;
+    };
+
+    [[nodiscard]] std::int64_t now_nanos() const;
+
+    RateLimiter* limiter_;
+    std::string friend_pk_;
+    std::size_t max_backlog_bytes_;
+    /// Earliest moment any queued packet asked to be released by; 0 when the
+    /// queue is empty. Only ever tightened while the queue is non-empty — a
+    /// popped packet's (later) deadline is not given back, which errs towards
+    /// releasing early, the safe direction.
+    std::int64_t release_deadline_ns_{0};
+    std::function<std::int64_t()> clock_;
+    bool active_{false};
+    /// Latched by either rail; cleared when the backlog empties. Latching (as
+    /// opposed to re-testing per packet) is what guarantees the whole queue
+    /// drains in one pass instead of releasing the head and re-parking the rest.
+    bool releasing_{false};
+    /// Set when the deadline rail latches; consumed by
+    /// `take_deadline_release_notice()`.
+    bool deadline_release_notice_{false};
+    std::deque<Deferred> backlog_;
+    std::size_t backlog_bytes_{0};
+    std::chrono::nanoseconds retry_after_{0};
+};
 
 }  // namespace detail
 
@@ -188,6 +380,42 @@ class TunnelServer {
 
     /// Handle self connection status changes (DHT connectivity).
     void on_self_connection(bool connected);
+
+    // -----------------------------------------------------------------
+    // Inbound byte throttle (rate_limit.bytes_per_sec)
+    // -----------------------------------------------------------------
+
+    /// Route one decoded inbound frame: OPEN, RESUME_REQUEST, or the friend's
+    /// TunnelManager. Split out of `on_lossless_packet()` so a frame the byte
+    /// throttle deferred is replayed through exactly the same path it would
+    /// have taken had it arrived within budget.
+    ///
+    /// Runs on `inbound_strand_` with no server lock held (H-01).
+    void dispatch_inbound_frame(uint32_t friend_number, const tunnel::ProtocolFrame& frame);
+
+    /// Replay a friend's deferred packets as its byte bucket refills, then
+    /// re-arm the retry timer if any remain. Strand-confined.
+    void drain_inbound_backlog(uint32_t friend_number);
+
+    /// Schedule the next backlog drain for a friend, if one is not already
+    /// scheduled. Strand-confined.
+    void arm_inbound_retry(uint32_t friend_number);
+
+    /// Longest one inbound frame may safely sit in a friend's throttle backlog.
+    ///
+    /// Computed per frame from ITS tunnel's remaining reaper slack — the
+    /// idle-reaper and half-close timeouts minus how long that tunnel has
+    /// already been idle, minus reaper-tick margin — because a tunnel that was
+    /// nearly idle when the frame arrived can afford almost no wait. A fixed
+    /// budget cannot express that, and getting it wrong means the reaper closes
+    /// a tunnel with bytes still queued for it.
+    [[nodiscard]] std::chrono::nanoseconds inbound_deferral_budget(uint32_t friend_number,
+                                                                   uint16_t tunnel_id) const;
+
+    /// Recompute `active()` on every known friend's throttle from the current
+    /// limiter specs. Posted onto `inbound_strand_` after a rules reload so a
+    /// newly added (or removed) byte budget takes effect without a reconnect.
+    void refresh_inbound_throttles();
 
     /// Apply the v0.4 adaptive coalescer mode + BDP flow control config to a
     /// freshly-built server-side tunnel.
@@ -300,6 +528,33 @@ class TunnelServer {
     /// dropped. The strand preserves arrival order while keeping the rest
     /// of the IO pool parallel.
     std::optional<asio::strand<asio::any_io_executor>> inbound_strand_;
+
+    /// Per-friend inbound byte-throttle state.
+    ///
+    /// STRAND-CONFINED, not mutex-protected: every member is created, read,
+    /// mutated and destroyed inside an `inbound_strand_` handler. That is what
+    /// lets the data-path gate run without acquiring any server lock, so it
+    /// cannot participate in the re-entrancy H-01 warns about.
+    struct FriendInbound {
+        detail::InboundByteThrottle throttle;
+        /// Cached hex public key. Resolved once on the friend-connected event
+        /// (where the lookup runs inline on the Tox thread) rather than per
+        /// frame: `get_friend_pk_hex()` marshals to the Tox thread and blocks
+        /// until its next tick, which on the data path would cost ~50 ms per
+        /// frame and stall the whole strand.
+        std::string pk_hex;
+        std::shared_ptr<asio::steady_timer> retry_timer;
+        /// True while a drain is scheduled. Re-arming a pending timer would
+        /// cancel it, and the cancelled handler would then clear this flag
+        /// after the new arm set it.
+        bool retry_armed{false};
+        /// Whether this friend's mode is `enforce` (as opposed to `report`,
+        /// which meters but never defers). Only an enforcing friend can park a
+        /// frame, so only it needs a release deadline computed — and computing
+        /// one costs a managers_mutex_ lookup per frame.
+        bool enforcing{false};
+    };
+    std::unordered_map<uint32_t, FriendInbound> inbound_;
 
     /// Tox network adapter.
     std::unique_ptr<tox::ToxAdapter> tox_adapter_;
