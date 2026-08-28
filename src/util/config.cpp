@@ -657,168 +657,15 @@ void Config::merge_cli_overrides(const Config& overrides) {
     sync_legacy_server_tox_fields(*this);
 }
 
-// Helper function to encode LogLevel to string
-static const char* log_level_to_string(util::LogLevel level) {
-    switch (level) {
-        case util::LogLevel::Trace:
-            return "trace";
-        case util::LogLevel::Debug:
-            return "debug";
-        case util::LogLevel::Info:
-            return "info";
-        case util::LogLevel::Warn:
-            return "warn";
-        case util::LogLevel::Error:
-            return "error";
-        case util::LogLevel::Critical:
-            return "critical";
-        case util::LogLevel::Off:
-            return "off";
-        default:
-            return "info";
-    }
-}
-
 std::string Config::to_yaml() const {
-    const ToxConfig effective_tox = effective_tox_config();
-
+    // Deliberately a thin wrapper over the yaml-cpp specialisation rather than a
+    // second emitter. The hand-rolled emitter that used to live here had drifted
+    // to omitting `tunnel`, `flow_control` and `watchdog` entirely, so `save()`
+    // silently discarded every setting in those blocks — the same failure mode
+    // that lost `inspect.enabled: false` earlier. With one field list, adding a
+    // block to convert<Config>::encode is the only step required.
     YAML::Emitter out;
-    out << YAML::BeginMap;
-
-    // Mode
-    out << YAML::Key << "mode" << YAML::Value << (mode == Mode::Server ? "server" : "client");
-
-    // Data directory
-    out << YAML::Key << "data_dir" << YAML::Value << data_dir.string();
-
-    // Logging
-    out << YAML::Key << "logging";
-    out << YAML::BeginMap;
-    out << YAML::Key << "level" << YAML::Value << log_level_to_string(logging.level);
-    if (logging.file) {
-        out << YAML::Key << "file" << YAML::Value << *logging.file;
-    }
-    out << YAML::EndMap;
-
-    out << YAML::Key << "service";
-    out << YAML::BeginMap;
-    out << YAML::Key << "auto_start" << YAML::Value << service.auto_start;
-    out << YAML::Key << "allow_client_daemon" << YAML::Value << service.allow_client_daemon;
-    out << YAML::EndMap;
-
-    if (metrics != MetricsConfig{}) {
-        out << YAML::Key << "metrics";
-        out << YAML::BeginMap;
-        out << YAML::Key << "enabled" << YAML::Value << metrics.enabled;
-        out << YAML::Key << "listen" << YAML::Value << metrics.listen;
-        out << YAML::Key << "path" << YAML::Value << metrics.path;
-        out << YAML::EndMap;
-    }
-
-    // Emitted only when it differs from the default, like `metrics` above.
-    // This is a hand-rolled emitter rather than convert<Config>::encode, so a
-    // new block has to be added in both places or `save()` silently drops it —
-    // exactly how `inspect.enabled: false` used to be lost on round-trip.
-    if (!(inspect == InspectConfig{})) {
-        out << YAML::Key << "inspect" << YAML::Value << YAML::BeginMap;
-        out << YAML::Key << "enabled" << YAML::Value << inspect.enabled;
-        out << YAML::EndMap;
-    }
-
-    out << YAML::Key << "tox" << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "udp_enabled" << YAML::Value << effective_tox.udp_enabled;
-    out << YAML::Key << "ipv6_enabled" << YAML::Value << effective_tox.ipv6_enabled;
-    out << YAML::Key << "tcp_port" << YAML::Value << effective_tox.tcp_port;
-    out << YAML::Key << "bootstrap_mode" << YAML::Value
-        << bootstrap_mode_to_string(effective_tox.bootstrap_mode);
-    if (!effective_tox.bootstrap_nodes.empty()) {
-        out << YAML::Key << "bootstrap_nodes";
-        out << YAML::BeginSeq;
-        for (const auto& node : effective_tox.bootstrap_nodes) {
-            out << YAML::BeginMap;
-            out << YAML::Key << "address" << YAML::Value << node.address;
-            out << YAML::Key << "port" << YAML::Value << node.port;
-            out << YAML::Key << "public_key" << YAML::Value << node.public_key;
-            out << YAML::EndMap;
-        }
-        out << YAML::EndSeq;
-    }
-    out << YAML::EndMap;
-
-    // Server config
-    if (server) {
-        out << YAML::Key << "server" << YAML::Value << YAML::BeginMap;
-        if (server->rules_file) {
-            out << YAML::Key << "rules_file" << YAML::Value << *server->rules_file;
-        }
-        if (server->disclose.any()) {
-            out << YAML::Key << "disclose" << YAML::Value << YAML::BeginMap;
-            out << YAML::Key << "hostname" << YAML::Value << server->disclose.hostname;
-            out << YAML::Key << "os" << YAML::Value << server->disclose.os;
-            out << YAML::Key << "os_version" << YAML::Value << server->disclose.os_version;
-            out << YAML::Key << "arch" << YAML::Value << server->disclose.arch;
-            out << YAML::Key << "uptime" << YAML::Value << server->disclose.uptime;
-            out << YAML::Key << "toxtunnel_version" << YAML::Value
-                << server->disclose.toxtunnel_version;
-            out << YAML::EndMap;
-        }
-        out << YAML::EndMap;
-    }
-
-    // Client config
-    if (client) {
-        out << YAML::Key << "client" << YAML::Value << YAML::BeginMap;
-        if (!client->server_id.empty()) {
-            if (!client->fallback_server_ids.empty()) {
-                out << YAML::Key << "server_id" << YAML::Value << YAML::BeginSeq;
-                out << client->server_id;
-                for (const auto& fb : client->fallback_server_ids) {
-                    out << fb;
-                }
-                out << YAML::EndSeq;
-            } else {
-                out << YAML::Key << "server_id" << YAML::Value << client->server_id;
-            }
-        }
-        {
-            const FailoverConfig defaults{};
-            if (!(client->failover == defaults)) {
-                out << YAML::Key << "failover" << YAML::Value << YAML::BeginMap;
-                out << YAML::Key << "timeout_seconds" << YAML::Value
-                    << client->failover.timeout_seconds;
-                out << YAML::Key << "prefer_primary_grace_seconds" << YAML::Value
-                    << client->failover.prefer_primary_grace_seconds;
-                out << YAML::EndMap;
-            }
-        }
-        if (client->pipe_target.has_value()) {
-            out << YAML::Key << "pipe" << YAML::Value << YAML::BeginMap;
-            out << YAML::Key << "remote_host" << YAML::Value << client->pipe_target->remote_host;
-            out << YAML::Key << "remote_port" << YAML::Value << client->pipe_target->remote_port;
-            out << YAML::EndMap;
-        }
-        if (!client->forwards.empty()) {
-            out << YAML::Key << "forwards";
-            out << YAML::BeginSeq;
-            for (const auto& fwd : client->forwards) {
-                out << YAML::BeginMap;
-                out << YAML::Key << "local_port" << YAML::Value << fwd.local_port;
-                out << YAML::Key << "remote_host" << YAML::Value << fwd.remote_host;
-                out << YAML::Key << "remote_port" << YAML::Value << fwd.remote_port;
-                out << YAML::EndMap;
-            }
-            out << YAML::EndSeq;
-        }
-        if (!(client->socks5 == Socks5Config{})) {
-            out << YAML::Key << "socks5" << YAML::Value << YAML::BeginMap;
-            out << YAML::Key << "enabled" << YAML::Value << client->socks5.enabled;
-            out << YAML::Key << "listen" << YAML::Value << client->socks5.listen;
-            out << YAML::EndMap;
-        }
-        out << YAML::EndMap;
-    }
-
-    out << YAML::EndMap;
+    out << YAML::convert<Config>::encode(*this);
     return out.c_str();
 }
 
@@ -1449,18 +1296,22 @@ bool convert<toxtunnel::Socks5Config>::decode(const Node& node, toxtunnel::Socks
 // ---------------------------------------------------------------------------
 
 Node convert<ClientConfig>::encode(const ClientConfig& rhs) {
-    Node node;
+    Node node(NodeType::Map);
     // Emit as a list only when there are fallbacks, otherwise stay
-    // backwards-compatible with the simple string form.
-    if (!rhs.fallback_server_ids.empty()) {
-        Node ids(NodeType::Sequence);
-        ids.push_back(rhs.server_id);
-        for (const auto& fb : rhs.fallback_server_ids) {
-            ids.push_back(fb);
+    // backwards-compatible with the simple string form. An unset primary is
+    // omitted rather than written as `server_id: ""`, so a freshly-defaulted
+    // client config does not gain a key that only looks configured.
+    if (!rhs.server_id.empty()) {
+        if (!rhs.fallback_server_ids.empty()) {
+            Node ids(NodeType::Sequence);
+            ids.push_back(rhs.server_id);
+            for (const auto& fb : rhs.fallback_server_ids) {
+                ids.push_back(fb);
+            }
+            node["server_id"] = ids;
+        } else {
+            node["server_id"] = rhs.server_id;
         }
-        node["server_id"] = ids;
-    } else {
-        node["server_id"] = rhs.server_id;
     }
     if (rhs.pipe_target.has_value()) {
         node["pipe"] = *rhs.pipe_target;
@@ -1482,11 +1333,14 @@ Node convert<ClientConfig>::encode(const ClientConfig& rhs) {
     return node;
 }
 
-bool convert<ClientConfig>::decode(const Node& node, ClientConfig& rhs) {
-    if (!node.IsMap()) {
-        return false;
-    }
+namespace {
 
+// The one reader of the `client:` field list. Both `convert<ClientConfig>` and
+// the client branch of `convert<Config>` call it: two hand-maintained copies is
+// exactly how `fallback_server_ids` ended up readable through one spelling and
+// silently ignored through the other. @p node is either the nested `client:`
+// map or, for the legacy flat layout, the document root.
+void decode_client_fields(const Node& node, ClientConfig& rhs) {
     if (node["server_id"]) {
         const auto& sid_node = node["server_id"];
         if (sid_node.IsSequence()) {
@@ -1550,7 +1404,15 @@ bool convert<ClientConfig>::decode(const Node& node, ClientConfig& rhs) {
     if (node["socks5"]) {
         rhs.socks5 = node["socks5"].as<toxtunnel::Socks5Config>();
     }
+}
 
+}  // namespace
+
+bool convert<ClientConfig>::decode(const Node& node, ClientConfig& rhs) {
+    if (!node.IsMap()) {
+        return false;
+    }
+    decode_client_fields(node, rhs);
     return true;
 }
 
@@ -1661,44 +1523,21 @@ Node convert<Config>::encode(const Config& rhs) {
     }
 
     if (rhs.server) {
-        Node server_node;
-        if (rhs.server->rules_file) {
-            server_node["rules_file"] = *rhs.server->rules_file;
-        }
+        // Delegate to convert<ServerConfig> so the server field list exists
+        // once; `disclose` was already missing here while to_yaml() emitted it.
+        // The tox-owned trio is then dropped: those fields are only a mirror of
+        // `tox:` kept by sync_legacy_server_tox_fields, and emitting them again
+        // would write a second copy that decode() ignores whenever a canonical
+        // `tox:` block is present (which encode always writes).
+        Node server_node = convert<ServerConfig>::encode(*rhs.server);
+        server_node.remove("tcp_port");
+        server_node.remove("udp_enabled");
+        server_node.remove("bootstrap_nodes");
         node["server"] = std::move(server_node);
     }
 
     if (rhs.client) {
-        Node client_node;
-        if (!rhs.client->server_id.empty()) {
-            if (!rhs.client->fallback_server_ids.empty()) {
-                Node ids(NodeType::Sequence);
-                ids.push_back(rhs.client->server_id);
-                for (const auto& fb : rhs.client->fallback_server_ids) {
-                    ids.push_back(fb);
-                }
-                client_node["server_id"] = ids;
-            } else {
-                client_node["server_id"] = rhs.client->server_id;
-            }
-        }
-        const toxtunnel::FailoverConfig defaults{};
-        if (!(rhs.client->failover == defaults)) {
-            Node fo;
-            fo["timeout_seconds"] = rhs.client->failover.timeout_seconds;
-            fo["prefer_primary_grace_seconds"] = rhs.client->failover.prefer_primary_grace_seconds;
-            client_node["failover"] = fo;
-        }
-        if (rhs.client->pipe_target.has_value()) {
-            client_node["pipe"] = *rhs.client->pipe_target;
-        }
-        if (!rhs.client->forwards.empty()) {
-            client_node["forwards"] = rhs.client->forwards;
-        }
-        if (!(rhs.client->socks5 == toxtunnel::Socks5Config{})) {
-            client_node["socks5"] = rhs.client->socks5;
-        }
-        node["client"] = std::move(client_node);
+        node["client"] = *rhs.client;
     }
 
     return node;
@@ -1797,62 +1636,7 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
     } else {  // Client mode
         rhs.client = ClientConfig{};
         const Node client_node = node["client"] ? node["client"] : node;
-
-        if (client_node["server_id"]) {
-            const auto& sid_node = client_node["server_id"];
-            if (sid_node.IsSequence()) {
-                rhs.client->server_id.clear();
-                rhs.client->fallback_server_ids.clear();
-                for (const auto& item : sid_node) {
-                    auto s = item.as<std::string>();
-                    if (rhs.client->server_id.empty()) {
-                        rhs.client->server_id = std::move(s);
-                    } else {
-                        rhs.client->fallback_server_ids.push_back(std::move(s));
-                    }
-                }
-            } else {
-                rhs.client->server_id = sid_node.as<std::string>();
-            }
-        }
-
-        // See convert<ClientConfig>::decode: the explicit key is additive on
-        // top of the list form of `server_id`, and duplicates are validate()'s
-        // problem rather than a silently-dropped entry.
-        // Same two shapes as above; see convert<ClientConfig>::decode for why a
-        // bare IsSequence() test is not enough.
-        if (const auto& fb_node = client_node["fallback_server_ids"]) {
-            if (fb_node.IsSequence()) {
-                for (const auto& item : fb_node) {
-                    rhs.client->fallback_server_ids.push_back(item.as<std::string>());
-                }
-            } else if (!fb_node.IsNull()) {
-                rhs.client->fallback_server_ids.push_back(fb_node.as<std::string>());
-            }
-        }
-
-        if (client_node["pipe"]) {
-            rhs.client->pipe_target = client_node["pipe"].as<PipeTarget>();
-        }
-
-        if (client_node["forwards"]) {
-            rhs.client->forwards = client_node["forwards"].as<std::vector<ForwardRule>>();
-        }
-
-        if (client_node["failover"] && client_node["failover"].IsMap()) {
-            const auto& fo = client_node["failover"];
-            if (fo["timeout_seconds"]) {
-                rhs.client->failover.timeout_seconds = fo["timeout_seconds"].as<uint32_t>();
-            }
-            if (fo["prefer_primary_grace_seconds"]) {
-                rhs.client->failover.prefer_primary_grace_seconds =
-                    fo["prefer_primary_grace_seconds"].as<uint32_t>();
-            }
-        }
-
-        if (client_node["socks5"]) {
-            rhs.client->socks5 = client_node["socks5"].as<toxtunnel::Socks5Config>();
-        }
+        decode_client_fields(client_node, *rhs.client);
     }
 
     return true;
