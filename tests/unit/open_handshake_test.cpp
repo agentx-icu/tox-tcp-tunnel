@@ -22,6 +22,7 @@
 #include <asio.hpp>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -669,8 +670,16 @@ class PeerCloseWatchTest : public ::testing::Test {
     /// a sleep: loopback FIN arrives in microseconds, and the bound only exists
     /// so a regression fails the assertion instead of hanging the suite.
     template <typename Predicate>
-    void pump_until(Predicate done, int max_iterations = 2000) {
-        for (int i = 0; i < max_iterations && !done(); ++i) {
+    /// Drive the io_context until `done()`, bounded by a WALL-CLOCK deadline.
+    ///
+    /// Not an iteration count: a count is a proxy for time, and on a contended
+    /// Windows runner the proxy expires before a real socket event arrives —
+    /// two tests in this file failed exactly that way. The deadline is generous
+    /// and is only a safety bound; every caller still asserts the outcome, so
+    /// reaching it fails loudly rather than passing vacuously.
+    void pump_until(Predicate done, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!done() && std::chrono::steady_clock::now() < deadline) {
             io_ctx.poll();
             io_ctx.restart();
         }
@@ -1106,8 +1115,16 @@ struct LoopbackPair {
 class PeerCloseHoldbackTest : public ::testing::Test {
    protected:
     template <typename Predicate>
-    void pump_until(Predicate done, int max_iterations = 2000) {
-        for (int i = 0; i < max_iterations && !done(); ++i) {
+    /// Drive the io_context until `done()`, bounded by a WALL-CLOCK deadline.
+    ///
+    /// Not an iteration count: a count is a proxy for time, and on a contended
+    /// Windows runner the proxy expires before a real socket event arrives —
+    /// two tests in this file failed exactly that way. The deadline is generous
+    /// and is only a safety bound; every caller still asserts the outcome, so
+    /// reaching it fails loudly rather than passing vacuously.
+    void pump_until(Predicate done, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!done() && std::chrono::steady_clock::now() < deadline) {
             io_ctx.poll();
             io_ctx.restart();
         }
@@ -1257,8 +1274,13 @@ TEST_F(PeerCloseHoldbackTest, ForeignThreadStartReadDoesNotRaceAnArmedWatch) {
         pair->conn->start_read();  // Foreign thread relative to the strand.
         pair->target.shutdown(asio::ip::tcp::socket::shutdown_send, ignored);
 
-        // Bounded spin on the observable outcome; no sleeps.
-        for (int i = 0; i < 100000 && eofs.load() == 0; ++i) {
+        // WALL-CLOCK DEADLINE, not an iteration count. A count is a proxy for
+        // time, and on a contended Windows runner the proxy expires before a
+        // real cross-thread EOF arrives — this test failed exactly that way in a
+        // --gtest_shuffle run. The deadline is generous and is only a safety
+        // bound; the assertions below still fail loudly if it is reached.
+        const auto eof_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (eofs.load() == 0 && std::chrono::steady_clock::now() < eof_deadline) {
             std::this_thread::yield();
         }
 
@@ -1294,8 +1316,16 @@ TEST_F(PeerCloseHoldbackTest, ForeignThreadStartReadDoesNotRaceAnArmedWatch) {
 class UnpublishedTunnelTeardownTest : public ::testing::Test {
    protected:
     template <typename Predicate>
-    void pump_until(Predicate done, int max_iterations = 2000) {
-        for (int i = 0; i < max_iterations && !done(); ++i) {
+    /// Drive the io_context until `done()`, bounded by a WALL-CLOCK deadline.
+    ///
+    /// Not an iteration count: a count is a proxy for time, and on a contended
+    /// Windows runner the proxy expires before a real socket event arrives —
+    /// two tests in this file failed exactly that way. The deadline is generous
+    /// and is only a safety bound; every caller still asserts the outcome, so
+    /// reaching it fails loudly rather than passing vacuously.
+    void pump_until(Predicate done, std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!done() && std::chrono::steady_clock::now() < deadline) {
             io_ctx.poll();
             io_ctx.restart();
         }
@@ -2217,9 +2247,13 @@ TEST(ForceCloseResourceTest, ForceCloseOnAnErroredTunnelKeepsErrorAndStillCloses
     bool connected = false;
     conn->async_connect(acceptor.local_endpoint(),
                         [&connected](const std::error_code& ec) { connected = !ec; });
-    for (int i = 0; i < 2000 && !(accepted && connected); ++i) {
-        io_ctx.poll();
-        io_ctx.restart();
+    // Wall-clock bound, not an iteration count — see pump_until().
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!(accepted && connected) && std::chrono::steady_clock::now() < deadline) {
+            io_ctx.poll();
+            io_ctx.restart();
+        }
     }
     ASSERT_TRUE(accepted);
     ASSERT_TRUE(connected);
@@ -2248,9 +2282,12 @@ TEST(ForceCloseResourceTest, ForceCloseOnAnErroredTunnelKeepsErrorAndStillCloses
 
     // THE RESOURCE ASSERTION: the socket is really gone, observed from both
     // ends rather than inferred from the state field.
-    for (int i = 0; i < 2000 && conn->is_connected(); ++i) {
-        io_ctx.poll();
-        io_ctx.restart();
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (conn->is_connected() && std::chrono::steady_clock::now() < deadline) {
+            io_ctx.poll();
+            io_ctx.restart();
+        }
     }
     EXPECT_FALSE(conn->is_connected()) << "force_close skipped the cleanup and leaked the socket";
 
@@ -2258,13 +2295,16 @@ TEST(ForceCloseResourceTest, ForceCloseOnAnErroredTunnelKeepsErrorAndStillCloses
     std::error_code ec;
     target.non_blocking(true, ec);
     bool far_end_saw_close = false;
-    for (int i = 0; i < 2000 && !far_end_saw_close; ++i) {
-        io_ctx.poll();
-        io_ctx.restart();
-        std::error_code read_ec;
-        const std::size_t got = target.read_some(asio::buffer(scratch), read_ec);
-        far_end_saw_close = got == 0 && read_ec && read_ec != asio::error::would_block &&
-                            read_ec != asio::error::try_again;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!far_end_saw_close && std::chrono::steady_clock::now() < deadline) {
+            io_ctx.poll();
+            io_ctx.restart();
+            std::error_code read_ec;
+            const std::size_t got = target.read_some(asio::buffer(scratch), read_ec);
+            far_end_saw_close = got == 0 && read_ec && read_ec != asio::error::would_block &&
+                                read_ec != asio::error::try_again;
+        }
     }
     EXPECT_TRUE(far_end_saw_close) << "the far end never saw the connection close";
 
@@ -2740,6 +2780,15 @@ TEST(ClaimTerminalIsAtomicTest, AnObserverCannotSampleTheStateBetweenClaimAndObl
         });
     tunnel->set_state(tunnel::Tunnel::State::Connected);
 
+    // The claimant BLOCKS on this until the observer has probed enough. Blocking
+    // — not spinning, not yielding — is what makes the rendezvous independent of
+    // the scheduler: a blocked thread leaves the run queue entirely, so the OS
+    // must run the observer. Yielding was measured insufficient on Windows
+    // (4/5 failures pinned to one CPU); SwitchToThread only offers the core to a
+    // thread already ready on that processor and returns immediately otherwise.
+    std::mutex rendezvous_mutex;
+    std::condition_variable rendezvous_cv;
+
     std::atomic<bool> claimant_paused{false};
     std::atomic<bool> claimant_resumed{false};
     std::atomic<int> probes{0};
@@ -2759,14 +2808,29 @@ TEST(ClaimTerminalIsAtomicTest, AnObserverCannotSampleTheStateBetweenClaimAndObl
     constexpr int kRequiredProbes = 64;
 
     tunnel->set_terminal_claim_test_hook([&]() {
-        claimant_paused.store(true, std::memory_order_release);
-        // Hold the claim open until the observer has genuinely probed. The cap
-        // is bounded work, not a clock, and is only a safety exit — the
-        // assertion below fails loudly if it is reached with too few probes.
-        std::atomic<int> guard_spin{0};
-        while (probes.load(std::memory_order_acquire) < kRequiredProbes &&
-               guard_spin.load(std::memory_order_relaxed) < 50'000'000) {
-            guard_spin.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::unique_lock<std::mutex> rendezvous(rendezvous_mutex);
+            claimant_paused.store(true, std::memory_order_release);
+            rendezvous_cv.notify_all();
+            // BLOCK until the observer has genuinely probed. Two earlier
+            // versions of this wait were scheduler-dependent and both failed on
+            // Windows CI with `probes_at_hook_exit == 0`: a bounded iteration
+            // count (a proxy for time), then a yielding loop. Reproduced here by
+            // pinning the process to a single CPU — the bounded spin failed 5/5
+            // and the yielding wait 4/5.
+            //
+            // Blocking is not a stronger proxy, it is a different mechanism: the
+            // claimant leaves the run queue, so the observer is scheduled by
+            // necessity rather than by the scheduler's goodwill. The deadline is
+            // only a safety bound, and reaching it still fails loudly below.
+            //
+            // Safe even though close_frame_mutex_ is held: the observer probes
+            // with try_lock, so it progresses WITHOUT that mutex and cannot
+            // deadlock against this wait. A blocking observer could not be
+            // waited for like this.
+            rendezvous_cv.wait_for(rendezvous, std::chrono::seconds(30), [&]() {
+                return probes.load(std::memory_order_acquire) >= kRequiredProbes;
+            });
         }
         // The boundary.
         //
@@ -2792,7 +2856,12 @@ TEST(ClaimTerminalIsAtomicTest, AnObserverCannotSampleTheStateBetweenClaimAndObl
     });
 
     std::thread observer([&]() {
-        while (!claimant_paused.load(std::memory_order_acquire)) {
+        {
+            // Block rather than spin, for the same reason as the claimant.
+            std::unique_lock<std::mutex> rendezvous(rendezvous_mutex);
+            rendezvous_cv.wait_for(rendezvous, std::chrono::seconds(30), [&]() {
+                return claimant_paused.load(std::memory_order_acquire);
+            });
         }
         while (!claimant_resumed.load(std::memory_order_acquire)) {
             // Never blocks, so being descheduled costs a probe rather than the
@@ -2803,6 +2872,11 @@ TEST(ClaimTerminalIsAtomicTest, AnObserverCannotSampleTheStateBetweenClaimAndObl
                 saw_premature_release.store(true, std::memory_order_release);
             }
             probes.fetch_add(1, std::memory_order_acq_rel);
+            // Wake the claimant as soon as the quota is met. Taking the
+            // rendezvous mutex here is what gives the notification a
+            // happens-before edge with the claimant's predicate check.
+            { std::lock_guard<std::mutex> rendezvous(rendezvous_mutex); }
+            rendezvous_cv.notify_all();
         }
     });
 
