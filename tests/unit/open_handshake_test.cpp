@@ -59,6 +59,69 @@ namespace {
 constexpr std::uint16_t kTunnelId = 42;
 constexpr std::uint32_t kFriendNumber = 1;
 
+/// Windows' default timer resolution.
+///
+/// An asio timer with a shorter nominal delay routinely takes about this long
+/// there — the same platform behaviour that forced
+/// `tunnel::kMinHonouredCoalesceDelayUs`. Any wait for a timer has to be sized
+/// against THIS, not against the timer's nominal delay.
+constexpr auto kTimerGranularity = std::chrono::milliseconds(16);
+
+/// Safety bound for any wait that depends on a SENDQ retry timer firing.
+///
+/// DERIVED from the retry cadence rather than hardcoded, so the budget and the
+/// thing it waits for cannot drift apart. Sized for Windows: the base retry
+/// delay is 2 ms, but there that is one ~15.6 ms tick, and a wait spanning
+/// several backoff steps needs the sum of those ticks, not the sum of the
+/// nominal delays.
+///
+/// Deliberately generous. Every wait below returns as soon as its predicate
+/// holds, so this is only ever reached when something is actually broken — at
+/// which point the caller's assertion fails loudly, which is the point.
+constexpr auto kRetryWaitBudget =
+    std::chrono::duration_cast<std::chrono::milliseconds>(tunnel::kSendqRetryMaxDelay) * 100 +
+    kTimerGranularity * 100;
+
+/// Drive @p io_ctx until @p done holds, bounded by a wall-clock deadline.
+///
+/// ONE mechanism for every asynchronous wait in this file. Two Windows-only CI
+/// failures came from hand-rolled waits here: first a spin bounded by an
+/// iteration count, then the same thing after a partial sweep missed a loop
+/// whose predicate sat in the body rather than the condition. An iteration count
+/// is a proxy for time and the proxy breaks under contention — 2000 non-blocking
+/// `poll()` calls complete in about a millisecond, so they expire before a 2 ms
+/// timer can even fire.
+///
+/// Uses `run_for`, not `poll()`: it BLOCKS until there is work, so waiting for a
+/// timer costs no CPU and cannot outrun the timer it is waiting for.
+///
+/// NOT for every `poll()` in this file. A bare `poll()` followed by an assertion
+/// that nothing happened is an ANTI-wait: it runs only already-ready handlers to
+/// prove no timer was armed (the retry-spin checks). Giving those a deadline
+/// would invert their meaning — they must not wait. Leave them alone.
+template <typename Predicate>
+void pump_io_until(asio::io_context& io_ctx, Predicate done,
+                   std::chrono::milliseconds timeout = kRetryWaitBudget) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!done()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return;
+        }
+        const auto slice = std::min<std::chrono::milliseconds>(
+            kTimerGranularity,
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
+                std::chrono::milliseconds(1));
+        io_ctx.restart();
+        io_ctx.run_for(slice);
+    }
+    // POST-CONDITION: leave the context runnable. `run_for()` stops the
+    // io_context when its slice expires, and a stopped one makes a later
+    // `run()` return immediately without servicing anything — which silently
+    // broke a test whose worker thread calls run() after connecting.
+    io_ctx.restart();
+}
+
 /// Frame type of an unprefixed wire buffer (offset 0; see ProtocolFrame).
 [[nodiscard]] FrameType type_of(std::span<const std::uint8_t> wire) {
     return static_cast<FrameType>(wire[0]);
@@ -670,19 +733,9 @@ class PeerCloseWatchTest : public ::testing::Test {
     /// a sleep: loopback FIN arrives in microseconds, and the bound only exists
     /// so a regression fails the assertion instead of hanging the suite.
     template <typename Predicate>
-    /// Drive the io_context until `done()`, bounded by a WALL-CLOCK deadline.
-    ///
-    /// Not an iteration count: a count is a proxy for time, and on a contended
-    /// Windows runner the proxy expires before a real socket event arrives —
-    /// two tests in this file failed exactly that way. The deadline is generous
-    /// and is only a safety bound; every caller still asserts the outcome, so
-    /// reaching it fails loudly rather than passing vacuously.
-    void pump_until(Predicate done, std::chrono::seconds timeout = std::chrono::seconds(30)) {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (!done() && std::chrono::steady_clock::now() < deadline) {
-            io_ctx.poll();
-            io_ctx.restart();
-        }
+    /// See pump_io_until(): one mechanism for every asynchronous wait here.
+    void pump_until(Predicate done, std::chrono::milliseconds timeout = kRetryWaitBudget) {
+        pump_io_until(io_ctx, done, timeout);
     }
 
     asio::io_context io_ctx;
@@ -1115,19 +1168,9 @@ struct LoopbackPair {
 class PeerCloseHoldbackTest : public ::testing::Test {
    protected:
     template <typename Predicate>
-    /// Drive the io_context until `done()`, bounded by a WALL-CLOCK deadline.
-    ///
-    /// Not an iteration count: a count is a proxy for time, and on a contended
-    /// Windows runner the proxy expires before a real socket event arrives —
-    /// two tests in this file failed exactly that way. The deadline is generous
-    /// and is only a safety bound; every caller still asserts the outcome, so
-    /// reaching it fails loudly rather than passing vacuously.
-    void pump_until(Predicate done, std::chrono::seconds timeout = std::chrono::seconds(30)) {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (!done() && std::chrono::steady_clock::now() < deadline) {
-            io_ctx.poll();
-            io_ctx.restart();
-        }
+    /// See pump_io_until(): one mechanism for every asynchronous wait here.
+    void pump_until(Predicate done, std::chrono::milliseconds timeout = kRetryWaitBudget) {
+        pump_io_until(io_ctx, done, timeout);
     }
 
     std::unique_ptr<LoopbackPair> Connect() {
@@ -1220,11 +1263,13 @@ TEST_F(PeerCloseHoldbackTest, ReadAheadIsReplayedInOrderWhenTheReadLoopStarts) {
     asio::write(pair->target, asio::buffer(std::string("first")), ignored);
     ASSERT_FALSE(ignored);
 
-    // Let the watch bank those bytes. It stays armed (the target is alive), so
-    // pump a bounded number of iterations rather than to a predicate.
-    for (int i = 0; i < 200; ++i) {
-        io_ctx.poll();
+    // Let the watch bank those bytes. There is no predicate for "banked", so
+    // this drives for a fixed SPAN OF TIME rather than a count of iterations —
+    // a count means nothing on a contended runner. Several Windows timer ticks
+    // is ample for a loopback read.
+    {
         io_ctx.restart();
+        io_ctx.run_for(kTimerGranularity * 4);
     }
     EXPECT_TRUE(received.empty()) << "nothing may be delivered before the read loop starts";
 
@@ -1279,7 +1324,9 @@ TEST_F(PeerCloseHoldbackTest, ForeignThreadStartReadDoesNotRaceAnArmedWatch) {
         // real cross-thread EOF arrives — this test failed exactly that way in a
         // --gtest_shuffle run. The deadline is generous and is only a safety
         // bound; the assertions below still fail loudly if it is reached.
-        const auto eof_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        // The io_context is being run by `runner`, so this waits rather than
+        // drives. Bounded by the same derived budget as every other wait here.
+        const auto eof_deadline = std::chrono::steady_clock::now() + kRetryWaitBudget;
         while (eofs.load() == 0 && std::chrono::steady_clock::now() < eof_deadline) {
             std::this_thread::yield();
         }
@@ -1316,19 +1363,9 @@ TEST_F(PeerCloseHoldbackTest, ForeignThreadStartReadDoesNotRaceAnArmedWatch) {
 class UnpublishedTunnelTeardownTest : public ::testing::Test {
    protected:
     template <typename Predicate>
-    /// Drive the io_context until `done()`, bounded by a WALL-CLOCK deadline.
-    ///
-    /// Not an iteration count: a count is a proxy for time, and on a contended
-    /// Windows runner the proxy expires before a real socket event arrives —
-    /// two tests in this file failed exactly that way. The deadline is generous
-    /// and is only a safety bound; every caller still asserts the outcome, so
-    /// reaching it fails loudly rather than passing vacuously.
-    void pump_until(Predicate done, std::chrono::seconds timeout = std::chrono::seconds(30)) {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (!done() && std::chrono::steady_clock::now() < deadline) {
-            io_ctx.poll();
-            io_ctx.restart();
-        }
+    /// See pump_io_until(): one mechanism for every asynchronous wait here.
+    void pump_until(Predicate done, std::chrono::milliseconds timeout = kRetryWaitBudget) {
+        pump_io_until(io_ctx, done, timeout);
     }
 
     /// Bring up a real loopback pair plus a manager holding the server tunnel,
@@ -1513,10 +1550,10 @@ TEST_F(PeerCloseHoldbackTest, HoldbackOverflowFailsTheHandshakeRatherThanGivingU
         if (ec) {
             break;
         }
-        for (int j = 0; j < 200 && wire.empty(); ++j) {
-            io_ctx.poll();
-            io_ctx.restart();
-        }
+        // Opportunistic drain between writes; the authoritative wait is the
+        // pump_io_until() below. Time-bounded rather than iteration-bounded so
+        // it cannot silently do nothing on a contended runner.
+        pump_io_until(io_ctx, [&]() { return !wire.empty(); }, kTimerGranularity * 4);
         if (!wire.empty()) {
             break;
         }
@@ -2123,15 +2160,16 @@ TEST_F(IdReservationTest, ABackpressuredCloseKeepsTheIdReservedUntilItIsEmitted)
         << "the id was released while a deferred TUNNEL_CLOSE still named it";
 
     // Let the transport drain; the retry timer emits the owed CLOSE.
+    //
+    // This wait is on a sendq_retry timer, so it is bounded by kRetryWaitBudget
+    // — derived from that cadence and sized for Windows timer granularity. It
+    // was an iteration count, which expired in about a millisecond and so could
+    // never outlast even the 2 ms base delay.
     transport_blocked.store(false);
-    for (int i = 0; i < 2000; ++i) {
-        io_ctx.poll();
-        io_ctx.restart();
+    pump_io_until(io_ctx, [&]() {
         std::lock_guard<std::mutex> lock(wire_mutex);
-        if (std::count(wire.begin(), wire.end(), FrameType::TUNNEL_CLOSE) > 0) {
-            break;
-        }
-    }
+        return std::count(wire.begin(), wire.end(), FrameType::TUNNEL_CLOSE) > 0;
+    });
     {
         std::lock_guard<std::mutex> lock(wire_mutex);
         ASSERT_EQ(std::count(wire.begin(), wire.end(), FrameType::TUNNEL_CLOSE), 1)
@@ -2247,14 +2285,7 @@ TEST(ForceCloseResourceTest, ForceCloseOnAnErroredTunnelKeepsErrorAndStillCloses
     bool connected = false;
     conn->async_connect(acceptor.local_endpoint(),
                         [&connected](const std::error_code& ec) { connected = !ec; });
-    // Wall-clock bound, not an iteration count — see pump_until().
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (!(accepted && connected) && std::chrono::steady_clock::now() < deadline) {
-            io_ctx.poll();
-            io_ctx.restart();
-        }
-    }
+    pump_io_until(io_ctx, [&]() { return accepted && connected; });
     ASSERT_TRUE(accepted);
     ASSERT_TRUE(connected);
 
@@ -2282,30 +2313,20 @@ TEST(ForceCloseResourceTest, ForceCloseOnAnErroredTunnelKeepsErrorAndStillCloses
 
     // THE RESOURCE ASSERTION: the socket is really gone, observed from both
     // ends rather than inferred from the state field.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (conn->is_connected() && std::chrono::steady_clock::now() < deadline) {
-            io_ctx.poll();
-            io_ctx.restart();
-        }
-    }
+    pump_io_until(io_ctx, [&]() { return !conn->is_connected(); });
     EXPECT_FALSE(conn->is_connected()) << "force_close skipped the cleanup and leaked the socket";
 
     std::array<std::uint8_t, 8> scratch{};
     std::error_code ec;
     target.non_blocking(true, ec);
     bool far_end_saw_close = false;
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        while (!far_end_saw_close && std::chrono::steady_clock::now() < deadline) {
-            io_ctx.poll();
-            io_ctx.restart();
-            std::error_code read_ec;
-            const std::size_t got = target.read_some(asio::buffer(scratch), read_ec);
-            far_end_saw_close = got == 0 && read_ec && read_ec != asio::error::would_block &&
-                                read_ec != asio::error::try_again;
-        }
-    }
+    pump_io_until(io_ctx, [&]() {
+        std::error_code read_ec;
+        const std::size_t got = target.read_some(asio::buffer(scratch), read_ec);
+        far_end_saw_close = got == 0 && read_ec && read_ec != asio::error::would_block &&
+                            read_ec != asio::error::try_again;
+        return far_end_saw_close;
+    });
     EXPECT_TRUE(far_end_saw_close) << "the far end never saw the connection close";
 
     target.close(ec);
@@ -2730,11 +2751,7 @@ TEST_F(IdReservationTest, ABackpressuredCloseFrameIsRetriedAndKeepsTheIdReserved
     // fixed number of non-blocking poll() calls can finish before it expires —
     // especially on the Windows ARM VM, whose timer granularity is ~15.6 ms.
     transport_blocked.store(false);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (close_attempts.load() < 2 && std::chrono::steady_clock::now() < deadline) {
-        io_ctx.restart();
-        io_ctx.run_for(std::chrono::milliseconds(20));
-    }
+    pump_io_until(io_ctx, [&]() { return close_attempts.load() >= 2; });
 
     EXPECT_GE(close_attempts.load(), 2)
         << "the backpressured TUNNEL_CLOSE was dropped instead of retried";
