@@ -1298,7 +1298,24 @@ TEST_F(PeerCloseHoldbackTest, ForeignThreadStartReadDoesNotRaceAnArmedWatch) {
         auto pair = Connect();
 
         std::atomic<unsigned> eofs{0};
-        std::atomic<unsigned> disconnects{0};
+        // Disconnects are CLASSIFIED BY CAUSE rather than counted, because this
+        // test closes the connection itself during teardown and a bare count
+        // cannot tell that apart from the escalation under test. Counting is
+        // what produced a CI false positive: the runner thread can still be
+        // inside the on_read_eof_ handler when this thread runs `work.reset()`,
+        // so the io_context's work count has not reached zero, it does not stop,
+        // and the force_close handler posted next is executed rather than left
+        // queued — incrementing the counter before it was read. Coverage
+        // instrumentation fattens the handler epilogue and widens that window.
+        //
+        // The causes are distinguishable at the source: force_close() passes
+        // asio::error::operation_aborted, while the watch's escalation passes
+        // `ec ? ec : std::error_code{}` — an EMPTY code for the FIN case. So
+        // anything that is not operation_aborted is an escalation, and unlike a
+        // snapshot this stays valid for the whole life of the connection: an
+        // escalation queued behind the EOF handler is still caught.
+        std::atomic<unsigned> escalations{0};
+        std::atomic<unsigned> teardown_closes{0};
         std::string received;
         std::mutex received_mutex;
         pair->conn->set_on_data([&](const std::uint8_t* data, std::size_t length) {
@@ -1306,8 +1323,13 @@ TEST_F(PeerCloseHoldbackTest, ForeignThreadStartReadDoesNotRaceAnArmedWatch) {
             received.append(reinterpret_cast<const char*>(data), length);
         });
         pair->conn->set_on_read_eof([&eofs]() { eofs.fetch_add(1); });
-        pair->conn->set_on_disconnect(
-            [&disconnects](const std::error_code&) { disconnects.fetch_add(1); });
+        pair->conn->set_on_disconnect([&escalations, &teardown_closes](const std::error_code& ec) {
+            if (ec == asio::error::operation_aborted) {
+                teardown_closes.fetch_add(1);
+            } else {
+                escalations.fetch_add(1);
+            }
+        });
 
         pair->conn->watch_peer_close();
         std::error_code ignored;
@@ -1331,14 +1353,45 @@ TEST_F(PeerCloseHoldbackTest, ForeignThreadStartReadDoesNotRaceAnArmedWatch) {
             std::this_thread::yield();
         }
 
-        work.reset();
+        // A half-close must leave the connection Connected with only its read
+        // half shut — our write side still usable — whereas an escalation drives
+        // do_close() to Disconnected. Sampled here, before our own close makes
+        // the state meaningless. This is a snapshot and only speaks for this
+        // moment; the escalation classifier above is what covers all of time.
+        const core::ConnectionState state_at_eof = pair->conn->state();
+
+        // Close while the work guard is still held so the runner actually
+        // executes it, then wait for it to land. Resetting the guard first can
+        // leave this handler queued-but-unrun, and it would then fire during a
+        // later iteration — against callbacks that capture this iteration's
+        // now-dead locals by reference.
         pair->conn->force_close();
+        const auto close_deadline = std::chrono::steady_clock::now() + kRetryWaitBudget;
+        while (pair->conn->state() != core::ConnectionState::Disconnected &&
+               std::chrono::steady_clock::now() < close_deadline) {
+            std::this_thread::yield();
+        }
+        // RECORD, do not assert: `runner` is still joinable here, and a fatal
+        // assertion would unwind through a joinable std::thread — that is
+        // std::terminate, which would take the whole test binary down instead of
+        // reporting a failure. Assert after the join below.
+        const bool teardown_settled = pair->conn->state() == core::ConnectionState::Disconnected;
+
+        work.reset();
         runner.join();
         io_ctx.restart();
 
+        // Past the join the runner thread is gone, so every callback has run to
+        // completion and the counters below are final rather than sampled.
+        ASSERT_TRUE(teardown_settled) << "iteration " << iteration << ": teardown did not settle";
         ASSERT_EQ(eofs.load(), 1u) << "iteration " << iteration;
-        ASSERT_EQ(disconnects.load(), 0u)
+        ASSERT_EQ(escalations.load(), 0u)
             << "iteration " << iteration << ": the watch escalated a half-close into a hard close";
+        ASSERT_EQ(teardown_closes.load(), 1u)
+            << "iteration " << iteration << ": expected exactly one close, from the teardown";
+        ASSERT_EQ(state_at_eof, core::ConnectionState::Connected)
+            << "iteration " << iteration
+            << ": a half-close must leave the write side usable, not close the connection";
         {
             std::lock_guard<std::mutex> lock(received_mutex);
             ASSERT_EQ(received, "payload") << "iteration " << iteration;
