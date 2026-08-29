@@ -316,7 +316,8 @@ TEST(ClientTunnelSenderTest, FixedFriendSenderUsesCapturedFriendForSpanFrames) {
         /*friend_number=*/41);
 
     const std::array<uint8_t, 3> frame = {0x01, 0x02, 0x03};
-    ASSERT_TRUE(sender(std::span<const uint8_t>(frame.data(), frame.size())));
+    ASSERT_EQ(sender(std::span<const uint8_t>(frame.data(), frame.size())),
+              tunnel::SendOutcome::Sent);
     ASSERT_EQ(friend_numbers.size(), 1u);
     EXPECT_EQ(friend_numbers[0], 41u);
 }
@@ -332,7 +333,7 @@ TEST(ClientTunnelSenderTest, FixedFriendSenderUsesCapturedFriendForOwnedFrames) 
 
     auto buf = tunnel::OwnedFrameBuffer::with_payload(std::span<const uint8_t>{});
     tunnel::ProtocolFrame::serialize_tunnel_data_in_place(buf, /*tunnel_id=*/9);
-    ASSERT_TRUE(sender(std::move(buf)));
+    ASSERT_EQ(sender(std::move(buf)), tunnel::SendOutcome::Sent);
     ASSERT_EQ(friend_numbers.size(), 1u);
     EXPECT_EQ(friend_numbers[0], 73u);
 }

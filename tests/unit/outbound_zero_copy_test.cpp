@@ -174,13 +174,13 @@ TEST_F(OutboundZeroCopyTunnelTest, SendDataPrefersOwnedCallback) {
 
     std::vector<OwnedFrameBuffer> owned_calls;
     std::atomic<int> span_calls{0};
-    tunnel.set_on_send_to_tox_owned([&owned_calls](OwnedFrameBuffer buf) -> bool {
+    tunnel.set_on_send_to_tox_owned([&owned_calls](OwnedFrameBuffer buf) -> tunnel::SendOutcome {
         owned_calls.push_back(std::move(buf));
-        return true;
+        return tunnel::SendOutcome::Sent;
     });
-    tunnel.set_on_send_to_tox([&span_calls](std::span<const std::uint8_t>) -> bool {
+    tunnel.set_on_send_to_tox([&span_calls](std::span<const std::uint8_t>) -> tunnel::SendOutcome {
         span_calls.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        return tunnel::SendOutcome::Sent;
     });
 
     const auto payload = make_pattern(800, 0x42);
@@ -212,10 +212,11 @@ TEST_F(OutboundZeroCopyTunnelTest, FallsBackToSpanCallbackWhenOwnedAbsent) {
     tunnel.set_state(tunnel::Tunnel::State::Connected);
 
     std::vector<std::vector<std::uint8_t>> span_calls;
-    tunnel.set_on_send_to_tox([&span_calls](std::span<const std::uint8_t> data) -> bool {
-        span_calls.emplace_back(data.begin(), data.end());
-        return true;
-    });
+    tunnel.set_on_send_to_tox(
+        [&span_calls](std::span<const std::uint8_t> data) -> tunnel::SendOutcome {
+            span_calls.emplace_back(data.begin(), data.end());
+            return tunnel::SendOutcome::Sent;
+        });
 
     const auto payload = make_pattern(64, 0xAB);
     ASSERT_TRUE(tunnel.send_data_to_tox(std::span<const std::uint8_t>(payload)));
@@ -236,9 +237,9 @@ TEST_F(OutboundZeroCopyTunnelTest, LargeWriteFragmentsIntoMultipleOwnedFrames) {
     tunnel.set_state(tunnel::Tunnel::State::Connected);
 
     std::vector<OwnedFrameBuffer> owned_calls;
-    tunnel.set_on_send_to_tox_owned([&owned_calls](OwnedFrameBuffer buf) -> bool {
+    tunnel.set_on_send_to_tox_owned([&owned_calls](OwnedFrameBuffer buf) -> tunnel::SendOutcome {
         owned_calls.push_back(std::move(buf));
-        return true;
+        return tunnel::SendOutcome::Sent;
     });
 
     // 4000 bytes > 1367-byte Tox MTU → ceil(4000/1367) = 3 frames.
@@ -272,9 +273,9 @@ TEST_F(OutboundZeroCopyTunnelTest, OwnedFrameBufferSurvivesHandoff) {
     tunnel.set_state(tunnel::Tunnel::State::Connected);
 
     std::shared_ptr<OwnedFrameBuffer> escaped;
-    tunnel.set_on_send_to_tox_owned([&escaped](OwnedFrameBuffer buf) -> bool {
+    tunnel.set_on_send_to_tox_owned([&escaped](OwnedFrameBuffer buf) -> tunnel::SendOutcome {
         escaped = std::make_shared<OwnedFrameBuffer>(std::move(buf));
-        return true;
+        return tunnel::SendOutcome::Sent;
     });
 
     {

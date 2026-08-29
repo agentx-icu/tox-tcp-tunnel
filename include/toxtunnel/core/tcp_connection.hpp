@@ -202,6 +202,42 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
         return read_paused_.load(std::memory_order_acquire);
     }
 
+    /// Watch for the peer closing the connection, WITHOUT starting the read
+    /// loop or delivering any data.
+    ///
+    /// A connected socket with no outstanding read notices nothing: a FIN or
+    /// RST from the peer is only surfaced by a read (or a write) completing.
+    /// The server's open handshake has exactly such a window — the target TCP
+    /// connection is established, but `start_read()` is deliberately held back
+    /// until the OPEN_ACK reaches the peer (see `detail::OpenAckGate`), because
+    /// data read before then could overtake the ACK. Without this watch, a
+    /// target that dies inside that window is invisible: nothing tears the
+    /// tunnel down and the client waits in `Connecting` for an ACK whose tunnel
+    /// is already dead.
+    ///
+    /// A socket that becomes readable with zero bytes available has received
+    /// FIN; a probe that errors means RST. Readable *with* data is not proof of
+    /// life for our purposes, though: a target that writes a banner and then
+    /// closes hides its FIN behind those bytes. So data seen here is read into a
+    /// bounded holdback buffer and the watch re-arms, which is what makes
+    /// data-then-close detectable. Nothing is delivered to `on_data_` until
+    /// `start_read()` replays the holdback ahead of the first live read, so the
+    /// OPEN_ACK barrier is preserved: reads happen, deliveries do not.
+    ///
+    /// On peer close this drives the ordinary teardown — `Disconnecting`, then
+    /// `on_disconnect_` — so callers need no separate callback. Deliberately a
+    /// hard close rather than the read loop's `on_read_eof_` half-close: there
+    /// is no published tunnel yet to half-close.
+    ///
+    /// Safe to call from any thread; at most one watch is armed at a time.
+    void watch_peer_close();
+
+    /// Stand the peer-close watch down. Idempotent, safe from any thread, and
+    /// implied by `start_read()` — once the read loop owns the socket it
+    /// reports peer close itself, and letting both fire would turn a half-close
+    /// (`on_read_eof_`) into a hard close.
+    void cancel_peer_close_watch();
+
     /// Queue data for asynchronous writing.
     ///
     /// @return `true` if the data was accepted; `false` if the write buffer
@@ -273,6 +309,13 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 
     /// Post the next async_read_some if reading is active.
     void do_read();
+
+    /// Arm the readability wait behind `watch_peer_close()`. Runs on the strand.
+    void do_watch_peer_close();
+
+    /// Hand any bytes the peer-close watch read ahead to `on_data_`, in order,
+    /// before the read loop's first delivery. Runs on the strand.
+    void deliver_peer_close_holdback();
 
     /// Append an already-built WriteBuffer to the queue, update accounting,
     /// arm the backpressure watermark, and kick do_write() if idle. Must run
@@ -352,6 +395,32 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 
     /// True after TCP read EOF. The socket may still be writable.
     bool read_closed_{false};
+
+    /// Largest read-ahead the peer-close watch will bank before standing down.
+    /// Bounds the memory a chatty target can make us hold while the OPEN_ACK is
+    /// backpressured.
+    static constexpr std::size_t kPeerCloseHoldbackCap = 64 * 1024;
+
+    /// True while a `watch_peer_close()` watch should still act on its result.
+    ///
+    /// A plain bool, not an atomic: every reader and writer runs on `strand_`.
+    /// That is the point — `start_read()`, `cancel_peer_close_watch()` and the
+    /// wait completion all dispatch onto the strand, so the takeover from watch
+    /// to read loop is serialised rather than merely flagged. An atomic could
+    /// not stop a watcher that was already past its own check.
+    ///
+    /// The outstanding `async_wait` is left to complete on its own and simply
+    /// does nothing when this is false — `socket_.cancel()` would tear down
+    /// unrelated in-flight writes too.
+    bool peer_close_watch_active_{false};
+
+    /// True between arming the readability wait and its completion. Strand-only;
+    /// stops a second `watch_peer_close()` submitting a duplicate wait.
+    bool peer_close_watch_in_flight_{false};
+
+    /// Bytes the watch read ahead of the read loop, replayed to `on_data_` by
+    /// `start_read()`. Strand-only. Capped at `kPeerCloseHoldbackCap`.
+    std::vector<std::uint8_t> peer_close_holdback_;
 
     /// True once a write enqueue pushed the queue at/above the backpressure
     /// limit; reset (and on_writable_ fired) when the queue drains back below

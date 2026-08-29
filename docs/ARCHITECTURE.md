@@ -137,6 +137,43 @@ has no SIGHUP, so the reload named pipe is served by one small dedicated thread
 - `MetricsRegistry` is updated lock-free (atomic increments) from any thread, including
   the Tox thread, without marshalling.
 
+### Outbound send seam
+
+Every per-tunnel send callback returns `tunnel::SendOutcome`
+(`Sent` / `SendqFull` / `PermanentFail`), not a bool. The distinction is
+load-bearing rather than cosmetic: `SendqFull` means the frame never reached
+toxcore and the caller still owns it, so a caller that reads it as "delivered"
+goes on to release the tunnel id while the frame is still queued — and ids are
+recycled per friend.
+
+Two owners exist for a backpressured frame, and exactly one owns any given one:
+
+| Frame | Retry owner |
+|---|---|
+| `TUNNEL_OPEN`, `TUNNEL_ACK` | the tunnel / the server's `OpenAckGate` (retained, re-sent on the SENDQ backoff in `tunnel/sendq_retry.hpp`) |
+| `TUNNEL_DATA` | the per-tunnel coalesce buffer |
+| everything else | `TunnelManager::pending_outbound_` (raw wire bytes, drained on a timer) |
+
+The manager queue carries no tunnel identity or generation, which is why the
+handshake frames were moved off it. All four production tunnel paths (the
+client's forward, SOCKS5 and pipe tunnels, and the server's target tunnel) are
+wired from one place, `app::detail::make_tunnel_senders()`.
+
+**Outbound FIFO barrier.** A per-tunnel send goes straight to toxcore, bypassing
+`TunnelManager::send_frame()`, so it must consult
+`TunnelManager::outbound_queue_busy()` *before* sending — otherwise a new
+`TUNNEL_OPEN` for a recycled id can be accepted ahead of the old, still-parked
+`TUNNEL_CLOSE` for that same id, and the CLOSE then kills the new tunnel. The
+barrier covers frames already parked *and* one popped by the drain and still
+inside the transport call. It is applied to `TUNNEL_OPEN` and `TUNNEL_ACK` only;
+`TUNNEL_DATA` is ordered behind them transitively (it cannot flow before the
+tunnel is `Connected`), and the still-parked control frames keep their existing
+best-effort ordering until they too move to driver ownership. The guarantee is
+causal, not total: the check releases `pending_mutex_` before calling toxcore, so
+a frame parked by an unrelated thread in that gap can still be overtaken.
+
+Design rationale and the remaining slices: `docs/design/outbound-send-driver.md`.
+
 ## Data Flow
 
 ### Client -> Server (Outbound Tunnel)
@@ -165,6 +202,64 @@ has no SIGHUP, so the reload named pipe is served by one small dedicated thread
             |------- TUNNEL_CLOSE --------->|  (or <-)
             |                               |
 ```
+
+#### Handshake ownership and the OPEN_ACK barrier
+
+Neither handshake frame is "fire and forget"; each is owned by a driver that
+retries it until the transport gives a definite answer.
+
+**Client, `TUNNEL_OPEN`.** `TunnelImpl::open()` moves to `Connecting` and sends.
+`SendqFull` keeps the frame and re-arms a dedicated retry timer — deliberately
+*not* the coalesce timer's delay, which is legally `0` (the effective Windows
+default) and would spin. Only `PermanentFail` rolls back to `None`. The
+`OpenPhase` state machine (`Pending → Sending → Sent | Abandoned | Failed`)
+records whether the peer can possibly know the id, which decides one invariant:
+
+> A local close before the OPEN was ever sent resolves the tunnel locally and
+> emits **no** `TUNNEL_CLOSE` — the peer has never heard of the id, and after
+> recycling that CLOSE would tear down an unrelated tunnel. Once the OPEN is
+> sent, the CLOSE becomes mandatory.
+
+`open()`, `retry_open_send()`, `close()` and `force_close()` can all race for the
+same tunnel. The phase claim excludes the two OPEN attempts from each other;
+`open()` and `close()` claim their terminal edges with
+`TunnelImpl::transition_state_if()`, a compare-exchange on `state_`, and
+`transition_state()` itself refuses to leave a terminal state so the remaining
+blind writers cannot resurrect one.
+
+`force_close()` goes further, through `TunnelImpl::claim_terminal()`: it publishes
+the terminal state AND the decision about whether a `TUNNEL_CLOSE` is owed in a
+single critical section. Those were two steps once, and the instant between them
+was observable as "terminal, owes nothing" — which is exactly the state that means
+the id is free, so a resolver could recycle the id and the claimant would then
+emit its CLOSE against whatever took it. `id_releasable()` reads the tunnel state
+under that same lock, which is what makes the pair atomic to every observer.
+
+**Server, `TUNNEL_ACK` (the OPEN_ACK).** `app::detail::OpenAckGate` puts the
+`Connected` transition, the open metrics, `start_read()` and therefore all DATA
+admission behind the *same* `Sent` transition of the ACK. Publishing any of them
+earlier lets TCP reads start while the ACK is still parked, and DATA — which
+travels the per-tunnel path, not the manager queue — then reaches a peer still in
+`Connecting`, which silently discards it. The gate's phases
+(`Pending → Sending → Committing → Committed | Abandoned`) exist because
+resolution is not instantaneous and the gap is observable from the TCP strand:
+`Sending` stops an abandonment from emitting `TUNNEL_ERROR` while an ACK is still
+in flight, and `Committing` stops a target death mid-commit being answered as
+"the tunnel is live" when `Tunnel::close()` would still be a no-op.
+
+If the target dies while the ACK is backpressured, the waiting client is resolved
+with a terminal `TUNNEL_ERROR`, not a `TUNNEL_CLOSE` — a CLOSE received in
+`Connecting` does not complete that state. Reaching that path needs
+`TcpConnection::watch_peer_close()`: with `start_read()` held back there is no
+outstanding read, and a socket with no outstanding read never surfaces a FIN. The
+watch is a readability wait plus an `available()` probe; data seen there is read
+into a bounded holdback buffer and the watch re-arms, so a target that writes a
+banner and *then* closes is still detected. The holdback is replayed to `on_data_`
+by `start_read()`, ahead of the first live read — reads happen early, deliveries
+do not, so the barrier holds. The whole watch-to-read takeover is dispatched onto
+the connection's strand: `start_read()` is called from a generic I/O worker (the
+gate's commit can run from a retry timer), and a stand-down flag alone cannot stop
+a watch handler that is already past its own check.
 
 ## Operational Endpoints
 

@@ -176,15 +176,61 @@ void TcpConnection::async_connect(const asio::ip::tcp::endpoint& endpoint, Conne
 }
 
 void TcpConnection::start_read() {
-    // Initiate the first read directly. After this, do_read chains itself from
-    // inside the strand-bound completion handler, so we only need to start it
-    // once. Sync initiation also avoids reordering relative to peer state.
-    if (state_.load(std::memory_order_acquire) != ConnectionState::Connected) {
-        util::Logger::warn("TcpConnection::start_read called in state {}",
-                           to_string(state_.load()));
+    // The takeover from the peer-close watch to the read loop happens ENTIRELY
+    // on the strand. Standing the watch down with an atomic and then calling
+    // do_read() on the caller's thread is not enough: the caller here is a
+    // generic io_context worker (the OPEN_ACK gate's commit can run from a retry
+    // timer), so a watcher already past its own check would still be running
+    // available()/do_close() on the strand while do_read() touched the same
+    // strand-only members. dispatch() runs inline when we are already on the
+    // strand — preserving the synchronous initiation that avoids reordering
+    // relative to peer state — and posts otherwise.
+    auto self = shared_from_this();
+    asio::dispatch(strand_, [this, self]() {
+        // Both halves of the takeover, in one strand-serialised step: the watch
+        // reports peer close as a hard close, while the read loop reports it as
+        // a *half*-close via on_read_eof_. Exactly one of them may own that.
+        peer_close_watch_active_ = false;
+
+        if (state_.load(std::memory_order_acquire) != ConnectionState::Connected) {
+            util::Logger::warn("TcpConnection::start_read called in state {}",
+                               to_string(state_.load()));
+            return;
+        }
+
+        // Anything the watch read ahead while the tunnel was still un-published
+        // must reach on_data_ before the socket's next bytes do.
+        deliver_peer_close_holdback();
+        do_read();
+    });
+}
+
+void TcpConnection::watch_peer_close() {
+    auto self = shared_from_this();
+    asio::post(strand_, [this, self]() {
+        peer_close_watch_active_ = true;
+        do_watch_peer_close();
+    });
+}
+
+void TcpConnection::cancel_peer_close_watch() {
+    auto self = shared_from_this();
+    asio::dispatch(strand_, [this, self]() { peer_close_watch_active_ = false; });
+}
+
+void TcpConnection::deliver_peer_close_holdback() {
+    if (peer_close_holdback_.empty()) {
         return;
     }
-    do_read();
+    // Move out first: on_data_ can re-enter this object, and the buffer must
+    // already look empty by then.
+    std::vector<std::uint8_t> holdback;
+    holdback.swap(peer_close_holdback_);
+    util::Logger::debug("TcpConnection: replaying {} bytes read ahead of the read loop",
+                        holdback.size());
+    if (on_data_) {
+        on_data_(holdback.data(), holdback.size());
+    }
 }
 
 bool TcpConnection::write(const uint8_t* data, std::size_t length) {
@@ -483,6 +529,118 @@ void TcpConnection::do_read() {
             }
 
             do_read();
+        }));
+}
+
+void TcpConnection::do_watch_peer_close() {
+    if (!peer_close_watch_active_) {
+        return;  // Stood down before we got here (the common, ACK-accepted case).
+    }
+    if (state_.load(std::memory_order_acquire) != ConnectionState::Connected) {
+        return;
+    }
+    if (read_closed_ || read_in_flight_ || peer_close_watch_in_flight_) {
+        // Either the read loop already owns peer-close reporting, or a watch is
+        // already armed. Never two.
+        return;
+    }
+
+    peer_close_watch_in_flight_ = true;
+    auto self = shared_from_this();
+    socket_.async_wait(
+        asio::ip::tcp::socket::wait_read,
+        asio::bind_executor(strand_, [this, self](const std::error_code& ec) {
+            peer_close_watch_in_flight_ = false;
+            if (ec == asio::error::operation_aborted) {
+                return;
+            }
+            if (!peer_close_watch_active_) {
+                // start_read() (or an explicit cancel) took over while the wait
+                // was outstanding — both run on this strand, so that decision is
+                // already final. Whatever made the socket readable now belongs
+                // to the read loop.
+                return;
+            }
+            if (state_.load(std::memory_order_acquire) != ConnectionState::Connected) {
+                return;
+            }
+
+            if (!ec) {
+                // Readable. That is either the peer closing (FIN: readable with
+                // nothing to read) or real data — and a target that sends a
+                // banner and *then* closes hides its FIN behind those bytes. So
+                // the data cannot simply be left in the kernel: read it into a
+                // holdback buffer and keep watching, which is what turns
+                // "data-then-close" into a detectable close.
+                //
+                // Reading here does NOT breach the OPEN_ACK barrier. Nothing is
+                // delivered to on_data_ until start_read() replays the holdback,
+                // and start_read() only runs from the gate's commit callback,
+                // after the ACK is on the wire.
+                std::error_code avail_ec;
+                const std::size_t available = socket_.available(avail_ec);
+                if (!avail_ec && available > 0) {
+                    if (peer_close_holdback_.size() >= kPeerCloseHoldbackCap) {
+                        // The read-ahead is bounded on purpose, but standing the
+                        // watch down here would silently give up close
+                        // detection: a later FIN would stay hidden behind the
+                        // unread bytes, and with the OPEN_ACK still
+                        // backpressured the peer would wait in Connecting for a
+                        // tunnel whose target is already gone — exactly the
+                        // failure this watch exists to prevent. Overflowing the
+                        // cap therefore terminates the unpublished handshake,
+                        // so the peer gets a definite TUNNEL_ERROR instead of an
+                        // indefinite wait.
+                        //
+                        // Only reachable when a target pushes more than the cap
+                        // faster than the ACK retry can clear it: a stalled Tox
+                        // link plus a fast talker.
+                        util::Logger::warn(
+                            "TcpConnection: target sent more than {} bytes before its tunnel was "
+                            "established; failing the handshake",
+                            kPeerCloseHoldbackCap);
+                        peer_close_watch_active_ = false;
+                        peer_close_holdback_.clear();
+                        peer_close_holdback_.shrink_to_fit();
+                        set_state(ConnectionState::Disconnecting);
+                        do_close(asio::error::no_buffer_space);
+                        return;
+                    }
+
+                    const std::size_t want =
+                        std::min(available, kPeerCloseHoldbackCap - peer_close_holdback_.size());
+                    const std::size_t offset = peer_close_holdback_.size();
+                    peer_close_holdback_.resize(offset + want);
+                    std::error_code read_ec;
+                    const std::size_t got = socket_.read_some(
+                        asio::buffer(peer_close_holdback_.data() + offset, want), read_ec);
+                    peer_close_holdback_.resize(offset + got);
+
+                    if (!read_ec) {
+                        // Still alive with bytes banked. Keep watching so a FIN
+                        // arriving behind them is still seen.
+                        do_watch_peer_close();
+                        return;
+                    }
+                    if (read_ec == asio::error::would_block || read_ec == asio::error::try_again) {
+                        do_watch_peer_close();
+                        return;
+                    }
+                    // eof / reset while draining: fall through to teardown.
+                }
+            }
+
+            // Readable with nothing to read is FIN; a failed probe, a failed
+            // wait or a failed read is RST or worse. Either way the target is
+            // gone, and it is gone before the tunnel was ever published — so
+            // this is a hard close, not the half-close the read loop would
+            // report. Anything banked in the holdback dies with it.
+            peer_close_watch_active_ = false;
+            peer_close_holdback_.clear();
+            peer_close_holdback_.shrink_to_fit();
+            util::Logger::debug("TcpConnection: peer closed before the read loop started");
+            set_state(ConnectionState::Disconnecting);
+            do_close(ec ? ec : std::error_code{});
         }));
 }
 

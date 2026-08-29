@@ -76,7 +76,9 @@ class HttpTunnelTest : public ::testing::Test {
             mgr.for_each_tunnel([](uint16_t /*id*/, tunnel::Tunnel* t) {
                 auto* impl = dynamic_cast<tunnel::TunnelImpl*>(t);
                 if (impl) {
-                    impl->set_on_send_to_tox([](std::span<const uint8_t>) -> bool { return true; });
+                    impl->set_on_send_to_tox([](std::span<const uint8_t>) -> tunnel::SendOutcome {
+                        return tunnel::SendOutcome::Sent;
+                    });
                     impl->set_on_data_for_tcp([](std::span<const uint8_t>) { return true; });
                     impl->set_on_state_change([](tunnel::Tunnel::State) {});
                     impl->set_on_error([](const tunnel::TunnelErrorPayload&) {});
@@ -176,13 +178,19 @@ class HttpTunnelTest : public ::testing::Test {
         auto client_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
         auto* client_raw = client_tunnel.get();
 
-        client_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
-            auto frame = tunnel::ProtocolFrame::deserialize(data);
-            if (frame) {
-                return client_mgr_->send_frame(frame.value());
-            }
-            return false;
-        });
+        client_tunnel->set_on_send_to_tox(
+            [this](std::span<const uint8_t> data) -> tunnel::SendOutcome {
+                auto frame = tunnel::ProtocolFrame::deserialize(data);
+                if (frame) {
+                    // The harness routes through the manager's bool send_frame; it
+                    // is a synchronous in-process hand-off, so "queued" and "sent"
+                    // coincide here.
+                    return client_mgr_->send_frame(frame.value())
+                               ? tunnel::SendOutcome::Sent
+                               : tunnel::SendOutcome::PermanentFail;
+                }
+                return tunnel::SendOutcome::PermanentFail;
+            });
 
         client_mgr_->add_tunnel(tid, std::move(client_tunnel));
         (void)client_raw->open("127.0.0.1", 9090);
@@ -191,13 +199,19 @@ class HttpTunnelTest : public ::testing::Test {
         auto server_tunnel = std::make_unique<tunnel::TunnelImpl>(*io_ctx_, tid, kFriendNumber);
         auto* server_raw = server_tunnel.get();
 
-        server_tunnel->set_on_send_to_tox([this](std::span<const uint8_t> data) -> bool {
-            auto frame = tunnel::ProtocolFrame::deserialize(data);
-            if (frame) {
-                return server_mgr_->send_frame(frame.value());
-            }
-            return false;
-        });
+        server_tunnel->set_on_send_to_tox(
+            [this](std::span<const uint8_t> data) -> tunnel::SendOutcome {
+                auto frame = tunnel::ProtocolFrame::deserialize(data);
+                if (frame) {
+                    // The harness routes through the manager's bool send_frame; it
+                    // is a synchronous in-process hand-off, so "queued" and "sent"
+                    // coincide here.
+                    return server_mgr_->send_frame(frame.value())
+                               ? tunnel::SendOutcome::Sent
+                               : tunnel::SendOutcome::PermanentFail;
+                }
+                return tunnel::SendOutcome::PermanentFail;
+            });
 
         server_tunnel->set_state(tunnel::Tunnel::State::Connected);
         server_mgr_->add_tunnel(tid, std::move(server_tunnel));

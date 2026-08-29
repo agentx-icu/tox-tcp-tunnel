@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -281,6 +282,263 @@ class InboundByteThrottle {
     std::deque<Deferred> backlog_;
     std::size_t backlog_bytes_{0};
     std::chrono::nanoseconds retry_after_{0};
+};
+
+// ---------------------------------------------------------------------------
+// Server tunnel publication / abandonment
+// ---------------------------------------------------------------------------
+//
+// Everything below exists because of one asymmetry: the OPEN_ACK gate
+// deliberately leaves a server tunnel in `Tunnel::State::None` until its ACK is
+// on the wire, and `Tunnel::close()` is a documented no-op in `None`. So every
+// teardown that routes through `close()` — including `TunnelManager::
+// remove_tunnel()` and `close_all()` — silently does nothing for an unpublished
+// tunnel, leaving its target socket open and its accounting unbalanced. These
+// helpers own the two transitions out of that state explicitly, and are free
+// functions rather than lambdas inside `wire_tcp_to_tunnel()` so they can be
+// tested against a real socket.
+
+/// Whether the server's `tunnels_active` gauge has been counted for a tunnel.
+///
+/// The gauge is incremented at publication (inside the gate's commit) but
+/// decremented from a state-change callback that can fire at any time,
+/// including before publication ever happens. A plain "already decremented"
+/// latch therefore gets it wrong in both directions: it decrements a gauge that
+/// was never incremented when a tunnel is abandoned, and it misses the
+/// decrement when a terminal transition beats the increment.
+enum class ActiveGaugeState : std::uint8_t {
+    NotCounted,  ///< Never published.
+    Counted,     ///< Published; the gauge owes one decrement.
+    Released,    ///< Settled — no further increment or decrement may happen.
+};
+
+/// The latch guards the metric SIDE EFFECT, not just the state word.
+///
+/// A lock-free version of this was wrong in a way that only shows up under
+/// concurrency: after the compare-exchange published `Counted`, a release could
+/// run before the matching increment had happened. Its decrement saturated at
+/// zero and did nothing, and the delayed increment then left the gauge stuck at
+/// +1 with nobody left to give it back. Ordering the state word is not enough —
+/// the increment and decrement have to be inside the same critical section as
+/// the transition that authorises them. The mutex is only ever held across a
+/// lock-free atomic counter update, never across a tunnel or manager callback.
+struct ActiveGauge {
+    std::mutex mutex;
+    ActiveGaugeState state{ActiveGaugeState::NotCounted};
+};
+
+using ActiveGaugeLatch = std::shared_ptr<ActiveGauge>;
+
+[[nodiscard]] inline ActiveGaugeLatch make_active_gauge_latch() {
+    return std::make_shared<ActiveGauge>();
+}
+
+/// Current latch state. Test observability only — production code must act
+/// through count/release so the side effect stays serialised.
+[[nodiscard]] ActiveGaugeState active_gauge_state(const ActiveGaugeLatch& latch);
+
+/// Count this tunnel as active, at most once and never after release.
+/// @return true if this call incremented the gauge.
+bool active_gauge_count(const ActiveGaugeLatch& latch);
+
+/// Settle the latch, decrementing only if it had actually been counted. Safe to
+/// call on a tunnel that was never published; safe to call repeatedly.
+void active_gauge_release(const ActiveGaugeLatch& latch);
+
+/// Install every hook that must settle a server tunnel's active-gauge count.
+///
+/// There are two, and both are needed. A terminal transition covers the paths
+/// that reach `Closed`/`Error` directly. `on_close_` covers the one that does
+/// not: a graceful close of a published tunnel stops at `Disconnecting`, fires
+/// `on_close_`, and then waits for the peer — so a release wired only to
+/// terminal states holds the count for as long as the tunnel sits half-closed,
+/// and forever when the half-close reaper is disabled.
+///
+/// @param extra_on_close  The caller's own on_close work, run after the gauge
+///                        is settled. May be null.
+void wire_active_gauge(tunnel::TunnelImpl& tunnel, ActiveGaugeLatch gauge,
+                       std::function<void()> extra_on_close);
+
+/// What `commit_open_ack()` did.
+enum class OpenAckCommit : std::uint8_t {
+    Published,  ///< Connected, gauge counted, read loop started.
+    Detached,   ///< The manager no longer owns this tunnel; resources released.
+    Gone,       ///< The tunnel or its socket had already been destroyed.
+};
+
+/// Publish a server tunnel, now that its OPEN_ACK is on the wire.
+///
+/// Verifies that @p weak_manager still owns *this exact tunnel* before
+/// publishing anything. A concurrent `close_all()` / `remove_tunnel()` can
+/// detach an unpublished tunnel while the ACK is still in flight, and because
+/// `close()` no-ops in `None` that detachment leaves the tunnel un-torn-down —
+/// so committing afterwards would strand a `Connected` tunnel nobody routes to,
+/// with a leaked active-gauge count, an open target socket and a read loop
+/// delivering into a manager that has forgotten it. On that path this releases
+/// the local resources instead of publishing.
+[[nodiscard]] OpenAckCommit commit_open_ack(
+    const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+    const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+    const std::weak_ptr<core::TcpConnection>& weak_tcp, std::uint16_t tunnel_id,
+    std::uint32_t friend_number, const ActiveGaugeLatch& gauge);
+
+/// Resolve a server tunnel whose OPEN_ACK DID reach the peer but which could
+/// not be published after all (detached or destroyed mid-flight).
+///
+/// Deliberately separate from `abandon_open_ack()`, because the obligation is
+/// different. Before the ACK the peer is still in `Connecting` and has never
+/// been told the tunnel exists; after it, the peer believes it has a working
+/// tunnel and will wait on it indefinitely. Silence is therefore not an option
+/// here — the peer has to be told the tunnel is over, with an identity-checked
+/// removal so a replacement that recycled the id is untouched.
+void abort_open_ack_after_send(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                               const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                               const std::weak_ptr<core::TcpConnection>& weak_tcp,
+                               std::uint16_t tunnel_id, std::uint32_t friend_number,
+                               const ActiveGaugeLatch& gauge);
+
+/// Resolve a server tunnel whose OPEN_ACK will never be delivered, or whose
+/// target died before it was.
+///
+/// Sends the terminal TUNNEL_ERROR the waiting client needs (a TUNNEL_CLOSE
+/// does not complete its `Connecting` state), then releases the local resources
+/// EXPLICITLY rather than via `remove_tunnel()` — which would delegate to
+/// `close()` and no-op on an unpublished tunnel, leaving the target socket open
+/// for as long as the target keeps it open.
+void abandon_open_ack(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                      const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                      const std::weak_ptr<core::TcpConnection>& weak_tcp, std::uint16_t tunnel_id,
+                      std::uint32_t friend_number, const ActiveGaugeLatch& gauge);
+
+/// Causal barrier between the server's OPEN_ACK and everything that means
+/// "this tunnel is usable".
+///
+/// THE BUG THIS EXISTS TO PREVENT
+///
+/// The server used to publish the tunnel as `Connected`, count it opened, and
+/// call `start_read()` on the target socket immediately after handing the
+/// OPEN_ACK to `TunnelManager::send_frame()` — whose bool return says "queued",
+/// not "sent". If toxcore was backpressured, the ACK went into the manager's
+/// retry queue while TCP reads started at once, and TUNNEL_DATA travels the
+/// *per-tunnel* path, not that queue. So data could reach the peer before the
+/// ACK that opens it. The client, still in `Connecting`, discards TUNNEL_DATA
+/// (see TunnelImpl::handle_tunnel_data_frame) — silent data loss at connection
+/// setup, presenting as a peer bug.
+///
+/// Delaying only `start_read()` while still publishing `Connected` early was
+/// considered and rejected: `Connected` is itself an admission signal (it is
+/// what lets `send_data_to_tox` accept bytes, and what the resume path reads to
+/// decide a tunnel is live), so it has to sit behind the same edge. Everything
+/// here is therefore driven by ONE transition: the OPEN_ACK actually being
+/// accepted by toxcore.
+///
+/// The gate holds no strong references — the caller wires it with weak handles
+/// — because the connection it is arming owns the callback that owns the gate.
+///
+/// Thread safety: `start()` runs on the caller's thread, retries on an
+/// io_context thread, and `target_gone()` on the TCP strand. All three resolve
+/// through one mutex-guarded phase, and no callback is invoked while that mutex
+/// is held (H-01).
+class OpenAckGate : public std::enable_shared_from_this<OpenAckGate> {
+   public:
+    /// One attempt to hand the OPEN_ACK to the transport.
+    using AckSender = std::function<tunnel::SendOutcome()>;
+
+    /// Publish the tunnel: `Connected`, the open metrics, and `start_read()`.
+    /// Invoked at most once, and only after the ACK reached toxcore.
+    ///
+    /// Returns false when publication did not happen after all — the tunnel was
+    /// detached or destroyed while the ACK was in flight. The gate must not then
+    /// report itself `Committed`: nothing was published, so a later target death
+    /// has no live tunnel for the ordinary close path to act on. A failed commit
+    /// has already released its own resources, so the gate does not additionally
+    /// run the abandon callback (and the ACK did reach the peer, so there is no
+    /// undelivered handshake left to report).
+    using CommitFn = std::function<bool()>;
+
+    /// The ACK will never arrive, or the target died before it did. Resolve the
+    /// waiting client with a terminal TUNNEL_ERROR and drop the tunnel.
+    /// Invoked at most once, and never together with the commit.
+    using AbandonFn = std::function<void()>;
+
+    /// Run the ordinary graceful close of an already-published tunnel.
+    ///
+    /// Needed for exactly one situation: the target died while the commit
+    /// callback was still running. `target_gone()` cannot truthfully answer
+    /// "the tunnel is live, run your close" at that instant — the tunnel may
+    /// still be in `None`, where `Tunnel::close()` is a no-op, and the commit
+    /// would then go on to publish `Connected` and start reading a socket that
+    /// is already dead. So the gate defers, and calls this once commit has
+    /// actually finished.
+    using PostCommitCloseFn = std::function<void()>;
+
+    OpenAckGate(asio::io_context& io_ctx, AckSender send_ack, CommitFn commit, AbandonFn abandon,
+                PostCommitCloseFn post_commit_close);
+
+    OpenAckGate(const OpenAckGate&) = delete;
+    OpenAckGate& operator=(const OpenAckGate&) = delete;
+    OpenAckGate(OpenAckGate&&) = delete;
+    OpenAckGate& operator=(OpenAckGate&&) = delete;
+
+    /// Attempt the OPEN_ACK now, and keep retrying on the SENDQ backoff
+    /// schedule (tunnel/sendq_retry.hpp — deliberately not the coalesce delay,
+    /// which is legally 0) until it is sent, permanently fails, or the target
+    /// goes away.
+    void start();
+
+    /// The target TCP connection died. Returns true when the gate has taken
+    /// ownership of the teardown — i.e. the tunnel was never published, so the
+    /// caller must NOT run its ordinary `Tunnel::close()` path. Returns false
+    /// once the tunnel is live, where the ordinary close is exactly right.
+    bool target_gone();
+
+    /// True once the tunnel has been published. Test observability.
+    [[nodiscard]] bool committed() const;
+
+    /// OPEN_ACK send attempts made so far (initial + retries). Test
+    /// observability: asserts that the retry cadence is not a spin.
+    [[nodiscard]] unsigned attempts() const noexcept {
+        return attempts_.load(std::memory_order_relaxed);
+    }
+
+   private:
+    /// Both intermediate phases exist because a resolution is not instantaneous
+    /// and the gap is observable to `target_gone()` running on the TCP strand.
+    ///
+    ///  * `Sending` — a send is inside the transport. Resolving to `Abandoned`
+    ///    here would let that send emit an OPEN_ACK *after* the TUNNEL_ERROR
+    ///    and after the tunnel was removed, so the peer would see an ACK for a
+    ///    tunnel it had just been told had failed. The sender resolves instead.
+    ///  * `Committing` — the commit callback is running but has not finished.
+    ///    Reporting `Committed` here would send the caller down the ordinary
+    ///    close path against a tunnel that is still `None`, where close() is a
+    ///    no-op — and commit would then publish `Connected` and start reading a
+    ///    dead socket.
+    enum class Phase : std::uint8_t {
+        Pending,     ///< Idle between attempts; a retry may be armed.
+        Sending,     ///< An ACK send is in flight on some thread right now.
+        Committing,  ///< ACK accepted; the commit callback is running.
+        Committed,   ///< Commit finished; the tunnel is published.
+        Abandoned,   ///< Resolved with a TUNNEL_ERROR instead.
+    };
+
+    void attempt(unsigned retry);
+    void arm_retry(unsigned retry);
+
+    /// Drop every callback and cancel the retry timer. Caller holds `mutex_`.
+    void release_callbacks_locked();
+
+    asio::steady_timer timer_;
+    mutable std::mutex mutex_;
+    Phase phase_{Phase::Pending};
+    /// Set when `target_gone()` arrives during `Sending` or `Committing`; the
+    /// thread that owns that phase consumes it when it finishes.
+    bool target_gone_requested_{false};
+    AckSender send_ack_;
+    CommitFn commit_;
+    AbandonFn abandon_;
+    PostCommitCloseFn post_commit_close_;
+    std::atomic<unsigned> attempts_{0};
 };
 
 }  // namespace detail

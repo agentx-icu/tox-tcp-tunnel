@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "toxtunnel/app/rate_limiter.hpp"
+#include "toxtunnel/app/tunnel_senders.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
@@ -1587,52 +1588,18 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     server_tunnel->configure_coalesce(config_.tunnel.coalesce_max_delay_us,
                                       config_.tunnel.coalesce_max_bytes);
     apply_coalesce_and_flow_control(*server_tunnel);
-    // Already-serialized frame from TunnelImpl: prepend the lossless prefix
-    // byte and send directly. Going via manager_ptr->send_frame would force a
-    // deserialize + re-serialize round trip plus a redundant byte copy.
-    server_tunnel->set_on_send_to_tox([this, manager_ptr,
-                                       friend_number](std::span<const uint8_t> data) -> bool {
-        std::vector<uint8_t> packet;
-        packet.reserve(1 + data.size());
-        packet.push_back(tunnel::kLosslessPacketByte);
-        packet.insert(packet.end(), data.begin(), data.end());
-        const auto outcome =
-            tox_adapter_->send_lossless_packet_typed(friend_number, packet.data(), packet.size());
-        if (outcome == tox::ToxAdapter::LosslessSendOutcome::Sent) {
-            manager_ptr->record_frame_sent();
-            manager_ptr->record_bytes_sent(data.size());
-            return true;
-        }
-        if (outcome == tox::ToxAdapter::LosslessSendOutcome::PermanentFail) {
-            // Friend disconnected, frame malformed, etc. Drop; the
-            // tunnel state machine will catch up via the friend-
-            // disconnect handler that tears all tunnels down.
-            return false;
-        }
-        // SendqFull: park control frames so the drain timer re-sends
-        // them; TUNNEL_DATA falls through to the per-tunnel coalesce
-        // buffer's retry path to avoid double-sending.
-        constexpr std::uint8_t kFrameTypeTunnelData = 0x02;
-        if (!data.empty() && data[0] != kFrameTypeTunnelData) {
-            return manager_ptr->queue_outbound_for_retry(
-                std::vector<uint8_t>(data.begin(), data.end()));
-        }
-        return false;
-    });
-    // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
-    // lossless prefix + 5-byte tunnel header in the same allocation.
-    server_tunnel->set_on_send_to_tox_owned(
-        [this, manager_ptr, friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
-            const auto wire = buf.wire_view();
-            const bool sent =
-                tox_adapter_->send_lossless_packet(friend_number, wire.data(), wire.size());
-            if (sent) {
-                manager_ptr->record_frame_sent();
-                // The lossless prefix byte is bookkeeping overhead, not payload.
-                manager_ptr->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);
-            }
-            return sent;
-        });
+    // Outbound wiring, shared with the client's three tunnel paths: manager
+    // byte/frame accounting plus the outbound FIFO barrier. Sends the
+    // already-serialized frame directly rather than via manager_ptr->send_frame,
+    // which would force a deserialize + re-serialize round trip and a redundant
+    // byte copy.
+    auto senders = detail::make_tunnel_senders(
+        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        },
+        manager_ptr, friend_number);
+    server_tunnel->set_on_send_to_tox(std::move(senders.span));
+    server_tunnel->set_on_send_to_tox_owned(std::move(senders.owned));
     // H-05: add_tunnel can fail (manager hit max_tunnels between
     // handle_incoming_open and here). On failure leave the guard uncommitted so
     // it releases the reserved id, tell the peer, and bail — otherwise the
@@ -1724,6 +1691,396 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
         });
 }
 
+// ---------------------------------------------------------------------------
+// detail::OpenAckGate
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+ActiveGaugeState active_gauge_state(const ActiveGaugeLatch& latch) {
+    std::lock_guard<std::mutex> lock(latch->mutex);
+    return latch->state;
+}
+
+bool active_gauge_count(const ActiveGaugeLatch& latch) {
+    std::lock_guard<std::mutex> lock(latch->mutex);
+    if (latch->state != ActiveGaugeState::NotCounted) {
+        // Already released by a terminal transition that beat us here. Counting
+        // now would leak the gauge, because the decrement has already run.
+        return false;
+    }
+    // The increment happens under the lock, so a release cannot observe
+    // `Counted` and decrement before the count it is meant to undo exists.
+    util::MetricsRegistry::instance().inc_tunnels_active(util::MetricsRegistry::Role::Server);
+    latch->state = ActiveGaugeState::Counted;
+    return true;
+}
+
+void active_gauge_release(const ActiveGaugeLatch& latch) {
+    std::lock_guard<std::mutex> lock(latch->mutex);
+    // Settles both directions: decrements exactly when the gauge was counted,
+    // and blocks any later count when it was not.
+    if (latch->state == ActiveGaugeState::Counted) {
+        util::MetricsRegistry::instance().dec_tunnels_active(util::MetricsRegistry::Role::Server);
+    }
+    latch->state = ActiveGaugeState::Released;
+}
+
+namespace {
+
+/// Drop a server tunnel's local resources without relying on `Tunnel::close()`,
+/// which is a no-op for a tunnel still in `None`.
+void release_unpublished_resources(const std::shared_ptr<tunnel::TunnelImpl>& tunnel,
+                                   const std::shared_ptr<core::TcpConnection>& conn) {
+    if (conn) {
+        // Closes the socket and cancels any peer-close watch still holding it.
+        conn->force_close();
+    }
+    if (tunnel) {
+        // Drives a terminal state and fires on_close_, so the owner's cleanup
+        // runs even though the tunnel never left None.
+        tunnel->force_close();
+    }
+}
+
+}  // namespace
+
+void wire_active_gauge(tunnel::TunnelImpl& tunnel, ActiveGaugeLatch gauge,
+                       std::function<void()> extra_on_close) {
+    tunnel.set_on_state_change([gauge](tunnel::Tunnel::State new_state) {
+        if (new_state == tunnel::Tunnel::State::Closed ||
+            new_state == tunnel::Tunnel::State::Error) {
+            active_gauge_release(gauge);
+        }
+    });
+    tunnel.set_on_close([gauge, extra = std::move(extra_on_close)]() {
+        // Settled here as well as on the terminal transition: a graceful close
+        // of a published tunnel never reaches one. The latch makes the overlap
+        // harmless.
+        active_gauge_release(gauge);
+        if (extra) {
+            extra();
+        }
+    });
+}
+
+OpenAckCommit commit_open_ack(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                              const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                              const std::weak_ptr<core::TcpConnection>& weak_tcp,
+                              std::uint16_t tunnel_id, std::uint32_t friend_number,
+                              const ActiveGaugeLatch& gauge) {
+    auto tunnel = weak_tunnel.lock();
+    auto conn = weak_tcp.lock();
+    if (!tunnel || !conn) {
+        // One of them was destroyed while the ACK was in flight. The peer still
+        // has the ACK, so it must be told — see abort_open_ack_after_send().
+        abort_open_ack_after_send(weak_manager, weak_tunnel, weak_tcp, tunnel_id, friend_number,
+                                  gauge);
+        return OpenAckCommit::Gone;
+    }
+
+    // Ownership pre-filter. Identity, not just the id: ids are recycled per
+    // friend, so "the manager has a tunnel numbered N" is not the same question
+    // as "the manager still has THIS tunnel".
+    //
+    // This is NOT the claim. get_tunnel() releases the manager's lock before we
+    // could act on its answer, so a removal landing in that gap would still slip
+    // through — check-then-act, exactly the shape this function exists to avoid.
+    // It is kept because it catches the common case early and produces the
+    // accurate log line; the claim below is what makes the decision atomic.
+    auto manager = weak_manager.lock();
+    const auto owned = manager ? manager->get_tunnel(tunnel_id) : nullptr;
+    const bool still_owned = owned.get() == static_cast<tunnel::Tunnel*>(tunnel.get());
+
+    // THE claim: one compare-exchange on the tunnel's own state word, which is
+    // the single arbiter every teardown of an unpublished tunnel also goes
+    // through — TunnelManager::remove_tunnel() and close_all() force-close a
+    // tunnel that is still None rather than calling close(), which would no-op
+    // there and leave this nothing to lose against. Losing means somebody else
+    // resolved this tunnel first.
+    if (!still_owned || !tunnel->try_publish_connected()) {
+        util::Logger::warn(
+            "Tunnel {} (friend {}) was detached while its OPEN_ACK was in flight; "
+            "releasing it instead of publishing",
+            tunnel_id, friend_number);
+        abort_open_ack_after_send(weak_manager, weak_tunnel, weak_tcp, tunnel_id, friend_number,
+                                  gauge);
+        return OpenAckCommit::Detached;
+    }
+
+    // The state claim is necessary but NOT sufficient: it covers the transition,
+    // not the publication. A removal landing between the claim and the work
+    // below would leave us counting a gauge and starting a target read loop for
+    // a tunnel the manager has already let go of. Re-verify ownership now that
+    // the state is Connected, and order the rest so nothing irreversible
+    // happens first — the gauge is undone by active_gauge_release(), and
+    // start_read() is last.
+    if (auto owner = weak_manager.lock();
+        !owner ||
+        owner->get_tunnel(tunnel_id).get() != static_cast<tunnel::Tunnel*>(tunnel.get())) {
+        util::Logger::warn(
+            "Tunnel {} (friend {}) was detached between claiming Connected and publishing; "
+            "releasing it",
+            tunnel_id, friend_number);
+        // force_close() sees Connected and therefore announces the CLOSE the
+        // peer is owed — it has our OPEN_ACK.
+        abort_open_ack_after_send(weak_manager, weak_tunnel, weak_tcp, tunnel_id, friend_number,
+                                  gauge);
+        return OpenAckCommit::Detached;
+    }
+
+    // Published. Connected is already set by the claim — it is what admits
+    // outbound bytes at all — so the metrics and then the read loop that
+    // produces those bytes follow it.
+    //
+    // A removal that lands from here on is harmless and self-correcting: with
+    // the state already Connected it takes the graceful close path, which
+    // announces to the peer, closes the socket the read loop is using, and
+    // drives the terminal transition that settles the gauge latch.
+    util::MetricsRegistry::instance().inc_tunnels_opened(util::MetricsRegistry::OpenResult::Ok);
+    active_gauge_count(gauge);
+    conn->start_read();
+    util::Logger::debug("Tunnel {} wired to TCP for friend {}", tunnel_id, friend_number);
+    return OpenAckCommit::Published;
+}
+
+void abort_open_ack_after_send(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                               const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                               const std::weak_ptr<core::TcpConnection>& weak_tcp,
+                               std::uint16_t tunnel_id, std::uint32_t friend_number,
+                               const ActiveGaugeLatch& gauge) {
+    util::MetricsRegistry::instance().inc_tunnels_opened(util::MetricsRegistry::OpenResult::Failed);
+
+    auto tunnel = weak_tunnel.lock();
+    if (auto manager = weak_manager.lock()) {
+        // The peer already has the OPEN_ACK and is treating this tunnel as
+        // open. Leaving it at that would strand it until its own reaper fires.
+        auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
+            tunnel_id, 3, "tunnel was torn down immediately after it was opened");
+        manager->send_frame(error_frame);
+        (void)manager->remove_tunnel_if(tunnel_id, tunnel.get());
+    }
+
+    release_unpublished_resources(tunnel, weak_tcp.lock());
+    active_gauge_release(gauge);
+
+    util::Logger::warn(
+        "Tunnel {} (friend {}) could not be published after its OPEN_ACK was sent; "
+        "peer notified with TUNNEL_ERROR",
+        tunnel_id, friend_number);
+}
+
+void abandon_open_ack(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                      const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                      const std::weak_ptr<core::TcpConnection>& weak_tcp, std::uint16_t tunnel_id,
+                      std::uint32_t friend_number, const ActiveGaugeLatch& gauge) {
+    util::MetricsRegistry::instance().inc_tunnels_opened(util::MetricsRegistry::OpenResult::Failed);
+
+    // Tell the peer first: it is sitting in Connecting and only a terminal
+    // frame resolves that.
+    auto tunnel = weak_tunnel.lock();
+    if (auto manager = weak_manager.lock()) {
+        auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
+            tunnel_id, 3, "target connection lost before tunnel was established");
+        manager->send_frame(error_frame);
+        // Identity-checked: by the time this deferred cleanup runs, the id may
+        // already have been recycled by a different tunnel, and removing that
+        // one is the very recycled-id failure this slice exists to eliminate.
+        //
+        // A lapsed weak_ptr must remove NOTHING rather than fall back to an
+        // id-only removal: if our tunnel is already destroyed, the manager can
+        // no longer be holding it, so anything registered under this id belongs
+        // to somebody else.
+        if (tunnel) {
+            (void)manager->remove_tunnel_if(tunnel_id, tunnel.get());
+        }
+    }
+
+    // Then drop the local resources explicitly. remove_tunnel() above delegates
+    // to Tunnel::close(), which no-ops in None — so on its own it would leave
+    // this socket open until the target happened to close it, and the
+    // peer-close watch's outstanding async_wait keeps the connection alive
+    // indefinitely for a target that simply stays quiet.
+    release_unpublished_resources(tunnel, weak_tcp.lock());
+    active_gauge_release(gauge);
+
+    util::Logger::warn(
+        "Tunnel {} (friend {}) abandoned before its OPEN_ACK reached the peer; "
+        "client notified with TUNNEL_ERROR",
+        tunnel_id, friend_number);
+}
+
+OpenAckGate::OpenAckGate(asio::io_context& io_ctx, AckSender send_ack, CommitFn commit,
+                         AbandonFn abandon, PostCommitCloseFn post_commit_close)
+    : timer_(io_ctx),
+      send_ack_(std::move(send_ack)),
+      commit_(std::move(commit)),
+      abandon_(std::move(abandon)),
+      post_commit_close_(std::move(post_commit_close)) {}
+
+void OpenAckGate::release_callbacks_locked() {
+    // No further retry is wanted, whichever way we resolved. Every touch of
+    // timer_ happens under mutex_.
+    timer_.cancel();
+    // Dropping the callbacks is also how a resolved gate stops keeping whatever
+    // they captured alive.
+    send_ack_ = nullptr;
+    commit_ = nullptr;
+    abandon_ = nullptr;
+}
+
+void OpenAckGate::start() {
+    attempt(/*retry=*/0);
+}
+
+void OpenAckGate::attempt(unsigned retry) {
+    AckSender sender;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (phase_ != Phase::Pending) {
+            return;  // Resolved, or another attempt already owns the send.
+        }
+        // Claim the send BEFORE dropping the lock. From here until the verdict
+        // is recorded, target_gone() must not resolve on its own — see Phase.
+        phase_ = Phase::Sending;
+        sender = send_ack_;
+    }
+
+    tunnel::SendOutcome outcome = tunnel::SendOutcome::PermanentFail;
+    if (sender) {
+        attempts_.fetch_add(1, std::memory_order_relaxed);
+        // Called with NO lock held: the sender re-enters TunnelManager (H-01).
+        outcome = sender();
+    }
+
+    CommitFn run_commit;
+    std::function<void()> run_abandon;
+    bool retry_again = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (target_gone_requested_) {
+            // The target died while this send was inside the transport.
+            // target_gone() deliberately deferred to us so no OPEN_ACK could be
+            // emitted after the TUNNEL_ERROR; resolve it here, after the send
+            // has definitely finished. If the ACK did go out, the peer sees
+            // ACK-then-ERROR, which is an ordinary teardown it handles; what it
+            // must never see is ERROR-then-ACK.
+            phase_ = Phase::Abandoned;
+            run_abandon = std::move(abandon_);
+            release_callbacks_locked();
+            post_commit_close_ = nullptr;  // Never published; nothing to close.
+        } else if (outcome == tunnel::SendOutcome::Sent) {
+            // Committing, not Committed: the tunnel is not published until the
+            // callback below has actually run.
+            phase_ = Phase::Committing;
+            run_commit = std::move(commit_);
+            release_callbacks_locked();
+        } else if (outcome == tunnel::SendOutcome::PermanentFail) {
+            // The peer will never get the ACK, so it would sit in Connecting
+            // until its own timeout. Resolve it explicitly instead.
+            phase_ = Phase::Abandoned;
+            run_abandon = std::move(abandon_);
+            release_callbacks_locked();
+            post_commit_close_ = nullptr;  // Never published; nothing to close.
+        } else {
+            phase_ = Phase::Pending;
+            retry_again = true;
+        }
+    }
+
+    if (run_abandon) {
+        run_abandon();
+        return;
+    }
+
+    if (run_commit) {
+        const bool published = run_commit();
+        // Publish only now, and only if the commit actually did. A target_gone()
+        // that arrived while the callback was running could not be answered
+        // truthfully at the time, so it left its request behind for us to
+        // honour — but only a real publication makes the ordinary close path the
+        // right handler.
+        std::function<void()> deferred_close;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            phase_ = published ? Phase::Committed : Phase::Abandoned;
+            if (published && target_gone_requested_) {
+                deferred_close = std::move(post_commit_close_);
+            }
+            post_commit_close_ = nullptr;
+        }
+        if (deferred_close) {
+            deferred_close();
+        }
+        return;
+    }
+
+    if (retry_again) {
+        arm_retry(retry);
+    }
+}
+
+void OpenAckGate::arm_retry(unsigned retry) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (phase_ != Phase::Pending) {
+        return;
+    }
+    timer_.expires_after(tunnel::sendq_retry_delay(retry));
+    // Hold the gate alive across the wait; nothing else is guaranteed to.
+    timer_.async_wait([self = shared_from_this(), retry](const std::error_code& ec) {
+        if (ec) {
+            return;  // Cancelled by a resolution.
+        }
+        self->attempt(retry + 1);
+    });
+}
+
+bool OpenAckGate::target_gone() {
+    std::function<void()> run_abandon;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        switch (phase_) {
+            case Phase::Pending:
+                // Nothing in flight: resolve here and now.
+                phase_ = Phase::Abandoned;
+                run_abandon = std::move(abandon_);
+                release_callbacks_locked();
+                post_commit_close_ = nullptr;
+                break;
+
+            case Phase::Sending:
+            case Phase::Committing:
+                // Somebody else owns this phase and is mid-callback. Hand them
+                // the request rather than racing them; they consume it the
+                // moment they finish. Either way the gate owns the teardown, so
+                // the caller must not run its ordinary close.
+                target_gone_requested_ = true;
+                timer_.cancel();
+                return true;
+
+            case Phase::Committed:
+                // The tunnel is live: Tunnel::close() is the right handler and
+                // the caller owns it.
+                return false;
+
+            case Phase::Abandoned:
+                // Already resolved by us; the ordinary close must not run.
+                return true;
+        }
+    }
+    if (run_abandon) {
+        run_abandon();
+    }
+    return true;
+}
+
+bool OpenAckGate::committed() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return phase_ == Phase::Committed;
+}
+
+}  // namespace detail
+
 void TunnelServer::send_resume_ack(uint32_t friend_number, uint16_t tunnel_id,
                                    uint64_t server_recv_offset, uint64_t server_send_offset,
                                    tunnel::TunnelResumeStatus status) {
@@ -1796,7 +2153,9 @@ void TunnelServer::handle_resume_request(uint32_t friend_number,
         util::Logger::info(
             "RESUME_REQUEST friend {} tunnel {}: tunnel not resumable (state={}); declined",
             friend_number, req->prior_tunnel_id, tunnel::to_string(st));
-        mgr->remove_tunnel(req->prior_tunnel_id);
+        // We are holding the very tunnel we looked up, so name it: an id-only
+        // removal here would take out whatever recycled the id instead.
+        (void)mgr->remove_tunnel_if(req->prior_tunnel_id, impl);
         return;
     }
 
@@ -1823,7 +2182,8 @@ void TunnelServer::handle_resume_request(uint32_t friend_number,
         send_resume_ack(friend_number, req->prior_tunnel_id, s_recv, s_sent,
                         tunnel::TunnelResumeStatus::TooOld);
         if (mgr) {
-            mgr->remove_tunnel(req->prior_tunnel_id);
+            // Same as above: we already hold the tunnel this decision is about.
+            (void)mgr->remove_tunnel_if(req->prior_tunnel_id, impl);
         }
         return;
     }
@@ -1909,45 +2269,121 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
         }
     });
 
+    // The OPEN_ACK barrier. Built before the callbacks that consult it, armed
+    // last (see the bottom of this function). It captures only weak handles:
+    // the TcpConnection owns the disconnect callback that owns this gate, so a
+    // strong capture of the connection would be a reference cycle.
+    const std::weak_ptr<core::TcpConnection> weak_tcp = tcp_conn;
+
+    // Counted at publication, released at the first terminal transition — and
+    // correct in both orders, which a bare "already decremented" flag is not:
+    // an abandoned tunnel is never counted, so nothing may decrement for it.
+    auto active_gauge = detail::make_active_gauge_latch();
+
+    auto ack_gate = std::make_shared<detail::OpenAckGate>(
+        io_context_->get_io_context(),
+        // Attempt: send_frame_typed, NOT send_frame — the bool one reports a
+        // frame parked in the manager's retry queue as "queued", which is
+        // exactly the "delivered?" question this gate has to answer honestly.
+        [weak_manager, tunnel_id]() -> tunnel::SendOutcome {
+            auto mgr = weak_manager.lock();
+            if (!mgr) {
+                return tunnel::SendOutcome::PermanentFail;
+            }
+            auto ack = tunnel::ProtocolFrame::make_tunnel_ack(tunnel_id, 0);
+            return mgr->send_frame_typed(ack);
+        },
+        // Commit: everything that says "this tunnel is usable", behind the one
+        // edge where the peer has actually been told it is open. See
+        // detail::commit_open_ack() for the ownership check it makes first.
+        [weak_manager, weak_tunnel, weak_tcp, tunnel_id, friend_number, active_gauge]() {
+            return detail::commit_open_ack(weak_manager, weak_tunnel, weak_tcp, tunnel_id,
+                                           friend_number,
+                                           active_gauge) == detail::OpenAckCommit::Published;
+        },
+        // Abandon: the ACK will never land, or the target died before it did.
+        // TUNNEL_ERROR, not TUNNEL_CLOSE — the client is still in Connecting,
+        // and a CLOSE received in that state does not complete it cleanly,
+        // whereas handle_tunnel_error_frame drives it to Error and resolves the
+        // waiting caller (a SOCKS5 reply, a pipe teardown) immediately.
+        [this, weak_manager, weak_tunnel, weak_tcp, tunnel_id, friend_number, active_gauge]() {
+            // Deferred for the same reason as the on_close teardown below:
+            // this can run synchronously from inside tcp_conn->close(), and
+            // remove_tunnel() re-enters the tunnel's own close callbacks.
+            asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, weak_tcp,
+                                                       tunnel_id, friend_number, active_gauge]() {
+                detail::abandon_open_ack(weak_manager, weak_tunnel, weak_tcp, tunnel_id,
+                                         friend_number, active_gauge);
+            });
+        },
+        // Post-commit close: the target died while the commit callback was
+        // still running, so the gate could not truthfully tell the disconnect
+        // handler "the tunnel is live, run your close". This is that close,
+        // run once commit has finished. Identical to the ordinary path below.
+        [this, weak_manager, weak_tunnel, tunnel_id]() {
+            asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, tunnel_id]() {
+                auto mgr = weak_manager.lock();
+                auto tunnel = weak_tunnel.lock();
+                if (!mgr || !tunnel) {
+                    return;
+                }
+                // Identity-checked for the same reason as the ordinary path.
+                (void)mgr->close_tunnel_if(tunnel_id, tunnel.get());
+            });
+        });
+
     // TCP disconnect: close the tunnel gracefully.
     // Uses asio::post to defer cleanup, avoiding re-entrance into managers_mutex_
     // if on_disconnect fires synchronously from tcp_conn->close().
-    tcp_conn->set_on_disconnect(
-        [this, weak_manager, friend_number, tunnel_id](const std::error_code& ec) {
-            // ec is default-constructed for a clean half-close / EOF teardown.
-            // Calling ec.message() in that case renders the platform's "no
-            // error" string ("Undefined error: 0" on macOS, "Success" on
-            // Linux), which reads as an error in logs even though nothing
-            // went wrong. Switch the wording on whether the code is real.
-            if (ec) {
-                util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}", tunnel_id,
-                                    friend_number, ec.message());
-            } else {
-                util::Logger::debug("TCP closed cleanly for tunnel {} (friend {})", tunnel_id,
-                                    friend_number);
-            }
+    tcp_conn->set_on_disconnect([this, weak_manager, weak_tunnel, ack_gate, friend_number,
+                                 tunnel_id](const std::error_code& ec) {
+        // ec is default-constructed for a clean half-close / EOF teardown.
+        // Calling ec.message() in that case renders the platform's "no
+        // error" string ("Undefined error: 0" on macOS, "Success" on
+        // Linux), which reads as an error in logs even though nothing
+        // went wrong. Switch the wording on whether the code is real.
+        if (ec) {
+            util::Logger::debug("TCP disconnected for tunnel {} (friend {}): {}", tunnel_id,
+                                friend_number, ec.message());
+        } else {
+            util::Logger::debug("TCP closed cleanly for tunnel {} (friend {})", tunnel_id,
+                                friend_number);
+        }
 
-            asio::post(io_context_->get_io_context(), [weak_manager, tunnel_id]() {
-                // Resolve via weak_manager (works whether the manager is live or
-                // held for resume) instead of managers_.find(friend) — a held
-                // manager is absent from managers_, so a lookup would miss the
-                // target-TCP drop and strand the tunnel in a phantom-Connected
-                // state that a later RESUME_REQUEST would ACK Ok on a dead socket.
-                auto mgr = weak_manager.lock();
-                if (!mgr) {
-                    return;
-                }
-                // Gracefully close (outside managers_mutex_): this flushes any
-                // buffered / backpressured bytes to the peer *before* emitting
-                // TUNNEL_CLOSE — deferring CLOSE until the coalesce buffer drains —
-                // then fires on_close_, which removes the tunnel. Emitting CLOSE and
-                // removing immediately (the old behaviour) discarded the still-in-
-                // flight data, truncating the transfer when the origin closed first.
-                if (auto tunnel = mgr->get_tunnel(tunnel_id)) {
-                    tunnel->close();
-                }
-            });
+        // The target can die while the OPEN_ACK is still backpressured. The
+        // tunnel was never published in that case, so the graceful close
+        // below is the wrong tool: with the client still in Connecting, a
+        // TUNNEL_CLOSE does not resolve it. The gate answers with a
+        // TUNNEL_ERROR instead.
+        if (ack_gate->target_gone()) {
+            return;
+        }
+
+        asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, tunnel_id]() {
+            // Resolve via weak_manager (works whether the manager is live or
+            // held for resume) instead of managers_.find(friend) — a held
+            // manager is absent from managers_, so a lookup would miss the
+            // target-TCP drop and strand the tunnel in a phantom-Connected
+            // state that a later RESUME_REQUEST would ACK Ok on a dead socket.
+            auto mgr = weak_manager.lock();
+            auto tunnel = weak_tunnel.lock();
+            if (!mgr || !tunnel) {
+                return;
+            }
+            // close_tunnel_if, not get_tunnel() + close(): this cleanup is
+            // deferred, and looking the id up and then closing unlocked let a
+            // replacement land in between, after which the old object's
+            // TUNNEL_CLOSE carried the NEW tunnel's id.
+            //
+            // Gracefully closes (outside managers_mutex_): flushes any buffered
+            // / backpressured bytes to the peer *before* emitting TUNNEL_CLOSE —
+            // deferring CLOSE until the coalesce buffer drains — then fires
+            // on_close_, which removes the tunnel. Emitting CLOSE and removing
+            // immediately (the old behaviour) discarded the still-in-flight
+            // data, truncating the transfer when the origin closed first.
+            (void)mgr->close_tunnel_if(tunnel_id, tunnel.get());
         });
+    });
 
     // Tox data -> TCP: set up the callback so tunnel data is written to TCP.
     //
@@ -1976,43 +2412,42 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // peer closed us). Close the local TCP connection and remove the tunnel.
     // The removal is deferred (asio::post) so it never re-enters managers_mutex_
     // or destroys the tunnel from within its own callback.
-    tunnel_impl->set_on_close([this, weak_manager, tunnel_id, tcp_conn]() {
-        tcp_conn->close();
-        asio::post(io_context_->get_io_context(), [weak_manager, tunnel_id]() {
-            // Same rationale as on_disconnect: remove via the weak_ptr so a
-            // tunnel closed while its manager is held for resume is still
-            // dropped from that (held) manager rather than leaking.
-            if (auto mgr = weak_manager.lock()) {
-                mgr->remove_tunnel(tunnel_id);
-            }
+    // Gauge settlement plus this server's own teardown, in one place — see
+    // detail::wire_active_gauge() for why on_close_ is needed as well as the
+    // terminal transition.
+    detail::wire_active_gauge(
+        *tunnel_impl, active_gauge, [this, weak_manager, weak_tunnel, tunnel_id, tcp_conn]() {
+            tcp_conn->close();
+            asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, tunnel_id]() {
+                // Same rationale as on_disconnect: remove via the weak_ptr so a
+                // tunnel closed while its manager is held for resume is still
+                // dropped from that (held) manager rather than leaking.
+                //
+                // Identity-checked, because this removal is deferred: an id-only
+                // remove_tunnel() here can tear down the replacement that
+                // recycled the id while this cleanup was still queued. A lapsed
+                // weak_ptr removes nothing: a destroyed tunnel cannot still be
+                // registered, so whatever holds this id is not ours.
+                auto mgr = weak_manager.lock();
+                auto owner = weak_tunnel.lock();
+                if (mgr && owner) {
+                    (void)mgr->remove_tunnel_if(tunnel_id, owner.get());
+                }
+            });
         });
-    });
 
-    // Transition the tunnel to Connected state and send ACK to the remote peer.
-    tunnel_impl->set_state(tunnel::Tunnel::State::Connected);
-    util::MetricsRegistry::instance().inc_tunnels_opened(util::MetricsRegistry::OpenResult::Ok);
-    util::MetricsRegistry::instance().inc_tunnels_active(util::MetricsRegistry::Role::Server);
-    // Decrement the active gauge once the tunnel reaches a terminal state.
-    // Latch via shared_ptr<atomic_flag> so multiple state callbacks (Closed
-    // and then Error, or vice versa) never double-decrement.
-    auto active_dec_latch = std::make_shared<std::atomic_flag>();
-    tunnel_impl->set_on_state_change([active_dec_latch](tunnel::Tunnel::State new_state) {
-        if ((new_state == tunnel::Tunnel::State::Closed ||
-             new_state == tunnel::Tunnel::State::Error) &&
-            !active_dec_latch->test_and_set()) {
-            util::MetricsRegistry::instance().dec_tunnels_active(
-                util::MetricsRegistry::Role::Server);
-        }
-    });
+    // Watch for the target dying before the read loop exists. `start_read()` is
+    // held back until the OPEN_ACK is on the wire, and a socket with no
+    // outstanding read never notices a FIN — so without this the abandon path
+    // below could not actually be reached by a real target death, only by a
+    // transport failure. Stood down automatically by `start_read()` inside the
+    // commit callback.
+    tcp_conn->watch_peer_close();
 
-    // Send TUNNEL_ACK to confirm the tunnel is open.
-    auto ack_frame = tunnel::ProtocolFrame::make_tunnel_ack(tunnel_id, 0);
-    manager_ptr->send_frame(ack_frame);
-
-    // Start reading from the TCP connection.
-    tcp_conn->start_read();
-
-    util::Logger::debug("Tunnel {} wired to TCP for friend {}", tunnel_id, friend_number);
+    // Send TUNNEL_ACK, and publish the tunnel only once it is actually on the
+    // wire. Connected, the open metrics and start_read() all live in the gate's
+    // commit callback for that reason — see detail::OpenAckGate.
+    ack_gate->start();
 }
 
 std::string TunnelServer::get_friend_pk_hex(uint32_t friend_number) const {

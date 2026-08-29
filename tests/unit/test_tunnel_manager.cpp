@@ -918,7 +918,7 @@ TEST_F(TunnelManagerTest, CloseAllLocal_ForceClosesHalfClosedTunnelWithoutEmitti
     std::atomic<int> tox_frames{0};
     auto counting_send = [&tox_frames](std::span<const uint8_t>) {
         tox_frames.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        return SendOutcome::Sent;
     };
     connected->set_on_send_to_tox(counting_send);
     half_closed->set_on_send_to_tox(counting_send);
@@ -1057,7 +1057,7 @@ TEST_F(TunnelManagerTest, StaleReaperRearm_DoesNotClobberTheLiveChain) {
     // A tunnel the maintenance scan is allowed to reap: any non-Connecting
     // TunnelImpl idle past the timeout qualifies.
     auto victim = std::make_shared<TunnelImpl>(io_ctx, /*tunnel_id=*/1, /*friend_number=*/0);
-    victim->set_on_send_to_tox([](std::span<const uint8_t>) { return true; });
+    victim->set_on_send_to_tox([](std::span<const uint8_t>) { return SendOutcome::Sent; });
     victim->set_state(Tunnel::State::Connected);
     ASSERT_TRUE(shared_manager->add_tunnel(1, victim));
 
@@ -1174,7 +1174,7 @@ TEST_F(TunnelManagerTest, CloseAllLocal_FencesAnInFlightTunnelSend) {
     BlockingSend blocking;
     tunnel->set_on_send_to_tox([&blocking](std::span<const uint8_t>) {
         blocking.run();
-        return true;
+        return SendOutcome::Sent;
     });
     tunnel->set_state(Tunnel::State::Connected);
     ASSERT_TRUE(shared_manager->add_tunnel(1, tunnel));
@@ -1253,7 +1253,7 @@ TEST_F(TunnelManagerTest, CloseAllLocalFromInsideSendCallbackDoesNotDeadlock) {
         if (!state->torn_down.exchange(true)) {
             state->manager->close_all_local();
         }
-        return true;
+        return SendOutcome::Sent;
     });
     state->tunnel->set_state(Tunnel::State::Connected);
     ASSERT_TRUE(state->manager->add_tunnel(1, state->tunnel));

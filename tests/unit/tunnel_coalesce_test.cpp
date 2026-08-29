@@ -65,9 +65,9 @@ class TunnelCoalesceTest : public ::testing::Test {
         // via make_unique would leave weak_from_this returning an expired
         // weak_ptr and the timer callbacks would silently no-op.
         tunnel_ = std::make_shared<TunnelImpl>(io_ctx_, 1, 0);
-        tunnel_->set_on_send_to_tox([this](std::span<const uint8_t> wire) -> bool {
+        tunnel_->set_on_send_to_tox([this](std::span<const uint8_t> wire) -> SendOutcome {
             captured_.record(wire);
-            return true;
+            return SendOutcome::Sent;
         });
         tunnel_->set_state(Tunnel::State::Connecting);
         tunnel_->set_state(Tunnel::State::Connected);
@@ -305,12 +305,12 @@ TEST_F(TunnelCoalesceTest, ExplicitFlushIsIdempotent) {
 
 TEST_F(TunnelCoalesceTest, BackpressuredSendRetainsBytesUntilDrained) {
     bool allow_send = false;
-    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
         if (!allow_send) {
-            return false;  // toxcore lossless SENDQ full: nothing transmitted
+            return SendOutcome::SendqFull;  // toxcore lossless SENDQ full: nothing transmitted
         }
         captured_.record(wire);
-        return true;
+        return SendOutcome::Sent;
     });
     tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
@@ -344,12 +344,12 @@ TEST_F(TunnelCoalesceTest, BackpressuredSendRetainsBytesUntilDrained) {
 
 TEST_F(TunnelCoalesceTest, ImmediatePathPreservesOrderAcrossBackpressure) {
     bool allow_send = false;
-    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
         if (!allow_send) {
-            return false;  // SENDQ full
+            return SendOutcome::SendqFull;  // SENDQ full
         }
         captured_.record(wire);
-        return true;
+        return SendOutcome::Sent;
     });
     // Zero delay selects the immediate-emit path.
     tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
@@ -389,12 +389,12 @@ TEST_F(TunnelCoalesceTest, ImmediatePathPreservesOrderAcrossBackpressure) {
 
 TEST_F(TunnelCoalesceTest, CloseDeferredUntilBackpressureDrains) {
     bool allow_send = false;
-    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
         if (!allow_send) {
-            return false;
+            return SendOutcome::SendqFull;
         }
         captured_.record(wire);
-        return true;
+        return SendOutcome::Sent;
     });
     tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
@@ -430,12 +430,12 @@ TEST_F(TunnelCoalesceTest, CloseDeferredUntilBackpressureDrains) {
 
 TEST_F(TunnelCoalesceTest, RemoteCloseWaitsForBackpressuredOutboundDrain) {
     bool allow_send = false;
-    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> bool {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
         if (!allow_send) {
-            return false;
+            return SendOutcome::SendqFull;
         }
         captured_.record(wire);
-        return true;
+        return SendOutcome::Sent;
     });
     tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
