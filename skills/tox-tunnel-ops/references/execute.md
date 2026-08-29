@@ -17,6 +17,13 @@ If not found, prefer package installation over source builds.
 
 #### One-line install (recommended)
 
+The canonical, always-current install instructions are the "Installation"
+section of the repo's [`README.md`](https://github.com/agentx-icu/tox-tcp-tunnel#installation).
+The commands below mirror it; if the two ever disagree, the README wins. None of
+them pin a version — the installer and the `-latest` asset aliases resolve to the
+newest release (**v0.4.11** at the time of writing). Pin an older one with
+`TOXTUNNEL_VERSION=vX.Y.Z` if you must.
+
 The repo ships installer scripts that auto-detect arch, download the matching
 native package from GitHub Releases, install it, and seed `config.yaml`
 based on `--mode`. Client mode writes a config scaffold and leaves the system
@@ -391,9 +398,14 @@ https_proxy=http://127.0.0.1:1080 curl https://internal.example.lan/
 ```
 
 **The server-side `rules.yaml` still gates which destinations succeed** — a
-SOCKS5 CONNECT to a host/port that isn't in the friend's allow list returns a
-SOCKS5 "connection not allowed by ruleset" reply. SOCKS5 and `client.pipe`
-cannot be enabled at the same time (validator error).
+SOCKS5 CONNECT to a host/port that isn't in the friend's allow list returns
+reply `0x02` ("connection not allowed by ruleset"); the same denial over HTTP
+CONNECT returns `403 Forbidden`. Everything else the open can fail with maps
+elsewhere — SOCKS5 `0x04` (host unreachable), `0x05` (connection refused),
+`0x01` (general failure), and `502 Bad Gateway` for all three over HTTP CONNECT
+— so the code tells you whether `rules.yaml` refused the destination or the
+server simply could not reach it. SOCKS5 and `client.pipe` cannot be enabled at
+the same time (validator error).
 
 ### Multi-server failover (production HA)
 
@@ -457,6 +469,9 @@ toxtunnel inspect tunnels -d /var/lib/toxtunnel
 ```
 
 `inspect.enabled` is **default-on**; set `inspect.enabled: false` to disable.
+The switch is only honoured from **v0.4.11** — earlier daemons parsed the key
+and started the listener regardless, so on an older build the only way to keep
+the IPC channel closed is not to run that build.
 
 ### Hot-reload (no restart)
 
@@ -573,7 +588,9 @@ bash scripts/verify.sh <local_port> <service_type>
 ## v0.4 Optional Config Blocks
 
 Operators with extra capacity / hardening needs can opt into the new
-v0.4 blocks. Defaults preserve v0.3.0 behaviour byte-for-byte.
+v0.4 blocks. Defaults preserve v0.3.0 behaviour, with two deliberate
+exceptions: `flow_control.mode` is `bdp` (since v0.4.1), and `watchdog`
+is on.
 
 ### Watchdog (on by default)
 
@@ -613,8 +630,8 @@ rate_limit_defaults:
   open_per_sec: 10
   open_burst: 50
   max_concurrent_tunnels: 100
-  # bytes_per_sec / bytes_burst are NOT implemented — the keys parse and the
-  # daemon warns at load, but no byte throttling happens. Do not rely on them.
+  bytes_per_sec: 1048576       # inbound TUNNEL_DATA payload, bytes/sec
+  bytes_burst: 4194304         # BOTH byte keys must be non-zero to engage
 
 rules:
   - friend: "...64hex..."
@@ -623,9 +640,70 @@ rules:
       # is inherited from rate_limit_defaults above (including `mode`). An
       # explicit 0 means "no limit for this friend on that field".
       max_concurrent_tunnels: 200
+      bytes_per_sec: 262144
+      bytes_burst: 1048576
     allow:
       - host: "127.0.0.1"
         ports: [22]
+```
+
+#### Byte budgets: what `bytes_per_sec` / `bytes_burst` actually do
+
+Implemented since **v0.4.11**. Earlier v0.4.x releases parsed these keys and
+never consulted them, so a rules file carried over from one of those will start
+shaping traffic on the first restart after upgrading — check the value is one
+you want before rolling it out.
+
+- **Direction.** It meters the payload of **inbound `TUNNEL_DATA` frames from
+  that friend**, per friend, summed across all of that friend's tunnels. Same
+  direction `open_per_sec` guards: a server's `rules.yaml` describes what a peer
+  may do *to it*. Traffic the server sends back is **not** metered by this key.
+  If the operator wants to cap what this host *transmits*, say so plainly and
+  point at an OS-level shaper (`tc` on Linux, `pf`/`dnctl` on macOS) — nothing
+  in `rules.yaml` does that.
+- **`report`** accounts and increments
+  `toxtunnel_rate_limit_bytes_throttled_total` while nothing is delayed. This is
+  the "measure before you enforce" mode; size the budget here first. A limit
+  that never moves the counter is not binding; one that moves it constantly is
+  tighter than the link.
+- **`enforce`** does not drop and does not close the tunnel. Dropping a
+  `TUNNEL_DATA` frame would punch a hole in a lossless byte stream that neither
+  end can detect. Instead the server **defers** the frame into a per-friend FIFO
+  and replays it, in arrival order, as the bucket refills. Every byte arrives —
+  just later.
+- **Why the queue does not grow without bound.** A deferred frame never reaches
+  its tunnel, so no `TUNNEL_ACK` is emitted for it, so the peer's send window
+  fills and the peer stops sending. The throttle propagates back to the origin
+  TCP socket instead of being absorbed by local memory.
+- **Ordering.** Total for tunnel-lifecycle frames (`TUNNEL_OPEN`, `DATA`,
+  `CLOSE`, `ERROR`, resume opcodes) — a `TUNNEL_CLOSE` that overtook deferred
+  data would strand it. `PING` / `PONG` (keepalive, or a healthy peer gets
+  declared dead), `TUNNEL_ACK` (window credit for the *other* direction) and
+  `INFO_REQUEST` / `INFO_REPLY` deliberately bypass the queue.
+- **The limitation to state up front.** A receiver-side deferral cannot hold an
+  average rate against a peer that ignores flow control; against such a peer it
+  degrades to bursts capped by a 32 MiB per-friend memory rail. Both that rail
+  and a per-frame release deadline (derived from the reaper timeouts, ≤ 60 s)
+  fail **open**: the backlog is released early, in order, with a `warn` line —
+  the budget is briefly exceeded, nothing is lost. So this is a bandwidth budget
+  for cooperative peers, not a defence against a hostile one.
+  `max_concurrent_tunnels` and `open_per_sec` are the anti-DoS knobs.
+- **Engaging it.** Both keys must be non-zero — a refill rate with no capacity
+  holds no tokens. `bytes_burst: 0` is the way to exempt a friend; a non-zero
+  value below 65535 is raised to 65535, and both fields are clamped to 1 GB/s.
+  The daemon enforces the clamped values, not the numbers in the file, and it
+  does not echo them anywhere — `toxtunnel inspect` carries no rate-limit
+  state at all, so do the arithmetic yourself rather than expecting the daemon
+  to confirm it. (`docs/CONFIGURATION.md` claims `inspect` reports the clamped
+  budget; as of v0.4.11 it does not.)
+
+Log lines worth knowing:
+
+```
+Inbound byte throttle engaged for friend <N> (rate_limit.bytes_per_sec)
+Inbound byte throttle engaged|disengaged for friend <N>        # after a reload
+Friend <N> reached the inbound throttle backlog rail (<B> bytes deferred); ...
+Friend <N>: a deferred frame reached its release deadline ...
 ```
 
 ### Tunnel resume (opt-in, live in v0.4.x)

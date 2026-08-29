@@ -692,9 +692,11 @@ no tokens. `bytes_burst: 0` is the way to exempt a friend. A non-zero
 an item bigger than its capacity, and a maximum-size TUNNEL_DATA frame
 would otherwise be deferred forever. Both fields are also clamped to 1
 GB/s, which is three orders of magnitude past what a Tox tunnel carries;
-the clamp exists so the refill arithmetic cannot overflow. `toxtunnel
-inspect` and `effective_spec` report the clamped values, i.e. what is
-actually enforced.
+the clamp exists so the refill arithmetic cannot overflow. `effective_spec`
+reports the clamped values, i.e. what is actually enforced. `toxtunnel
+inspect` does **not** — it carries no rate-limit state at all, so if you
+configured a value above the clamp you have to apply the clamp yourself to
+know what is in force.
 
 ### Reloading rate limits resets every token bucket
 

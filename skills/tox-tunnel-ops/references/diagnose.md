@@ -100,7 +100,8 @@ These layers only apply when the corresponding feature is enabled.
 - Check startup log for `Invalid client.socks5.listen value` or `must bind to a loopback address` — the validator rejects non-loopback binds (`0.0.0.0`, LAN IPs)
 - Verify the listener is actually enabled: `socks5.enabled: true` in YAML, OR `--socks5 host:port` on the CLI
 - SOCKS5 and `client.pipe` are mutually exclusive; the validator emits `socks5.enabled and client.pipe cannot be used together`
-- If listener bound but CONNECTs are refused with SOCKS5 reply 0x02 ("connection not allowed"), the server-side `rules.yaml` is denying the target — that's expected; widen the allow list on the server, not the client
+- If listener bound but CONNECTs are refused with SOCKS5 reply 0x02 ("connection not allowed") — or `403 Forbidden` when the client spoke HTTP CONNECT — the server-side `rules.yaml` is denying the target; that's expected, widen the allow list on the server, not the client. A `0x04` / `0x05` / `0x01` reply (all `502 Bad Gateway` over HTTP CONNECT) means the server accepted the request and the *target* was unreachable, refused, or the open failed — a different problem entirely
+- One trap: an OPEN refused by the **rate limiter** (`TUNNEL_ERROR` code 3, "Rate limit exceeded") reaches the SOCKS5 client as `0x04` "host unreachable", indistinguishable from a genuinely dead target. If SOCKS5 CONNECTs start failing as unreachable under load, check `toxtunnel_rate_limit_open_rejected_total` on the **server** before chasing the target
 
 **Multi-server failover not switching:**
 - Tail the log for `Failover: switching active server X... -> Y... (friend N)` — absence means no switch decision has fired
@@ -155,7 +156,9 @@ These layers only apply when the corresponding feature is enabled.
 | `reload rejected: <reason>` in logs | New config failed parse/validation | Daemon kept old config; fix the YAML and re-trigger reload |
 | `reload: no pid file at ...` | Daemon not running, different `data_dir`, a pre-v0.4.11 daemon (never wrote the file), **or a corrupt pid file** — parsing is strict, so anything other than one positive integer (`123abc`, `12.5`, empty) reads as absent rather than being partially parsed into a signal for an unrelated process | Verify daemon is up; pass `-d` or `-c` so reload looks in the right place; check the file really holds just a number; or set `TOXTUNNEL_RELOAD_PID` |
 | `reload: pid N is no longer a toxtunnel process (stale toxtunnel.pid?)` | Daemon crashed / was killed and the pid was reused | Start the daemon again (it overwrites the pid file) |
-| SOCKS5 CONNECT returns reply 0x02 | Server-side rules.yaml denied the destination | Add the host/port to the friend's allow list on the **server** (not client) |
+| SOCKS5 CONNECT returns reply 0x02 (HTTP CONNECT: `403 Forbidden`) | Server-side rules.yaml denied the destination | Add the host/port to the friend's allow list on the **server** (not client). Reply `0x04`/`0x05`/`0x01` (HTTP `502`) is *not* a rules denial — the target was unreachable/refused |
+| One friend's throughput plateaus while others are fine; `toxtunnel_rate_limit_bytes_throttled_total` climbing | Its `rate_limit.bytes_per_sec` budget is binding — inbound TUNNEL_DATA is being deferred and replayed, not dropped (implemented in v0.4.11; the keys were inert before) | Working as configured. Raise `bytes_per_sec` / `bytes_burst`, or set `bytes_burst: 0` to exempt the friend, then reload |
+| `Friend N reached the inbound throttle backlog rail (… bytes deferred)` | 32 MiB of that friend's inbound frames are parked. The backlog is released early, in order — nothing is lost, but the budget is exceeded for the burst | Either `bytes_per_sec` is far below what the peer offers, or the peer is not honouring flow control. Raise the budget, or use `max_concurrent_tunnels` / `open_per_sec` if the peer is the problem |
 | Tunnel reaped while still in use | `tunnel.idle_timeout_seconds` too aggressive for the protocol | Raise the timeout or set `0` (disabled) |
 
 ## Output Format
@@ -223,6 +226,39 @@ Rate limiter rejected the TUNNEL_OPEN. Check:
 
 Loosen `rate_limit_defaults` or add a per-friend override block in
 `rules.yaml` and `kill -HUP` to reload.
+
+### Symptom: one friend's transfers are slow but nothing is erroring
+
+No `TUNNEL_ERROR`, no closed tunnels, no rules denial — that friend's bytes
+just arrive slower than the link allows. Check whether its byte budget is
+binding (`rate_limit.bytes_per_sec` / `bytes_burst`, live since v0.4.11 —
+in earlier v0.4.x releases these keys parsed and did nothing, so a config
+carried across the upgrade can start shaping traffic that never was before):
+
+1. `curl 127.0.0.1:9100/metrics | grep rate_limit_bytes_throttled_total`
+   — a climbing counter means frames are finding the bucket short. In
+   `enforce` that is the throttle working; in `report` nothing is being
+   delayed and the counter is pure measurement.
+2. Server log at startup / after reload:
+   `Inbound byte throttle engaged for friend <N> (rate_limit.bytes_per_sec)`,
+   or `Inbound byte throttle engaged|disengaged for friend <N>`.
+3. `toxtunnel inspect status --json` does **not** expose bucket levels;
+   the counter and the log lines are the only signals.
+
+Remember what this key does and does not cover before concluding anything:
+it meters **inbound TUNNEL_DATA from that friend** only. If the slow
+direction is server → client, the byte budget is not the cause — look at
+transport (UDP vs TCP relay) and flow control instead. Enforcement defers
+and replays in order; it never drops bytes and never closes a tunnel, so a
+throttled tunnel is slow, not broken. Two rails release the backlog early
+rather than growing it (32 MiB per friend, and a per-frame deadline of at
+most 60 s derived from the reaper timeouts) — both log at `warn` and both
+mean the configured rate was briefly exceeded, not that data was lost.
+
+Fix: raise `bytes_per_sec` / `bytes_burst`, switch the friend to
+`mode: report` to confirm the budget is the cause, or set `bytes_burst: 0`
+to exempt it — then reload. A reload refills every bucket, so give it a
+moment before re-measuring.
 
 ### Symptom: adaptive coalescing is making bad decisions
 
@@ -292,19 +328,37 @@ the service (`install-windows-service`), as a Scheduled Task, or via
 `TUNNEL_CLOSE`, `PING`, `PONG`) hit toxcore's lossless SENDQ while it
 was full and got silently dropped. Fixed in v0.4.5+:
 
-- Control frames routed via `TunnelManager::send_frame` (notably the
-  server's `TUNNEL_OPEN_ACK`) are parked in a bounded FIFO retry queue
-  (cap 4096) and re-emitted every 20 ms until SENDQ drains.
+- Control frames routed via `TunnelManager::send_frame` are parked in a
+  bounded FIFO retry queue (cap 4096) and re-emitted every 20 ms until
+  SENDQ drains. (v0.4.11 took the handshake frames back out of that
+  queue — see below.)
 - Control frames sent via the per-tunnel `on_send_to_tox` callback
-  (`TUNNEL_OPEN`, `TUNNEL_CLOSE` from either side) inspect the frame
-  type at offset 0 and, on failure, hand non-DATA frames off to the
-  same retry queue via `queue_outbound_for_retry`. `TUNNEL_DATA`
-  frames keep using the per-tunnel coalesce-buffer retry-on-timer
-  path instead — routing them through the manager queue would double-
-  send. Without the per-tunnel-path fix, a `TUNNEL_CLOSE` lost to
-  SENDQ-full would leave the peer's tunnel hung in `Disconnecting`
-  (the bidirectional bulk-transfer close-handshake hang seen in the
-  v0.4.5 1 MB-echo soak).
+  (`TUNNEL_CLOSE`, `PING`/`PONG`, `INFO`, resume opcodes) inspect the
+  frame type at offset 0 and, on failure, hand off to the same retry
+  queue. `TUNNEL_DATA` frames keep using the per-tunnel coalesce-buffer
+  retry-on-timer path instead — routing them through the manager queue
+  would double-send. Without the per-tunnel-path fix, a `TUNNEL_CLOSE`
+  lost to SENDQ-full would leave the peer's tunnel hung in
+  `Disconnecting` (the bidirectional bulk-transfer close-handshake hang
+  seen in the v0.4.5 1 MB-echo soak).
+
+v0.4.11 closed the remaining hole on the handshake frames themselves:
+
+- The client's `TUNNEL_OPEN` and the server's OPEN_ACK (`TUNNEL_ACK`) are
+  no longer parked in the shared queue at all — the queue holds bare wire
+  bytes with no tunnel identity, so a parked handshake frame could be
+  delivered later against whatever tunnel had recycled that id. They now
+  report backpressure to their own driver, which retains and re-sends
+  them. A `TUNNEL_OPEN` refused by a full SENDQ is retried, not dropped;
+  `create_tunnel()` releases the id and reports failure rather than
+  handing back an id the peer never heard of.
+- Those two frame types also consult the outbound queue before being
+  handed to toxcore, so neither can overtake something already parked.
+  `TUNNEL_DATA` is covered transitively — it only flows once the OPEN or
+  the OPEN_ACK has gone out — so DATA can no longer arrive ahead of a
+  backpressured OPEN_ACK. The still-parked control frames (CLOSE, ERROR,
+  PING/PONG, INFO, resume) keep the older, weaker ordering; that is a
+  known and documented residual, not a bug to chase.
 
 If you see a wedge anyway:
 

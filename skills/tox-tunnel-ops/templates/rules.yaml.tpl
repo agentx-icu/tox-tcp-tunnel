@@ -34,11 +34,30 @@
 #   open_per_sec: 10
 #   open_burst: 50
 #   max_concurrent_tunnels: 100
+#   bytes_per_sec: 1048576        # 1 MiB/s of inbound TUNNEL_DATA from a friend
+#   bytes_burst: 4194304          # bucket capacity; BOTH keys must be non-zero
 #
-# NOT IMPLEMENTED: `bytes_per_sec` and `bytes_burst` are still accepted by the
-# parser but the data path never consults them, so they throttle nothing and
-# toxtunnel_rate_limit_bytes_throttled_total stays at 0. The daemon logs a
-# warning if you set them. Do not use them to cap bandwidth.
+# About the byte budget (implemented since v0.4.11 — earlier releases parsed
+# these keys and did nothing with them, so check the value before upgrading
+# into it):
+#
+#   * Direction: it meters the payload a friend pushes AT this server, per
+#     friend, summed across that friend's tunnels — the same direction
+#     `open_per_sec` guards. It does NOT limit what this server sends back.
+#   * `enforce` never drops a frame and never closes a tunnel. Over-budget
+#     frames are deferred and replayed in arrival order; withholding their
+#     TUNNEL_ACK closes the peer's send window, so the throttle propagates
+#     back to the origin TCP socket instead of piling up here.
+#   * `report` accounts and moves toxtunnel_rate_limit_bytes_throttled_total
+#     without delaying anything. Size the limit here first.
+#   * Limitation to be honest about: a receiver-side deferral cannot hold an
+#     average rate against a peer that ignores flow control — against one it
+#     degrades to bursts capped by a 32 MiB per-friend memory rail (logged at
+#     warn when hit). This is a bandwidth budget for cooperative peers, not a
+#     defence against a hostile one. `max_concurrent_tunnels` / `open_per_sec`
+#     remain the anti-DoS knobs.
+#   * `bytes_burst: 0` is how you exempt a friend; a non-zero value below
+#     65535 is raised to 65535.
 
 rules:
 {{#RULES}}
@@ -48,6 +67,8 @@ rules:
     # rate_limit_defaults above.
     # rate_limit:
     #   max_concurrent_tunnels: 200
+    #   bytes_per_sec: 262144        # 256 KiB/s inbound for this friend only
+    #   bytes_burst: 1048576
     allow:
 {{#ALLOW}}
       - host: "{{HOST}}"

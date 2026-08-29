@@ -99,6 +99,11 @@ Binary framing over Tox lossless custom packets:
 - Pipe mode: **POSIX only** (macOS/Linux) — not supported on Windows
 - Watchdog deadline: minimum 5 s (config-validator enforced); default 30 s.
 - Rate-limit defaults: absent block ⇒ no limiting (v0.3.0 behaviour).
+- Byte budgets (`rate_limit.bytes_per_sec` / `bytes_burst`, live since v0.4.11):
+  both clamped to 1 GB/s so the refill arithmetic cannot overflow; a non-zero
+  `bytes_burst` below 65535 is raised to 65535 (a bucket cannot admit a frame
+  bigger than its capacity). Deferred bytes are bounded at **32 MiB per friend**,
+  and any single deferred frame is released after at most 60 s.
 
 ### Configuration Format (YAML)
 
@@ -124,6 +129,7 @@ inspect:
   enabled: true                     # default-on; serves a Unix socket / named pipe for `toxtunnel inspect`
 tunnel:
   coalesce_max_delay_us: 200        # default-on small-write coalescing (perf, benign to leave)
+                                    # Windows: sub-15.6 ms values are treated as 0 (no batching)
   coalesce_max_bytes: 1362          # flush threshold (≤ Tox 1367-byte frame limit)
   coalesce_mode: fixed              # v0.4: fixed (default) | adaptive | bypass | drain
   idle_timeout_seconds: 0           # 0 = disabled; e.g. 900 closes tunnels idle for 15 min
@@ -192,7 +198,7 @@ client:
 |-------|-------|-------|
 | `metrics.enabled` | **opt-in** (default `false`) | Listener binds wherever `metrics.listen` says; defaults to loopback |
 | `inspect.enabled` | **default-on** | Local IPC only (Unix socket / named pipe), never network-exposed |
-| `tunnel.coalesce_*` | **default-on** | Tiny latency cost (≤200 µs) in exchange for fewer Tox frames; safe to leave alone |
+| `tunnel.coalesce_*` | **default-on** | Tiny latency cost (≤200 µs) in exchange for fewer Tox frames; safe to leave alone. **Windows:** a delay below the ~15.6 ms system timer tick — which includes the 200 µs default — is treated as `0`, so writes go out immediately and nothing is batched (the daemon warns once). Set ≥ `15600` if you actually want batching there |
 | `tunnel.idle_timeout_seconds` | **opt-in** (default `0` = disabled) | Set non-zero to reap silently abandoned tunnels |
 | `client.socks5.enabled` | **opt-in** (default `false`) | `listen` MUST be loopback (`127.0.0.1`, `::1`, `localhost`); validator rejects others |
 | `client.failover` | **default values applied only when `server_id` is a list** | Single-ID configs ignore this block |
@@ -379,8 +385,8 @@ Analyze the user's message and route to the appropriate mode:
 | "Production redundancy", "my homelab dies sometimes", "two servers, prefer primary" | **Multi-server failover** (`server_id` list + `client.failover`) | Primary-preference: client switches back to entry 0 after `prefer_primary_grace_seconds` of stable uptime |
 | "See live tunnel state without log diving", "what's open right now", "how many bytes" | **`toxtunnel inspect`** | Local IPC only; `--json` for machine consumption |
 | "Close zombie tunnels", "free old connections" | **Idle reaper** (`tunnel.idle_timeout_seconds`) | 0 = disabled (default); typical setting: 600–1800 |
-| "A friend is DoSing me with TUNNEL_OPENs", "cap how many tunnels one friend can hold", "anti-abuse" | **Per-friend rate limit** (`rate_limit_defaults` + per-rule `rate_limit`) | v0.4. Covers **connection setup only**: `open_per_sec` / `open_burst` (TUNNEL_OPEN rate) and `max_concurrent_tunnels`. Modes: `off \| report \| enforce`; a per-rule block overrides the defaults field by field. Hot-reloadable via the rules file, but a reload refills every bucket and zeroes the rejection counts. Start with `mode: report` to size limits against real traffic. |
-| "Throttle a friend's bandwidth", "cap MB/s per friend", "shape traffic" | **Not supported — do not route here** | `bytes_per_sec` / `bytes_burst` parse and warn but do nothing: the byte buckets are never consulted on the data path, so they shape no traffic and `toxtunnel_rate_limit_bytes_throttled_total` stays at 0. Say so plainly and point at an OS-level shaper (`tc`, pf) on the tunnel endpoint instead. |
+| "A friend is DoSing me with TUNNEL_OPENs", "cap how many tunnels one friend can hold", "anti-abuse" | **Per-friend connection limits** (`rate_limit_defaults` + per-rule `rate_limit`) | v0.4. Connection setup: `open_per_sec` / `open_burst` (TUNNEL_OPEN rate) and `max_concurrent_tunnels`. These are the knobs that actually refuse a request — an over-budget OPEN gets `TUNNEL_ERROR` reason 3 and no tunnel. Modes: `off \| report \| enforce`; a per-rule block overrides the defaults field by field. Hot-reloadable via the rules file, but a reload refills every bucket and zeroes the rejection counts. Start with `mode: report` to size limits against real traffic. |
+| "Throttle a friend's bandwidth", "cap MB/s per friend", "shape traffic" | **Per-friend byte budget** (`bytes_per_sec` + `bytes_burst` in the same `rate_limit` blocks) — with the direction caveat opposite | Implemented since **v0.4.11**. Meters the payload of **inbound TUNNEL_DATA from that friend**, per friend, summed across their tunnels — the same direction `open_per_sec` guards. `enforce` never drops a frame and never closes the tunnel: it **defers** over-budget frames and replays them in arrival order, withholding their `TUNNEL_ACK` so the peer's send window closes and the backpressure reaches the origin TCP socket. `report` accounts and moves `toxtunnel_rate_limit_bytes_throttled_total` without delaying anything — use it first. **Both keys must be non-zero to engage.** Route to an OS-level shaper (`tc`, pf) instead when the ask is to cap what this host **sends** (not covered at all) or to survive a **hostile** peer — a receiver-side deferral cannot hold an average rate against a peer that ignores flow control, and degrades to bursts capped by a 32 MiB per-friend memory rail. `max_concurrent_tunnels` / `open_per_sec` stay the anti-DoS knobs. |
 | "An SSH session shouldn't drop when I restart the server", "fast reattach across maintenance" | **Tunnel resume** (`tunnel.resume.enabled: true`) | v0.4 opt-in. Live handshake: server holds the friend's tunnels for `resume.max_age_seconds`, client re-sends `TUNNEL_RESUME_REQUEST` per surviving tunnel and reconciles byte offsets. Gap behaviour configurable via `resume.on_gap` (`close` / `passthrough`). Live-reconnect only; cannot survive a process restart. |
 | "Bulk transfer is slow", "throughput-tune", "high BDP link" | **Adaptive coalescing** (`tunnel.coalesce_mode: adaptive`) + **BDP flow control** (`flow_control.mode: bdp`) | v0.4. `flow_control.mode: bdp` is the default since v0.4.1 — verify it isn't overridden to `fixed`. `tunnel.coalesce_mode` is still `fixed` by default; flip to `adaptive` on bulk-heavy deployments. |
 | "Daemon went silent without exiting", "tunnels stop but RSS flat", "detect a wedge" | **Watchdog metrics** (`toxtunnel_tox_iterate_lag_milliseconds_max`, `toxtunnel_watchdog_aborts_total`) | v0.4. The watchdog is on by default; alert when the `_max` gauge rises sustained (> 100 ms is the conventional trip) or when the abort counter ticks. |
