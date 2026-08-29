@@ -83,7 +83,7 @@ Offset  Size  Field
 | `TUNNEL_DATA`   | 0x02  | Data frame                                        |
 | `TUNNEL_CLOSE`  | 0x03  | Close tunnel gracefully                           |
 | `TUNNEL_ACK`    | 0x04  | Acknowledge tunnel open                           |
-| `TUNNEL_ERROR`  | 0x05  | Error (connect failed, etc.)                      |
+| `TUNNEL_ERROR`  | 0x05  | Error. Payload: `[code:1][utf-8 description]`. See **TUNNEL_ERROR categories** below — the code, not the text, is the contract. |
 | `INFO_REQUEST`  | 0x06  | Client → Server: ask peer for system info (`tunnel_id` = 0, empty payload). Sent once when the friend transitions to online. |
 | `INFO_REPLY`    | 0x07  | Server → Client response (`tunnel_id` = 0, UTF-8 YAML map filtered by `server.disclose.*`). Empty payload = "policy is to disclose nothing"; client persists the result to `known_servers.yaml`. Old servers ignore `INFO_REQUEST` — client falls back to locally-observable metadata only. |
 | `TUNNEL_RESUME_REQUEST` | 0x08 | Client → Server: reattach a tunnel that survived a brief disconnect (the server held it for `resume.max_age_seconds`). Binary payload: `[version:1=0x01][prior_id:2][recv:8][send:8][host_len:1][host:N][port:2]`. Wire-inactive when `tunnel.resume.enabled: false` (the default). Old servers ignore unknown opcodes; the client falls back to `TUNNEL_OPEN` if the server declines or doesn't recognise the tunnel. |
@@ -95,6 +95,51 @@ Offset  Size  Field
 > handed to toxcore's lossless custom packet API. ToxTunnel does **not**
 > implement remote command execution — `INFO_REPLY` is the only metadata
 > channel and the server operator opts in per field.
+
+### TUNNEL_ERROR categories (v0.4.12+)
+
+The error code is a **category**, and the three values are disjoint so a peer
+can act on the number alone. The description is for humans; it carries no
+protocol meaning.
+
+| Code | Category | Emitted for | Client outcome |
+| ---- | -------- | ----------- | -------------- |
+| 1 | Policy-denied open | Rules denial, rate limit, concurrent-tunnel cap — anything the server *operator's* configuration refused | `Denied` → SOCKS5 `0x02` / HTTP `403` |
+| 2 | General non-policy failure | DNS failure, any connect failure that is not a refusal, "Tunnel ID in use", "Tunnel not found", target lost before the tunnel was established, half-close linger timeout | `Unreachable` → SOCKS5 `0x04` / HTTP `502` |
+| 3 | Actively refused | The target's TCP stack refused the connection, and nothing else | `Refused` → SOCKS5 `0x05` / HTTP `502` |
+
+The **Client outcome** column applies while an open is still pending — that is
+the window in which a SOCKS5 or HTTP CONNECT caller is waiting for its reply.
+Some code 2 emitters are inherently post-open ("Tunnel not found", the
+half-close linger timeout): by the time they arrive the reply has already been
+sent, so they tear down the established connection instead of producing a fresh
+`0x04` / `502`. Their code still matters — it is what the peer logs and what any
+future consumer classifies on.
+
+Code 2 is the whole non-policy bucket, deliberately not "cannot reach target":
+a new failure mode belongs there unless it genuinely fits 1 or 3.
+
+**Why the categories exist.** Up to v0.4.11 code 3 conflated policy denials,
+target failures and teardowns, so a rate-limited `TUNNEL_OPEN` reached a SOCKS5
+caller as `0x04` "host unreachable" — indistinguishable from a dead target. The
+client compensated by searching the description for `"refused"`, which is not
+portable: C++ only requires `error_code::message()` to *describe* the error, and
+on Windows asio takes that text from `FormatMessage`, whose language follows the
+machine locale. The server therefore classifies numerically
+(`ec == asio::error::connection_refused`, in
+`app::detail::open_failure_for_connect_error`) rather than by string.
+
+**Mixed versions.** A v0.4.12+ client keeps a compatibility shim for servers
+≤ v0.4.11 (`app::tunnel_open_outcome_for`): under code 3 it treats the exact
+strings `"Rate limit exceeded"` and `"Tunnel limit exceeded"` as denials, then
+falls back to the legacy `"refused"` substring, then to `Unreachable`. Code 3
+cannot simply be redefined as "refused" on the client, because an old server
+also sends 3 for a connect *timeout*. In the other direction an un-upgraded
+client benefits too: the new server's policy denials arrive as code 1, which
+v0.4.11 already mapped to `Denied`. The refused branch emits the fixed
+lowercase literal `"TCP connection refused: "` so old clients' substring check
+keeps working regardless of the platform's message language. The shim is
+deletable once no ≤ v0.4.11 server remains in service.
 
 ## Threading Model
 

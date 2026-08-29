@@ -306,6 +306,84 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
     EXPECT_EQ(reply[1], socks5::kReplySuccess);
 }
 
+// END-TO-END REGRESSION SEAM: a peer's TUNNEL_ERROR (code + description, as it
+// arrives on the wire) -> the client's classification -> the byte a real SOCKS5
+// caller reads off a real socket. The units either side of this are tested in
+// tunnel_error_classification_test.cpp; what this adds is proof that the chain
+// is actually wired together, which is what was missing when a rate-limited
+// open was reaching callers as 0x04 "host unreachable".
+TEST_F(Socks5ListenerLifecycleTest, WireErrorReachesTheCallerAsTheRightSocks5Reply) {
+    struct Case {
+        const char* label;
+        std::uint8_t error_code;
+        const char* description;
+        std::uint8_t expected_reply;
+    };
+    // Each row names which server version produces it.
+    const Case cases[] = {
+        {"new server, rate limited", 1, "Rate limit exceeded", socks5::kReplyConnNotAllowed},
+        {"new server, rules denial", 1, "Access denied", socks5::kReplyConnNotAllowed},
+        {"new server, connect timeout", 2, "TCP connect failed: Operation timed out",
+         socks5::kReplyHostUnreachable},
+        {"new server, refused", 3, "TCP connection refused: Connection refused",
+         socks5::kReplyConnRefused},
+        {"v0.4.11 server, rate limited", 3, "Rate limit exceeded", socks5::kReplyConnNotAllowed},
+        {"v0.4.11 server, refused", 3, "TCP connect failed: Connection refused",
+         socks5::kReplyConnRefused},
+        {"v0.4.11 server, timeout", 3, "TCP connect failed: Operation timed out",
+         socks5::kReplyHostUnreachable},
+        {"no TUNNEL_ERROR at all", 0, "", socks5::kReplyGeneralFailure},
+    };
+
+    for (const auto& c : cases) {
+        std::atomic<bool> got_dest{false};
+        std::function<void(TunnelOpenOutcome)> captured_reply_cb;
+
+        auto listener = std::make_shared<Socks5Listener>();
+        auto err = listener->start(
+            io_ctx_, "127.0.0.1", 0,
+            [&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t, std::vector<uint8_t>,
+                std::function<void(TunnelOpenOutcome)> reply_cb) {
+                captured_reply_cb = std::move(reply_cb);
+                got_dest.store(true);
+            });
+        ASSERT_TRUE(err.empty()) << c.label << ": " << err;
+
+        asio::io_context client_io;
+        asio::ip::tcp::socket sock(client_io);
+        sock.connect({asio::ip::make_address("127.0.0.1"), listener->bound_port()});
+
+        const uint8_t greeting[] = {0x05, 0x01, 0x00};
+        asio::write(sock, asio::buffer(greeting, sizeof(greeting)));
+        auto greeting_reply = read_some(sock, 2, 5s);
+        ASSERT_EQ(greeting_reply.size(), 2u) << c.label;
+
+        const uint8_t req[] = {0x05, 0x01, 0x00, 0x01, 10, 0, 0, 7, 0x01, 0xBB};
+        asio::write(sock, asio::buffer(req, sizeof(req)));
+
+        // WALL-CLOCK DEADLINE, not an iteration count.
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!got_dest.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(5ms);
+        }
+        ASSERT_TRUE(got_dest.load()) << c.label;
+        ASSERT_TRUE(captured_reply_cb) << c.label;
+
+        // The one line under test: what the client does with the peer's error.
+        captured_reply_cb(tunnel_open_outcome_for(c.error_code, c.description));
+
+        auto reply = read_some(sock, 10, 5s);
+        ASSERT_EQ(reply.size(), 10u) << c.label;
+        EXPECT_EQ(reply[0], 0x05) << c.label;
+        EXPECT_EQ(reply[1], c.expected_reply)
+            << c.label << ": TUNNEL_ERROR code " << static_cast<int>(c.error_code) << " (\""
+            << c.description << "\") produced SOCKS5 reply " << static_cast<int>(reply[1])
+            << ", expected " << static_cast<int>(c.expected_reply);
+
+        listener->stop();
+    }
+}
+
 TEST_F(Socks5ListenerLifecycleTest, RejectsClientThatOffersNoNoAuth) {
     std::atomic<bool> got_dest{false};
     start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,

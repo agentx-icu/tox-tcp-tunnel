@@ -697,10 +697,23 @@ class TunnelImpl : public Tunnel {
     }
 
     /// Error code from the last TUNNEL_ERROR this tunnel received (0 = none).
-    /// The server uses 1 for a rules denial, 2 for DNS failure and 3 for a
-    /// failed TCP connect / limit rejection; the SOCKS5 listener maps this
-    /// onto the RFC 1928 reply byte so a policy denial is distinguishable
-    /// from an unreachable target.
+    ///
+    /// WIRE CONTRACT (v0.4.12+) — three disjoint categories, so a client can
+    /// act on the number alone rather than parsing the description:
+    ///
+    ///   1 — policy-denied open: rules denial, rate limit, concurrent-tunnel
+    ///       cap. Anything the *server operator's* configuration refused.
+    ///   2 — general non-policy open failure: DNS failure, any connect failure
+    ///       that is not a refusal, "Tunnel ID in use", target lost before the
+    ///       tunnel was established, half-close linger timeout. This is the
+    ///       whole non-policy bucket, not specifically "cannot reach target";
+    ///       new failure modes belong here unless they fit 1 or 3.
+    ///   3 — the target actively refused the TCP connection, and nothing else.
+    ///
+    /// Up to v0.4.11 code 3 conflated policy denials, connect failures and
+    /// teardowns, so a rate-limited open reached a SOCKS5 client as 0x04 "host
+    /// unreachable". `app::tunnel_open_outcome_for()` maps these onto the
+    /// RFC 1928 reply byte and carries the compatibility shim for old servers.
     [[nodiscard]] std::uint8_t last_error_code() const noexcept {
         return last_error_code_.load(std::memory_order_acquire);
     }

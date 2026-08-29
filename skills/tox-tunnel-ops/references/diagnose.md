@@ -100,8 +100,8 @@ These layers only apply when the corresponding feature is enabled.
 - Check startup log for `Invalid client.socks5.listen value` or `must bind to a loopback address` — the validator rejects non-loopback binds (`0.0.0.0`, LAN IPs)
 - Verify the listener is actually enabled: `socks5.enabled: true` in YAML, OR `--socks5 host:port` on the CLI
 - SOCKS5 and `client.pipe` are mutually exclusive; the validator emits `socks5.enabled and client.pipe cannot be used together`
-- If listener bound but CONNECTs are refused with SOCKS5 reply 0x02 ("connection not allowed") — or `403 Forbidden` when the client spoke HTTP CONNECT — the server-side `rules.yaml` is denying the target; that's expected, widen the allow list on the server, not the client. A `0x04` / `0x05` / `0x01` reply (all `502 Bad Gateway` over HTTP CONNECT) means the server accepted the request and the *target* was unreachable, refused, or the open failed — a different problem entirely
-- One trap: an OPEN refused by the **rate limiter** (`TUNNEL_ERROR` code 3, "Rate limit exceeded") reaches the SOCKS5 client as `0x04` "host unreachable", indistinguishable from a genuinely dead target. If SOCKS5 CONNECTs start failing as unreachable under load, check `toxtunnel_rate_limit_open_rejected_total` on the **server** before chasing the target
+- If listener bound but CONNECTs are refused with SOCKS5 reply 0x02 ("connection not allowed") — or `403 Forbidden` when the client spoke HTTP CONNECT — the request was denied by **server policy**: `rules.yaml`, the rate limiter, or the concurrent-tunnel cap. Widen the allow list or the limits on the server, not the client. A `0x04` / `0x05` / `0x01` reply (all `502 Bad Gateway` over HTTP CONNECT) means policy allowed the request and the *target* was unreachable, refused, or the open failed — a different problem entirely
+- Reading the reply byte back to a cause (v0.4.12+): `0x02` = policy denial (`TUNNEL_ERROR` code 1) · `0x05` = the target actively refused the connection (code 3) · `0x04` = every other open failure — DNS, connect timeout, target lost mid-open (code 2). Before v0.4.12 the server sent code 3 for policy denials too, so a rate-limited OPEN arrived as `0x04` "host unreachable", indistinguishable from a dead target; if you are diagnosing an **older server**, check `toxtunnel_rate_limit_open_rejected_total` on it before chasing the target. A v0.4.12+ client still reports that older server's rate limit correctly as `0x02`
 
 **Multi-server failover not switching:**
 - Tail the log for `Failover: switching active server X... -> Y... (friend N)` — absence means no switch decision has fired
@@ -156,7 +156,7 @@ These layers only apply when the corresponding feature is enabled.
 | `reload rejected: <reason>` in logs | New config failed parse/validation | Daemon kept old config; fix the YAML and re-trigger reload |
 | `reload: no pid file at ...` | Daemon not running, different `data_dir`, a pre-v0.4.11 daemon (never wrote the file), **or a corrupt pid file** — parsing is strict, so anything other than one positive integer (`123abc`, `12.5`, empty) reads as absent rather than being partially parsed into a signal for an unrelated process | Verify daemon is up; pass `-d` or `-c` so reload looks in the right place; check the file really holds just a number; or set `TOXTUNNEL_RELOAD_PID` |
 | `reload: pid N is no longer a toxtunnel process (stale toxtunnel.pid?)` | Daemon crashed / was killed and the pid was reused | Start the daemon again (it overwrites the pid file) |
-| SOCKS5 CONNECT returns reply 0x02 (HTTP CONNECT: `403 Forbidden`) | Server-side rules.yaml denied the destination | Add the host/port to the friend's allow list on the **server** (not client). Reply `0x04`/`0x05`/`0x01` (HTTP `502`) is *not* a rules denial — the target was unreachable/refused |
+| SOCKS5 CONNECT returns reply 0x02 (HTTP CONNECT: `403 Forbidden`) | Server **policy** denied the open: rules.yaml, rate limiter, or tunnel cap | Add the host/port to the friend's allow list on the **server** (not client), or loosen its `rate_limit`. Reply `0x04`/`0x05`/`0x01` (HTTP `502`) is *not* a policy denial — the target was unreachable/refused |
 | One friend's throughput plateaus while others are fine; `toxtunnel_rate_limit_bytes_throttled_total` climbing | Its `rate_limit.bytes_per_sec` budget is binding — inbound TUNNEL_DATA is being deferred and replayed, not dropped (implemented in v0.4.11; the keys were inert before) | Working as configured. Raise `bytes_per_sec` / `bytes_burst`, or set `bytes_burst: 0` to exempt the friend, then reload |
 | `Friend N reached the inbound throttle backlog rail (… bytes deferred)` | 32 MiB of that friend's inbound frames are parked. The backlog is released early, in order — nothing is lost, but the budget is exceeded for the burst | Either `bytes_per_sec` is far below what the peer offers, or the peer is not honouring flow control. Raise the budget, or use `max_concurrent_tunnels` / `open_per_sec` if the peer is the problem |
 | Tunnel reaped while still in use | `tunnel.idle_timeout_seconds` too aggressive for the protocol | Raise the timeout or set `0` (disabled) |
@@ -223,6 +223,10 @@ Rate limiter rejected the TUNNEL_OPEN. Check:
 2. The structured WARN log line carries the friend public key prefix.
 3. `toxtunnel inspect status --json` does **not** expose per-friend bucket
    levels — the WARN log line and the counter above are the only signals.
+
+On the client side this surfaces as `TUNNEL_ERROR` code 1 and a SOCKS5
+`0x02` / HTTP `403` — a denial, not an unreachable host. If the client is
+reporting `0x04` instead, the **server** predates v0.4.12.
 
 Loosen `rate_limit_defaults` or add a per-friend override block in
 `rules.yaml` and `kill -HUP` to reload.

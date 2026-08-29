@@ -1165,7 +1165,11 @@ void TunnelImpl::close_for_timeout() {
         // The peer abandoned its side of the close handshake. Tell it plainly:
         // TUNNEL_ERROR drives the peer's tunnel to Error and through its normal
         // teardown (see handle_tunnel_error_frame), releasing its target fd.
-        auto frame = ProtocolFrame::make_tunnel_error(tunnel_id_, 3, "half-close linger timeout");
+        // Code 2, not 3. Its post-open timing means no SOCKS5 reply is riding on
+        // it, but code 3 now means "the target refused the connection" and this
+        // is a local linger timeout — leaving it at 3 would contradict the wire
+        // contract even though nothing observable would break today.
+        auto frame = ProtocolFrame::make_tunnel_error(tunnel_id_, 2, "half-close linger timeout");
         send_frame_to_tox(frame);
         util::MetricsRegistry::instance().inc_tunnels_closed(
             util::MetricsRegistry::CloseReason::Timeout);
@@ -1673,12 +1677,19 @@ void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
     // is aborted, so it flooded the log at error level. Log the first one
     // per tunnel at info; repeats (tunnel already in Error) and anything
     // arriving during teardown at debug. Real failures keep error. Match on
-    // the description too: code 1 is also used for rules denials
-    // (tunnel_server.cpp), and a policy denial must never be demoted.
+    // the description too: code 1 means a POLICY denial (rules, rate limit,
+    // tunnel cap) and a policy denial must never be demoted to routine noise.
+    //
+    // Both codes are accepted because this is a MIXED-VERSION log path: a peer
+    // running <= v0.4.11 sends this as code 1, a v0.4.12+ peer as code 2. If we
+    // only matched the new code, an older peer's routine cross-on-the-wire
+    // replies would go back to flooding the log at error level.
     const State prior_state = state();
     const bool teardown = prior_state == State::Disconnecting || prior_state == State::Closed ||
                           prior_state == State::Error;
-    if (payload->error_code == 1 && payload->description == "Tunnel not found") {
+    const bool routine_tunnel_not_found = (payload->error_code == 2 || payload->error_code == 1) &&
+                                          payload->description == "Tunnel not found";
+    if (routine_tunnel_not_found) {
         if (prior_state == State::Error) {
             util::Logger::debug("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
                                 payload->error_code, payload->description);

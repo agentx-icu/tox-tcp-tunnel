@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "toxtunnel/core/tcp_connection.hpp"
@@ -136,11 +137,65 @@ struct HttpConnectResult {
 /// `rules.yaml` is the thing rejecting a destination.
 enum class TunnelOpenOutcome : std::uint8_t {
     Connected,    ///< tunnel reached Connected
-    Denied,       ///< server rules rejected the destination (TUNNEL_ERROR code 1)
-    Unreachable,  ///< server could not resolve / route to the destination (code 2)
-    Refused,      ///< server's TCP connect was actively refused (code 3, "refused")
+    Denied,       ///< server POLICY rejected the open (TUNNEL_ERROR code 1)
+    Unreachable,  ///< general non-policy open failure (code 2)
+    Refused,      ///< the target actively refused the TCP connect (code 3)
     Failed,       ///< anything else (client offline, no tunnel ids, unknown error)
 };
+
+/// Classify a peer's `TUNNEL_ERROR` into an open outcome.
+///
+/// WIRE CONTRACT (v0.4.12+). The three codes are disjoint *categories*, so a
+/// client can act on the number alone:
+///
+///   1 — policy-denied open: rules denial, rate limit, concurrent-tunnel cap.
+///   2 — general non-policy open failure: DNS failure, any connect failure that
+///       is not a refusal, "Tunnel ID in use", target lost before the tunnel was
+///       established. Deliberately NOT "cannot reach target" — it is the whole
+///       non-policy bucket, and new members belong here unless they fit 1 or 3.
+///   3 — the target actively refused the connection, and nothing else.
+///
+/// Before v0.4.12 code 3 conflated policy denials, connect failures and
+/// teardowns, which is why a rate-limited open reached a SOCKS5 client as 0x04
+/// "host unreachable" — indistinguishable from a dead target.
+///
+/// Pure by design: the whole old/new compatibility matrix is then testable
+/// without a live tunnel, and the classification has exactly one definition.
+[[nodiscard]] inline TunnelOpenOutcome tunnel_open_outcome_for(std::uint8_t error_code,
+                                                               std::string_view description) {
+    switch (error_code) {
+        case 1:
+            return TunnelOpenOutcome::Denied;
+        case 2:
+            return TunnelOpenOutcome::Unreachable;
+        case 3:
+            // COMPATIBILITY SHIM for servers <= v0.4.11, where code 3 was the
+            // grab-bag. Safe to delete once no such server is in service.
+            //
+            // Exact matches only, against the two literals those releases
+            // actually shipped for policy denials. Description matching is
+            // unsuitable as the primary protocol contract — which is the whole
+            // point of the numeric scheme above — but matching a known released
+            // string is exactly what backward compatibility requires.
+            if (description == "Rate limit exceeded" || description == "Tunnel limit exceeded") {
+                return TunnelOpenOutcome::Denied;
+            }
+            // Old servers put the platform's connect message here, so a genuine
+            // refusal still has to be recognised by substring. New servers emit
+            // the fixed lowercase literal "TCP connection refused: " precisely so
+            // that this keeps matching. Note this cannot be promoted to an
+            // unconditional "code 3 means refused": an OLD server also sends 3
+            // for a connect *timeout*, which must stay Unreachable.
+            if (description.find("refused") != std::string_view::npos) {
+                return TunnelOpenOutcome::Refused;
+            }
+            return TunnelOpenOutcome::Unreachable;
+        default:
+            // Includes 0 ("no TUNNEL_ERROR seen"), so a tunnel that failed
+            // without one is a generic failure rather than a fabricated reason.
+            return TunnelOpenOutcome::Failed;
+    }
+}
 
 using OpenTunnelFn = std::function<void(std::shared_ptr<core::TcpConnection> conn, std::string host,
                                         uint16_t port, std::vector<uint8_t> initial_payload,

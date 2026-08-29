@@ -80,10 +80,11 @@ rules:
 Even though the *client* can dial any host:port via SOCKS5, the server denies
 anything not in this list and the SOCKS5 listener returns reply code 0x02
 ("connection not allowed by ruleset") — or `403 Forbidden` if the client came
-in over HTTP CONNECT. A target that was *allowed* but unreachable answers
-differently (`0x04` / `0x05` / `0x01`, all `502 Bad Gateway` over HTTP
-CONNECT), so the reply distinguishes "the rules said no" from "the server
-couldn't get there".
+in over HTTP CONNECT. The same 0x02 covers the other server-side policy
+rejections, the rate limiter and the concurrent-tunnel cap. A target that was
+*allowed* but unreachable answers differently (`0x04` / `0x05` / `0x01`, all
+`502 Bad Gateway` over HTTP CONNECT), so the reply distinguishes "the server
+said no" from "the server couldn't get there".
 
 ## Client Config
 

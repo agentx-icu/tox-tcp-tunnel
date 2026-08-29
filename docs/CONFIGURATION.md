@@ -132,13 +132,17 @@ are rejected with reply code `0x07` (command not supported). The CLI form
 Failures carry the server's reason, so a policy rejection is distinguishable
 from a network fault:
 
-| Server outcome | SOCKS5 reply | HTTP CONNECT status |
-|---|---|---|
-| Connected | `0x00` success | `200 Connection Established` |
-| `rules.yaml` denied the destination | `0x02` connection not allowed by ruleset | `403 Forbidden` |
-| Server could not resolve / route to the target | `0x04` host unreachable | `502 Bad Gateway` |
-| Target actively refused the connection | `0x05` connection refused | `502 Bad Gateway` |
-| Anything else (server offline, no tunnel ids) | `0x01` general failure | `502 Bad Gateway` |
+| Server outcome | `TUNNEL_ERROR` code | SOCKS5 reply | HTTP CONNECT status |
+|---|---|---|---|
+| Connected | — | `0x00` success | `200 Connection Established` |
+| Denied by policy: `rules.yaml`, rate limit, or tunnel cap | 1 | `0x02` connection not allowed by ruleset | `403 Forbidden` |
+| Any other open failure: DNS, connect timeout, target lost mid-open | 2 | `0x04` host unreachable | `502 Bad Gateway` |
+| Target actively refused the connection | 3 | `0x05` connection refused | `502 Bad Gateway` |
+| Anything else (server offline, no tunnel ids) | — | `0x01` general failure | `502 Bad Gateway` |
+
+Servers up to v0.4.11 sent code 3 for policy denials as well, so a rate limit
+reached the client as `0x04` "host unreachable". A v0.4.12+ client recognises
+those older replies and still reports them as `0x02`.
 
 ## Data Directory Locking
 
@@ -574,8 +578,15 @@ Modes:
   `enforce` to `report` by reload releases anything already deferred for
   it immediately, in order.
 - `enforce` — over-budget OPENs receive `TUNNEL_ERROR` with reason
-  code 3 (`Rate limit exceeded`); over-budget TUNNEL_DATA is deferred
+  code 1 (`Rate limit exceeded`); over-budget TUNNEL_DATA is deferred
   and replayed (see below).
+
+  Code 1 is the *policy-denied* category, so a SOCKS5 client answers
+  `0x02` ("connection not allowed by ruleset") and an HTTP CONNECT
+  client `403 Forbidden` — the caller can tell your rate limit apart
+  from a dead target. Servers up to v0.4.11 sent code 3 here, which
+  clients could only report as `0x04` "host unreachable"; a v0.4.12+
+  client still recognises that older reply as a denial.
 
 ### Override merging
 

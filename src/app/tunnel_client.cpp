@@ -1319,26 +1319,15 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
                    new_state == tunnel::Tunnel::State::Error) {
             if (!reply_sent->exchange(true)) {
                 // Translate the peer's TUNNEL_ERROR reason so the listener can
-                // answer 0x02 ("not allowed by ruleset") for a rules denial
-                // rather than a generic host-unreachable.
+                // answer 0x02 ("not allowed by ruleset") for a policy denial
+                // rather than a generic host-unreachable. The classification
+                // itself lives in tunnel_open_outcome_for() so that it is pure,
+                // has a single definition, and can be tested across the whole
+                // old-server / new-server matrix without a live tunnel.
                 auto outcome = TunnelOpenOutcome::Failed;
                 if (auto locked = weak_tunnel.lock()) {
-                    switch (locked->last_error_code()) {
-                        case 1:
-                            outcome = TunnelOpenOutcome::Denied;
-                            break;
-                        case 2:
-                            outcome = TunnelOpenOutcome::Unreachable;
-                            break;
-                        case 3:
-                            outcome = locked->last_error_description().find("refused") !=
-                                              std::string::npos
-                                          ? TunnelOpenOutcome::Refused
-                                          : TunnelOpenOutcome::Unreachable;
-                            break;
-                        default:
-                            break;
-                    }
+                    outcome = tunnel_open_outcome_for(locked->last_error_code(),
+                                                      locked->last_error_description());
                 }
                 (*reply_cb)(outcome);
             }

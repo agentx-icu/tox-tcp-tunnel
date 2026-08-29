@@ -139,7 +139,20 @@ struct TunnelAckPayload {
 
 /// Parsed payload for a TUNNEL_ERROR frame.
 struct TunnelErrorPayload {
-    uint8_t error_code{0};    ///< Application-defined error code.
+    /// Wire error category (v0.4.12+). Three disjoint values, so a peer can act
+    /// on the number alone rather than parsing `description`:
+    ///
+    ///   1 — policy-denied open: rules denial, rate limit, tunnel cap.
+    ///   2 — general non-policy failure: DNS, any non-refused connect failure,
+    ///       "Tunnel ID in use", "Tunnel not found", target lost before the
+    ///       tunnel was established, half-close linger timeout.
+    ///   3 — the target actively refused the TCP connection, and nothing else.
+    ///
+    /// Up to v0.4.11 code 3 was a grab-bag covering policy denials, connect
+    /// failures and teardowns alike. Full contract and the compatibility rules
+    /// for older peers: `TunnelImpl::last_error_code()` and
+    /// `app::tunnel_open_outcome_for()`.
+    uint8_t error_code{0};
     std::string description;  ///< Human-readable error description.
 };
 
@@ -234,7 +247,9 @@ class ProtocolFrame {
     /// Create a TUNNEL_ERROR frame.
     ///
     /// @param tunnel_id    Logical tunnel identifier.
-    /// @param error_code   Application-defined error code.
+    /// @param error_code   Wire error category: 1 = policy-denied open,
+    ///                     2 = general non-policy failure, 3 = actively
+    ///                     refused. See `TunnelErrorPayload::error_code`.
     /// @param description  Human-readable error message.
     [[nodiscard]] static ProtocolFrame make_tunnel_error(uint16_t tunnel_id, uint8_t error_code,
                                                          const std::string& description);

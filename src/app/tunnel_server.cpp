@@ -1480,8 +1480,11 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
             }
         }
         if (mgr) {
+            // Code 1 = policy denial. This used to be 3, which a SOCKS5 client
+            // could only read as 0x04 "host unreachable" — the operator saw a
+            // dead target instead of their own rate limit.
             auto error_frame =
-                tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 3, "Rate limit exceeded");
+                tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 1, "Rate limit exceeded");
             mgr->send_frame(error_frame);
         }
         return;
@@ -1609,8 +1612,10 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                            friend_number);
         util::MetricsRegistry::instance().inc_tunnels_opened(
             util::MetricsRegistry::OpenResult::Denied);
+        // Code 1: the concurrent-tunnel cap is a policy limit, like the rate
+        // limiter — not a statement about the target.
         auto error_frame =
-            tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 3, "Tunnel limit exceeded");
+            tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 1, "Tunnel limit exceeded");
         manager_ptr->send_frame(error_frame);
         return;
     }
@@ -1674,8 +1679,13 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                         }
                     }
                     if (mgr) {
+                        // Code 3 now means "actively refused" and nothing else;
+                        // every other connect failure is the general code 2.
+                        // Classified numerically — see
+                        // detail::open_failure_for_connect_error().
+                        const auto reason = detail::open_failure_for_connect_error(connect_ec);
                         auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
-                            tunnel_id, 3, "TCP connect failed: " + connect_ec.message());
+                            tunnel_id, reason.code, reason.description);
                         mgr->send_frame(error_frame);
                         mgr->remove_tunnel(tunnel_id);
                     }
@@ -1855,8 +1865,9 @@ void abort_open_ack_after_send(const std::weak_ptr<tunnel::TunnelManager>& weak_
     if (auto manager = weak_manager.lock()) {
         // The peer already has the OPEN_ACK and is treating this tunnel as
         // open. Leaving it at that would strand it until its own reaper fires.
+        // Code 2, not 3: a teardown is not a refusal by the target.
         auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
-            tunnel_id, 3, "tunnel was torn down immediately after it was opened");
+            tunnel_id, 2, "tunnel was torn down immediately after it was opened");
         manager->send_frame(error_frame);
         (void)manager->remove_tunnel_if(tunnel_id, tunnel.get());
     }
@@ -1880,8 +1891,9 @@ void abandon_open_ack(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
     // frame resolves that.
     auto tunnel = weak_tunnel.lock();
     if (auto manager = weak_manager.lock()) {
+        // Code 2, not 3: the target went away, it did not refuse us.
         auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
-            tunnel_id, 3, "target connection lost before tunnel was established");
+            tunnel_id, 2, "target connection lost before tunnel was established");
         manager->send_frame(error_frame);
         // Identity-checked: by the time this deferred cleanup runs, the id may
         // already have been recycled by a different tunnel, and removing that

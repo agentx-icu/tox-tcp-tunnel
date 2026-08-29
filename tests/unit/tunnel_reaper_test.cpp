@@ -320,6 +320,43 @@ TEST_F(ReaperTest, HalfCloseCapReapsStuckDisconnectingTunnel) {
     EXPECT_FALSE(manager->has_tunnel(800));
 }
 
+// The linger timeout tells the peer with a TUNNEL_ERROR. From v0.4.12 code 3
+// means "the target actively refused the connection" and nothing else, so this
+// local timeout must not use it. Its post-open timing means no SOCKS5 reply is
+// riding on the value today — but a code that contradicts the wire contract is
+// a trap for the next reader, and this pins it.
+TEST_F(ReaperTest, HalfCloseCapNotifiesThePeerWithAGeneralFailureNotARefusal) {
+    std::vector<std::vector<uint8_t>> frames;
+    auto stuck = std::make_unique<TunnelImpl>(io_ctx, /*tunnel_id=*/810, /*friend_number=*/1);
+    stuck->set_on_send_to_tox([&frames](std::span<const uint8_t> data) -> SendOutcome {
+        frames.emplace_back(data.begin(), data.end());
+        return SendOutcome::Sent;
+    });
+    stuck->set_state(Tunnel::State::Connected);
+    stuck->set_state(Tunnel::State::Disconnecting);
+    manager->add_tunnel(810, std::move(stuck));
+
+    manager->enable_half_close_reaper(/*half_close_timeout_seconds=*/1, /*tick_seconds=*/3600);
+    std::this_thread::sleep_for(1100ms);
+    ASSERT_EQ(manager->reap_idle_tunnels_once(), 1u);
+
+    // Find the TUNNEL_ERROR the timeout announced.
+    bool saw_error = false;
+    for (const auto& wire : frames) {
+        auto parsed = ProtocolFrame::deserialize(wire);
+        if (!parsed || parsed.value().type() != FrameType::TUNNEL_ERROR) {
+            continue;
+        }
+        auto payload = parsed.value().as_tunnel_error();
+        ASSERT_TRUE(payload);
+        saw_error = true;
+        EXPECT_EQ(payload->error_code, 2)
+            << "a local linger timeout is not the target refusing the connection";
+        EXPECT_EQ(payload->description, "half-close linger timeout");
+    }
+    EXPECT_TRUE(saw_error) << "the peer must be told why its half-open tunnel was dropped";
+}
+
 TEST_F(ReaperTest, HalfCloseCapLeavesConnectedTunnelAlone) {
     // A Connected tunnel idle past the half-close window must survive: the cap
     // is scoped to Disconnecting and the general idle reaper is off here. This

@@ -397,14 +397,16 @@ https_proxy=http://127.0.0.1:1080 curl https://internal.example.lan/
 # Firefox / Chrome: SOCKS host 127.0.0.1, port 1080, "Proxy DNS when using SOCKS v5"
 ```
 
-**The server-side `rules.yaml` still gates which destinations succeed** — a
-SOCKS5 CONNECT to a host/port that isn't in the friend's allow list returns
-reply `0x02` ("connection not allowed by ruleset"); the same denial over HTTP
+**Server-side policy still gates which destinations succeed** — a SOCKS5
+CONNECT the friend's `rules.yaml` does not allow returns reply `0x02`
+("connection not allowed by ruleset"), and so do the other policy rejections,
+the rate limiter and the concurrent-tunnel cap; the same denial over HTTP
 CONNECT returns `403 Forbidden`. Everything else the open can fail with maps
 elsewhere — SOCKS5 `0x04` (host unreachable), `0x05` (connection refused),
 `0x01` (general failure), and `502 Bad Gateway` for all three over HTTP CONNECT
-— so the code tells you whether `rules.yaml` refused the destination or the
-server simply could not reach it. SOCKS5 and `client.pipe` cannot be enabled at
+— so the code tells you whether the **server** refused the request or simply
+could not reach the target. (Servers before v0.4.12 reported rate-limit and
+tunnel-cap denials as `0x04`, indistinguishable from an unreachable host.) SOCKS5 and `client.pipe` cannot be enabled at
 the same time (validator error).
 
 ### Multi-server failover (production HA)

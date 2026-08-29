@@ -273,10 +273,25 @@ TEST_F(TunnelManagerTest, FrameRouting_HandlesUnknownTunnelId) {
     std::array<uint8_t, 3> data = {0x01, 0x02, 0x03};
     ProtocolFrame data_frame = ProtocolFrame::make_tunnel_data(999, make_span(data));
 
-    // Set up a send handler for error responses
-    manager->set_send_handler([](const std::vector<uint8_t>&) { return SendOutcome::Sent; });
+    std::vector<std::vector<uint8_t>> sent;
+    manager->set_send_handler([&sent](const std::vector<uint8_t>& wire) {
+        sent.push_back(wire);
+        return SendOutcome::Sent;
+    });
 
     EXPECT_NO_THROW(manager->route_frame(data_frame));
+
+    // A frame for a tunnel we do not know is a routing failure — the general
+    // non-policy category (2). It used to go out as code 1, which from v0.4.12
+    // means specifically "the server's policy refused this open".
+    ASSERT_EQ(sent.size(), 1u);
+    auto parsed = ProtocolFrame::deserialize(sent[0]);
+    ASSERT_TRUE(parsed);
+    ASSERT_EQ(parsed.value().type(), FrameType::TUNNEL_ERROR);
+    auto payload = parsed.value().as_tunnel_error();
+    ASSERT_TRUE(payload);
+    EXPECT_EQ(payload->error_code, 2) << "an unknown tunnel is not a policy denial";
+    EXPECT_EQ(payload->description, "Tunnel not found");
 }
 
 TEST_F(TunnelManagerTest, FrameRouting_TunnelErrorTriggersOnCloseCleanup) {
@@ -542,6 +557,59 @@ TEST_F(TunnelManagerTest, TunnelOpenHandling_RespectsMaxTunnels) {
 
     EXPECT_FALSE(accepted);
     EXPECT_EQ(manager->tunnel_count(), 2u);
+}
+
+// The concurrent-tunnel cap is a POLICY limit, so from v0.4.12 it must go out
+// as TUNNEL_ERROR code 1 and reach a SOCKS5 caller as 0x02, not as the old
+// code 3 which callers could only read as 0x04 "host unreachable". Decoded off
+// the wire rather than asserted on an internal, because the code is the
+// contract with peers that this build never sees.
+TEST_F(TunnelManagerTest, TunnelOpenHandling_CapRejectionIsAPolicyDenialOnTheWire) {
+    manager->set_max_tunnels(1);
+    manager->add_tunnel(1, create_test_tunnel(1));
+
+    std::vector<std::vector<uint8_t>> sent;
+    manager->set_send_handler([&sent](const std::vector<uint8_t>& wire) {
+        sent.push_back(wire);
+        return SendOutcome::Sent;
+    });
+
+    ProtocolFrame open_frame = ProtocolFrame::make_tunnel_open(2, "example.com", 443);
+    EXPECT_FALSE(manager->handle_incoming_open(open_frame));
+
+    ASSERT_EQ(sent.size(), 1u) << "the peer must be told, not left waiting";
+    auto parsed = ProtocolFrame::deserialize(sent[0]);
+    ASSERT_TRUE(parsed) << "the rejection must be a well-formed frame";
+    ASSERT_EQ(parsed.value().type(), FrameType::TUNNEL_ERROR);
+    auto payload = parsed.value().as_tunnel_error();
+    ASSERT_TRUE(payload);
+    EXPECT_EQ(payload->error_code, 1) << "a capacity cap is policy, not a target failure";
+    EXPECT_EQ(payload->description, "Tunnel limit exceeded");
+}
+
+// Code 2 is the general non-policy bucket. "Tunnel ID in use" is a protocol
+// collision, neither a policy denial nor a refusal, and pinning it here stops
+// it drifting into either neighbouring category.
+TEST_F(TunnelManagerTest, TunnelOpenHandling_DuplicateIdIsAGeneralFailureOnTheWire) {
+    manager->set_max_tunnels(8);
+    manager->add_tunnel(5, create_test_tunnel(5));
+
+    std::vector<std::vector<uint8_t>> sent;
+    manager->set_send_handler([&sent](const std::vector<uint8_t>& wire) {
+        sent.push_back(wire);
+        return SendOutcome::Sent;
+    });
+
+    ProtocolFrame open_frame = ProtocolFrame::make_tunnel_open(5, "example.com", 443);
+    EXPECT_FALSE(manager->handle_incoming_open(open_frame));
+
+    ASSERT_EQ(sent.size(), 1u);
+    auto parsed = ProtocolFrame::deserialize(sent[0]);
+    ASSERT_TRUE(parsed);
+    auto payload = parsed.value().as_tunnel_error();
+    ASSERT_TRUE(payload);
+    EXPECT_EQ(payload->error_code, 2);
+    EXPECT_EQ(payload->description, "Tunnel ID in use");
 }
 
 // ============================================================================

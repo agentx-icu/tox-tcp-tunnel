@@ -1443,6 +1443,10 @@ class UnpublishedTunnelTeardownTest : public ::testing::Test {
         manager = std::make_shared<TunnelManager>(io_ctx);
         manager->set_send_handler([this](const std::vector<std::uint8_t>& wire) -> SendOutcome {
             sent.push_back(type_of(wire));
+            // Keep the bytes, not just the opcode: the TUNNEL_ERROR *code* is
+            // the contract with peers this build never sees, so it has to be
+            // asserted off the wire rather than trusted.
+            sent_wire.push_back(wire);
             return SendOutcome::Sent;
         });
 
@@ -1480,7 +1484,19 @@ class UnpublishedTunnelTeardownTest : public ::testing::Test {
     std::shared_ptr<TunnelImpl> tunnel;
     app::detail::ActiveGaugeLatch gauge;
     std::vector<FrameType> sent;
+    std::vector<std::vector<std::uint8_t>> sent_wire;
     std::uint64_t gauge_before{0};
+
+    /// Decode the first TUNNEL_ERROR the manager put on the wire.
+    [[nodiscard]] std::optional<tunnel::TunnelErrorPayload> first_error_payload() const {
+        for (const auto& wire : sent_wire) {
+            auto parsed = ProtocolFrame::deserialize(wire);
+            if (parsed && parsed.value().type() == FrameType::TUNNEL_ERROR) {
+                return parsed.value().as_tunnel_error();
+            }
+        }
+        return std::nullopt;
+    }
 };
 
 TEST_F(UnpublishedTunnelTeardownTest, AbandonClosesTheTargetSocketAndDoesNotTouchTheGauge) {
@@ -1493,6 +1509,15 @@ TEST_F(UnpublishedTunnelTeardownTest, AbandonClosesTheTargetSocketAndDoesNotTouc
     EXPECT_NE(std::find(sent.begin(), sent.end(), FrameType::TUNNEL_ERROR), sent.end())
         << "the client is waiting in Connecting; only a terminal frame resolves it";
 
+    // ...and told the right thing. This tunnel died in our own teardown, which
+    // is the general non-policy category (2). Code 3 would claim the target
+    // actively refused the connection — a lie about who failed, even though
+    // this particular description has no "refused" in it, so today's classifier
+    // would still land on Unreachable rather than changing the SOCKS5 reply.
+    auto error = first_error_payload();
+    ASSERT_TRUE(error);
+    EXPECT_EQ(error->error_code, 2) << "a local teardown is not a refusal by the target";
+
     // The resource outcome, which is the part remove_tunnel() cannot deliver on
     // its own: close() no-ops in None, so nothing would have shut this socket.
     EXPECT_FALSE(conn->is_connected()) << "the target socket was left open";
@@ -1503,6 +1528,24 @@ TEST_F(UnpublishedTunnelTeardownTest, AbandonClosesTheTargetSocketAndDoesNotTouc
     EXPECT_EQ(util::MetricsRegistry::instance().tunnels_active(util::MetricsRegistry::Role::Server),
               gauge_before)
         << "the gauge was never counted for this tunnel, so nothing may decrement it";
+}
+
+// The other post-OPEN_ACK teardown. Same category for the same reason: the peer
+// already has our ACK and is treating the tunnel as open, and what we are
+// telling it is "we tore this down", not "your target refused you".
+TEST_F(UnpublishedTunnelTeardownTest, AbortAfterSendReportsAGeneralFailureNotARefusal) {
+    SetUpUnpublishedTunnel();
+
+    app::detail::abort_open_ack_after_send(manager, tunnel, conn, kTunnelId, kFriendNumber, gauge);
+    pump_until([&] { return !sent_wire.empty(); });
+
+    auto error = first_error_payload();
+    ASSERT_TRUE(error) << "the peer holds an ACKed tunnel; it must be told terminally";
+    EXPECT_EQ(error->error_code, 2) << "a post-ACK teardown is not a refusal by the target";
+    EXPECT_EQ(error->description, "tunnel was torn down immediately after it was opened");
+
+    io_ctx.restart();
+    io_ctx.run();
 }
 
 TEST_F(UnpublishedTunnelTeardownTest, CommitOnADetachedTunnelReleasesInsteadOfPublishing) {

@@ -1090,8 +1090,11 @@ void TunnelManager::route_frame(const ProtocolFrame& frame) {
 
         // Send TUNNEL_ERROR back if this was a data frame
         if (frame.type() == FrameType::TUNNEL_DATA) {
+            // Code 2, not 1: a frame for an unknown tunnel is a routing
+            // failure, not a policy denial. Code 1 now means specifically
+            // "the server's configuration refused this open".
             ProtocolFrame error_frame =
-                ProtocolFrame::make_tunnel_error(tid, static_cast<uint8_t>(1), "Tunnel not found");
+                ProtocolFrame::make_tunnel_error(tid, static_cast<uint8_t>(2), "Tunnel not found");
             send_frame(error_frame);
         }
     }
@@ -1120,8 +1123,9 @@ bool TunnelManager::handle_incoming_open(const ProtocolFrame& frame) {
         if (tunnels_.size() >= max_tunnels_) {
             util::Logger::warn("TunnelManager: max tunnels ({}) reached, rejecting incoming open",
                                max_tunnels_);
+            // Code 1: a capacity cap is policy, not a target failure.
             ProtocolFrame error_frame = ProtocolFrame::make_tunnel_error(
-                tunnel_id, static_cast<uint8_t>(3), "Tunnel limit exceeded");
+                tunnel_id, static_cast<uint8_t>(1), "Tunnel limit exceeded");
             // Unlock before sending to avoid potential deadlock
             lock.unlock();
             send_frame(error_frame);

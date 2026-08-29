@@ -768,9 +768,10 @@ curl --socks5-hostname 127.0.0.1:1080 http://10.0.0.5:8080/health
 curl --proxy 127.0.0.1:1080 https://internal.example.org    # HTTP CONNECT
 ```
 
-A destination the server's `rules.yaml` rejects comes back as SOCKS5 reply
-`0x02` ("connection not allowed by ruleset") / HTTP `403 Forbidden`, which is
-how you tell a policy denial from an unreachable host (`0x04` / `502`).
+An open the server denies by policy — `rules.yaml`, the rate limiter, or the
+concurrent-tunnel cap — comes back as SOCKS5 reply `0x02` ("connection not
+allowed by ruleset") / HTTP `403 Forbidden`, which is how you tell a policy
+denial from an unreachable host (`0x04` / `502`) or a refused one (`0x05`).
 
 ---
 

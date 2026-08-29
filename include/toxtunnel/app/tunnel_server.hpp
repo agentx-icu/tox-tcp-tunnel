@@ -541,6 +541,41 @@ class OpenAckGate : public std::enable_shared_from_this<OpenAckGate> {
     std::atomic<unsigned> attempts_{0};
 };
 
+/// The `TUNNEL_ERROR` a failed target connect should produce.
+struct OpenFailureReason {
+    std::uint8_t code{};
+    std::string description;
+};
+
+/// Classify a failed `async_connect` into a wire error code plus description.
+///
+/// NUMERIC, NOT TEXTUAL. The predecessor of this code grepped `ec.message()`
+/// for "refused", which is not portable: C++ only requires `message()` to
+/// describe the error — no guaranteed wording, casing or language — and on
+/// Windows asio obtains it through `FormatMessage`, whose language follows the
+/// machine locale. On a non-English Windows host the genuine refusal was
+/// therefore misclassified. Comparing against `asio::error::connection_refused`
+/// is exact on every platform, because asio builds both codes the same way.
+///
+/// The refused branch still emits the fixed lowercase literal
+/// "TCP connection refused: " ahead of the platform message. That is not
+/// decoration: clients <= v0.4.11 identify a refusal by substring, so appending
+/// only `ec.message()` would carry the locale bug into every deployed old
+/// client. See tunnel_open_outcome_for().
+///
+/// PRECONDITION: @p ec comes from an asio operation, so it carries asio's
+/// system category. A `std::errc::connection_refused` built in the *generic*
+/// category does not compare equal to `asio::error::connection_refused` and
+/// would fall to code 2. That is not a portability gap in the comparison —
+/// asio's own error is what the caller passes, and it matches on every
+/// platform (guarded by a real refused-connect test, not a synthesised code).
+[[nodiscard]] inline OpenFailureReason open_failure_for_connect_error(const std::error_code& ec) {
+    if (ec == asio::error::connection_refused) {
+        return {3, "TCP connection refused: " + ec.message()};
+    }
+    return {2, "TCP connect failed: " + ec.message()};
+}
+
 }  // namespace detail
 
 /// Server application that accepts Tox friend connections and tunnels
