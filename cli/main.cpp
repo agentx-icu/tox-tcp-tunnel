@@ -19,7 +19,9 @@
 #include "toxtunnel/app/tunnel_server.hpp"
 #include "toxtunnel/tox/tox_adapter.hpp"
 #include "toxtunnel/util/config.hpp"
+#include "toxtunnel/util/config_diagnostics.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/pid_file.hpp"
 #include "toxtunnel/util/qr_code.hpp"
 #include "toxtunnel/util/systemd_notify.hpp"
 #include "toxtunnel/util/windows_service.hpp"
@@ -228,29 +230,34 @@ std::optional<std::string> inspect_send_request(const std::filesystem::path& dat
                                                 const std::string& request) {
 #if defined(_WIN32)
     // The named pipe is per-pid so the CLI has to discover it. The daemon
-    // doesn't currently publish a pid file, so for now we probe the
-    // hard-coded path used when the daemon shares a host with the CLI:
-    // %ProgramData%\ToxTunnel\toxtunnel.pid. If absent, surface a clear
-    // error so the user can supply a pid manually via env override.
+    // publishes its pid in `<data_dir>/toxtunnel.pid` (see util::PidFileGuard
+    // in run_server / run_client); TOXTUNNEL_INSPECT_PID overrides that for
+    // the odd case where the CLI cannot read the daemon's data_dir.
     std::string pipe_name = "\\\\.\\pipe\\toxtunnel-";
     if (const char* pid_override = std::getenv("TOXTUNNEL_INSPECT_PID")) {
         pipe_name += pid_override;
     } else {
-        const auto pid_path = data_dir / "toxtunnel.pid";
-        std::ifstream pid_file(pid_path);
-        if (!pid_file) {
-            std::cerr << "Inspect: no pid file at " << pid_path.string()
-                      << "; set TOXTUNNEL_INSPECT_PID to the daemon pid.\n";
+        const auto pid = toxtunnel::util::read_pid_file(data_dir);
+        if (!pid.has_value()) {
+            std::cerr << "Inspect: no pid file at "
+                      << (data_dir / toxtunnel::util::kPidFileName).string()
+                      << " (is the daemon running with this data_dir?); "
+                         "set TOXTUNNEL_INSPECT_PID to the daemon pid to override.\n";
             return std::nullopt;
         }
-        std::string pid;
-        pid_file >> pid;
-        pipe_name += pid;
+        pipe_name += std::to_string(*pid);
     }
     HANDLE pipe = CreateFileA(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                               OPEN_EXISTING, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
-        std::cerr << "Inspect: cannot connect to " << pipe_name << " (is the daemon running?)\n";
+        const DWORD err = GetLastError();
+        std::cerr << "Inspect: cannot connect to " << pipe_name << " (error " << err << ": "
+                  << (err == ERROR_FILE_NOT_FOUND ? "no such pipe - is the daemon running?"
+                      : err == ERROR_ACCESS_DENIED
+                          ? "access denied - a service daemon only admits SYSTEM and "
+                            "Administrators; run from an elevated prompt"
+                          : "see `net helpmsg`")
+                  << ")\n";
         return std::nullopt;
     }
     DWORD written = 0;
@@ -506,37 +513,87 @@ int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subact
     return 0;
 }
 
+/// Parse, validate and lint a config file without starting anything.
+///
+/// Exit codes: 0 = usable, 1 = cannot be loaded or fails validation, and with
+/// `--strict`, 1 as well when the file carries keys the daemon would ignore.
+/// Unknown keys are always *reported*; they are only fatal under --strict, so
+/// an older binary reading a newer config still works by default.
+[[nodiscard]] int cmd_config_check(const std::string& config_path, bool strict) {
+    auto loaded = toxtunnel::Config::from_file(config_path);
+    if (!loaded.has_value()) {
+        std::cerr << "config check: " << loaded.error() << "\n";
+        return 1;
+    }
+
+    const auto unknown = toxtunnel::util::find_unknown_config_keys(config_path);
+    for (const auto& key : unknown) {
+        std::cerr << "config check: unknown key '" << key.path << "' (ignored by this build)\n";
+    }
+
+    auto validation = loaded.value().validate();
+    if (!validation.has_value()) {
+        std::cerr << "config check: " << validation.error() << "\n";
+        return 1;
+    }
+
+    std::cout << "config check: " << config_path << " is valid ("
+              << (loaded.value().is_server() ? "server" : "client") << " mode";
+    if (!unknown.empty()) {
+        std::cout << ", " << unknown.size() << " unknown key" << (unknown.size() == 1 ? "" : "s");
+    }
+    std::cout << ")\n";
+
+    return (strict && !unknown.empty()) ? 1 : 0;
+}
+
 /// Trigger a hot-reload on a running daemon.
 ///
-/// POSIX: a no-op for the binary itself — we just print the equivalent
-/// `kill -HUP <pid>` for the operator to run, since asking the toxtunnel
-/// binary to deliver SIGHUP would require us to chase a pid file we don't
-/// universally write. This keeps the subcommand discoverable from `--help`
-/// without inventing extra IPC where the kernel already has it.
+/// The daemon records its pid in `<data_dir>/toxtunnel.pid` (util::PidFileGuard),
+/// which is how both platforms find it; TOXTUNNEL_RELOAD_PID overrides the file.
+///
+/// POSIX: sends SIGHUP to that pid. util::pid_is_toxtunnel narrows the stale-pid
+/// window (daemon crashed, pid recycled) but cannot close it — the pid could in
+/// principle be reused between the check and the signal.
 ///
 /// Windows: connects to `\\.\pipe\toxtunnel-reload-<pid>` and writes
-/// "RELOAD\n". The pid comes from TOXTUNNEL_RELOAD_PID or, failing that, the
-/// `toxtunnel.pid` file under data_dir (same lookup the inspect CLI uses).
-[[nodiscard]] int cmd_reload([[maybe_unused]] const std::filesystem::path& data_dir) {
-#if defined(_WIN32)
-    std::string pid;
-    if (const char* pid_override = std::getenv("TOXTUNNEL_RELOAD_PID")) {
-        pid = pid_override;
-    } else {
-        const auto pid_path = data_dir / "toxtunnel.pid";
-        std::ifstream pid_file(pid_path);
-        if (!pid_file) {
-            std::cerr << "reload: no pid file at " << pid_path.string()
-                      << "; set TOXTUNNEL_RELOAD_PID to the daemon pid.\n";
+/// "RELOAD\n".
+[[nodiscard]] int cmd_reload(const std::filesystem::path& data_dir) {
+    const char* env_name = "TOXTUNNEL_RELOAD_PID";
+    long pid = 0;
+    if (const char* pid_override = std::getenv(env_name)) {
+        char* end = nullptr;
+        pid = std::strtol(pid_override, &end, 10);
+        if (end == pid_override || *end != '\0' || pid <= 0) {
+            std::cerr << "reload: " << env_name << "='" << pid_override
+                      << "' is not a positive integer\n";
             return 1;
         }
-        pid_file >> pid;
+    } else {
+        const auto recorded = toxtunnel::util::read_pid_file(data_dir);
+        if (!recorded.has_value()) {
+            std::cerr << "reload: no pid file at "
+                      << (data_dir / toxtunnel::util::kPidFileName).string()
+                      << " (is the daemon running with this data_dir? pass -d/-c to point at "
+                         "it, or set "
+                      << env_name << " to the daemon pid).\n";
+            return 1;
+        }
+        pid = *recorded;
     }
-    const std::string pipe_name = "\\\\.\\pipe\\toxtunnel-reload-" + pid;
+#if defined(_WIN32)
+    const std::string pipe_name = "\\\\.\\pipe\\toxtunnel-reload-" + std::to_string(pid);
     HANDLE pipe =
         CreateFileA(pipe_name.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
-        std::cerr << "reload: cannot connect to " << pipe_name << " (is the daemon running?)\n";
+        const DWORD err = GetLastError();
+        std::cerr << "reload: cannot connect to " << pipe_name << " (error " << err << ": "
+                  << (err == ERROR_FILE_NOT_FOUND
+                          ? "no such pipe - is the daemon running? a stale pid file is "
+                            "removed on the next clean daemon start"
+                      : err == ERROR_ACCESS_DENIED ? "access denied - run from an elevated prompt"
+                                                   : "see `net helpmsg`")
+                  << ")\n";
         return 1;
     }
     const char msg[] = "RELOAD\n";
@@ -546,9 +603,19 @@ int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subact
     std::cout << "Sent RELOAD to " << pipe_name << "\n";
     return 0;
 #else
-    std::cout << "On POSIX, send SIGHUP to the running toxtunnel process:\n"
-              << "  kill -HUP $(pgrep -x toxtunnel)\n"
-              << "or, if you have the pid:  kill -HUP <pid>\n";
+    if (const auto looks_right = toxtunnel::util::pid_is_toxtunnel(pid);
+        looks_right.has_value() && !*looks_right) {
+        std::cerr << "reload: pid " << pid << " is no longer a toxtunnel process (stale "
+                  << toxtunnel::util::kPidFileName
+                  << "?). Start the daemon again or send SIGHUP by hand: kill -HUP <pid>\n";
+        return 1;
+    }
+    if (::kill(static_cast<pid_t>(pid), SIGHUP) != 0) {
+        std::cerr << "reload: kill(" << pid << ", SIGHUP) failed: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+    std::cout << "Sent SIGHUP to toxtunnel pid " << pid
+              << "; check the daemon log for 'config reloaded'.\n";
     return 0;
 #endif
 }
@@ -589,6 +656,10 @@ std::optional<toxtunnel::Config> reload_config_from_disk(const std::string& conf
         toxtunnel::util::Logger::error("reload failed: invalid config in {}: {}", config_path,
                                        validation.error());
         return std::nullopt;
+    }
+    for (const auto& unknown : toxtunnel::util::find_unknown_config_keys(config_path)) {
+        toxtunnel::util::Logger::warn("config: ignoring unknown key '{}' in {}", unknown.path,
+                                      config_path);
     }
     return std::move(result).value();
 }
@@ -671,9 +742,77 @@ class WindowsReloadPipeServer {
 #endif  // _WIN32
 
 /// Run the tunnel server until a signal is received.
+/// Decide what to do about the data-dir guard's outcome.
+///
+/// Returns a process exit code when the caller must stop, or nullopt to carry
+/// on. Three cases:
+///  * acquired — carry on.
+///  * already locked by a live daemon — never carry on: sharing a data_dir
+///    means sharing the Tox identity, the inspect socket and known_servers.yaml.
+///  * any other failure (cannot open, lock or write) — also never carry on. A
+///    guard that failed for an unexpected reason gives no protection at all, so
+///    "warn and start anyway" would quietly reintroduce exactly the two-daemon
+///    corruption the lock exists to prevent. The escape hatch for a filesystem
+///    that genuinely cannot host a lock (some network mounts) is explicit:
+///    TOXTUNNEL_ALLOW_UNLOCKED_DATA_DIR=1.
+///
+/// Both cases exit 1, including under `--service`: with `Restart=on-failure`
+/// the supervisor retries, which is the right recovery when the holder is a
+/// racing predecessor that is about to exit. Exiting 0 would leave the unit
+/// `active (exited)` forever and never retry.
+[[nodiscard]] std::optional<int> handle_data_dir_conflict(
+    const toxtunnel::util::PidFileGuard& guard, const std::filesystem::path& data_dir) {
+    using Logger = toxtunnel::util::Logger;
+
+    if (guard.active()) {
+        return std::nullopt;
+    }
+
+    if (guard.conflicted()) {
+        std::string who = "another toxtunnel process";
+        if (guard.holder_pid() > 0) {
+            who = "toxtunnel pid " + std::to_string(guard.holder_pid());
+        }
+        Logger::error(
+            "data directory {} is already in use by {}. Two daemons cannot share one data_dir: "
+            "they would share the Tox identity, the inspect socket and known_servers.yaml. Stop "
+            "the other instance, or give this one its own data_dir.",
+            data_dir.string(), who);
+        return 1;
+    }
+
+    // Not a conflict, but the guard gave us nothing. Starting anyway would mean
+    // running with no protection at all.
+    if (const char* allow = std::getenv("TOXTUNNEL_ALLOW_UNLOCKED_DATA_DIR");
+        allow != nullptr && std::string_view(allow) == "1") {
+        Logger::warn(
+            "Could not claim the data directory ({}); continuing anyway because "
+            "TOXTUNNEL_ALLOW_UNLOCKED_DATA_DIR=1. Nothing stops a second daemon from using this "
+            "data_dir, and `inspect` / `reload` may need TOXTUNNEL_INSPECT_PID / "
+            "TOXTUNNEL_RELOAD_PID.",
+            guard.error());
+        return std::nullopt;
+    }
+
+    Logger::error(
+        "Could not claim the data directory: {}. Refusing to start without it — an unlocked "
+        "data_dir lets a second daemon corrupt the Tox identity and known_servers.yaml. Fix the "
+        "permissions/filesystem, or set TOXTUNNEL_ALLOW_UNLOCKED_DATA_DIR=1 to override.",
+        guard.error());
+    return 1;
+}
+
 int run_server(const toxtunnel::Config& config, bool run_as_service,
                const std::string& config_path) {
     using Logger = toxtunnel::util::Logger;
+
+    // Claim the data dir BEFORE initialize(): that call opens tox_save.dat, the
+    // inspect socket and the resume store, none of which two daemons may share.
+    // The guard also publishes our pid for inspect/reload discovery.
+    toxtunnel::util::PidFileGuard pid_file(config.data_dir);
+    if (auto rc = handle_data_dir_conflict(pid_file, config.data_dir); rc.has_value()) {
+        return *rc;
+    }
 
     toxtunnel::app::TunnelServer server;
 
@@ -785,6 +924,12 @@ int run_client(const toxtunnel::Config& config, bool run_as_service,
                const std::string& config_path) {
     using Logger = toxtunnel::util::Logger;
 
+    // See run_server(): the data dir is claimed before anything opens it.
+    toxtunnel::util::PidFileGuard pid_file(config.data_dir);
+    if (auto rc = handle_data_dir_conflict(pid_file, config.data_dir); rc.has_value()) {
+        return *rc;
+    }
+
     toxtunnel::app::TunnelClient client;
 
     auto init_result = client.initialize(config);
@@ -817,6 +962,11 @@ int run_client(const toxtunnel::Config& config, bool run_as_service,
         auto apply = client.reload(*new_cfg);
         if (!apply) {
             toxtunnel::util::Logger::error("reload rejected: {}", apply.error());
+        } else if (!apply.value().warnings.empty()) {
+            // Applied, but some added forwards could not listen. Distinct from
+            // a rejection: the rest of the new config IS live.
+            toxtunnel::util::Logger::error("reload applied with warnings: {}",
+                                           apply.value().warnings);
         }
     };
 
@@ -992,9 +1142,21 @@ int main(int argc, char* argv[]) {
     std::string reload_data_dir;
     std::string reload_config_path;
     reload_cmd->add_option("-d,--data-dir", reload_data_dir,
-                           "Daemon data directory (Windows: holds toxtunnel.pid)");
+                           "Daemon data directory (holds toxtunnel.pid)");
     reload_cmd->add_option("-c,--config", reload_config_path,
                            "Read data_dir from this config file (overridden by --data-dir)");
+
+    // ----- `config check` ----------------------------------------------------
+    auto* config_cmd = app.add_subcommand("config", "Configuration helpers");
+    auto* config_check_cmd =
+        config_cmd->add_subcommand("check", "Parse and validate a config file without starting");
+    std::string config_check_path;
+    bool config_check_strict = false;
+    config_check_cmd->add_option("-c,--config", config_check_path, "Config file to check")
+        ->required();
+    config_check_cmd->add_flag("--strict", config_check_strict,
+                               "Exit non-zero when unknown keys are present, not just on "
+                               "parse/validation errors");
 
 #if defined(_WIN32)
     auto* install_win_svc =
@@ -1043,7 +1205,10 @@ int main(int argc, char* argv[]) {
             cfg = std::string(pd ? pd : "C:\\ProgramData") + "\\ToxTunnel\\config.yaml";
         }
         if (!util::register_packaged_toxtunnel_service(cfg)) {
-            std::cerr << "Failed to register Windows service (run as Administrator).\n";
+            const auto why = util::last_windows_service_error();
+            std::cerr << "Failed to register Windows service"
+                      << (why.empty() ? std::string(" (run as Administrator)") : ": " + why)
+                      << "\n";
             return 1;
         }
         std::cerr << "Registered Windows service ToxTunnel.\n";
@@ -1051,7 +1216,10 @@ int main(int argc, char* argv[]) {
     }
     if (*uninstall_win_svc) {
         if (!util::unregister_packaged_toxtunnel_service()) {
-            std::cerr << "Failed to unregister Windows service (run as Administrator).\n";
+            const auto why = util::last_windows_service_error();
+            std::cerr << "Failed to unregister Windows service"
+                      << (why.empty() ? std::string(" (run as Administrator)") : ": " + why)
+                      << "\n";
             return 1;
         }
         std::cerr << "Unregistered Windows service ToxTunnel.\n";
@@ -1091,6 +1259,14 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return cmd_inspect(*inspect_dir, inspect_subaction, inspect_json);
+    }
+
+    if (*config_cmd) {
+        if (*config_check_cmd) {
+            return cmd_config_check(config_check_path, config_check_strict);
+        }
+        std::cerr << "Unknown 'config' subcommand. Try --help.\n";
+        return 2;
     }
 
     if (*reload_cmd) {
@@ -1356,6 +1532,15 @@ int main(int argc, char* argv[]) {
 
     Logger::info("ToxTunnel v{} starting in {} mode", kVersion,
                  config.is_server() ? "server" : "client");
+
+    // Surface keys the parser will silently ignore. A typo (or a plausible but
+    // non-existent setting like `tox.local_discovery_enabled`) otherwise looks
+    // exactly like a working config.
+    if (!config_path.empty()) {
+        for (const auto& unknown : util::find_unknown_config_keys(config_path)) {
+            Logger::warn("config: ignoring unknown key '{}' in {}", unknown.path, config_path);
+        }
+    }
     Logger::debug("Data directory: {}", config.data_dir.string());
 
     // -----------------------------------------------------------------------

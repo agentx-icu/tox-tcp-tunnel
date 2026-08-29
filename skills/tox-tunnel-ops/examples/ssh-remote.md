@@ -73,6 +73,14 @@ Note: The `friend` field must be the client's 64-character hex public key (NOT t
 ## Alternative: SSH ProxyCommand (pipe mode)
 
 > **Note:** Pipe mode is POSIX only (macOS / Linux). It is **not supported on Windows**. On Windows, use the port forwarding approach above.
+>
+> **Latency caveat:** each `ssh` invocation starts a fresh toxtunnel process
+> that must (re)establish the Tox friend link before any byte flows — ~10 s on
+> a LAN, but **minutes** when the peers only reach each other through a Tox TCP
+> relay. `ssh` gives up long before that and exits with no error text. If the
+> first attempt dies silently, either retry (the server now knows the friend,
+> so it is faster) or use a long-lived `forwards:` client instead — a resident
+> client keeps the friend link warm and `ssh -p 2222 …` connects instantly.
 
 Instead of port forwarding, you can use pipe mode directly:
 

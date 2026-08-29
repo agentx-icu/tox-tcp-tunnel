@@ -141,9 +141,22 @@ class TunnelClient {
     ///     but already-accepted connections finish on their own).
     ///   - `logging.level` (forwarded to `spdlog::set_level`)
     ///
-    /// Non-reloadable fields are rejected via `util::check_reloadable`. On
-    /// any error the running client keeps its previous state.
-    [[nodiscard]] util::Expected<void, std::string> reload(const Config& new_config);
+    /// Non-reloadable fields are rejected via `util::check_reloadable`. On an
+    /// error return **nothing** is applied and the running client keeps its
+    /// previous state.
+    ///
+    /// A successful return may still carry `warnings`: the reload was applied,
+    /// but one or more *added* forwards could not bind their local port (busy,
+    /// privileged, …). Those forwards are simply not served — the rest of the
+    /// reload stands and the daemon keeps running, and because the failed rule
+    /// is not recorded in `forward_rules_`, the next reload retries it.
+    struct ReloadResult {
+        /// Empty when every added forward bound. Otherwise a human-readable
+        /// list of "local port N: <reason>" entries.
+        std::string warnings;
+    };
+
+    [[nodiscard]] util::Expected<ReloadResult, std::string> reload(const Config& new_config);
 
     // -----------------------------------------------------------------
     // Accessors
@@ -164,7 +177,11 @@ class TunnelClient {
     void setup_tunnel_manager();
 
     /// Create TcpListeners for each forwarding rule.
-    void create_listeners(const std::vector<ForwardRule>& forwards);
+    /// Create one TcpListener per forward. Returns an error listing the local
+    /// ports that could not be bound (e.g. already in use) — the caller aborts
+    /// startup rather than running a client whose forwards silently do nothing.
+    [[nodiscard]] util::Expected<void, std::string> create_listeners(
+        const std::vector<ForwardRule>& forwards);
 
     /// Handle a new TCP connection accepted on a given local port.
     void on_tcp_connection_accepted(std::shared_ptr<core::TcpConnection> conn,
@@ -411,7 +428,7 @@ class TunnelClient {
     /// pushed upstream as the first tunnel write once Connected.
     void open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
                             uint16_t port, std::vector<uint8_t> initial_payload,
-                            std::function<void(bool)> on_tunnel_state);
+                            std::function<void(TunnelOpenOutcome)> on_tunnel_state);
 };
 
 }  // namespace toxtunnel::app

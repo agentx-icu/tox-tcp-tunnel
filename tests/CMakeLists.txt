@@ -16,6 +16,7 @@ include(GoogleTest)
 # Unit tests
 add_executable(unit_tests
     unit/placeholder_test.cpp
+    unit/log_throttle_test.cpp
     unit/test_bootstrap_source.cpp
     unit/test_expected.cpp
     unit/test_circular_buffer.cpp
@@ -42,6 +43,9 @@ add_executable(unit_tests
     unit/rate_limiter_test.cpp
     unit/tox_watchdog_test.cpp
     unit/atomic_file_test.cpp
+    unit/pid_file_test.cpp
+    unit/tcp_listener_bind_test.cpp
+    unit/config_diagnostics_test.cpp
     unit/path_security_test.cpp
     unit/tunnel_id_allocator_test.cpp
     unit/tunnel_resume_test.cpp

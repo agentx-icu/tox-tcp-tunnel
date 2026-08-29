@@ -10,6 +10,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/bdp_flow_control.hpp"
@@ -17,6 +18,25 @@
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/write_coalescer.hpp"
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/metrics.hpp"
+
+namespace toxtunnel::tunnel {
+
+/// Smallest coalesce delay this platform can actually honour.
+///
+/// asio's timer resolution follows the OS. Linux and macOS deliver a 200 us
+/// steady_timer within tens of microseconds; Windows rides the system tick, and
+/// on a Windows 11 ARM64 VM a 200 us timer measured 68 ms mean / 139 ms worst.
+/// Holding data for 68 ms when the operator asked for 200 us breaks the setting's
+/// contract far worse than not batching at all, so a sub-floor delay is treated
+/// as 0 (emit immediately) — see clamp_coalesce_delay_to_platform in tunnel.cpp.
+#if defined(_WIN32)
+inline constexpr std::uint32_t kMinHonouredCoalesceDelayUs = 15'600;  // classic Windows tick
+#else
+inline constexpr std::uint32_t kMinHonouredCoalesceDelayUs = 1;
+#endif
+
+}  // namespace toxtunnel::tunnel
 
 namespace toxtunnel::tunnel {
 
@@ -281,6 +301,29 @@ class TunnelImpl : public Tunnel {
     /// frames are NOT activity for the reaper's purposes.
     [[nodiscard]] int64_t IdleNanos() const noexcept;
 
+    /// Close this tunnel because a maintenance timer reaped it (idle reaper or
+    /// half-close linger cap), as opposed to the application closing it.
+    ///
+    /// Two things differ from close():
+    ///  * the close is accounted as `CloseReason::Timeout` rather than `Local`,
+    ///    so `toxtunnel_tunnels_closed_total{reason="timeout"}` is no longer a
+    ///    permanently-zero label and reaper activity is distinguishable from
+    ///    ordinary application disconnects;
+    ///  * a tunnel already in `Disconnecting` (we sent our half-close, the peer
+    ///    never reciprocated — exactly the case the linger cap exists for) is
+    ///    NOT silently dropped. close() is a no-op in that state, so the peer
+    ///    would keep its own tunnel in `Connected` with the target fd open
+    ///    forever: the cap would "fix" a local fd leak by handing the peer a
+    ///    permanent one. Instead we send TUNNEL_ERROR so the peer tears down
+    ///    too.
+    void close_for_timeout();
+
+   private:
+    /// Local (we-initiated) closes are booked as Local, unless a maintenance
+    /// timer is the one closing us — see close_for_timeout().
+    [[nodiscard]] util::MetricsRegistry::CloseReason local_close_reason() const noexcept;
+
+   public:
     // -----------------------------------------------------------------
     // TCP connection management
     // -----------------------------------------------------------------
@@ -491,7 +534,107 @@ class TunnelImpl : public Tunnel {
     /// Set callback for tunnel close.
     void set_on_close(CloseCallback cb);
 
+    // -----------------------------------------------------------------
+    // Outbound gate — "no further send is authorised" (H-2, 3rd review)
+    // -----------------------------------------------------------------
+
+    /// Close this tunnel's outbound gate.
+    ///
+    /// Swapping the send callbacks was NOT enough to silence a tunnel: every
+    /// send path copies the callback out from under `mutex_` and invokes it
+    /// after the lock is dropped (it must — a Tox send re-enters the manager,
+    /// so holding a tunnel lock across it deadlocks; H-01). A sender that had
+    /// already taken its copy therefore still delivered its frame *after* the
+    /// swap, and one stale TUNNEL_CLOSE / TUNNEL_ERROR is enough to kill the
+    /// winning session's identically-numbered tunnel (ids are recycled per
+    /// friend).
+    ///
+    /// The gate replaces the copy-then-call race: a sender tests the gate and
+    /// copies its callbacks in ONE critical section, and this call closes the
+    /// gate in that same critical section. After it returns, no send that had
+    /// not already copied its callback can reach one.
+    ///
+    /// Sends authorised by a **pre-gate snapshot** are NOT waited for, and note
+    /// that is broader than "already inside their callback": a sender can copy
+    /// the callbacks, be descheduled, and start its send after this returns. So
+    /// the guarantee is about snapshot acquisition, not invocation — several
+    /// frames, TUNNEL_DATA among them, may still land. See
+    /// TunnelManager::close_all_local() for the full residual and for why
+    /// waiting deadlocks against `coalesce_mutex_`.
+    ///
+    /// This also collapses the old two-setter mute (`set_on_send_to_tox_owned`
+    /// followed by `set_on_send_to_tox`) into a single atomic step, closing the
+    /// window where DATA was muted but control frames were not.
+    ///
+    /// Gated sends report **success**, not failure: a failed send makes the
+    /// tunnel refund send-window bytes and park the frame for a retry that
+    /// keeps the object alive waiting to re-emit it.
+    void close_outbound_gate();
+
+    /// True once `close_outbound_gate()` has run on this tunnel.
+    [[nodiscard]] bool outbound_gate_closed() const noexcept {
+        return outbound_gate_closed_.load(std::memory_order_acquire);
+    }
+
+    /// Error code from the last TUNNEL_ERROR this tunnel received (0 = none).
+    /// The server uses 1 for a rules denial, 2 for DNS failure and 3 for a
+    /// failed TCP connect / limit rejection; the SOCKS5 listener maps this
+    /// onto the RFC 1928 reply byte so a policy denial is distinguishable
+    /// from an unreachable target.
+    [[nodiscard]] std::uint8_t last_error_code() const noexcept {
+        return last_error_code_.load(std::memory_order_acquire);
+    }
+
+    /// Description carried by that last TUNNEL_ERROR ("" when none).
+    [[nodiscard]] std::string last_error_description() const {
+        std::lock_guard lock(last_error_mutex_);
+        return last_error_description_;
+    }
+
    private:
+    // -----------------------------------------------------------------
+    // Outbound send-callback snapshot — see close_outbound_gate()
+    // -----------------------------------------------------------------
+
+    /// A scoped copy of the send callbacks, taken under an open gate.
+    ///
+    /// Construction takes `mutex_` once and does two things atomically: test
+    /// the outbound gate and copy the send callbacks. The actual Tox call then
+    /// happens with NO lock held — that is the whole point (H-01 forbids
+    /// re-entering the manager under a tunnel lock), and it is why the gate has
+    /// to be tested in the same breath as the copy rather than re-checked
+    /// afterwards.
+    ///
+    /// It owns nothing and is registered nowhere: nothing enumerates the
+    /// outstanding ones and nothing waits on them. It was once `OutboundLease`,
+    /// which kept inviting the withdrawn "in-flight / drain" reading; the gate
+    /// bounds snapshot *acquisition* only, so a snapshot taken just before the
+    /// gate closed may still deliver its frame. See
+    /// TunnelManager::close_all_local() for that residual.
+    class OutboundSnapshot {
+       public:
+        explicit OutboundSnapshot(TunnelImpl& tunnel);
+
+        OutboundSnapshot(const OutboundSnapshot&) = delete;
+        OutboundSnapshot& operator=(const OutboundSnapshot&) = delete;
+        OutboundSnapshot(OutboundSnapshot&&) = delete;
+        OutboundSnapshot& operator=(OutboundSnapshot&&) = delete;
+
+        /// True when the gate was already closed, i.e. no snapshot was taken
+        /// and the caller must discard its frame.
+        [[nodiscard]] bool gate_closed() const noexcept { return gate_closed_; }
+
+        [[nodiscard]] const SendToToxCallback& span_callback() const noexcept { return span_cb_; }
+        [[nodiscard]] const SendOwnedToToxCallback& owned_callback() const noexcept {
+            return owned_cb_;
+        }
+
+       private:
+        bool gate_closed_{false};
+        SendToToxCallback span_cb_;
+        SendOwnedToToxCallback owned_cb_;
+    };
+
     // -----------------------------------------------------------------
     // Internal frame handlers
     // -----------------------------------------------------------------
@@ -605,6 +748,17 @@ class TunnelImpl : public Tunnel {
 
     /// Current state.
     std::atomic<State> state_{State::None};
+
+    /// Set when a maintenance timer (idle reaper / half-close cap) is closing
+    /// this tunnel, so the close is booked as CloseReason::Timeout.
+    std::atomic<bool> timeout_close_{false};
+
+    /// Last TUNNEL_ERROR seen, exposed via last_error_code() /
+    /// last_error_description() so callers (SOCKS5) can tell a rules denial
+    /// apart from an unreachable target.
+    std::atomic<std::uint8_t> last_error_code_{0};
+    mutable std::mutex last_error_mutex_;
+    std::string last_error_description_;
 
     /// Target hostname (set during open).
     std::string target_host_;
@@ -733,6 +887,13 @@ class TunnelImpl : public Tunnel {
     /// Protects non-atomic members.
     mutable std::mutex mutex_;
 
+    // ---- Outbound fence (see close_outbound_gate) -------------------------
+    /// One-way latch. Always *stored* under `mutex_` so the "gate closed?" test
+    /// and the copy of the callbacks below are one atomic step (`OutboundSnapshot`);
+    /// exposed as an atomic only so `outbound_gate_closed()` can be a lock-free
+    /// accessor. Nothing is registered anywhere — the latch bounds which senders
+    /// can still obtain a callback, not which sends are still running.
+    std::atomic<bool> outbound_gate_closed_{false};
     // Callbacks (accessed under mutex)
     SendToToxCallback on_send_to_tox_;
     SendOwnedToToxCallback on_send_to_tox_owned_;

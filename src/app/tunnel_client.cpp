@@ -204,7 +204,9 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     setup_tunnel_manager();
 
     // Create TCP listeners for each forwarding rule
-    create_listeners(client_cfg.forwards);
+    if (auto listeners_ok = create_listeners(client_cfg.forwards); !listeners_ok) {
+        return util::make_unexpected(listeners_ok.error());
+    }
 
     return {};
 }
@@ -307,7 +309,8 @@ void TunnelClient::start() {
             auto err = socks5_listener_->start(
                 io_ctx_->get_io_context(), s5_host, s5_port,
                 [this](std::shared_ptr<core::TcpConnection> conn, std::string host, uint16_t port,
-                       std::vector<uint8_t> initial_payload, std::function<void(bool)> reply_cb) {
+                       std::vector<uint8_t> initial_payload,
+                       std::function<void(TunnelOpenOutcome)> reply_cb) {
                     open_socks5_tunnel(std::move(conn), std::move(host), port,
                                        std::move(initial_payload), std::move(reply_cb));
                 });
@@ -446,7 +449,8 @@ void TunnelClient::wait_until_stopped() {
     }
 }
 
-util::Expected<void, std::string> TunnelClient::reload(const Config& new_config) {
+util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
+    const Config& new_config) {
     if (auto check = util::check_reloadable(config_, new_config); !check) {
         return util::make_unexpected(check.error());
     }
@@ -465,7 +469,10 @@ util::Expected<void, std::string> TunnelClient::reload(const Config& new_config)
     // but the mutation itself is posted onto io_ctx_ and we block on the
     // future so the CLI still gets a synchronous result. (TcpListener's own
     // contract also requires operations from its io_context thread.)
-    auto apply = [this, new_config, diff]() {
+    // Collected on the io thread, read back here after the apply completes.
+    auto bind_failures = std::make_shared<std::string>();
+    auto failed_count = std::make_shared<std::size_t>(0);
+    auto apply = [this, new_config, diff, bind_failures, failed_count]() {
         if (!is_pipe_mode() && !diff.empty()) {
             for (const auto& removed : diff.removed) {
                 for (std::size_t i = 0; i < forward_rules_.size();) {
@@ -486,6 +493,21 @@ util::Expected<void, std::string> TunnelClient::reload(const Config& new_config)
             for (const auto& added : diff.added) {
                 auto listener = std::make_shared<core::TcpListener>(io_ctx_->get_io_context(),
                                                                     added.local_port);
+                if (!listener->is_bound()) {
+                    // Reload is best-effort per forward: a busy port must not
+                    // take down a daemon that is happily serving the others.
+                    // The rule is NOT recorded, so a later reload retries it.
+                    if (!bind_failures->empty()) {
+                        *bind_failures += "; ";
+                    }
+                    *bind_failures += "local port " + std::to_string(added.local_port) + ": " +
+                                      listener->bind_error().message();
+                    ++*failed_count;
+                    util::Logger::error("Reload: not forwarding local port {} -> {}:{} ({})",
+                                        added.local_port, added.remote_host, added.remote_port,
+                                        listener->bind_error().message());
+                    continue;
+                }
                 const auto rule = added;
                 listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
                     on_tcp_connection_accepted(std::move(conn), rule);
@@ -516,9 +538,12 @@ util::Expected<void, std::string> TunnelClient::reload(const Config& new_config)
         apply();
     }
 
-    util::Logger::info("config reloaded (forwards: +{} -{})", diff.added.size(),
+    util::Logger::info("config reloaded (forwards: +{} -{})", diff.added.size() - *failed_count,
                        diff.removed.size());
-    return {};
+    // Bind failures are warnings, not a rejection: the rest of the reload has
+    // already been applied and the daemon is still serving. Returning an error
+    // here would contradict the "on error nothing was applied" contract.
+    return ReloadResult{*bind_failures};
 }
 
 // -------------------------------------------------------------------------
@@ -745,15 +770,33 @@ void TunnelClient::setup_tunnel_manager() {
     }
 }
 
-void TunnelClient::create_listeners(const std::vector<ForwardRule>& forwards) {
+util::Expected<void, std::string> TunnelClient::create_listeners(
+    const std::vector<ForwardRule>& forwards) {
     forward_rules_ = forwards;
     listeners_.reserve(forwards.size());
 
+    std::string failures;
     for (const auto& rule : forwards) {
         auto listener =
             std::make_shared<core::TcpListener>(io_ctx_->get_io_context(), rule.local_port);
+        if (!listener->is_bound()) {
+            if (!failures.empty()) {
+                failures += "; ";
+            }
+            failures += "local port " + std::to_string(rule.local_port) + ": " +
+                        listener->bind_error().message();
+        }
         listeners_.push_back(std::move(listener));
     }
+    if (!failures.empty()) {
+        // Startup-time bind failures are fatal: a client whose forward port is
+        // taken would look healthy while forwarding nothing. (Another
+        // toxtunnel already running on that port is the usual cause.)
+        listeners_.clear();
+        forward_rules_.clear();
+        return util::make_unexpected("cannot listen on configured forward port(s): " + failures);
+    }
+    return {};
 }
 
 bool TunnelClient::is_pipe_mode() const noexcept {
@@ -1023,6 +1066,7 @@ void TunnelClient::send_resume_requests() {
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), wire.begin(), wire.end());
         (void)tox_adapter_->send_lossless_packet(fn, packet.data(), packet.size());
+        util::MetricsRegistry::instance().inc_resume_attempts();
         util::Logger::info("Sent RESUME_REQUEST for tunnel {} (recv={} send={})", id,
                            req.last_local_recv_offset, req.last_local_send_offset);
     }
@@ -1036,11 +1080,13 @@ void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack) 
         return;
     }
     if (ack.status == tunnel::TunnelResumeStatus::Ok) {
+        util::MetricsRegistry::instance().inc_resume_successes();
         util::Logger::info("Tunnel {} resumed (server recv={} send={})", ack.new_tunnel_id,
                            ack.server_recv_offset, ack.server_send_offset);
         // The tunnel kept its Connected state and TCP connection; nothing more
         // to do — buffered bytes flush via the coalesce retry timer.
     } else {
+        util::MetricsRegistry::instance().inc_resume_failures();
         util::Logger::warn("Tunnel {} resume declined (status {}); closing", ack.new_tunnel_id,
                            static_cast<int>(ack.status));
         impl->close();
@@ -1236,10 +1282,10 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
 
 void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
                                       uint16_t port, std::vector<uint8_t> initial_payload,
-                                      std::function<void(bool)> on_tunnel_state) {
+                                      std::function<void(TunnelOpenOutcome)> on_tunnel_state) {
     if (!server_online_) {
         util::Logger::warn("SOCKS5 destination {}:{} requested but server is offline", host, port);
-        on_tunnel_state(false);
+        on_tunnel_state(TunnelOpenOutcome::Failed);
         conn->close();
         return;
     }
@@ -1247,7 +1293,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     auto allocated_id = tunnel_mgr_->allocate_tunnel_id();
     if (!allocated_id) {
         util::Logger::error("No available tunnel IDs for SOCKS5 destination {}:{}", host, port);
-        on_tunnel_state(false);
+        on_tunnel_state(TunnelOpenOutcome::Failed);
         conn->close();
         return;
     }
@@ -1315,7 +1361,8 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     auto reply_sent = std::make_shared<std::atomic<bool>>(false);
     auto open_counted = std::make_shared<std::atomic<bool>>(false);
     auto active_dec_latch = std::make_shared<std::atomic<bool>>(false);
-    auto reply_cb = std::make_shared<std::function<void(bool)>>(std::move(on_tunnel_state));
+    auto reply_cb =
+        std::make_shared<std::function<void(TunnelOpenOutcome)>>(std::move(on_tunnel_state));
     // Wrap initial_payload in a shared_ptr so the state-change lambda can drain
     // it exactly once. Bytes that arrived past the SOCKS/CONNECT handshake go
     // upstream BEFORE we start_read so the tunnel sees them in original order.
@@ -1331,7 +1378,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
                 return;
             }
             if (!reply_sent->exchange(true)) {
-                (*reply_cb)(true);
+                (*reply_cb)(TunnelOpenOutcome::Connected);
             }
             if (!initial_payload_holder->empty()) {
                 locked_tunnel->on_tcp_data_received(initial_payload_holder->data(),
@@ -1349,7 +1396,29 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         } else if (new_state == tunnel::Tunnel::State::Closed ||
                    new_state == tunnel::Tunnel::State::Error) {
             if (!reply_sent->exchange(true)) {
-                (*reply_cb)(false);
+                // Translate the peer's TUNNEL_ERROR reason so the listener can
+                // answer 0x02 ("not allowed by ruleset") for a rules denial
+                // rather than a generic host-unreachable.
+                auto outcome = TunnelOpenOutcome::Failed;
+                if (auto locked = weak_tunnel.lock()) {
+                    switch (locked->last_error_code()) {
+                        case 1:
+                            outcome = TunnelOpenOutcome::Denied;
+                            break;
+                        case 2:
+                            outcome = TunnelOpenOutcome::Unreachable;
+                            break;
+                        case 3:
+                            outcome = locked->last_error_description().find("refused") !=
+                                              std::string::npos
+                                          ? TunnelOpenOutcome::Refused
+                                          : TunnelOpenOutcome::Unreachable;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                (*reply_cb)(outcome);
             }
             util::Logger::debug("SOCKS5 tunnel {} state: {}", tunnel_id, to_string(new_state));
             conn->close();
@@ -1393,7 +1462,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         util::Logger::error("Tunnel manager at capacity; rejecting SOCKS5 {}:{}", host, port);
         tunnel_mgr_->release_tunnel_id(tunnel_id);
         if (!reply_sent->exchange(true)) {
-            (*reply_cb)(false);
+            (*reply_cb)(TunnelOpenOutcome::Failed);
         }
         conn->close();
         return;
@@ -1404,7 +1473,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
         util::Logger::error("Failed to open SOCKS5 tunnel {} to {}:{}", tunnel_id, host, port);
         tunnel_mgr_->remove_tunnel(tunnel_id);
         if (!reply_sent->exchange(true)) {
-            (*reply_cb)(false);
+            (*reply_cb)(TunnelOpenOutcome::Failed);
         }
         conn->close();
         return;

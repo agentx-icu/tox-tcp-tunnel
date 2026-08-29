@@ -156,7 +156,7 @@ curl -s 127.0.0.1:9100/metrics | grep tunnels_active
 
 # What's actually open right now
 toxtunnel inspect tunnels
-toxtunnel inspect status --json | jq '{friends_online, active_server, tunnels_active}'
+toxtunnel inspect status --json | jq '{friends_online, tunnels_active, bytes_in, bytes_out}'
 ```
 
 ## Verification

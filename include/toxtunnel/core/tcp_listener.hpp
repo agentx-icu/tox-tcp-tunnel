@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <system_error>
 
 #include "tcp_connection.hpp"
 
@@ -159,12 +160,22 @@ class TcpListener : public std::enable_shared_from_this<TcpListener> {
     /// Return the local endpoint the acceptor is bound to.
     [[nodiscard]] asio::ip::tcp::endpoint local_endpoint() const;
 
+    /// True when open/bind/listen all succeeded. A listener that failed to
+    /// bind (port already in use, privileged port, address not local) is inert:
+    /// `start_accept` is a no-op on it. Construction never throws for these —
+    /// a busy local port is an ordinary misconfiguration, not a crash.
+    [[nodiscard]] bool is_bound() const noexcept { return bind_error_ == std::error_code{}; }
+
+    /// The error that made `is_bound()` false (default-constructed when bound).
+    [[nodiscard]] const std::error_code& bind_error() const noexcept { return bind_error_; }
+
    private:
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------
 
-    /// Set up the acceptor: open, set options, bind, and listen.
+    /// Set up the acceptor: open, set options, bind, and listen. Records any
+    /// failure in `bind_error_` instead of throwing.
     void setup_acceptor(const asio::ip::tcp::endpoint& endpoint);
 
     /// Post the next async_accept if the accept loop is active and the
@@ -176,6 +187,7 @@ class TcpListener : public std::enable_shared_from_this<TcpListener> {
     // -----------------------------------------------------------------
 
     asio::ip::tcp::acceptor acceptor_;
+    std::error_code bind_error_;
     AcceptHandler accept_handler_;
 
     std::uint16_t port_;

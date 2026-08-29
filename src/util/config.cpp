@@ -363,7 +363,8 @@ util::Expected<void, std::string> Config::validate() const {
         std::string host;
         uint16_t port = 0;
         if (!util::parse_listen_spec(metrics.listen, host, port)) {
-            return util::make_unexpected(std::string("Invalid metrics.listen value: ") +
+            return util::make_unexpected(std::string("Invalid metrics.listen value (expected "
+                                                     "host:port, e.g. 127.0.0.1:9100): ") +
                                          metrics.listen);
         }
         if (metrics.path.empty() || metrics.path.front() != '/') {
@@ -711,6 +712,16 @@ std::string Config::to_yaml() const {
         out << YAML::Key << "enabled" << YAML::Value << metrics.enabled;
         out << YAML::Key << "listen" << YAML::Value << metrics.listen;
         out << YAML::Key << "path" << YAML::Value << metrics.path;
+        out << YAML::EndMap;
+    }
+
+    // Emitted only when it differs from the default, like `metrics` above.
+    // This is a hand-rolled emitter rather than convert<Config>::encode, so a
+    // new block has to be added in both places or `save()` silently drops it —
+    // exactly how `inspect.enabled: false` used to be lost on round-trip.
+    if (!(inspect == InspectConfig{})) {
+        out << YAML::Key << "inspect" << YAML::Value << YAML::BeginMap;
+        out << YAML::Key << "enabled" << YAML::Value << inspect.enabled;
         out << YAML::EndMap;
     }
 
@@ -1495,6 +1506,28 @@ bool convert<ClientConfig>::decode(const Node& node, ClientConfig& rhs) {
         }
     }
 
+    // Explicit `fallback_server_ids:` is additive on top of whatever the list
+    // form of `server_id` already yielded — the documented layout is "a primary
+    // plus optional fallbacks", and the two spellings may be mixed. Appending
+    // (rather than replacing) means a duplicate is caught by validate() with a
+    // clear message instead of being silently swallowed by one form winning.
+    //
+    // Accept the same two shapes `server_id` does. Testing only for IsSequence
+    // and dropping everything else is what made this key a silent no-op in the
+    // first place: a scalar parsed, validated and started with the fallback
+    // missing. A map or other non-scalar now raises YAML::BadConversion, which
+    // from_file()/from_string() report as "Failed to parse configuration"; an
+    // explicit-but-empty key stays an empty list rather than an error.
+    if (const auto& fb_node = node["fallback_server_ids"]) {
+        if (fb_node.IsSequence()) {
+            for (const auto& item : fb_node) {
+                rhs.fallback_server_ids.push_back(item.as<std::string>());
+            }
+        } else if (!fb_node.IsNull()) {
+            rhs.fallback_server_ids.push_back(fb_node.as<std::string>());
+        }
+    }
+
     if (node["pipe"]) {
         rhs.pipe_target = node["pipe"].as<PipeTarget>();
     }
@@ -1613,6 +1646,9 @@ Node convert<Config>::encode(const Config& rhs) {
     if (rhs.metrics != toxtunnel::MetricsConfig{}) {
         node["metrics"] = rhs.metrics;
     }
+    if (!(rhs.inspect == toxtunnel::InspectConfig{})) {
+        node["inspect"] = rhs.inspect;
+    }
     node["tox"] = effective_tox;
     if (!(rhs.tunnel == toxtunnel::TunnelConfig{})) {
         node["tunnel"] = rhs.tunnel;
@@ -1697,6 +1733,13 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
         rhs.metrics = node["metrics"].as<toxtunnel::MetricsConfig>();
     }
 
+    // `inspect.enabled` defaults to true and gates a local IPC listener, so a
+    // dropped decode here is not a cosmetic default — it silently opens a
+    // socket the operator asked to be off. Keep it wired next to `metrics`.
+    if (node["inspect"]) {
+        rhs.inspect = node["inspect"].as<toxtunnel::InspectConfig>();
+    }
+
     if (node["tox"]) {
         rhs.tox = node["tox"].as<ToxConfig>();
     }
@@ -1770,6 +1813,21 @@ bool convert<Config>::decode(const Node& node, Config& rhs) {
                 }
             } else {
                 rhs.client->server_id = sid_node.as<std::string>();
+            }
+        }
+
+        // See convert<ClientConfig>::decode: the explicit key is additive on
+        // top of the list form of `server_id`, and duplicates are validate()'s
+        // problem rather than a silently-dropped entry.
+        // Same two shapes as above; see convert<ClientConfig>::decode for why a
+        // bare IsSequence() test is not enough.
+        if (const auto& fb_node = client_node["fallback_server_ids"]) {
+            if (fb_node.IsSequence()) {
+                for (const auto& item : fb_node) {
+                    rhs.client->fallback_server_ids.push_back(item.as<std::string>());
+                }
+            } else if (!fb_node.IsNull()) {
+                rhs.client->fallback_server_ids.push_back(fb_node.as<std::string>());
             }
         }
 

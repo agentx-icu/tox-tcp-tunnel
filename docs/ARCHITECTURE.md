@@ -27,7 +27,7 @@
 | `Tunnel`            | State machine for a single bidirectional tunnel                  |
 | `ProtocolFrame`     | Binary frame serialization/deserialization                       |
 | `ToxAdapter`        | High-level wrapper for the toxcore C API                         |
-| `ToxThread`         | Dedicated thread for the toxcore event loop                      |
+| `ToxThread`         | **Unused.** Compiled but never instantiated; the toxcore event loop lives in `ToxAdapter`. Kept in-tree pending a decision to delete or adopt it — do not add to it, and do not assume anything registered there runs. |
 | `RulesEngine`       | Per-friend access control (allow/deny rules)                     |
 | `KnownServersStore` | Client-only YAML-backed registry of previously-connected servers (`<data_dir>/known_servers.yaml`); provides alias resolution for `--server-id` and `client.server_id`. |
 | `SystemInfo`        | Server-side platform probes gated by `ServerInfoDisclose` policy (hostname / os / arch / uptime / version). Used to build `INFO_REPLY` payloads. |
@@ -38,13 +38,13 @@
 | `MetricsRegistry`   | Lock-free registry of atomic counters / gauges / summaries; updated from any thread. |
 | `MetricsServer`     | Asio HTTP/1.1 listener that renders `MetricsRegistry` as Prometheus text format on `GET /metrics`. Default-off; see [Operational Endpoints](#operational-endpoints). |
 | `InspectServer`     | Local IPC server (Unix-domain socket on POSIX, named pipe on Windows) for the `toxtunnel inspect` CLI. Default-on, loopback-only by construction — no remote attack surface. |
-| `Socks5Listener`    | Client-side TCP listener that auto-detects SOCKS5 v5 vs HTTP CONNECT by sniffing the first byte; binds loopback-only (enforced at config validation). Pipelined CONNECT payloads are preserved across the handshake. |
+| `Socks5Listener`    | Client-side TCP listener that auto-detects SOCKS5 v5 vs HTTP CONNECT by sniffing the first byte; binds loopback-only (enforced at config validation). Pipelined CONNECT payloads are preserved across the handshake. The tunnel layer reports why an open failed (`TunnelOpenOutcome`), so a rules denial answers `0x02` / `403` rather than a generic unreachable. |
 | `OwnedBufferView`   | `shared_ptr<vector<uint8_t>>` slice handed from the Tox callback down to `TcpConnection::write`. Eliminates one copy on the inbound path (see [Inbound Copy Path](#inbound-copy-path)). |
 | `WriteQueue`        | Per-tunnel write coalescer in `TunnelManager`. Accumulates small writes for up to `tunnel.coalesce_max_delay_us` (200µs default) or `tunnel.coalesce_max_bytes` (1362 = TUNNEL_DATA MTU) before flushing one TUNNEL_DATA frame. Wire-format unchanged. |
 | `OwnedFrameBuffer`  | Outbound zero-copy buffer (Wave B). Reserves 6 bytes of prefix (`0xA0` lossless byte + 5-byte tunnel frame header) inside a single `shared_ptr<vector<uint8_t>>` allocation; the TCP read path writes directly into the payload region and `ProtocolFrame::serialize_tunnel_data_in_place()` fills in the header before toxcore is called. See [Outbound Copy Path](#outbound-copy-path). |
 | `WriteCoalescer`    | Per-tunnel EWMA + policy state machine. Selects between `Bypass`, `Drain`, and `Batch` policies based on `avg_write_size` vs MTU and `avg_write_gap` vs `4 × max_delay_us`. α = 1/8, 4-tick hysteresis. Operator pins mode via `tunnel.coalesce_mode`. |
-| `BdpFlowControl`    | Per-tunnel send-window state. Tracks RTT (PING/PONG round-trip) and bandwidth (cumulative-ACK delta) as EWMAs; recomputes the target window as `bdp × safety_factor` clamped to `[min, max]`. In `mode: fixed` the window is pinned to the v0.3.0 value; `mode: bdp` opts in to dynamic sizing. |
-| `RateLimiter`       | Per-friend token-bucket layer that runs before `RulesEngine` on TUNNEL_OPEN and (optionally) alongside the data path. Modes: `off | report | enforce`. Hot-reloadable via the rules file. Defaults to `off` (no v0.3.0 behaviour change). |
+| `BdpFlowControl`    | Per-tunnel send-window state. Tracks RTT (PING/PONG round-trip) and bandwidth (cumulative-ACK delta) as EWMAs; recomputes the target window as `bdp × safety_factor` clamped to `[min, max]`. In `mode: fixed` the window is pinned to the v0.3.0 value; `mode: bdp` (the default since v0.4.1) sizes it dynamically. |
+| `RateLimiter`       | Per-friend token-bucket layer that runs before `RulesEngine` on TUNNEL_OPEN. Modes: `off \| report \| enforce`. Hot-reloadable via the rules file. Defaults to `off` (no v0.3.0 behaviour change). A per-friend `rate_limit:` block **overrides only the fields it names**, inheriting the rest from `rate_limit_defaults`. **The byte buckets (`bytes_per_sec` / `bytes_burst`) are NOT wired into the data path**: the structure exists and the keys parse, but nothing consumes byte tokens, so configuring them throttles nothing (the rules loader warns). |
 | `ToxWatchdog`       | Heartbeat-based detector for a stalled `tox_iterate`. The Tox thread bumps the counter on every return; a 1 Hz observer on the main IO context calls `std::abort()` if the deadline is exceeded. Persistent abort count lives at `<data_dir>/abort_count`. |
 | `TunnelIdAllocator` | Bitset-backed 1..65535 allocator with a roving cursor and an explicit `reserve(id)` API for the tunnel-resume path. |
 | `TunnelResumeStore` | Client-side `<data_dir>/tunnel_resume_state.yaml` persistence (schema-versioned, age-pruned). Wipes itself when the active server's Tox ID changes. Persisted via `util::atomic_write_file`. |
@@ -121,15 +121,20 @@ Offset  Size  Field
 - **I/O pool**: Async TCP operations via asio (default: 10 threads)
 
 v0.3.0 introduced four new I/O participants — `MetricsServer`, `InspectServer`,
-`Socks5Listener`, and the SIGHUP reload watcher — **none of which add new
-threads**. All four live entirely on the existing asio I/O pool:
+`Socks5Listener`, and the reload watcher. On POSIX **none of them add a thread**:
+all four live on the existing asio I/O pool. Windows is the one exception — it
+has no SIGHUP, so the reload named pipe is served by one small dedicated thread
+(`WindowsReloadPipeServer` in `cli/main.cpp`) that only posts the reload:
 
-- `MetricsServer` and `InspectServer` are plain asio acceptors with per-connection strands.
+- `MetricsServer` is a plain asio acceptor with per-connection strands. `InspectServer`
+  is too on POSIX (AF_UNIX); on Windows it serves its per-pid named pipe from one
+  dedicated thread (`pipe_thread_`).
 - `Socks5Listener` shares the pool with the regular forward listeners.
 - SIGHUP is wired through `asio::signal_set` bound to the main `IoContext` on POSIX. On
   Windows there is no SIGHUP — `ConfigReload` watches a named pipe at
-  `\\.\pipe\toxtunnel-reload-<pid>` (path hard-coded by PID, not configurable) on the
-  same pool. The `toxtunnel reload` CLI helper writes one byte to it.
+  `\\.\pipe\toxtunnel-reload-<pid>` (path hard-coded by PID, not configurable) on a
+  small dedicated thread. The `toxtunnel reload` CLI helper writes `RELOAD\n` to it,
+  resolving the pid from `<data_dir>/toxtunnel.pid`.
 - `MetricsRegistry` is updated lock-free (atomic increments) from any thread, including
   the Tox thread, without marshalling.
 
@@ -197,9 +202,12 @@ auth if you do.
 
 `InspectServer` accepts connections on a local Unix-domain socket (POSIX) or
 named pipe (Windows). Default path follows `data_dir/toxtunnel.sock` /
-`\\.\pipe\toxtunnel-inspect-<pid>`. **Default-on, loopback-only by
+`\\.\pipe\toxtunnel-<pid>`. **Default-on, loopback-only by
 construction** — there is no TCP listener and no auth layer because the OS
-permission bits on the socket file are the access control.
+permission bits on the socket file (POSIX) / the pipe DACL (Windows: daemon
+user, SYSTEM, Administrators) are the access control. The daemon writes its
+pid to `<data_dir>/toxtunnel.pid` (`util::PidFileGuard`) so the CLI can derive
+the per-pid pipe name; `TOXTUNNEL_INSPECT_PID` overrides it.
 
 Wire format is intentionally trivial:
 
@@ -210,7 +218,7 @@ Wire format is intentionally trivial:
 
 ```
 > GET /tunnels
-< {"mode":"client","version":"0.4.5","friends_online":1,"tunnels":[{"id":17,"friend_pk_prefix":"AA…","target":"127.0.0.1:22","state":"OPEN","bytes_in":4096,"bytes_out":8192,"idle_seconds":3.2}]}
+< {"mode":"client","version":"0.4.5","friends_online":1,"tunnels":[{"id":17,"friend_pk_prefix":"AA…","target":"127.0.0.1:22","state":"Connected","bytes_in":4096,"bytes_out":8192,"idle_seconds":3}]}
 
 > GET /status
 < {"mode":"client","version":"0.4.5","friends_online":1,"tunnels_active":4,"bytes_in":12345,"bytes_out":67890}
@@ -218,18 +226,94 @@ Wire format is intentionally trivial:
 
 The CLI ships only two subactions — `toxtunnel inspect tunnels` (default) and
 `toxtunnel inspect status` — and they pretty-print the reply. Any other
-subaction string is silently coerced to `tunnels`. Unknown request paths get
-`{"error":"unknown request"}`. Tooling that wants structured output should
+subaction string is rejected by the argument parser (`CLI::IsMember`). An
+unknown request path sent straight down the socket gets
+`{"error":"unknown request"}`. `idle_seconds` is an integer and is omitted
+entirely for a tunnel that has never been idle. Tooling that wants structured output should
 either pass `--json` or speak the socket directly with `socat - UNIX-CONNECT:…`.
+
+### Friend list and the per-friend manager map
+
+Two pieces of server state need their concurrency protocol stated, because both
+have produced real bugs.
+
+**Friend list.** The server's Tox friend list is seeded from `rules.yaml`, at
+startup and again after every rules reload (`preseed_friends_from_rules`).
+Without this, `on_friend_request` was the only path that ever added a friend —
+and it refuses a public key that is not yet in the rules. Since toxcore does not
+re-send a friend request the peer has already recorded, the ordinary first-run
+mistake (client started before its key was added) was **unrecoverable** without
+minting a new client identity. The pre-seed makes adding the rule sufficient.
+
+Keys removed from `rules.yaml` are deliberately **not** deleted from the friend
+list. The access decision is already enforced by default-deny on `TUNNEL_OPEN`,
+and the rate limiter drops the friend's spec on reload, so a stale friend entry
+grants nothing; deleting it would additionally drop live tunnels and the
+transport relationship for what is usually a reversible administrative edit. The
+cost is a friend-list slot. (Note that `tox_friend_delete` does not notify the
+peer, so deletion is recoverable — the reason to avoid it is the disruption, not
+irreversibility.)
+
+The pre-seed snapshots the rule keys under `rules_mutex_` and **releases it
+before** calling the Tox adapter: those calls marshal onto the Tox thread, which
+takes `rules_mutex_` itself on its inbound paths, so holding it across the call
+would deadlock. At startup the adapter is not yet running and the marshalling
+degenerates to an inline call.
+
+**`managers_` / `held_managers_`.** Two mechanisms protect this state, and both
+are needed.
+
+*Serialisation.* Every friend-lifecycle transition — `connected`, `disconnected`,
+a keepalive peer-dead teardown, and the resume hold's prune timer — is posted
+onto `inbound_strand_`, the same strand that runs inbound frame handling. Map
+locking alone is not sufficient, because each transition classifies state under
+`managers_mutex_` and then acts after releasing it: two transitions for one
+friend could interleave in that gap (a `connected` deciding to keep a live
+manager while a queued teardown moves that very manager to the held map, leaving
+no live manager behind). On one strand they cannot overlap, so a decision is
+still true when it is acted on. Sharing the strand with frame handling also means
+a `TUNNEL_RESUME_REQUEST` can never land halfway through a teardown.
+
+*Locking.* `managers_mutex_` guards both maps, and the invariant is that a friend
+is in at most one of them. Teardown performs {look up live, stop maintenance,
+decide hold, insert held, erase live} in a single critical section, erasing last
+— an earlier version erased first and inserted the hold later, and a `connected`
+landing in that window produced a live manager *and* a held one for the same
+friend, so every `TUNNEL_RESUME_REQUEST` routed to the fresh manager and declined
+tunnels that were still being held.
+
+Only work that cannot re-enter `managers_mutex_` runs under it
+(`TunnelManager::empty()`, `disable_keepalive()`, `disable_reaper()` — a map read
+and two timer cancellations). Anything that can — `close_all()`, tunnel
+callbacks, frame sends — runs after the lock is released (the "H-01 discipline").
+Insertions use `try_emplace` so a concurrent installer wins rather than being
+silently overwritten; a manager that loses such a race is torn down with
+`close_all_local()`, because tunnel ids are recycled per friend and the winner
+may already own the same ids. That call releases local state, emits no teardown
+frame of its own, and closes an outbound gate after which no further send can be
+authorised. It does **not** suppress a send another thread authorised just
+before the gate closed — the stronger "nothing of this session reaches the wire"
+form was withdrawn because waiting for those sends deadlocked against the data
+path's `coalesce_mutex_`. The exact residual is documented on
+`TunnelManager::close_all_local()`.
+
+toxcore does not guarantee a `disconnected` before every `connected`, so
+`setup_tunnel_manager` classifies the event (`classify_connected_event`) instead
+of assuming: an unpaired `connected` for a friend whose manager is still live
+keeps the existing manager and logs a warning, rather than replacing it.
 
 ### SIGHUP / reload pipe
 
 POSIX: `kill -HUP <pid>` (or `systemctl reload toxtunnel`) is delivered to an
 `asio::signal_set` on the main `IoContext`. Windows has no SIGHUP, so the
-equivalent path is a named pipe — write a single byte to it, or run
-`toxtunnel reload --pipe <path>`.
+equivalent path is a named pipe. `toxtunnel reload [-d DIR | -c CONFIG]` wraps
+both: it reads `<data_dir>/toxtunnel.pid`, checks the pid still names a
+toxtunnel process (Linux `/proc/<pid>/comm`, macOS `proc_pidpath`) and sends
+SIGHUP, or on Windows writes `RELOAD\n` to `\\.\pipe\toxtunnel-reload-<pid>`.
 
-Either trigger calls `ConfigReload::apply()`, which:
+Either trigger runs `reload_config_from_disk()` (cli/main.cpp) followed by
+`TunnelServer::reload()` / `TunnelClient::reload()`, with
+`util::check_reloadable()` as the gate. Together they:
 
 1. Re-reads the original config file.
 2. Diffs the parsed result against the live `Config`.
@@ -240,12 +324,17 @@ Either trigger calls `ConfigReload::apply()`, which:
    `keepalive_*`, `resume.*`), `flow_control.*`, and `watchdog.*`.
 4. Otherwise atomically swaps the reloadable subset — `rules_file` contents,
    `client.forwards`, and `logging.level` — under the strand that owns each
-   consumer. Existing tunnels are **not** torn down on a successful reload
-   unless their friend or destination is no longer allowed by the new rules.
+   consumer. Existing tunnels are **never** torn down by a reload — not even
+   ones the new rules would now deny. Only the next `TUNNEL_OPEN` is judged
+   against the new rules.
 
-A `Reload applied: …` line is emitted at INFO. A rejected reload emits a
-`Reload rejected: field <name> is not reloadable` line at WARN and leaves the
-running config untouched.
+A successful reload is logged at INFO as `config reloaded (rules: N rules)`
+(server) or `config reloaded (forwards: +A -B)` (client). A rejected reload is
+logged at ERROR as `reload rejected: config reload rejected: field '<name>'
+requires a restart (not in the reloadable subset)` and leaves the running config
+untouched. On the client, an added forward whose local port cannot bind is not
+a rejection: the rest of the reload is applied and the daemon logs
+`reload applied with warnings: local port N: <reason>`.
 
 ## Inbound Copy Path
 

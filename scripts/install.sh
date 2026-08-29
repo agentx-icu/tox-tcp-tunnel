@@ -221,6 +221,17 @@ if [ "$MODE" = "client" ]; then
             echo "         Any in-place customisations (rules_file, forwards, …) WILL be lost." >&2
             echo "         (Press Ctrl-C now to abort.)" >&2
             echo >&2
+            # Actually give the operator the window the message promises.
+            # Without this the overwrite happened before the warning could be
+            # read. Only pause on a TTY: a piped `curl … | sh` install must not
+            # hang, and CI must not gain 5 seconds per run.
+            if [ -t 0 ] && [ -t 2 ]; then
+                for _i in 5 4 3 2 1; do
+                    printf '\r         overwriting in %ss... ' "$_i" >&2
+                    sleep 1
+                done
+                printf '\r                                   \r' >&2
+            fi
         fi
         echo "==> Writing client config at ${CONFIG_PATH}"
         mkdir -p "$(dirname "$CONFIG_PATH")"
@@ -238,11 +249,20 @@ echo
 if [ "$MODE" = "server" ]; then
     cat <<EOF
 Next steps (server):
-  - The service is enabled and running. Get your Tox ID:
+  - Get your Tox ID:
       toxtunnel print-id --qr
   - Hand the printed Tox ID (or QR code) to the client side.
   - Optional: tighten access with rules_file in ${CONFIG_PATH}.
 EOF
+    # Only claim the service is running when there is a service manager to run
+    # it. On containers / WSL / non-systemd hosts the previous unconditional
+    # "The service is enabled and running" was simply false.
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "  - The systemd service is enabled and running (systemctl status toxtunnel)."
+    else
+        echo "  - No systemd here, so nothing was started. Run it yourself:"
+        echo "      toxtunnel -c ${CONFIG_PATH}"
+    fi
 else
     cat <<EOF
 Next steps (client):

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <asio.hpp>
 #include <chrono>
+#include <functional>
 #include <numeric>
 #include <span>
 #include <thread>
@@ -13,6 +14,18 @@
 
 using namespace toxtunnel::tunnel;
 using namespace std::chrono_literals;
+
+// Shared io_context pump helpers. Defined once in test_tunnel_manager.cpp,
+// which links into the same unit_tests binary; declared here rather than in a
+// new header because tests/CMakeLists.txt lists its sources explicitly and
+// adding files to it is out of scope for this change.
+namespace toxtunnel::test_support {
+
+bool PumpUntil(asio::io_context& io_ctx, const std::function<bool()>& pred,
+               std::chrono::milliseconds deadline);
+void PumpFor(asio::io_context& io_ctx, std::chrono::milliseconds duration);
+
+}  // namespace toxtunnel::test_support
 
 namespace {
 
@@ -60,41 +73,29 @@ class TunnelCoalesceTest : public ::testing::Test {
         tunnel_->set_state(Tunnel::State::Connected);
     }
 
-    // Advance the io_context past the coalesce timer so the delayed flush runs.
+    // Pump the io_context until `predicate` holds, or the deadline passes.
     //
-    // On asio's Windows IOCP backend, run_for() can return without dispatching
-    // an expired steady_timer in this single-threaded test shape. Polling ready
-    // handlers between small sleeps keeps the test deterministic across backends.
-    void run_for(std::chrono::microseconds dur) {
-        const auto deadline = std::chrono::steady_clock::now() + dur;
-        while (std::chrono::steady_clock::now() < deadline) {
-            io_ctx_.poll_one();
-            io_ctx_.restart();
-            std::this_thread::sleep_for(1ms);
-        }
-        while (io_ctx_.poll_one() > 0) {
-            io_ctx_.restart();
-        }
-        io_ctx_.restart();
+    // The loop itself lives once, in test_tunnel_manager.cpp (same unit_tests
+    // binary) — this file used to carry a second copy of it. See that file for
+    // why the loop must never sleep and must use poll() rather than run_for().
+    template <typename Predicate>
+    bool pump_until(Predicate predicate,
+                    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+        return toxtunnel::test_support::PumpUntil(
+            io_ctx_, std::function<bool()>(std::move(predicate)), timeout);
+    }
+
+    // Pump for a fixed wall-clock budget without waiting on a condition. Used
+    // only by the negative assertions ("advancing time must NOT emit an extra
+    // frame"), where there is nothing to wait *for*.
+    void pump_for(std::chrono::milliseconds budget) {
+        toxtunnel::test_support::PumpFor(io_ctx_, budget);
     }
 
     template <typename Predicate>
     bool wait_until(Predicate predicate,
-                    std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (predicate()) {
-                return true;
-            }
-            io_ctx_.poll_one();
-            io_ctx_.restart();
-            std::this_thread::sleep_for(1ms);
-        }
-        while (io_ctx_.poll_one() > 0) {
-            io_ctx_.restart();
-        }
-        io_ctx_.restart();
-        return predicate();
+                    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+        return pump_until(std::move(predicate), timeout);
     }
 
     asio::io_context io_ctx_;
@@ -104,12 +105,28 @@ class TunnelCoalesceTest : public ::testing::Test {
 
 }  // namespace
 
+namespace {
+
+/// A coalesce delay that is actually honoured on every platform.
+///
+/// Windows cannot deliver a sub-tick timer, so the production code treats a
+/// sub-floor delay as "do not hold" (see kMinHonouredCoalesceDelayUs). Tests
+/// that assert *batching* must therefore ask for a delay the platform can keep,
+/// or they would be asserting behaviour the operator explicitly does not get
+/// there. Tests that assert the immediate path keep using 0.
+constexpr std::uint32_t kBatchingDelayUs =
+    toxtunnel::tunnel::kMinHonouredCoalesceDelayUs > 500
+        ? toxtunnel::tunnel::kMinHonouredCoalesceDelayUs + 400
+        : 500;
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // 1. Many small writes collapse into one frame on delay flush
 // ---------------------------------------------------------------------------
 
 TEST_F(TunnelCoalesceTest, CoalescesManyOneByteWritesIntoSingleFrame) {
-    tunnel_->configure_coalesce(/*max_delay_us=*/500, /*max_bytes=*/1362);
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
     for (uint8_t i = 0; i < 32; ++i) {
         ASSERT_TRUE(tunnel_->send_data_to_tox(std::vector<uint8_t>{i}));
@@ -118,7 +135,8 @@ TEST_F(TunnelCoalesceTest, CoalescesManyOneByteWritesIntoSingleFrame) {
     // Nothing should have been emitted yet — the delay timer hasn't fired.
     EXPECT_TRUE(captured_.data_payloads.empty());
 
-    run_for(20ms);
+    ASSERT_TRUE(pump_until([&] { return !captured_.data_payloads.empty(); }))
+        << "coalesce timer never flushed the buffered writes";
 
     ASSERT_EQ(captured_.data_payloads.size(), 1u);
     ASSERT_EQ(captured_.data_payloads[0].size(), 32u);
@@ -133,7 +151,7 @@ TEST_F(TunnelCoalesceTest, CoalescesManyOneByteWritesIntoSingleFrame) {
 
 TEST_F(TunnelCoalesceTest, ExactMtuWriteEmitsImmediatelyNoRemainder) {
     constexpr std::size_t kMtu = 1362;
-    tunnel_->configure_coalesce(500, kMtu);
+    tunnel_->configure_coalesce(kBatchingDelayUs, kMtu);
 
     std::vector<uint8_t> payload(kMtu);
     std::iota(payload.begin(), payload.end(), uint8_t{0});
@@ -145,7 +163,7 @@ TEST_F(TunnelCoalesceTest, ExactMtuWriteEmitsImmediatelyNoRemainder) {
     EXPECT_EQ(captured_.data_payloads[0].size(), kMtu);
 
     // Advancing time must NOT add a spurious empty/extra frame.
-    run_for(20ms);
+    pump_for(20ms);
     EXPECT_EQ(captured_.data_payloads.size(), 1u);
 }
 
@@ -155,7 +173,7 @@ TEST_F(TunnelCoalesceTest, ExactMtuWriteEmitsImmediatelyNoRemainder) {
 
 TEST_F(TunnelCoalesceTest, OversizedWriteSplitsIntoFullFramesPlusLeftover) {
     constexpr std::size_t kMtu = 100;
-    tunnel_->configure_coalesce(500, kMtu);
+    tunnel_->configure_coalesce(kBatchingDelayUs, kMtu);
 
     std::vector<uint8_t> payload(255);
     std::iota(payload.begin(), payload.end(), uint8_t{0});
@@ -168,7 +186,8 @@ TEST_F(TunnelCoalesceTest, OversizedWriteSplitsIntoFullFramesPlusLeftover) {
     EXPECT_EQ(captured_.data_payloads[0].size(), kMtu);
     EXPECT_EQ(captured_.data_payloads[1].size(), kMtu);
 
-    run_for(20ms);
+    ASSERT_TRUE(pump_until([&] { return captured_.data_payloads.size() >= 3u; }))
+        << "coalesce timer never flushed the sub-MTU remainder";
 
     ASSERT_EQ(captured_.data_payloads.size(), 3u);
     EXPECT_EQ(captured_.data_payloads[2].size(), 55u);
@@ -199,7 +218,7 @@ TEST_F(TunnelCoalesceTest, ZeroDelayEmitsEveryWriteImmediately) {
 
 TEST_F(TunnelCoalesceTest, OrderPreservedAcrossInterleavedWrites) {
     constexpr std::size_t kMtu = 64;
-    tunnel_->configure_coalesce(500, kMtu);
+    tunnel_->configure_coalesce(kBatchingDelayUs, kMtu);
 
     std::vector<uint8_t> expected;
     expected.reserve(1024);
@@ -227,7 +246,8 @@ TEST_F(TunnelCoalesceTest, OrderPreservedAcrossInterleavedWrites) {
         }
     }
 
-    run_for(20ms);
+    ASSERT_TRUE(pump_until([&] { return captured_.concatenated_data() == expected; }))
+        << "coalescer did not deliver every byte in order";
 
     EXPECT_EQ(captured_.concatenated_data(), expected);
     // Every frame except possibly the last must be exactly MTU-sized.
@@ -266,7 +286,7 @@ TEST_F(TunnelCoalesceTest, CloseFlushesPendingAccumulator) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TunnelCoalesceTest, ExplicitFlushIsIdempotent) {
-    tunnel_->configure_coalesce(500, 1362);
+    tunnel_->configure_coalesce(kBatchingDelayUs, 1362);
 
     ASSERT_TRUE(tunnel_->send_data_to_tox(std::vector<uint8_t>{42, 43, 44}));
     tunnel_->flush_pending_writes();
@@ -292,7 +312,7 @@ TEST_F(TunnelCoalesceTest, BackpressuredSendRetainsBytesUntilDrained) {
         captured_.record(wire);
         return true;
     });
-    tunnel_->configure_coalesce(/*max_delay_us=*/1000, /*max_bytes=*/1362);
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
     // 3 full MTUs + a sub-MTU remainder.
     std::vector<uint8_t> payload(3 * 1362 + 100);
@@ -301,7 +321,7 @@ TEST_F(TunnelCoalesceTest, BackpressuredSendRetainsBytesUntilDrained) {
 
     // Backpressured: nothing transmitted, but nothing dropped either — the
     // bytes are parked in the coalesce buffer and the retry timer is armed.
-    run_for(20ms);
+    pump_for(20ms);
     EXPECT_TRUE(captured_.data_payloads.empty());
 
     // Release backpressure; the retry timer must now drain everything, in
@@ -347,11 +367,16 @@ TEST_F(TunnelCoalesceTest, ImmediatePathPreservesOrderAcrossBackpressure) {
     ASSERT_TRUE(tunnel_->send_data_to_tox(second));
 
     // Drain the retry timer and assert strict first-then-second ordering.
-    run_for(20ms);
-
+    // Wait on the *bytes*, not the frame count: both writes are sub-MTU and the
+    // drain legitimately merges them into a single frame.
     std::vector<uint8_t> expected;
     expected.insert(expected.end(), first.begin(), first.end());
     expected.insert(expected.end(), second.begin(), second.end());
+
+    ASSERT_TRUE(pump_until([&] { return captured_.concatenated_data() == expected; }))
+        << "FIFO drain never emitted both parked writes in order; got "
+        << captured_.concatenated_data().size() << " of " << expected.size() << " bytes";
+
     EXPECT_EQ(captured_.concatenated_data(), expected);
 }
 
@@ -371,7 +396,7 @@ TEST_F(TunnelCoalesceTest, CloseDeferredUntilBackpressureDrains) {
         captured_.record(wire);
         return true;
     });
-    tunnel_->configure_coalesce(/*max_delay_us=*/1000, /*max_bytes=*/1362);
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
     std::vector<uint8_t> payload(2 * 1362 + 50);
     std::iota(payload.begin(), payload.end(), uint8_t{0});
@@ -379,7 +404,7 @@ TEST_F(TunnelCoalesceTest, CloseDeferredUntilBackpressureDrains) {
 
     // Close while the queue is backpressured: CLOSE must be withheld.
     tunnel_->close();
-    run_for(20ms);
+    pump_for(20ms);
     EXPECT_TRUE(captured_.all_frame_types.empty());
 
     // Release: the timer drains all DATA first, then emits the deferred CLOSE.
@@ -412,7 +437,7 @@ TEST_F(TunnelCoalesceTest, RemoteCloseWaitsForBackpressuredOutboundDrain) {
         captured_.record(wire);
         return true;
     });
-    tunnel_->configure_coalesce(/*max_delay_us=*/1000, /*max_bytes=*/1362);
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
     std::atomic<bool> close_notified{false};
     tunnel_->set_on_close([&]() { close_notified.store(true, std::memory_order_release); });
@@ -424,7 +449,7 @@ TEST_F(TunnelCoalesceTest, RemoteCloseWaitsForBackpressuredOutboundDrain) {
     // Simulate the peer closing while our outbound side is still stuck behind
     // a full Tox SENDQ. The close callback must be deferred, not fired now.
     tunnel_->handle_frame(ProtocolFrame::make_tunnel_close(tunnel_->tunnel_id()));
-    run_for(20ms);
+    pump_for(20ms);
 
     EXPECT_FALSE(close_notified.load(std::memory_order_acquire));
     EXPECT_TRUE(captured_.all_frame_types.empty());

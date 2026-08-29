@@ -68,7 +68,7 @@ rules:
         ports: [5000, 22, 445]
 ```
 
-Note: Replace with your actual 64-character hex public key from the client's toxtunnel startup log.
+Note: The `friend` value is the **first 64 hex characters** of the peer's 76-char Tox ID — not the whole ID. They get it from their own daemon's startup log line `Client Tox ID: <76 hex>`, or from `toxtunnel print-id -c client.yaml`. A wrong length is rejected when the rules file loads (`Invalid public key length: expected 64`), so the server refuses to start or hot-reload rather than silently denying.
 
 ## Steps
 

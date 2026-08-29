@@ -1,6 +1,8 @@
 #include "toxtunnel/tunnel/tunnel.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <limits>
 #include <utility>
 
@@ -15,6 +17,54 @@ namespace {
 // bytes for raw TCP payload per frame.
 constexpr std::size_t kMaxTcpPayloadPerToxFrame = 1367;
 constexpr auto kAckRetryDelay = std::chrono::milliseconds(1);
+
+/// Which of the two backpressure log statements a throttle bucket belongs to.
+/// Packed into the low half of the throttle key so the sites cannot share a
+/// budget; see `backpressure_log_throttle()`.
+enum class BackpressureSite : std::uint32_t {
+    /// Bypass/immediate path in `send_data_to_tox` — remainder buffered.
+    Immediate = 0,
+    /// Coalesce drain path in `coalesce_emit_front_locked` — bytes held.
+    CoalesceDrain = 1,
+};
+
+/// Shared rate limiter for the Tox-backpressure retry logs.
+///
+/// The coalesce retry timer re-arms at `tunnel.coalesce_max_delay_us` (200 us
+/// by default) with no backoff, so a stalled Tox link makes both backpressure
+/// sites fire up to ~5 kHz. Measured: 5218 lines / 37 MB from a single
+/// disconnect, which rolled three 5 MiB log files in under a minute and
+/// discarded exactly the pre-failure history needed to diagnose it.
+///
+/// KEY CHOICE — `(friend_number, site)`, NOT tunnel id:
+///
+///  * Not per tunnel, because the flood is an aggregate property of *one
+///    transport* being down: every tunnel on that friend stalls in the same
+///    instant, so a per-tunnel budget would just multiply the volume by the
+///    tunnel count (the pathology this throttle exists to stop). A tunnel id is
+///    also only unique within its friend's `TunnelManager`, so keying on it
+///    alone would merge genuinely different transports — two friends' tunnel 1
+///    — into one bucket while splitting one transport across many.
+///  * Per friend, because two friends stalling are two independent incidents,
+///    and with a single process-wide bucket the second one's onset was
+///    invisible: it landed in the first friend's `[+N suppressed]` tally. In a
+///    multi-server client (failover) that is exactly the comparison — is the
+///    fallback stalling too? — the line is being read for.
+///  * Per site, because the two statements report different states (remainder
+///    pushed into the coalesce buffer vs. bytes held at its front). Sharing one
+///    budget meant whichever fired first silenced the other for the whole
+///    second, so the log showed one path backpressured and said nothing about
+///    the other.
+///
+/// Volume stays bounded at one line per second per (friend, site) — two per
+/// stalled friend, against the ~5 kHz being defended — and 64 buckets caps it
+/// absolutely regardless of friend count. A collision degrades that pair to the
+/// old shared budget and never worse. Function-local `static` keeps the storage
+/// out of the Tunnel header (and out of every Tunnel instance).
+util::LogThrottle& backpressure_log_throttle(std::uint32_t friend_number, BackpressureSite site) {
+    static util::KeyedLogThrottle<64> throttle{std::chrono::seconds(1)};
+    return throttle.for_key(util::log_key(friend_number, static_cast<std::uint32_t>(site)));
+}
 
 }  // namespace
 
@@ -199,8 +249,7 @@ void TunnelImpl::close() {
     if (current == State::Connecting) {
         auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
         send_frame_to_tox(frame);
-        util::MetricsRegistry::instance().inc_tunnels_closed(
-            util::MetricsRegistry::CloseReason::Local);
+        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
         transition_state(State::Closed);
         notify_close_once();
         util::Logger::info("Tunnel {} closed during handshake", tunnel_id_);
@@ -248,8 +297,7 @@ void TunnelImpl::emit_close_and_transition() {
     if (should_send_close) {
         auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
         send_frame_to_tox(frame);
-        util::MetricsRegistry::instance().inc_tunnels_closed(
-            util::MetricsRegistry::CloseReason::Local);
+        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
     }
 
     // Transition to Disconnecting state
@@ -266,10 +314,44 @@ void TunnelImpl::emit_close_and_transition() {
     notify_close_once();
 }
 
+util::MetricsRegistry::CloseReason TunnelImpl::local_close_reason() const noexcept {
+    // A close driven by the idle reaper / half-close cap is a timeout, not an
+    // application-initiated close. Keeping them apart is the whole point of the
+    // `reason` label: an operator alerting on reaper activity was previously
+    // watching a label that could never be non-zero.
+    return timeout_close_.load(std::memory_order_acquire)
+               ? util::MetricsRegistry::CloseReason::Timeout
+               : util::MetricsRegistry::CloseReason::Local;
+}
+
+void TunnelImpl::close_for_timeout() {
+    timeout_close_.store(true, std::memory_order_release);
+
+    if (state() == State::Disconnecting) {
+        // The peer abandoned its side of the close handshake. Tell it plainly:
+        // TUNNEL_ERROR drives the peer's tunnel to Error and through its normal
+        // teardown (see handle_tunnel_error_frame), releasing its target fd.
+        auto frame = ProtocolFrame::make_tunnel_error(tunnel_id_, 3, "half-close linger timeout");
+        send_frame_to_tox(frame);
+        util::MetricsRegistry::instance().inc_tunnels_closed(
+            util::MetricsRegistry::CloseReason::Timeout);
+        transition_state(State::Closed);
+        util::Logger::info("Tunnel {} force-closed after half-close linger timeout; peer notified",
+                           tunnel_id_);
+        notify_close_once();
+        return;
+    }
+
+    // Any other reapable state: the ordinary close path is correct (it emits
+    // TUNNEL_CLOSE and drains buffered data first); only the accounting
+    // differs, which timeout_close_ takes care of.
+    close();
+}
+
 void TunnelImpl::emit_local_close_only() {
     auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
     send_frame_to_tox(frame);
-    util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Local);
+    util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
     transition_state(State::Disconnecting);
     util::Logger::info("Tunnel {} sent local half-close", tunnel_id_);
 }
@@ -357,7 +439,31 @@ void TunnelImpl::force_close() {
         return;
     }
 
-    flush_pending_writes();
+    // Local-abandon path: skip the flush once the outbound gate is closed.
+    //
+    // This is not an optimisation, it is deadlock avoidance. The coalesced
+    // data path calls its Tox send callback while holding `coalesce_mutex_`
+    // (see coalesce_emit_front_locked). `flush_pending_writes()` re-takes that
+    // same plain non-recursive mutex, so ANY route from inside a send callback
+    // back into force_close() self-deadlocks the thread.
+    //
+    // No production send callback does that today — all six (tunnel_server.cpp
+    // and tunnel_client.cpp) return a bool and defer teardown, and the
+    // disconnect handlers go through close_all(), posted, not from inside a
+    // send. The guard is here because the coupling is invisible at both call
+    // sites: nothing at the callback end hints that a close re-enters a mutex
+    // the caller already holds. Do not remove it on the grounds that the
+    // deadlock is currently unreachable.
+    //
+    // Skipping the flush costs nothing in that state: with the gate closed
+    // every emit is rejected, so the flush could only ever spin the buffer and
+    // return. The buffered bytes are being discarded either way — we are
+    // destroying the tunnel. When the gate is still open (an ordinary
+    // force_close, e.g. reaping a half-closed tunnel) the best-effort flush
+    // still runs, because there it can genuinely deliver.
+    if (!outbound_gate_closed()) {
+        flush_pending_writes();
+    }
 
     // Close TCP connection if any
     {
@@ -689,6 +795,12 @@ void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
         return;
     }
 
+    last_error_code_.store(payload->error_code, std::memory_order_release);
+    {
+        std::lock_guard lock(last_error_mutex_);
+        last_error_description_ = payload->description;
+    }
+
     // "Tunnel not found" is the peer's routine reply to frames that crossed
     // a close on the wire — one arrives per in-flight frame when a transfer
     // is aborted, so it flooded the log at error level. Log the first one
@@ -973,7 +1085,8 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
                     const auto remainder = data.subspan(offset);
                     coalesce_buf_.insert(coalesce_buf_.end(), remainder.begin(), remainder.end());
                     coalesce_arm_timer_locked();
-                    util::Logger::debug(
+                    util::Logger::debug_throttled(
+                        backpressure_log_throttle(friend_number_, BackpressureSite::Immediate),
                         "Tunnel {} Tox send backpressured; buffered {} bytes for retry", tunnel_id_,
                         remainder.size());
                     break;
@@ -1161,31 +1274,64 @@ void TunnelImpl::set_on_close(CloseCallback cb) {
 }
 
 // ===========================================================================
+// Outbound fence
+// ===========================================================================
+
+TunnelImpl::OutboundSnapshot::OutboundSnapshot(TunnelImpl& tunnel) {
+    std::lock_guard<std::mutex> lock(tunnel.mutex_);
+    // Relaxed is enough for the load: the store side is this very mutex.
+    if (tunnel.outbound_gate_closed_.load(std::memory_order_relaxed)) {
+        gate_closed_ = true;
+        return;
+    }
+    span_cb_ = tunnel.on_send_to_tox_;
+    owned_cb_ = tunnel.on_send_to_tox_owned_;
+}
+
+void TunnelImpl::close_outbound_gate() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    outbound_gate_closed_.store(true, std::memory_order_release);
+    // Belt and braces: drop the callbacks too, so any future code path that
+    // forgets to take an OutboundSnapshot still finds nothing to call. The gate
+    // — not this swap — is the authoritative check.
+    on_send_to_tox_ = nullptr;
+    on_send_to_tox_owned_ = nullptr;
+}
+
+// ===========================================================================
 // Internal helpers
 // ===========================================================================
 
 bool TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
-    SendToToxCallback cb;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        cb = on_send_to_tox_;
+    // The snapshot fuses "is the gate open?" with "copy the callback" into one
+    // critical section, so close_outbound_gate() can never slip between them.
+    OutboundSnapshot snapshot(*this);
+    if (snapshot.gate_closed()) {
+        // Report success: a false here would refund the send window and park
+        // the frame for a retry that keeps this tunnel alive. See
+        // close_outbound_gate().
+        return true;
     }
 
+    const auto& cb = snapshot.span_callback();
     if (!cb) {
         return false;
     }
     auto wire = frame.serialize();
+    // Called with NO lock held — the callback re-enters ToxAdapter and the
+    // manager. The gate tested at snapshot time (not a lock) is what bounds
+    // teardown: it stops later senders, not this one.
     return cb(std::span<const uint8_t>(wire.data(), wire.size()));
 }
 
 bool TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
-    SendOwnedToToxCallback owned_cb;
-    SendToToxCallback span_cb;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        owned_cb = on_send_to_tox_owned_;
-        span_cb = on_send_to_tox_;
+    OutboundSnapshot snapshot(*this);
+    if (snapshot.gate_closed()) {
+        return true;  // Discarded; see send_frame_to_tox().
     }
+
+    const auto& owned_cb = snapshot.owned_callback();
+    const auto& span_cb = snapshot.span_callback();
 
     if (owned_cb) {
         return owned_cb(std::move(buf));
@@ -1213,6 +1359,45 @@ void TunnelImpl::BumpActivity() noexcept {
 // Write-side coalescing
 // ===========================================================================
 
+namespace {
+
+/// Refuse to hold a write longer than the operator asked for.
+///
+/// `tunnel.coalesce_max_delay_us` is a promise: "batch small writes, but never
+/// sit on them for more than N microseconds". On Linux and macOS asio honours
+/// a 200 us steady_timer to within ~60 us. On Windows it cannot: the timer
+/// rides the system tick, and on a Windows 11 ARM64 VM a 200 us timer measured
+/// **68 ms mean / 139 ms worst** by default (~4 ms even with
+/// timeBeginPeriod(1)). Holding an SSH keystroke for 68 ms to save one frame
+/// inverts the trade the setting exists to make, and silently breaks the
+/// documented latency bound by two orders of magnitude.
+///
+/// So on Windows, a sub-tick delay is treated as 0 (emit immediately, the
+/// documented "disabled" behaviour) instead of being rounded *up* by the OS.
+/// Delays at or above the tick are honoured normally. Nothing changes on
+/// POSIX. Raising the system timer resolution process-wide (timeBeginPeriod)
+/// is deliberately not done: it is a global, power-consuming side effect, and
+/// even then the granularity would not reach the requested microseconds.
+[[nodiscard]] std::uint32_t clamp_coalesce_delay_to_platform(std::uint32_t max_delay_us) {
+#if defined(_WIN32)
+    constexpr std::uint32_t kWindowsTimerTickUs = kMinHonouredCoalesceDelayUs;
+    if (max_delay_us > 0 && max_delay_us < kWindowsTimerTickUs) {
+        static std::once_flag warned;
+        std::call_once(warned, [max_delay_us] {
+            util::Logger::warn(
+                "tunnel.coalesce_max_delay_us={} is below the Windows timer tick (~{} us); "
+                "small writes are emitted immediately instead of being held for tens of "
+                "milliseconds. Set a delay >= {} us to actually batch on this platform.",
+                max_delay_us, kWindowsTimerTickUs, kWindowsTimerTickUs);
+        });
+        return 0;
+    }
+#endif
+    return max_delay_us;
+}
+
+}  // namespace
+
 void TunnelImpl::configure_coalesce(std::uint32_t max_delay_us, std::uint32_t max_bytes) {
     // Clamp to the Tox-MTU ceiling so a single emitted frame always fits one
     // lossless custom packet.
@@ -1220,6 +1405,8 @@ void TunnelImpl::configure_coalesce(std::uint32_t max_delay_us, std::uint32_t ma
     if (clamped == 0 || clamped > kMaxTcpPayloadPerToxFrame) {
         clamped = static_cast<std::uint32_t>(kMaxTcpPayloadPerToxFrame);
     }
+
+    max_delay_us = clamp_coalesce_delay_to_platform(max_delay_us);
 
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
     coalesce_max_delay_us_ = max_delay_us;
@@ -1339,10 +1526,16 @@ bool TunnelImpl::coalesce_emit_front_locked(std::size_t bytes) {
         // transfer large/fast enough to outrun the Tox congestion window —
         // observed as a hard ~85-90 KiB cap with the remainder lost.)
         total_bytes_emitted_.fetch_sub(bytes, std::memory_order_release);
-        util::Logger::debug("Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_,
-                            bytes);
+        util::Logger::debug_throttled(
+            backpressure_log_throttle(friend_number_, BackpressureSite::CoalesceDrain),
+            "Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_, bytes);
         return false;
     }
+    // NOTE: deliberately no "backpressure cleared" line here. A half-full Tox
+    // SENDQ makes sends alternate fail/succeed at the retry cadence, so a
+    // recovery line on the success path would itself flood at kHz rates. The
+    // once-per-second throttled line above already reports the burst size via
+    // its `[+N suppressed in Mms]` suffix, and its absence marks the end.
     // Emitted successfully — the counter bumped above stands.
     // Consume via the offset (O(1)) instead of erase-from-front (O(n)). When
     // the buffer is fully drained, reset to reclaim it cheaply; otherwise the

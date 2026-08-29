@@ -9,6 +9,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "toxtunnel/app/inspect_server.hpp"
 #include "toxtunnel/app/rules_engine.hpp"
@@ -33,6 +34,64 @@ namespace toxtunnel::app {
                                                   uint64_t peer_send) noexcept {
     return local_send > peer_recv || peer_send > local_recv;
 }
+
+/// Pure decision helpers, extracted from TunnelServer so they can be unit
+/// tested without standing up a Tox stack. They are in `detail` to say plainly
+/// that they are an internal seam, not part of the server's API: nothing
+/// outside TunnelServer and its tests should call them, and their signatures
+/// may change with the implementation they describe.
+namespace detail {
+
+/// What a friend-`connected` callback must do with this friend's TunnelManager.
+enum class ConnectedManagerAction {
+    KeepExisting,  ///< A live manager is already installed — must NOT be replaced.
+    Resurrect,     ///< A manager is parked in held_managers_ (resume) — revive it.
+    CreateFresh,   ///< Nothing known about this friend — build a new manager.
+};
+
+/// Decide how to service a friend-`connected` event, given the state of the
+/// server's two manager maps.
+///
+/// toxcore does not guarantee that every `connected` transition is preceded by a
+/// matching `disconnected` one: after a long outage the friend-connection
+/// callback is observed jumping straight back to `connected`. The pre-fix server
+/// unconditionally assigned a freshly built manager into `managers_`, so such an
+/// unpaired event destroyed the still-live manager — and with it every open
+/// tunnel and every target TCP connection — with no log above debug level. The
+/// client's subsequent TUNNEL_RESUME_REQUEST then met "no held tunnel; declined".
+///
+/// Keeping the live manager is always the correct answer: its tunnels and target
+/// sockets are intact, its send handler captured the (stable) friend_number, and
+/// `handle_resume_request` resolves against `managers_` — so resume works
+/// through this branch exactly as it does through a resurrection.
+///
+/// Pure — extracted for unit testing (see tunnel_resume_test.cpp).
+[[nodiscard]] inline ConnectedManagerAction classify_connected_event(bool live_manager_present,
+                                                                     bool held_manager_present,
+                                                                     bool resume_enabled) noexcept {
+    if (live_manager_present) {
+        return ConnectedManagerAction::KeepExisting;
+    }
+    if (resume_enabled && held_manager_present) {
+        return ConnectedManagerAction::Resurrect;
+    }
+    return ConnectedManagerAction::CreateFresh;
+}
+
+/// Compute which rules-file public keys still need to be added to the Tox friend
+/// list, given the keys already present in it.
+///
+/// Both inputs are hex public keys in any case; the result is canonical
+/// uppercase, de-duplicated, and contains only well-formed 64-char keys. Keys
+/// already in @p existing_friend_public_keys are omitted, which is what makes
+/// the caller idempotent across repeated startups and hot reloads.
+///
+/// Pure — extracted for unit testing (see test_tunnel_manager.cpp).
+[[nodiscard]] std::vector<std::string> friend_keys_to_preseed(
+    const std::vector<std::string>& rule_public_keys,
+    const std::vector<std::string>& existing_friend_public_keys);
+
+}  // namespace detail
 
 /// Server application that accepts Tox friend connections and tunnels
 /// their traffic to local TCP targets based on access control rules.
@@ -144,7 +203,13 @@ class TunnelServer {
     /// RateLimiter::kAbsoluteTunnelCap). MUST be called without managers_mutex_
     /// held: it resolves the friend pk via the Tox thread, which itself takes
     /// managers_mutex_ on the inbound path.
-    void apply_tunnel_cap(tunnel::TunnelManager& manager, uint32_t friend_number);
+    /// `pk_hex` lets a caller that already has the friend's public key hand it
+    /// in. Resolving it here marshals to the Tox thread and blocks until its
+    /// next tick, which is fine on the reload path but not on the lifecycle
+    /// strand — that strand also carries inbound frames, so a blocked handler
+    /// stalls data, not just the connect event.
+    void apply_tunnel_cap(tunnel::TunnelManager& manager, uint32_t friend_number,
+                          std::string_view pk_hex = {});
 
     /// Re-apply per-friend `rate_limit.max_concurrent_tunnels` to every live and
     /// held TunnelManager, so a hot-reloaded rules_file takes effect immediately
@@ -152,12 +217,42 @@ class TunnelServer {
     /// cap to fresh and resurrected managers; this covers the already-connected ones.
     void reapply_tunnel_caps();
 
+    /// Add every public key named in the access rules to the Tox friend list
+    /// (`tox_friend_add_norequest`), skipping the ones already there.
+    ///
+    /// Without this, `on_friend_request()` is the server's ONLY path into the
+    /// friend list, and it refuses any key that is not yet in rules.yaml. That
+    /// makes the most common first-run ordering mistake — start the client, then
+    /// add its key to rules.yaml — stick: the client has already persisted the
+    /// server in its own `tox_save.dat`, so toxcore never re-sends the friend
+    /// request, and no amount of reloading or restarting on either side
+    /// produces one. It is recoverable only by intervening on the *client*
+    /// (delete its saved friendship, or its whole identity, so a fresh request
+    /// is sent) — which is not something the server operator can do or would
+    /// guess. Pre-seeding closes the hole by treating rules.yaml as the
+    /// authoritative allowlist in both directions.
+    ///
+    /// Called at the end of `initialize()` and after every successful
+    /// `reload()`. Idempotent: an already-present key is skipped, so no
+    /// duplicate-add error is logged and no redundant `tox_save.dat` write
+    /// happens. Removing a key from rules.yaml deliberately does NOT remove the
+    /// friend — see the implementation comment.
+    ///
+    /// Thread-safe: `ToxAdapter::get_friend_info_list()` and
+    /// `add_friend_norequest()` both marshal onto the Tox thread themselves
+    /// (`run_on_tox_thread`), so this may be called from the main/signal thread.
+    /// MUST be called with no lock on `rules_mutex_` held — it blocks on the Tox
+    /// thread, which takes that lock on the inbound-frame path.
+    void preseed_friends_from_rules();
+
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------
 
     /// Set up a TunnelManager for a newly connected friend.
-    void setup_tunnel_manager(uint32_t friend_number);
+    /// `pk_hex` is threaded through from on_friend_connection(), which resolves
+    /// it cheaply on the Tox thread; see apply_tunnel_cap().
+    void setup_tunnel_manager(uint32_t friend_number, std::string_view pk_hex = {});
 
     /// Tear down the TunnelManager for a disconnected friend.
     void teardown_tunnel_manager(uint32_t friend_number);

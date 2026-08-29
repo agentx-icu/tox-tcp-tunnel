@@ -1,8 +1,12 @@
 #include "toxtunnel/app/tunnel_server.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <shared_mutex>
 #include <span>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
 
 #include "toxtunnel/app/rate_limiter.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
@@ -16,6 +20,54 @@
 namespace toxtunnel::app {
 
 using tunnel::kLosslessPacketByte;
+
+namespace {
+
+/// Canonicalise a hex public key to the uppercase form used everywhere else
+/// (RulesEngine canonicalises on load; `tox::bytes_to_hex` emits uppercase).
+std::string canonical_pk(std::string_view pk) {
+    std::string out;
+    out.reserve(pk.size());
+    for (char c : pk) {
+        out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+}  // namespace
+
+namespace detail {
+
+std::vector<std::string> friend_keys_to_preseed(
+    const std::vector<std::string>& rule_public_keys,
+    const std::vector<std::string>& existing_friend_public_keys) {
+    // Seeded with the keys already in the friend list; from then on it doubles
+    // as the de-dup set, so a key listed twice in rules.yaml is emitted once.
+    std::unordered_set<std::string> seen;
+    seen.reserve(existing_friend_public_keys.size() + rule_public_keys.size());
+    for (const auto& pk : existing_friend_public_keys) {
+        seen.insert(canonical_pk(pk));
+    }
+
+    std::vector<std::string> missing;
+    for (const auto& pk : rule_public_keys) {
+        auto key = canonical_pk(pk);
+        // RulesEngine::from_file already rejects malformed keys, but a
+        // programmatically-assembled engine can still carry one and
+        // tox_friend_add_norequest would read a short buffer. Filter here so the
+        // caller can convert every returned key unconditionally.
+        if (!tox::parse_public_key(key)) {
+            continue;
+        }
+        if (!seen.insert(key).second) {
+            continue;
+        }
+        missing.push_back(std::move(key));
+    }
+    return missing;
+}
+
+}  // namespace detail
 
 // ---------------------------------------------------------------------------
 // Construction / Destruction
@@ -131,6 +183,12 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
 
     tox_adapter_->set_on_self_connection([this](bool connected) { on_self_connection(connected); });
 
+    // Populate the friend list from the rules allowlist before the iterate
+    // thread starts. Safe here: the Tox instance is initialized but
+    // `ToxAdapter::running_` is still false, so run_on_tox_thread() executes
+    // inline on this thread.
+    preseed_friends_from_rules();
+
     util::Logger::info("TunnelServer initialized successfully");
     return {};
 }
@@ -165,8 +223,16 @@ void TunnelServer::start() {
         watchdog_->set_data_dir(config_.data_dir);
         tox_adapter_->set_watchdog(watchdog_.get());
         watchdog_->start(io_context_->get_io_context());
-        util::Logger::info("Tox-thread watchdog enabled (deadline={}s)",
-                           config_.watchdog.deadline_seconds);
+        // Report the deadline the watchdog ACTUALLY runs with: configure()
+        // clamps anything under 5 s, and printing the raw config value made
+        // `deadline_seconds: 0` look like it had taken effect.
+        const auto effective_deadline = watchdog_->deadline().count();
+        if (static_cast<std::int64_t>(config_.watchdog.deadline_seconds) != effective_deadline) {
+            util::Logger::warn("watchdog.deadline_seconds={} is below the {}s minimum; using {}s",
+                               config_.watchdog.deadline_seconds, effective_deadline,
+                               effective_deadline);
+        }
+        util::Logger::info("Tox-thread watchdog enabled (deadline={}s)", effective_deadline);
     }
 
     // Start ToxAdapter iteration thread.
@@ -339,6 +405,12 @@ util::Expected<void, std::string> TunnelServer::reload(const Config& new_config)
     // push the new values onto already-connected managers too — not just fresh
     // ones via setup_tunnel_manager().
     reapply_tunnel_caps();
+    // Keys added to rules.yaml by this reload must reach the Tox friend list
+    // now: a client that already knows this server will never re-send a friend
+    // request, so `on_friend_request` cannot pick them up later. Runs after the
+    // rules_mutex_ writer lock above has been released — this call blocks on the
+    // Tox thread, which takes rules_mutex_ on the inbound path.
+    preseed_friends_from_rules();
 
     if (config_.logging.level != new_config.logging.level) {
         util::Logger::set_level(new_config.logging.level);
@@ -398,19 +470,46 @@ void TunnelServer::on_friend_request(const tox::PublicKeyArray& public_key,
 }
 
 void TunnelServer::on_friend_connection(uint32_t friend_number, bool connected) {
+    // Fires on the Tox iterate thread. Every friend-lifecycle transition is
+    // funnelled onto inbound_strand_ instead of running here, for two reasons:
+    //
+    //  1. Serialisation. setup/teardown classify state under managers_mutex_
+    //     and then act after releasing it. Locking the maps is not enough on
+    //     its own: two transitions for the same friend could interleave between
+    //     classification and action (a `connected` deciding KeepExisting while a
+    //     queued keepalive teardown moves that very manager to the held map, so
+    //     the connected path returns leaving no live manager). On one strand the
+    //     transitions cannot overlap at all, so the decision a transition made
+    //     is still true when it acts.
+    //  2. Mutual exclusion with inbound frames. RESUME_REQUEST handling runs on
+    //     this same strand, so a resume can no longer land halfway through a
+    //     teardown and be told there is no held tunnel while one is being
+    //     installed.
+    //
+    // Ordering is preserved: toxcore delivers per-friend events in order and a
+    // strand runs posted work in post order.
+    // Resolve the public key HERE, on the Tox thread, where
+    // ToxAdapter::run_on_tox_thread() detects the same-thread case and runs the
+    // lookup inline. Doing it inside the strand handler instead would marshal
+    // back to the Tox thread and BLOCK until its next tick (up to one
+    // tox_iteration_interval, ~50 ms) — and because this strand also carries
+    // inbound frame handling, that stall would apply to data, not just to the
+    // connect event. Cheap here, expensive there.
     auto pk_hex = get_friend_pk_hex(friend_number);
 
-    if (connected) {
-        util::Logger::info("Friend {} (pk={}) connected", friend_number, pk_hex);
-        setup_tunnel_manager(friend_number);
-    } else {
-        util::Logger::info("Friend {} (pk={}) disconnected", friend_number, pk_hex);
-        teardown_tunnel_manager(friend_number);
-    }
-    // Recompute from the canonical source (managers_ map) so churn during
-    // a Tox reconnect can't drift the gauge.
-    std::lock_guard lock(managers_mutex_);
-    util::MetricsRegistry::instance().set_friends_online(managers_.size());
+    asio::post(*inbound_strand_, [this, friend_number, connected, pk_hex = std::move(pk_hex)]() {
+        if (connected) {
+            util::Logger::info("Friend {} (pk={}) connected", friend_number, pk_hex);
+            setup_tunnel_manager(friend_number, pk_hex);
+        } else {
+            util::Logger::info("Friend {} (pk={}) disconnected", friend_number, pk_hex);
+            teardown_tunnel_manager(friend_number);
+        }
+        // Recompute from the canonical source (managers_ map) so churn during
+        // a Tox reconnect can't drift the gauge.
+        std::lock_guard lock(managers_mutex_);
+        util::MetricsRegistry::instance().set_friends_online(managers_.size());
+    });
 }
 
 void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* data,
@@ -507,22 +606,107 @@ void TunnelServer::on_self_connection(bool connected) {
 void TunnelServer::sync_rate_limiter() {
     auto& limiter = rate_limiter_instance();
     std::shared_lock rules_lock(rules_mutex_);
-    // Wipe all prior per-friend specs and bucket state. Without this, a
-    // friend that was present in the old rules but removed from the new
-    // ones would silently retain its old token bucket and continue to be
-    // limited (or unlimited) per the stale spec. Re-applying defaults +
-    // per-friend overrides below rebuilds the table from scratch.
-    limiter.clear_all_friend_specs();
-    limiter.set_default_spec(rules_engine_.rate_limit_defaults());
+    // A rules reload is ONE logical transition, so it must be published as one.
+    // Expressed as clear_all_friend_specs() + set_default_spec() + N x
+    // set_friend_spec(), each call took the limiter's mutex on its own and
+    // published a half-applied generation in between: a TUNNEL_OPEN landing in
+    // one of those gaps was judged against the new defaults with the
+    // per-friend specs still missing, and could be admitted or rejected against
+    // limits no rules file ever described. replace_all() does the whole swap
+    // under a single lock hold, so a concurrent consumer observes either the
+    // entire old generation or the entire new one.
+    //
+    // Semantics are unchanged: every bucket is still destroyed, so a friend
+    // dropped from the new rules cannot retain a stale bucket, and each
+    // surviving friend restarts from a full burst with zeroed rejection
+    // counters (documented in docs/CONFIGURATION.md).
+    std::vector<RateLimiter::FriendOverride> overrides;
+    overrides.reserve(rules_engine_.rules().size());
     for (const auto& rule : rules_engine_.rules()) {
         if (!rule.rate_limit.empty()) {
-            limiter.set_friend_spec(rule.friend_pk, rule.rate_limit);
+            overrides.emplace_back(rule.friend_pk, rule.rate_limit);
         }
     }
+    limiter.replace_all(rules_engine_.rate_limit_defaults(), overrides);
 }
 
-void TunnelServer::apply_tunnel_cap(tunnel::TunnelManager& manager, uint32_t friend_number) {
-    const auto spec = rate_limiter_instance().effective_spec(get_friend_pk_hex(friend_number));
+void TunnelServer::preseed_friends_from_rules() {
+    if (!tox_adapter_) {
+        return;
+    }
+
+    // Snapshot the rule keys and RELEASE rules_mutex_ before touching the Tox
+    // adapter: every call below blocks on the Tox thread, and the Tox thread
+    // takes rules_mutex_ itself (on_friend_request / handle_tunnel_open).
+    std::vector<std::string> rule_pks;
+    {
+        std::shared_lock rules_lock(rules_mutex_);
+        rule_pks.reserve(rules_engine_.rules().size());
+        for (const auto& rule : rules_engine_.rules()) {
+            rule_pks.push_back(rule.friend_pk);
+        }
+    }
+    if (rule_pks.empty()) {
+        return;
+    }
+
+    // One marshaled round trip for the whole friend list, rather than a
+    // friend_by_public_key() hop per rule.
+    std::vector<std::string> existing;
+    const auto friends = tox_adapter_->get_friend_info_list();
+    existing.reserve(friends.size());
+    for (const auto& info : friends) {
+        existing.push_back(tox::bytes_to_hex(info.public_key.data(), info.public_key.size()));
+    }
+
+    // NOTE (deliberate asymmetry): keys REMOVED from rules.yaml are not removed
+    // from the friend list. Deleting a friend is a strictly more destructive act
+    // than the access decision that motivated it: it drops any live tunnels and
+    // the transport relationship for what is usually a reversible administrative
+    // edit. Meanwhile a stale friend entry grants nothing — the rules engine
+    // default-denies every TUNNEL_OPEN from an unlisted key, and the rate
+    // limiter drops its per-friend spec on reload — so the only cost is a
+    // friend-list slot.
+    //
+    // (To be precise about the mechanics: `tox_friend_delete` does NOT notify
+    // the peer, so deletion is recoverable — restoring the rule would re-add
+    // this side and the link can re-form without a new friend request. The
+    // reason to avoid it is the disruption, not irreversibility.) Operators who
+    // want a friend gone can stop the daemon and remove it explicitly.
+    const auto missing = detail::friend_keys_to_preseed(rule_pks, existing);
+    if (missing.empty()) {
+        util::Logger::debug("Friend pre-seed: all {} rule key(s) already in the friend list",
+                            rule_pks.size());
+        return;
+    }
+
+    std::size_t added = 0;
+    for (const auto& pk_hex : missing) {
+        auto parsed = tox::parse_public_key(pk_hex);
+        if (!parsed) {
+            continue;  // filtered by friend_keys_to_preseed; belt and braces
+        }
+        auto result = tox_adapter_->add_friend_norequest(parsed.value());
+        if (result) {
+            ++added;
+            util::Logger::info("Pre-seeded friend {} from rules (friend_number={})", pk_hex,
+                               result.value());
+        } else {
+            // Not fatal: the peer can still reach us if it ever does send a
+            // friend request, and every other rule key is unaffected.
+            util::Logger::warn("Could not pre-seed friend {} from rules: {}", pk_hex,
+                               result.error());
+        }
+    }
+    util::Logger::info("Friend pre-seed: added {} of {} missing key(s) ({} rule key(s) total)",
+                       added, missing.size(), rule_pks.size());
+}
+
+void TunnelServer::apply_tunnel_cap(tunnel::TunnelManager& manager, uint32_t friend_number,
+                                    std::string_view pk_hex) {
+    const std::string resolved =
+        pk_hex.empty() ? get_friend_pk_hex(friend_number) : std::string(pk_hex);
+    const auto spec = rate_limiter_instance().effective_spec(resolved);
     // 0 => reset to the manager's default ceiling (100) so a removed limit is
     // honoured; otherwise clamp to the absolute safety cap.
     const std::size_t cap =
@@ -576,16 +760,48 @@ void TunnelServer::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
+void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view pk_hex) {
+    // Classify the event against both maps under one lock so the decision and
+    // the state it was taken on cannot drift apart.
+    detail::ConnectedManagerAction action;
+    {
+        std::lock_guard lock(managers_mutex_);
+        action = detail::classify_connected_event(managers_.contains(friend_number),
+                                                  held_managers_.contains(friend_number),
+                                                  config_.tunnel.resume.enabled);
+    }
+
+    if (action == detail::ConnectedManagerAction::KeepExisting) {
+        // toxcore delivered `connected` without a preceding `disconnected` (seen
+        // after long outages). Overwriting managers_[friend] here — what this
+        // function used to do unconditionally — silently destroyed the live
+        // manager along with every open tunnel and its target TCP connection,
+        // and left the peer's later RESUME_REQUEST to be declined with "no held
+        // tunnel". Keep what we have: those tunnels are still usable and
+        // handle_resume_request() finds them in managers_ just as it would find
+        // a resurrected manager. Warn, because an unpaired event also means the
+        // idle/half-close reapers have been running against a peer that was in
+        // fact away, so some tunnels may be reaped shortly.
+        util::Logger::warn(
+            "Friend {} reported connected while its tunnel manager is still live "
+            "(no matching disconnected event); keeping the existing manager and its tunnels",
+            friend_number);
+        return;
+    }
+
     // H-07: if this friend's previous manager is being held across a brief
     // disconnect (resume), resurrect it instead of building a fresh one. Its
     // tunnels + target TCP connections are intact and the send handler captures
     // the (stable) friend_number, so a subsequent RESUME_REQUEST can reattach
     // each tunnel and continue the stream.
-    if (config_.tunnel.resume.enabled) {
+    if (action == detail::ConnectedManagerAction::Resurrect) {
         std::shared_ptr<tunnel::TunnelManager> resurrected;
         {
             std::lock_guard lock(managers_mutex_);
+            // Re-look-up rather than trusting the classification: the lock was
+            // released in between, and teardown_tunnel_manager() can run
+            // concurrently on the IO pool (posted by the keepalive peer-dead
+            // handler). A vanished hold simply falls through to a fresh manager.
             auto held = held_managers_.find(friend_number);
             if (held != held_managers_.end()) {
                 if (held->second.prune_timer) {
@@ -599,7 +815,10 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
             // Re-arm keepalive (it was paused while held).
             if (config_.tunnel.keepalive_enabled()) {
                 resurrected->set_on_peer_dead([this, friend_number]() {
-                    asio::post(io_context_->get_io_context(),
+                    // Onto the lifecycle strand, not the raw pool: see
+                    // on_friend_connection() for why every transition is
+                    // serialised.
+                    asio::post(*inbound_strand_,
                                [this, friend_number]() { teardown_tunnel_manager(friend_number); });
                 });
                 resurrected->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
@@ -613,11 +832,33 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
             // manager re-enters managers_. During this handoff it is in neither
             // managers_ nor held_managers_, so a concurrent reapply_tunnel_caps()
             // would miss it; applying here guarantees it carries the current cap.
-            apply_tunnel_cap(*resurrected, friend_number);
-            std::lock_guard lock(managers_mutex_);
-            managers_[friend_number] = std::move(resurrected);
-            util::Logger::info("Resurrected held tunnel manager for friend {} (resume)",
-                               friend_number);
+            apply_tunnel_cap(*resurrected, friend_number, pk_hex);
+            bool installed = false;
+            {
+                std::lock_guard lock(managers_mutex_);
+                // try_emplace, not operator[]: a live manager installed while we
+                // were outside the lock must win over this resurrection, because
+                // it is the one the peer is actually talking to.
+                installed = managers_.try_emplace(friend_number, resurrected).second;
+            }
+            if (installed) {
+                util::Logger::info("Resurrected held tunnel manager for friend {} (resume)",
+                                   friend_number);
+            } else {
+                util::Logger::error(
+                    "Friend {} gained a live tunnel manager mid-resurrection; discarding the "
+                    "held one",
+                    friend_number);
+                // Release the loser's local state OUTSIDE managers_mutex_ (close
+                // paths re-enter it). Its tunnel ids belong to a session the peer
+                // has abandoned, and ids are recycled per friend, so a
+                // TUNNEL_CLOSE from here could close the winner's
+                // identically-numbered tunnel instead. close_all_local() emits no
+                // teardown frame of its own and authorises no further send; it
+                // does not retract a send some other thread authorised just
+                // before the gate closed (see TunnelManager::close_all_local()).
+                resurrected->close_all_local();
+            }
             return;
         }
     }
@@ -629,7 +870,7 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
     // gate (checked by handle_incoming_open / add_tunnel). It was parsed into
     // RateLimitSpec but never applied anywhere. Done before managers_mutex_ is
     // taken below (apply_tunnel_cap marshals to the Tox thread).
-    apply_tunnel_cap(*manager, friend_number);
+    apply_tunnel_cap(*manager, friend_number, pk_hex);
 
     // Set up the send handler: serialize frame, prepend lossless packet byte,
     // send via ToxAdapter.
@@ -673,7 +914,8 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
         manager->set_on_peer_dead([this, friend_number]() {
             util::Logger::warn("Friend {} unresponsive (keepalive); tearing down its tunnels",
                                friend_number);
-            asio::post(io_context_->get_io_context(),
+            // Lifecycle strand, not the raw pool — see on_friend_connection().
+            asio::post(*inbound_strand_,
                        [this, friend_number]() { teardown_tunnel_manager(friend_number); });
         });
         manager->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
@@ -688,11 +930,47 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number) {
                                       config_.tunnel.reaper_tick_seconds);
 
     std::lock_guard lock(managers_mutex_);
-    managers_[friend_number] = std::move(manager);
+    // try_emplace, not operator[]: same no-clobber rule as the resurrection path
+    // above. try_emplace leaves `manager` untouched when the key already exists,
+    // so the loser is this freshly built (and still empty) manager, never the
+    // live one holding the peer's tunnels.
+    if (!managers_.try_emplace(friend_number, std::move(manager)).second) {
+        util::Logger::warn(
+            "Friend {} already had a live tunnel manager when a fresh one was built; "
+            "keeping the existing one",
+            friend_number);
+    }
 }
 
 void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {
+    // The live -> held transition must be ATOMIC with respect to
+    // setup_tunnel_manager(). Doing the erase in one critical section and the
+    // hold insertion in a later one leaves a window in which the friend appears
+    // in NEITHER map; a `connected` event landing there classifies as
+    // CreateFresh, and the subsequent hold insertion then produces a live
+    // manager AND a held one for the same friend. Every RESUME_REQUEST would
+    // route to the fresh manager and decline the tunnels that were, in fact,
+    // still being held. So: build the timer first (allocation only), then do
+    // the whole decision inside one lock.
+    //
+    // Everything called under the lock is deliberately non-reentrant with
+    // respect to managers_mutex_: TunnelManager::empty() takes only its own
+    // shared_lock, and disable_keepalive()/disable_reaper() only cancel asio
+    // timers (cancel posts, it does not run handlers inline). The heavyweight
+    // work — close_all(), arming the prune timer, logging — stays outside, per
+    // the H-01 discipline.
+    // Build AND arm the prune timer before it can become visible in
+    // held_managers_. Publishing an unarmed timer and calling expires_after()
+    // afterwards leaves a window in which a resurrection cancels a timer that
+    // has no deadline yet — the cancel is a no-op and the subsequent arming
+    // then schedules a prune for a manager that is live again. expires_after()
+    // on a timer with no pending wait is harmless, and async_wait() is attached
+    // below only on the path that actually holds.
+    auto timer = std::make_shared<asio::steady_timer>(io_context_->get_io_context());
+    timer->expires_after(std::chrono::seconds(config_.tunnel.resume.max_age_seconds));
+
     std::shared_ptr<tunnel::TunnelManager> mgr;
+    bool held = false;
     {
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
@@ -700,62 +978,63 @@ void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {
             return;
         }
         mgr = it->second;
+
+        // Stop background maintenance while still holding the lock, so a
+        // resurrection cannot re-arm it and then have us disable it again on a
+        // manager that is live once more. Re-armed on resurrection; harmless on
+        // the close path. (A reap pass already in flight can still finish, but
+        // it only reaps tunnels already idle past the cap — which is exactly
+        // what the cap is for, so the residual is benign.)
+        mgr->disable_keepalive();
+        mgr->disable_reaper();
+
+        // H-07: if resume is enabled and this manager still has live tunnels,
+        // hold it (and its target TCP connections) for up to
+        // resume.max_age_seconds so a quick reconnect can reattach.
+        held = config_.tunnel.resume.enabled && !mgr->empty();
+        if (held) {
+            held_managers_[friend_number] = HeldManager{mgr, timer};
+        }
+        // Erase LAST: until this line the friend is still visible as live, and
+        // after it the hold (if any) is already visible. There is no gap.
         managers_.erase(it);
     }
 
-    // This manager is leaving the active set (held for resume, or closed below).
-    // Stop its background maintenance immediately, BEFORE the hold/close branch.
-    // The io_context is a thread pool, so a reaper tick on another thread could
-    // otherwise race in during hold setup and force-close a Disconnecting tunnel
-    // that resume wants to preserve. Re-armed on resurrection; harmless on the
-    // close path. (A reap pass already in flight when we get here can still
-    // finish, but it only reaps tunnels already idle past the cap — which is
-    // exactly what the cap is for, so the residual is benign.)
-    mgr->disable_keepalive();  // re-armed on resurrection
-    mgr->disable_reaper();     // re-armed on resurrection
-
-    // H-07: if resume is enabled and this manager still has live tunnels, hold
-    // it (and its target TCP connections) for up to resume.max_age_seconds so a
-    // quick reconnect can reattach. Otherwise close immediately. close_all and
-    // the hold bookkeeping run outside managers_mutex_ (H-01 discipline).
-    if (config_.tunnel.resume.enabled && !mgr->empty()) {
-        auto timer = std::make_shared<asio::steady_timer>(io_context_->get_io_context());
-        timer->expires_after(std::chrono::seconds(config_.tunnel.resume.max_age_seconds));
-        {
-            std::lock_guard lock(managers_mutex_);
-            held_managers_[friend_number] = HeldManager{mgr, timer};
-        }
+    if (held) {
         util::Logger::info("Holding tunnel manager for friend {} for resume (up to {}s)",
                            friend_number, config_.tunnel.resume.max_age_seconds);
         std::weak_ptr<asio::steady_timer> weak_timer = timer;
-        timer->async_wait([this, friend_number, weak_timer](const asio::error_code& ec) {
-            if (ec) {
-                return;  // cancelled — the friend reconnected and we resurrected it
-            }
-            std::shared_ptr<tunnel::TunnelManager> expired;
-            {
-                std::lock_guard lock(managers_mutex_);
-                auto h = held_managers_.find(friend_number);
-                if (h == held_managers_.end()) {
-                    return;
+        // Completion runs on the lifecycle strand so pruning cannot interleave
+        // with a setup/teardown for the same friend (see on_friend_connection).
+        timer->async_wait(asio::bind_executor(
+            *inbound_strand_, [this, friend_number, weak_timer](const asio::error_code& ec) {
+                if (ec) {
+                    return;  // cancelled — the friend reconnected and we resurrected it
                 }
-                // Generation guard: a cancel() that loses the race against an
-                // already-queued completion would otherwise let THIS stale
-                // handler evict a *newer* held manager (reconnect→disconnect
-                // installed a fresh hold under the same friend_number). Only act
-                // if the held entry is still the one this timer belongs to.
-                if (h->second.prune_timer != weak_timer.lock()) {
-                    return;
+                std::shared_ptr<tunnel::TunnelManager> expired;
+                {
+                    std::lock_guard lock(managers_mutex_);
+                    auto h = held_managers_.find(friend_number);
+                    if (h == held_managers_.end()) {
+                        return;
+                    }
+                    // Generation guard: a cancel() that loses the race against an
+                    // already-queued completion would otherwise let THIS stale
+                    // handler evict a *newer* held manager (reconnect→disconnect
+                    // installed a fresh hold under the same friend_number). Only act
+                    // if the held entry is still the one this timer belongs to.
+                    if (h->second.prune_timer != weak_timer.lock()) {
+                        return;
+                    }
+                    expired = std::move(h->second.manager);
+                    held_managers_.erase(h);
                 }
-                expired = std::move(h->second.manager);
-                held_managers_.erase(h);
-            }
-            if (expired) {
-                util::Logger::info("Resume hold expired for friend {}; closing held tunnels",
-                                   friend_number);
-                expired->close_all();
-            }
-        });
+                if (expired) {
+                    util::Logger::info("Resume hold expired for friend {}; closing held tunnels",
+                                       friend_number);
+                    expired->close_all();
+                }
+            }));
     } else {
         mgr->close_all();
     }

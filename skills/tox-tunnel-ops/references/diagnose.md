@@ -22,8 +22,11 @@ toxtunnel inspect status --json | jq .
 toxtunnel inspect tunnels
 ```
 
-Look for: `pid`, `version`, `mode`, `friends_online`, `active_server` (client),
-`tunnels_active`. Empty / missing fields point at the failing layer.
+Look for: `mode`, `version`, `friends_online`, `peer_online_seconds` (client),
+`tunnels_active`, `bytes_in`, `bytes_out` — that is the complete field set.
+`friends_online: 0` points at Layer 4; friends online with no tunnels points at
+Layer 5. (There is no `active_server`, `pid` or `uptime` field, and `inspect`
+takes only `tunnels` / `status`.)
 
 ### Layer 2: Configuration Static Check
 
@@ -64,10 +67,16 @@ Report risk level: LOW / MEDIUM / HIGH.
   - If `bootstrap_mode: auto`, internet is required for DHT bootstrap
 - Is UDP blocked?
 - Is `tox.tcp_port` (default `33445`) available?
-- Check logs for:
-  - `Connected to DHT`
-  - `Self connection status: Online`
-  - `Friend connection status: Connected`
+- Check logs for (exact strings the daemon emits):
+  - `Connected to Tox DHT` / `Self connection status: connected (UDP|TCP)`
+  - client: `Server friend N is now online` (and `Still trying to reach server …; offline for Ns` while it is not)
+  - server: `Friend N (pk=…) connected`, `Accepted friend request from …`, or
+    `Refused friend request from …: no rule entry` when the client's PK is missing from rules
+  - server (startup **and** every reload): `Pre-seeded friend <PK> from rules
+    (friend_number=N)` / `Friend pre-seed: added X of Y missing key(s)`. Every PK in
+    `rules.yaml` is pushed into the Tox friend list directly, so a client whose key was
+    added *after* it first tried to connect no longer needs a friend request it can never
+    re-send — see "client can never connect after being refused once" below
 
 ### Layer 5: Port & Tunnel Connectivity
 
@@ -85,7 +94,7 @@ These layers only apply when the corresponding feature is enabled.
 **Hot-reload didn't apply:**
 - Grep the daemon log for `config reloaded` (success) or `reload failed:` / `reload rejected:` (parse / validation error)
 - If neither appears, the SIGHUP / pipe message never reached the daemon — check pid resolution (`<data_dir>/toxtunnel.pid` exists?), permissions (can the caller signal the process?), and on Windows that the named pipe `\\.\pipe\toxtunnel-reload-<pid>` exists
-- Remember the reloadable set is small: `server.rules_file` contents, `client.forwards`, `logging.level`. Changes to Tox identity / listen ports / mode / `data_dir` will silently NOT take effect on reload — they need a restart
+- Remember the reloadable set is small: `server.rules_file` contents, `client.forwards`, `logging.level`. Anything else (Tox identity, listen ports, mode, `data_dir`, `client.socks5`, `client.failover`, `metrics.*`, `tunnel.*`, `flow_control.*`, `watchdog.*`) makes the daemon **reject the whole reload** — it is not silently ignored: `reload rejected: config reload rejected: field '<name>' requires a restart (not in the reloadable subset)`, with the previous config left running
 
 **SOCKS5 listener didn't bind:**
 - Check startup log for `Invalid client.socks5.listen value` or `must bind to a loopback address` — the validator rejects non-loopback binds (`0.0.0.0`, LAN IPs)
@@ -98,7 +107,9 @@ These layers only apply when the corresponding feature is enabled.
 - Check `client.failover.timeout_seconds` (default 60) — if set too high, the client waits longer than expected before promoting a fallback
 - Make sure the fallback servers are in the list (`server_id` must be a YAML sequence, or use `--server-id-fallback` repeated); a single-string `server_id` ignores the failover block
 - After fallback promotion, the client waits `prefer_primary_grace_seconds` (default 30) of *continuous* primary uptime before switching back — brief primary flaps reset the grace timer
-- `toxtunnel inspect status --json | jq .active_server` shows the currently active server without log diving
+- The active server is **not** in `inspect status` — grep the log for
+  `Failover: switching active server <A>... -> <B>... (friend N)`; the most
+  recent such line names the current one
 
 **Metrics endpoint missing / wrong values:**
 - `curl -s localhost:9100/metrics | head` — if connection refused, `metrics.enabled: false` (the default) or the daemon didn't pick up the config (restart, since metrics listen isn't hot-reloadable)
@@ -127,18 +138,23 @@ These layers only apply when the corresponding feature is enabled.
 | Friend online but tunnel fails | Rules block the target or target service is down | Check `rules.yaml` and test target with `nc -zv host port` |
 | `Invalid public key length` | Wrong friend key format in `rules.yaml` | Friend public key must be exactly 64 hex chars, not the full 76-char Tox ID |
 | `Rules file not found` | Bad `server.rules_file` path | Use an absolute path and verify permissions |
-| Slow transfer speed | Tox TCP relay instead of direct UDP | Check for direct UDP connection in logs and unblock UDP if possible |
+| Slow transfer speed (≈5–10 KB/s; a tiny request takes seconds while a bulk transfer runs) | Tox **TCP relay** instead of direct UDP — `toxtunnel servers list` / `known_servers.yaml` shows `last_connection_type: tcp`. toxcore's congestion control over relays tops out at a few packets/s; interactive SSH / DB queries are fine, bulk copies are not | Get the peers onto direct UDP: same LAN → `bootstrap_mode: lan` (that is what turns on toxcore local discovery — there is no separate `local_discovery_enabled` YAML key); otherwise make sure UDP 33445+ is reachable on at least one side. On a relay-only path keep payloads small (compress) and avoid concurrent bulk flows — every tunnel to one friend shares a single toxcore send queue, so one bulk copy starves the others |
 | Periodic disconnects | Unstable Tox friend connectivity | Raise log level and check network stability |
 | Crashes on startup with `std::bad_alloc` (huge `mmap`) | A non-regular file — usually a **directory** — sits at `<data_dir>/tox_save.dat` (or it's corrupt), so the loader read a garbage size | `rm -rf <data_dir>/tox_save.dat` (the daemon recreates a fresh identity). Hardened to fail gracefully in builds after v0.4.7 |
 | Both peers reach DHT but `friends_online` stays 0 **across different machines** | Tox friend-discovery (onion) blocked by the network — a local HTTP/SOCKS proxy or VPN in TUN mode (e.g. Clash) degrades onion routing; a corporate switch usually filters the multicast that `bootstrap_mode: lan` needs | Same LAN allowing multicast → `lan`. Else the path must pass Tox UDP/onion (don't proxy the daemon's traffic), or pin a mutually-reachable bootstrap node. Same-host loopback (`lan`) always works |
-| `Failed to bind port` | Port already in use | Find the conflicting process and pick a different local port |
+| `TcpListener: failed to bind 0.0.0.0:<port>: Address already in use` (Windows: `Only one usage of each socket address … is normally permitted`) | Local forward port taken (often a second toxtunnel) | At startup the client refuses to run: `Failed to initialize client: cannot listen on configured forward port(s): local port N: …` and exits 1. On reload it is per-forward: `Reload: not forwarding local port N -> …` plus `reload applied with warnings: …`, everything else stays live. Free the port (`ss -tlnp \| grep :N`) or pick another |
+| `failed to create Tox instance: could not bind Tox TCP relay port <N>` | Another toxtunnel (or anything else) holds that port. The Tox **UDP** port auto-walks to the next free one; the **TCP relay** port does not, and server mode will not accept `tcp_port: 0` | Give this daemon its own `tox.tcp_port` |
+| `data directory <dir> is already in use by toxtunnel pid <N>` | A second daemon tried to take a `data_dir` another one owns. Sharing it would mean sharing the Tox identity, the inspect socket and `known_servers.yaml`, so startup refuses with exit 1 — including under `--service`, so `Restart=on-failure` retries once the holder exits | Stop the other instance, or give this one its own `data_dir` |
+| `Could not claim the data directory: … Refusing to start without it` | The lock could not be taken for a reason other than a live holder (unwritable dir, filesystem without working locks) | Fix the permissions/filesystem. If the data_dir genuinely cannot host a lock, `TOXTUNNEL_ALLOW_UNLOCKED_DATA_DIR=1` starts anyway — at the cost of nothing preventing a second daemon |
+| `config: ignoring unknown key '<path>'` | The config contains a key no version of the parser reads — a typo, or a plausible-but-nonexistent setting | Fix or delete the key. `toxtunnel config check -c <file>` lists them all; `--strict` makes it exit non-zero for CI |
 | `Permission denied` on `data_dir` | Wrong ownership or permissions | `chmod 700 data_dir` and fix owner |
 | Config parse error | YAML syntax problem | Fix indentation and validate with `python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" config.yaml` |
 | `client.socks5.listen must bind to a loopback address` | SOCKS5 listener set to non-loopback bind | Change to `127.0.0.1:<port>`, `::1`, or `localhost`; for remote consumers use SSH local-forward over loopback |
 | `socks5.enabled and client.pipe cannot be used together` | Both dynamic-destination modes enabled | Pick one — SOCKS5 for dynamic, `pipe` for SSH ProxyCommand |
 | `Invalid metrics.listen value` / `metrics.path must start with '/'` | Bad metrics config | Use `host:port` for listen and a path starting with `/` |
 | `reload rejected: <reason>` in logs | New config failed parse/validation | Daemon kept old config; fix the YAML and re-trigger reload |
-| `reload: no pid file at ...` (Windows) | Daemon not running, or different data_dir | Verify daemon is up; pass `-d` or `-c` so reload looks in the right place |
+| `reload: no pid file at ...` | Daemon not running, different `data_dir`, a pre-v0.4.11 daemon (never wrote the file), **or a corrupt pid file** — parsing is strict, so anything other than one positive integer (`123abc`, `12.5`, empty) reads as absent rather than being partially parsed into a signal for an unrelated process | Verify daemon is up; pass `-d` or `-c` so reload looks in the right place; check the file really holds just a number; or set `TOXTUNNEL_RELOAD_PID` |
+| `reload: pid N is no longer a toxtunnel process (stale toxtunnel.pid?)` | Daemon crashed / was killed and the pid was reused | Start the daemon again (it overwrites the pid file) |
 | SOCKS5 CONNECT returns reply 0x02 | Server-side rules.yaml denied the destination | Add the host/port to the friend's allow list on the **server** (not client) |
 | Tunnel reaped while still in use | `tunnel.idle_timeout_seconds` too aggressive for the protocol | Raise the timeout or set `0` (disabled) |
 
@@ -202,8 +218,8 @@ Rate limiter rejected the TUNNEL_OPEN. Check:
 1. `curl 127.0.0.1:9100/metrics | grep rate_limit_open_rejected_total`
    — global counter.
 2. The structured WARN log line carries the friend public key prefix.
-3. `toxtunnel inspect status --json` shows per-friend bucket levels
-   (when configured).
+3. `toxtunnel inspect status --json` does **not** expose per-friend bucket
+   levels — the WARN log line and the counter above are the only signals.
 
 Loosen `rate_limit_defaults` or add a per-friend override block in
 `rules.yaml` and `kill -HUP` to reload.
@@ -219,19 +235,54 @@ EWMA is flapping. Workarounds:
 
 ### Symptom: high BDP link still capped at 256 KiB
 
-`flow_control.mode` defaults to `fixed`. Set `mode: bdp` and the
-per-tunnel `BdpFlowControl` will scale the window between
-`send_window_min_bytes` and `send_window_max_bytes` based on RTT ×
-bandwidth EWMA. Inspect via the
-`toxtunnel_tunnel_send_window_bytes` summary.
+`flow_control.mode` defaults to `bdp` since v0.4.1 — check the config has
+not pinned `mode: fixed`. In `bdp` mode the per-tunnel `BdpFlowControl`
+scales the window between `send_window_min_bytes` and
+`send_window_max_bytes` based on RTT × bandwidth EWMA. Inspect via the
+`toxtunnel_tunnel_send_window_bytes` summary. If the link is a TCP relay
+the window is not the limiter — see "Slow transfer speed" above.
 
 ### Symptom: tunnels die across server restart
 
-v0.4 ships the wire format + state store for tunnel-resume but the
-live handshake driver is partial. With `tunnel.resume.enabled: false`
-(the default) restarts behave exactly as in v0.3.0. Track the v0.4.1
-follow-up at
-`docs/plans/2026-05-15-tunnel-resume-protocol-partial.md`.
+Tunnel resume (`tunnel.resume.enabled: true`) holds a disconnected
+friend's tunnels for `resume.max_age_seconds` and reattaches them on
+reconnect — but only while **both processes stay up** (live reconnect).
+A process restart loses the local TCP sockets, so tunnels always die
+across a restart; that is by design, not a bug. With the default
+`enabled: false` the opcodes are wire-inactive.
+
+### Symptom (macOS 15+): every LAN target fails with "No route to host"
+
+`TCP connect failed: No route to host` for **other devices on the LAN**, while
+`127.0.0.1` targets and the Mac's *own* LAN addresses work, and `nc`/`curl` from
+a shell on the same Mac reach the target fine. This is macOS **Local Network
+privacy**, not a tunnel fault: the check is per responsible process, and a
+daemon left running by `nohup … &` from an SSH session (re-parented to launchd)
+gets denied with no prompt and no log entry.
+
+Reproduce without toxtunnel: run any small TCP-connect binary the same detached
+way — it fails identically. Fix: run the server as an approved launchd
+daemon/agent (System Settings → Privacy & Security → Local Network), or keep
+its targets on loopback.
+
+### Symptom (Windows): daemon started from an SSH session dies silently
+
+A daemon launched with `Start-Process` inside an `ssh host "..."` command
+logs `Client started` / `Server started` and then nothing: when the SSH
+command returns, Win32-OpenSSH tears down the session's job object and
+the process is killed with no log line and no Event Log entry. Run it as
+the service (`install-windows-service`), as a Scheduled Task, or via
+`Invoke-CimMethod -ClassName Win32_Process -MethodName Create`.
+
+### Symptom (Windows): `inspect` / `reload` say "no pid file" or "cannot connect"
+
+- Daemons before v0.4.11 never wrote `toxtunnel.pid`; set
+  `TOXTUNNEL_INSPECT_PID` / `TOXTUNNEL_RELOAD_PID` to the pid printed in
+  `Inspect IPC listening at \\.\pipe\toxtunnel-<pid>`.
+- `cannot connect … (error 5: access denied)` against the service:
+  the pipe only admits SYSTEM and Administrators — use an elevated prompt.
+- `error 2: no such pipe`: the pid is stale (daemon restarted) — re-read
+  the pid file / log.
 
 ### Symptom: tunnels stuck in `Connecting` or `Disconnecting` after a burst
 
@@ -259,9 +310,9 @@ If you see a wedge anyway:
 
 1. Grep `journalctl -u toxtunnel | grep 'pending queue at cap'` — the
    only path that drops a control frame today is overflow at the cap.
-2. Inspect the depth via `toxtunnel inspect status --json` and watch
-   the per-tunnel `BYTES_IN` / `BYTES_OUT` rather than just state — a
-   tunnel with traffic moving is not actually wedged.
+2. The queue depth is not exposed anywhere; use `toxtunnel inspect tunnels`
+   and watch each tunnel's `BYTES_IN` / `BYTES_OUT` rather than just state —
+   a tunnel whose counters advance is not actually wedged.
 3. Pair with `toxtunnel_tox_iterate_lag_milliseconds_max`: a sustained
    spike there usually precedes a backpressure pulse.
 
@@ -276,3 +327,66 @@ close-completion latency grows. Confirm via `inspect tunnels`: an
 idle counter that resets means the tunnel is alive but slow, not
 wedged.
 
+
+### Symptom: a client can never connect after being refused once
+
+The server logged `Refused friend request from <PK>: no rule entry for this Tox
+ID`, the operator added `<PK>` to `rules.yaml`, and the client *still* never comes
+online — reloading the server, restarting the server, and restarting the client
+all change nothing. Waiting does not help either; measured at 3.5+ minutes with a
+full client restart in between.
+
+Cause (fixed; on releases before this fix the only escape is destructive). The
+client persists the server in its own `tox_save.dat` the moment it first adds it,
+so toxcore considers the friendship already requested and **never re-sends the
+friend request**. On the server, `on_friend_request` used to be the one and only
+path into the friend list, and it refuses any key not yet in `rules.yaml`. Adding
+the rule afterwards therefore fixes the access check for a friend request that
+will never arrive again. The two sides deadlock permanently.
+
+- On a fixed build: nothing to do. The server pre-seeds every `rules.yaml` public
+  key into its Tox friend list at startup and after every reload, so `kill -HUP`
+  (or `toxtunnel reload`) is enough. Confirm with `Pre-seeded friend <PK> from
+  rules` in the server log; the client comes online within ~50 s.
+- On an affected older build, the only recovery is to destroy the client's
+  identity — `rm -rf <client data_dir>` — which mints a **new public key**, so the
+  `rules.yaml` entry has to be rewritten with the new PK. Order matters on those
+  builds: put the client's PK in `rules.yaml` and reload the server *before*
+  starting the client for the first time.
+
+Note the pre-seed is deliberately one-way: removing a key from `rules.yaml` does
+**not** delete the friend. The rules engine default-denies every `TUNNEL_OPEN`
+from an unlisted key, so a leftover friend entry grants no access — while deleting
+it would invalidate the peer's saved friendship and recreate exactly this deadlock
+if the rule is ever restored. To actually drop a friend, stop the daemon and
+remove it explicitly.
+
+### Symptom: resume declines with "no held tunnel" after a long outage
+
+Client log shows `TUNNEL_RESUME_REQUEST` answered with a decline; server log has
+`RESUME_REQUEST from friend N (tunnel M): no held tunnel; declined (re-open)`,
+and there is **no** preceding `Holding tunnel manager for friend N for resume`.
+
+Cause (fixed): toxcore does not guarantee a `disconnected` callback before the
+matching `connected` one — after a long outage it can report the friend back
+online with no disconnect in between. The resume hold only ever ran from the
+`disconnected` path, while the `connected` path unconditionally installed a fresh
+`TunnelManager`, silently destroying the live one along with every open tunnel and
+its target TCP connection. Measured failure rate before the fix: 2 of 3
+long-disconnect trials.
+
+The fixed server keeps the live manager and logs
+`Friend N reported connected while its tunnel manager is still live (no matching
+disconnected event); keeping the existing manager and its tunnels` at **warn**.
+Seeing that line is normal and benign — the tunnels survive and the follow-up
+`RESUME_REQUEST` resolves against them. What it *does* tell you is that the peer
+was away for a while without the server noticing, so:
+
+- Some of those tunnels may be reaped shortly afterwards if
+  `tunnel.idle_timeout_seconds` or `tunnel.half_close_timeout_seconds` elapsed
+  during the invisible outage. That is the reaper working as configured, not a
+  resume failure.
+- Repeated warns for the same friend point at a flapping Tox path (check
+  `last_connection_type` — relay-only links flap far more than direct UDP), not at
+  a server bug. Enabling `tunnel.keepalive_interval_seconds` makes the server
+  notice these outages itself and take the proper hold-for-resume path.

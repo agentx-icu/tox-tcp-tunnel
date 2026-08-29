@@ -129,6 +129,40 @@ are rejected with reply code `0x07` (command not supported). The CLI form
 `--socks5 host:port` is equivalent to setting `socks5.enabled: true` plus
 `socks5.listen`.
 
+Failures carry the server's reason, so a policy rejection is distinguishable
+from a network fault:
+
+| Server outcome | SOCKS5 reply | HTTP CONNECT status |
+|---|---|---|
+| Connected | `0x00` success | `200 Connection Established` |
+| `rules.yaml` denied the destination | `0x02` connection not allowed by ruleset | `403 Forbidden` |
+| Server could not resolve / route to the target | `0x04` host unreachable | `502 Bad Gateway` |
+| Target actively refused the connection | `0x05` connection refused | `502 Bad Gateway` |
+| Anything else (server offline, no tunnel ids) | `0x01` general failure | `502 Bad Gateway` |
+
+## Data Directory Locking
+
+A running daemon holds an exclusive lock on its `data_dir`
+(`<data_dir>/toxtunnel.lock`, `fcntl` on POSIX / exclusive `CreateFile` on
+Windows) for its whole lifetime, and publishes its pid in
+`<data_dir>/toxtunnel.pid`. A second daemon pointed at the same directory
+refuses to start:
+
+```
+data directory /var/lib/toxtunnel is already in use by toxtunnel pid 1234.
+```
+
+This is not tidiness: two daemons sharing a `data_dir` share one Tox identity
+(`tox_save.dat`), one inspect socket, one `known_servers.yaml` and one resume
+store. The lock is a kernel lock, so it is released automatically however the
+holder dies — a `kill -9` leaves a stale pid file, which the next daemon simply
+overwrites.
+
+Startup also fails (exit 1) if the lock cannot be taken for any other reason,
+such as an unwritable directory. Set `TOXTUNNEL_ALLOW_UNLOCKED_DATA_DIR=1` to
+start anyway; only do that when the `data_dir` provably cannot host a lock, and
+be aware nothing then stops a second daemon from corrupting shared state.
+
 ## Service Policy (`service:`)
 
 Controls whether `toxtunnel --service` (run under systemd / launchd / Windows SCM)
@@ -513,19 +547,16 @@ semantics). When configured, `RateLimiter` runs before `RulesEngine`
 on the TUNNEL_OPEN path.
 
 ```yaml
-# Top-level defaults — apply to every friend that does NOT name its own block.
+# Top-level defaults — the baseline for every friend.
 rate_limit_defaults:
   mode: enforce              # off (default) | report | enforce
   open_per_sec: 10
   open_burst: 50
-  bytes_per_sec: 10485760    # 10 MiB/s
-  bytes_burst: 33554432      # 32 MiB
   max_concurrent_tunnels: 100
 
 rules:
   - friend: "AABB...64hex..."
-    rate_limit:              # per-friend override; additive over defaults
-      bytes_per_sec: 104857600
+    rate_limit:              # per-friend override, merged field by field
       max_concurrent_tunnels: 200
     allow:
       - host: "127.0.0.1"
@@ -540,9 +571,84 @@ Modes:
 - `enforce` — over-budget OPENs receive `TUNNEL_ERROR` with reason
   code 3 (`Rate limit exceeded`).
 
-Hot-reloadable via the rules file (`SIGHUP` / `toxtunnel reload`).
-Loosening takes effect immediately; tightening is observed lazily on
-the next consume + refill cycle.
+### Override merging
+
+A per-friend `rate_limit:` block overrides **only the fields it names**;
+every other field — `mode` included — keeps its `rate_limit_defaults`
+value. In the example above the friend raises `max_concurrent_tunnels`
+to 200 and still inherits `mode: enforce`, `open_per_sec: 10` and
+`open_burst: 50`.
+
+Writing a field explicitly is therefore different from omitting it:
+
+| In the friend's block | Effect |
+|---|---|
+| field omitted | inherits the `rate_limit_defaults` value |
+| `open_per_sec: 0` | that friend is exempt from the OPEN rate limit; other fields still inherit |
+| `mode: off` | limiting disabled for that friend only |
+
+If the rules file has no `rate_limit_defaults:` block at all, a
+friend-only `rate_limit:` block with no `mode` defaults to `enforce` —
+there is nothing to inherit, and a configured limit is meant to apply.
+
+> Earlier releases made a per-friend block **replace** the defaults
+> wholesale, so naming one field zeroed the rest. Tightening
+> `max_concurrent_tunnels` for a friend switched that friend's OPEN rate
+> limiting off entirely. Rules files that worked around this by
+> repeating every field in each friend block remain correct.
+
+### `bytes_per_sec` / `bytes_burst` are not implemented
+
+These two keys parse and validate, and the token buckets behind them
+refill correctly, but **nothing on the data path consumes them**:
+TUNNEL_DATA is forwarded without consulting the byte budget. A
+configured byte limit does not shape traffic, and
+`toxtunnel_rate_limit_bytes_throttled_total` stays at 0. The rules
+loader logs a warning naming the offending block.
+
+They are accepted rather than rejected so that existing rules files —
+earlier revisions of this document and the ops template both showed
+them — keep loading after an upgrade. Use `open_per_sec` /
+`open_burst` / `max_concurrent_tunnels` for real limiting; enforcing a
+byte rate needs read-side backpressure on the tunnel data path, which
+has not been built.
+
+### Reloading rate limits resets every token bucket
+
+Rate limits are hot-reloadable via the rules file (`SIGHUP` /
+`toxtunnel reload`). The reload is applied as a single atomic swap: the
+daemon discards the whole per-friend limiter table and rebuilds it from
+the new rules, so a concurrent `TUNNEL_OPEN` is judged against either
+the complete old generation or the complete new one — never a mixture.
+
+**A reload therefore refills every friend's bucket and zeroes its
+rejection counters.** The table is destroyed wholesale because it has
+to be: a friend that was dropped from the new rules must not keep its
+old bucket alive. There is no carry-over of accumulated token state and
+no "lazy tightening" — an earlier revision of this document claimed the
+new limits were observed gradually on the next refill cycle, which was
+never what the code did.
+
+Operational consequences, in order of how much they matter:
+
+- **Anyone who can trigger a reload can refresh their own burst
+  allowance.** A friend that is mid-flood and pinned at zero tokens
+  gets a full `open_burst` again on every `SIGHUP`. If reloads are
+  automated (a config-management agent, a file watcher, a cron
+  `toxtunnel reload`), keep the cadence well above the window you
+  expect the limiter to enforce over — a limiter reset every 30 s
+  cannot hold an average rate measured over minutes. The rate limiter
+  is not a defence against an adversary who also controls reloads.
+- **Per-friend rejection counts in `toxtunnel inspect` restart at 0.**
+  Treat them as "since the last reload", not "since start".
+- **Prometheus counters are unaffected.**
+  `toxtunnel_rate_limit_open_rejected_total` and its siblings live in
+  `MetricsRegistry`, not in the buckets, so they stay monotonic across
+  reloads. Alert on those, not on the inspect snapshot.
+
+Everything else about a limit change applies at once: the new spec is
+in force for the very next `TUNNEL_OPEN`, whether it loosens or
+tightens.
 
 ## Prometheus Metrics (`metrics:`)
 
@@ -586,7 +692,9 @@ inspect:
 The socket path is hard-coded by platform — there is no
 `inspect.socket_path` or `inspect.socket_mode` setting. On POSIX the
 listener binds at `<data_dir>/toxtunnel.sock` (mode `0600` per OS umask
-at create time); on Windows it serves `\\.\pipe\toxtunnel-inspect-<pid>`.
+at create time); on Windows it serves `\\.\pipe\toxtunnel-<pid>` (DACL: the
+daemon's user, SYSTEM, and Administrators). The daemon also writes
+`<data_dir>/toxtunnel.pid` so the CLI can find the pipe / process.
 If you need a different path, change `data_dir`.
 
 The IPC wire format (single-line JSON request → single-line JSON reply) and
@@ -598,9 +706,14 @@ the catalogue of `cmd` values live in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
 A running daemon will reload a tightly scoped subset of its configuration in
 place, without dropping existing tunnels, when it receives:
 
-- POSIX: `SIGHUP` (e.g. `kill -HUP <pid>` or `systemctl reload toxtunnel`).
-- Windows: a single byte written to the reload named pipe (default
-  `\\.\pipe\toxtunnel-reload-<pid>`). The CLI helper is `toxtunnel reload`.
+- POSIX: `SIGHUP` (e.g. `kill -HUP "$(cat <data_dir>/toxtunnel.pid)"` or
+  `systemctl reload toxtunnel`).
+- Windows: `RELOAD\n` written to the reload named pipe
+  (`\\.\pipe\toxtunnel-reload-<pid>`).
+
+The CLI helper `toxtunnel reload [-d DIR | -c CONFIG]` does the right thing on
+both platforms: it reads `<data_dir>/toxtunnel.pid` and sends SIGHUP (POSIX) or
+writes to the pipe (Windows). `TOXTUNNEL_RELOAD_PID` overrides the pid file.
 
 ### Reloadable fields
 
@@ -608,7 +721,7 @@ place, without dropping existing tunnels, when it receives:
 |---|---|
 | `logging.level` | Swapped atomically — next log line uses the new level. |
 | `client.forwards` | New listeners are bound, removed listeners are closed, unchanged listeners keep their open tunnels. |
-| `server.rules_file` | File is re-read and the parsed `RulesEngine` is swapped in. Tunnels disallowed by the new rules are closed; everything else continues. |
+| `server.rules_file` | File is re-read, the parsed `RulesEngine` is swapped in, rate-limit buckets are synced and per-friend tunnel caps re-applied. **Already-open tunnels are not touched** — even ones the new rules would now deny; only the next `TUNNEL_OPEN` is evaluated against them. Drop the friend (or restart) to cut live traffic. |
 
 ### Non-reloadable fields (reload is rejected, running config untouched)
 
@@ -620,14 +733,26 @@ block (including `coalesce_*`, `idle_timeout_seconds`, `reaper_tick_seconds`,
 the entire `watchdog.*` block.
 
 Changing any of those requires a full restart. A reload that touches one of
-them is rejected as a whole — no partial application — and logged at WARN:
+them is rejected as a whole — no partial application — and logged at ERROR:
 
 ```
-Reload rejected: field client.server_id is not reloadable
+reload rejected: config reload rejected: field 'client.server_id' requires a restart (not in the reloadable subset)
 ```
 
-A successful reload is logged at INFO and increments
-`toxtunnel_reloads_total{result="success"}`.
+A successful reload is logged at INFO (`config reloaded (rules: N rules)` on the
+server, `config reloaded (forwards: +A -B)` on the client). There is no reload
+counter in the metrics endpoint — the log is the record.
+
+One client-side caveat: a reload that *adds* a forward whose local port is
+already taken applies everything else and logs
+`reload applied with warnings: local port N: Address already in use`. That one
+forward is not served; the next reload retries it. At **startup** a busy forward
+port is fatal instead: the daemon logs `cannot listen on configured forward
+port(s): local port N: …` and exits 1, rather than coming up healthy-looking
+while forwarding nothing. (On Windows the OS wording is "Only one usage of each
+socket address … is normally permitted"; listeners there take
+`SO_EXCLUSIVEADDRUSE`, so a second instance cannot quietly share the port the
+way plain `SO_REUSEADDR` would allow.)
 
 For a worked example, see [`docs/ADVANCED_SCENARIOS.md`](ADVANCED_SCENARIOS.md)
 ("Hot-reloading rules.yaml without dropping connections").

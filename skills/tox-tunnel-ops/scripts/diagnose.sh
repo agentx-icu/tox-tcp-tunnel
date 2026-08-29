@@ -348,26 +348,49 @@ if [ -n "${CONFIG_FILE:-}" ] && [ -f "${CONFIG_FILE:-}" ]; then
     if [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
         info "Log file found: $LOG_FILE"
 
-        if grep -q "Connected to DHT" "$LOG_FILE" 2>/dev/null; then
+        if grep -q "Connected to Tox DHT" "$LOG_FILE" 2>/dev/null; then
             info "DHT connection: established"
         else
             warn "DHT connection: not found in logs"
         fi
 
-        if grep -q "Self connection status: Online" "$LOG_FILE" 2>/dev/null; then
-            info "Self connection: Online"
+        SELF_STATUS=$(grep "Self connection status:" "$LOG_FILE" 2>/dev/null | tail -1 | sed 's/.*Self connection status: //' || true)
+        if [ -n "$SELF_STATUS" ]; then
+            info "Self connection (latest): $SELF_STATUS"
         fi
 
-        if grep -q "Friend connection status: Connected" "$LOG_FILE" 2>/dev/null; then
-            info "Friend connection: established"
+        # Client logs "Server friend N is now online"; server logs "Friend N (pk=..) connected".
+        if grep -qE "Server friend [0-9]+ is now online|Friend [0-9]+ \(pk=[0-9A-Fa-f]+\) connected" "$LOG_FILE" 2>/dev/null; then
+            info "Friend connection: established (at least once)"
+            LAST_FRIEND=$(grep -E "Server friend [0-9]+ (is now online|went offline)|Friend [0-9]+ \(pk=[0-9A-Fa-f]+\) (connected|disconnected)" "$LOG_FILE" 2>/dev/null | tail -1 || true)
+            echo "       latest: $LAST_FRIEND"
         else
             warn "Friend connection: not established (or not in logs)"
+            if grep -q "Refused friend request" "$LOG_FILE" 2>/dev/null; then
+                fail "Server refused a friend request — the client's public key is missing from rules.yaml:"
+                grep "Refused friend request" "$LOG_FILE" 2>/dev/null | tail -2 | while IFS= read -r line; do echo "       $line"; done
+            fi
+            if grep -q "Still trying to reach server" "$LOG_FILE" 2>/dev/null; then
+                echo "       client is still retrying — allow 1–3 min on a relay path; check the server accepted the friend request"
+            fi
         fi
 
-        ERRORS=$(grep -ci "error" "$LOG_FILE" 2>/dev/null || echo "0")
+        # TCP relay = working but slow (~5–10 KB/s). Direct UDP is the fast path.
+        KS_FILE="${DATA_DIR:-}/known_servers.yaml"
+        if [ -n "${DATA_DIR:-}" ] && [ -f "$KS_FILE" ]; then
+            LAST_TRANSPORT=$(grep -E "last_connection_type:" "$KS_FILE" 2>/dev/null | tail -1 | awk '{print $2}' || true)
+            case "$LAST_TRANSPORT" in
+                udp) info "Last transport to server: udp (direct)";;
+                tcp) warn "Last transport to server: tcp (Tox relay) — expect ~5-10 KB/s bulk throughput; fine for SSH/DB queries";;
+            esac
+        fi
+
+        # "Send lossless packet failed ... error 7" is toxcore back-pressure (SENDQ full),
+        # not a fault; exclude it so a busy-but-healthy tunnel does not read as broken.
+        ERRORS=$(grep -i "error" "$LOG_FILE" 2>/dev/null | grep -vc "Send lossless packet failed" || echo "0")
         if [ "$ERRORS" -gt 0 ]; then
             warn "Found $ERRORS error(s) in log. Last 5:"
-            grep -i "error" "$LOG_FILE" 2>/dev/null | tail -5 | while IFS= read -r line; do
+            grep -i "error" "$LOG_FILE" 2>/dev/null | grep -v "Send lossless packet failed" | tail -5 | while IFS= read -r line; do
                 echo "       $line"
             done
         else
@@ -381,8 +404,15 @@ if [ -n "${CONFIG_FILE:-}" ] && [ -f "${CONFIG_FILE:-}" ]; then
         if grep -q "Rules file not found" "$LOG_FILE" 2>/dev/null; then
             fail "Log contains 'Rules file not found' — check rules_file path in server config"
         fi
-        if grep -q "Failed to bind" "$LOG_FILE" 2>/dev/null; then
-            fail "Log contains 'Failed to bind' — port already in use"
+        # The listener logs "TcpListener: failed to bind 0.0.0.0:PORT: <reason>";
+        # startup additionally aborts with "cannot listen on configured forward
+        # port(s): local port N: ..." and a reload logs "Reload: not forwarding
+        # local port N -> ...". Match all three, case-insensitively.
+        if grep -qiE "failed to bind|cannot listen on configured forward port|Reload: not forwarding local port" "$LOG_FILE" 2>/dev/null; then
+            fail "Log shows a local port could not be bound (usually already in use):"
+            grep -iE "failed to bind|cannot listen on configured forward port|Reload: not forwarding local port" "$LOG_FILE" 2>/dev/null | tail -3 | while IFS= read -r line; do
+                echo "       $line"
+            done
         fi
     else
         warn "No log file configured or file not found — run with -l debug for verbose output"

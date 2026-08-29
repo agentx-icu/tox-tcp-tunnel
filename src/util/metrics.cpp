@@ -458,8 +458,13 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_rate_limit_open_rejected_total counter\n"
            "toxtunnel_rate_limit_open_rejected_total "
         << rate_limit_open_rejected() << "\n";
-    out << "# HELP toxtunnel_rate_limit_bytes_throttled_total Times the per-friend bytes "
-           "bucket went into deny.\n"
+    // The HELP text is deliberately blunt: byte rate limiting is parsed and
+    // bucketed but never consulted on the data path (`try_consume_bytes` has
+    // no production caller), so this counter cannot move in a shipped daemon.
+    // Describing it as "times the bucket went into deny" led operators to
+    // alert on a metric that is structurally pinned at 0.
+    out << "# HELP toxtunnel_rate_limit_bytes_throttled_total Always 0: byte rate limiting is "
+           "not wired into the data path; the byte buckets exist but nothing consumes them.\n"
            "# TYPE toxtunnel_rate_limit_bytes_throttled_total counter\n"
            "toxtunnel_rate_limit_bytes_throttled_total "
         << rate_limit_bytes_throttled() << "\n";
@@ -594,8 +599,24 @@ std::string MetricsServer::start(std::string_view listen_spec, std::string_view 
         running_ = false;
         return "acceptor.open: " + ec.message();
     }
-    acceptor_->set_option(asio::socket_base::reuse_address(true), ec);
-    // reuse_address failing is non-fatal — proceed without it.
+    // See the note in core/tcp_listener.cpp for why Windows gets
+    // SO_EXCLUSIVEADDRUSE instead of SO_REUSEADDR. Unlike the forward listeners
+    // this one is deliberately non-fatal: a read-only /metrics endpoint that
+    // came up without the option is not a security hazard worth refusing to
+    // serve over. The result is discarded into its own error_code rather than
+    // the shared `ec`, which the following bind() would clear on success and so
+    // make the assignment look handled when it isn't.
+    asio::error_code addr_opt_ec;
+#if defined(_WIN32)
+    int exclusive = 1;
+    if (::setsockopt(acceptor_->native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                     reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) != 0) {
+        addr_opt_ec = asio::error_code(::WSAGetLastError(), asio::error::get_system_category());
+    }
+#else
+    acceptor_->set_option(asio::socket_base::reuse_address(true), addr_opt_ec);
+#endif
+    (void)addr_opt_ec;
     acceptor_->bind(endpoint, ec);
     if (ec) {
         acceptor_.reset();

@@ -59,7 +59,7 @@ rules:
         ports: [5432]
 ```
 
-The `friend` value must be the contractor's 64-character hex public key. They can find it in their toxtunnel startup log.
+The `friend` value is the **first 64 hex characters** of the peer's 76-char Tox ID — not the whole ID. They get it from their own daemon's startup log line `Client Tox ID: <76 hex>`, or from `toxtunnel print-id -c client.yaml`. A wrong length is rejected when the rules file loads (`Invalid public key length: expected 64`), so the server refuses to start or hot-reload rather than silently denying.
 
 ## Steps
 
@@ -81,7 +81,12 @@ The `friend` value must be the contractor's 64-character hex public key. They ca
    `toxtunnel reload` (cross-platform; uses the local IPC).
    Use `sudo systemctl restart toxtunnel` only if the change touched a
    non-reloadable field.
-3. The contractor's NEW tunnel attempts will be denied immediately.
+3. The contractor's NEW tunnel attempts are denied immediately — but a reload
+   does **not** cut sessions that are already open. A `psql` connection the
+   contractor established before the reload keeps working until they
+   disconnect. If you need to end live access this second, restart the server
+   (`sudo systemctl restart toxtunnel`), which drops every tunnel, or revoke at
+   the database (`ALTER ROLE … NOLOGIN` + terminate their backends).
 
 Also consider:
 - Drop the temporary database user

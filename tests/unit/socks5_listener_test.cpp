@@ -263,11 +263,11 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
     std::atomic<bool> got_dest{false};
     std::string got_host;
     uint16_t got_port = 0;
-    std::function<void(bool)> captured_reply_cb;
+    std::function<void(TunnelOpenOutcome)> captured_reply_cb;
 
     start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string host,
                        uint16_t port, std::vector<uint8_t> /*initial_payload*/,
-                       std::function<void(bool)> reply_cb) {
+                       std::function<void(TunnelOpenOutcome)> reply_cb) {
         got_host = std::move(host);
         got_port = port;
         captured_reply_cb = std::move(reply_cb);
@@ -298,7 +298,7 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
     EXPECT_EQ(got_port, 443);
 
     if (captured_reply_cb) {
-        captured_reply_cb(true);
+        captured_reply_cb(TunnelOpenOutcome::Connected);
     }
     auto reply = read_some(sock, 10);
     ASSERT_EQ(reply.size(), 10u);
@@ -309,7 +309,8 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
 TEST_F(Socks5ListenerLifecycleTest, RejectsClientThatOffersNoNoAuth) {
     std::atomic<bool> got_dest{false};
     start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
-                       std::vector<uint8_t>, std::function<void(bool)>) { got_dest.store(true); });
+                       std::vector<uint8_t>,
+                       std::function<void(TunnelOpenOutcome)>) { got_dest.store(true); });
 
     asio::io_context client_io;
     asio::ip::tcp::socket sock(client_io);
@@ -328,7 +329,8 @@ TEST_F(Socks5ListenerLifecycleTest, RejectsClientThatOffersNoNoAuth) {
 TEST_F(Socks5ListenerLifecycleTest, RejectsBindCommandAtRequest) {
     std::atomic<bool> got_dest{false};
     start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
-                       std::vector<uint8_t>, std::function<void(bool)>) { got_dest.store(true); });
+                       std::vector<uint8_t>,
+                       std::function<void(TunnelOpenOutcome)>) { got_dest.store(true); });
 
     asio::io_context client_io;
     asio::ip::tcp::socket sock(client_io);
@@ -352,11 +354,11 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesHttpConnectAndInvokesOpenTunnel) {
     std::atomic<bool> got_dest{false};
     std::string got_host;
     uint16_t got_port = 0;
-    std::function<void(bool)> captured_reply_cb;
+    std::function<void(TunnelOpenOutcome)> captured_reply_cb;
 
     start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string host,
                        uint16_t port, std::vector<uint8_t> /*initial_payload*/,
-                       std::function<void(bool)> reply_cb) {
+                       std::function<void(TunnelOpenOutcome)> reply_cb) {
         got_host = std::move(host);
         got_port = port;
         captured_reply_cb = std::move(reply_cb);
@@ -379,7 +381,7 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesHttpConnectAndInvokesOpenTunnel) {
     EXPECT_EQ(got_port, 8080);
 
     if (captured_reply_cb) {
-        captured_reply_cb(true);
+        captured_reply_cb(TunnelOpenOutcome::Connected);
     }
     auto reply = read_some(sock, 17);
     ASSERT_GE(reply.size(), 12u);
@@ -389,9 +391,9 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesHttpConnectAndInvokesOpenTunnel) {
 
 TEST_F(Socks5ListenerLifecycleTest, HttpConnectReturns502OnTunnelFailure) {
     std::atomic<bool> reply_cb_ready{false};
-    std::function<void(bool)> captured_reply_cb;
+    std::function<void(TunnelOpenOutcome)> captured_reply_cb;
     start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
-                       std::vector<uint8_t>, std::function<void(bool)> reply_cb) {
+                       std::vector<uint8_t>, std::function<void(TunnelOpenOutcome)> reply_cb) {
         captured_reply_cb = std::move(reply_cb);
         reply_cb_ready.store(true);
     });
@@ -409,7 +411,7 @@ TEST_F(Socks5ListenerLifecycleTest, HttpConnectReturns502OnTunnelFailure) {
     }
     ASSERT_TRUE(reply_cb_ready.load());
     ASSERT_TRUE(captured_reply_cb);
-    captured_reply_cb(false);
+    captured_reply_cb(TunnelOpenOutcome::Failed);
 
     auto reply = read_some(sock, 12);
     const std::string reply_str(reply.begin(), reply.end());
@@ -423,7 +425,7 @@ TEST_F(Socks5ListenerLifecycleTest, Socks5HandoffForwardsPipelinedPayload) {
     std::vector<uint8_t> captured_payload;
     start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string /*host*/,
                        uint16_t /*port*/, std::vector<uint8_t> initial_payload,
-                       std::function<void(bool)> /*reply_cb*/) {
+                       std::function<void(TunnelOpenOutcome)> /*reply_cb*/) {
         captured_payload = std::move(initial_payload);
         got_dest.store(true);
     });
@@ -464,7 +466,7 @@ TEST_F(Socks5ListenerLifecycleTest, HttpConnectHandoffForwardsPipelinedPayload) 
     std::vector<uint8_t> captured_payload;
     start_listener([&](std::shared_ptr<core::TcpConnection> /*conn*/, std::string /*host*/,
                        uint16_t /*port*/, std::vector<uint8_t> initial_payload,
-                       std::function<void(bool)> /*reply_cb*/) {
+                       std::function<void(TunnelOpenOutcome)> /*reply_cb*/) {
         captured_payload = std::move(initial_payload);
         got_dest.store(true);
     });
@@ -486,4 +488,54 @@ TEST_F(Socks5ListenerLifecycleTest, HttpConnectHandoffForwardsPipelinedPayload) 
     }
     ASSERT_TRUE(got_dest.load());
     EXPECT_EQ(captured_payload, client_hello);
+}
+
+// A server-side rules denial must reach the SOCKS5 client as reply code 0x02
+// ("connection not allowed by ruleset") — the code every diagnosis doc tells
+// operators to look for — and as 403 over HTTP CONNECT, rather than a blanket
+// host-unreachable / 502 that reads like a network fault.
+TEST(Socks5ReplyMappingTest, OutcomeMapsToProtocolReplies) {
+    EXPECT_EQ(socks5_reply_for(TunnelOpenOutcome::Connected), socks5::kReplySuccess);
+    EXPECT_EQ(socks5_reply_for(TunnelOpenOutcome::Denied), socks5::kReplyConnNotAllowed);
+    EXPECT_EQ(socks5_reply_for(TunnelOpenOutcome::Unreachable), socks5::kReplyHostUnreachable);
+    EXPECT_EQ(socks5_reply_for(TunnelOpenOutcome::Refused), socks5::kReplyConnRefused);
+    EXPECT_EQ(socks5_reply_for(TunnelOpenOutcome::Failed), socks5::kReplyGeneralFailure);
+
+    EXPECT_STREQ(http_status_for(TunnelOpenOutcome::Connected), "200 Connection Established");
+    EXPECT_STREQ(http_status_for(TunnelOpenOutcome::Denied), "403 Forbidden");
+    EXPECT_STREQ(http_status_for(TunnelOpenOutcome::Unreachable), "502 Bad Gateway");
+    EXPECT_STREQ(http_status_for(TunnelOpenOutcome::Failed), "502 Bad Gateway");
+}
+
+TEST_F(Socks5ListenerLifecycleTest, DeniedDestinationRepliesNotAllowedByRuleset) {
+    std::atomic<bool> ready{false};
+    std::function<void(TunnelOpenOutcome)> captured_reply_cb;
+    start_listener([&](std::shared_ptr<core::TcpConnection>, std::string, uint16_t,
+                       std::vector<uint8_t>, std::function<void(TunnelOpenOutcome)> reply_cb) {
+        captured_reply_cb = std::move(reply_cb);
+        ready.store(true);
+    });
+
+    asio::io_context client_io;
+    asio::ip::tcp::socket sock(client_io);
+    sock.connect({asio::ip::make_address("127.0.0.1"), listener_->bound_port()});
+
+    const uint8_t greeting[] = {0x05, 0x01, 0x00};
+    asio::write(sock, asio::buffer(greeting, sizeof(greeting)));
+    (void)read_some(sock, 2);
+    const uint8_t req[] = {0x05, 0x01, 0x00, 0x01, 10, 0, 0, 7, 0x01, 0xBB};
+    asio::write(sock, asio::buffer(req, sizeof(req)));
+
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!ready.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_TRUE(ready.load());
+    ASSERT_TRUE(captured_reply_cb);
+    captured_reply_cb(TunnelOpenOutcome::Denied);
+
+    auto reply = read_some(sock, 10);
+    ASSERT_GE(reply.size(), 2u);
+    EXPECT_EQ(reply[0], socks5::kVersion);
+    EXPECT_EQ(reply[1], socks5::kReplyConnNotAllowed);
 }

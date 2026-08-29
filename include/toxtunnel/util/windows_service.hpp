@@ -5,6 +5,11 @@
 
 namespace toxtunnel::util {
 
+/// Human-readable reason the last install/uninstall failed, including the Win32
+/// error code and, for the common cases, what to do about it. Empty on
+/// non-Windows or when nothing has failed yet.
+[[nodiscard]] std::string last_windows_service_error();
+
 /// Install a Windows service via the Service Control Manager.
 /// @param extra_arguments Optional arguments appended after the quoted executable path
 ///                        (e.g. `-c "C:\\ProgramData\\ToxTunnel\\config.yaml" --service`).

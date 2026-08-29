@@ -53,7 +53,8 @@ logging:
 #     max_age_seconds: 300        # drop saved entries older than this
 #     on_gap: passthrough         # passthrough | close
 
-# v0.4 stability + performance blocks (all opt-in; defaults preserve v0.3.0).
+# v0.4 stability + performance blocks. Defaults preserve v0.3.0 semantics
+# EXCEPT flow_control.mode, which defaults to `bdp` since v0.4.1.
 # watchdog:
 #   enabled: true                 # in-process tox-thread wedge detector
 #   deadline_seconds: 30          # std::abort() if heartbeat stalls past this

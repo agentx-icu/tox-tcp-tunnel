@@ -55,6 +55,11 @@ if ! grep -Fxq "RemainAfterExit=yes" "${unit_path}"; then
     exit 1
 fi
 
+if ! grep -Fxq "ExecReload=/bin/kill -HUP \$MAINPID" "${unit_path}"; then
+    echo "expected ${unit_path} to declare ExecReload so 'systemctl reload toxtunnel' delivers SIGHUP" >&2
+    exit 1
+fi
+
 example_config="/usr/share/toxtunnel/config.yaml.example"
 if [[ ! -f "${example_config}" ]]; then
     echo "expected installed example config at ${example_config}" >&2

@@ -53,6 +53,56 @@ TEST(ResumeOffsetTest, NoGapAtZeroOffsets) {
     EXPECT_FALSE(app::resume_offsets_have_gap(0, 0, 0, 0));
 }
 
+// ---------------------------------------------------------------------------
+// Unpaired friend-`connected` events (resume-destroying race).
+//
+// toxcore can report a friend `connected` without ever having reported the
+// preceding `disconnected`. setup_tunnel_manager() used to assign a fresh
+// manager into managers_ unconditionally, destroying the live manager's tunnels
+// and their target TCP connections; the peer's follow-up RESUME_REQUEST was then
+// answered "no held tunnel; declined". classify_connected_event() is the guard.
+// ---------------------------------------------------------------------------
+
+using app::detail::classify_connected_event;
+using app::detail::ConnectedManagerAction;
+
+TEST(ConnectedEventTest, LiveManagerIsNeverReplaced) {
+    // The regression itself: `connected` arrives with a live manager already
+    // installed and nothing held. Must keep the live one, not build a fresh one.
+    EXPECT_EQ(classify_connected_event(/*live=*/true, /*held=*/false, /*resume_enabled=*/true),
+              ConnectedManagerAction::KeepExisting);
+    // Same answer with resume off: the live manager's tunnels are just as real.
+    EXPECT_EQ(classify_connected_event(/*live=*/true, /*held=*/false, /*resume_enabled=*/false),
+              ConnectedManagerAction::KeepExisting);
+}
+
+TEST(ConnectedEventTest, LiveManagerWinsOverAHeldOne) {
+    // Should not be reachable (teardown erases from managers_ before it holds),
+    // but if both maps somehow carry this friend, the live manager is the one the
+    // peer is actually talking to.
+    EXPECT_EQ(classify_connected_event(/*live=*/true, /*held=*/true, /*resume_enabled=*/true),
+              ConnectedManagerAction::KeepExisting);
+}
+
+TEST(ConnectedEventTest, HeldManagerIsResurrectedWhenResumeEnabled) {
+    EXPECT_EQ(classify_connected_event(/*live=*/false, /*held=*/true, /*resume_enabled=*/true),
+              ConnectedManagerAction::Resurrect);
+}
+
+TEST(ConnectedEventTest, HeldManagerIsIgnoredWhenResumeDisabled) {
+    // resume.enabled is non-reloadable, so a hold cannot outlive the flag in
+    // practice; assert the disabled path still never resurrects.
+    EXPECT_EQ(classify_connected_event(/*live=*/false, /*held=*/true, /*resume_enabled=*/false),
+              ConnectedManagerAction::CreateFresh);
+}
+
+TEST(ConnectedEventTest, FreshManagerForAnUnknownFriend) {
+    EXPECT_EQ(classify_connected_event(/*live=*/false, /*held=*/false, /*resume_enabled=*/true),
+              ConnectedManagerAction::CreateFresh);
+    EXPECT_EQ(classify_connected_event(/*live=*/false, /*held=*/false, /*resume_enabled=*/false),
+              ConnectedManagerAction::CreateFresh);
+}
+
 TEST(TunnelResumeProtocolTest, RoundTripRequest) {
     TunnelResumeRequestPayload p;
     p.prior_tunnel_id = 17;

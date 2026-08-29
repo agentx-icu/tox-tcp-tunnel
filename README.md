@@ -78,16 +78,24 @@ Forward any TCP port through Tox with end-to-end encryption, no central server, 
   keep the v0.3.0 batching default. Selectable via `tunnel.coalesce_mode`;
   defaults to `fixed` (v0.3.0 behaviour) for one release of soak.
 
-- **BDP-aware flow control** — opt-in via `flow_control.mode: bdp`. The
-  per-tunnel send window is recomputed from RTT × bandwidth EWMA and
-  clamped to `[64 KiB, 4 MiB]`, replacing the v0.3.0 fixed 256 KiB cap on
-  high-RTT × high-bandwidth links. Default stays `fixed`.
+- **BDP-aware flow control** — `flow_control.mode: bdp` is the **default**
+  since v0.4.1. The per-tunnel send window is recomputed from RTT × bandwidth
+  EWMA and clamped to `[64 KiB, 4 MiB]`, replacing the v0.3.0 fixed 256 KiB cap
+  on high-RTT × high-bandwidth links. Set `mode: fixed` to pin the v0.3.0
+  behaviour.
 
 - **Per-friend rate limiting** — anti-DoS layer in `rules.yaml`. Per-
   friend `rate_limit:` blocks and a top-level `rate_limit_defaults:`
-  configure token buckets for `TUNNEL_OPEN` frames/sec and `TUNNEL_DATA`
-  bytes/sec. Modes: `off | report | enforce`. Reloadable with the rules
-  file via `SIGHUP`.
+  limit the rate of `TUNNEL_OPEN` frames (`open_per_sec` / `open_burst`)
+  and the number of concurrent tunnels (`max_concurrent_tunnels`) per
+  friend. Modes: `off | report | enforce`; a per-friend block overrides
+  `rate_limit_defaults` field by field, so tightening one setting leaves
+  the rest inherited. Reloadable with the rules file via `SIGHUP` — note
+  that a reload resets every friend's token bucket and rejection counts.
+  **Bandwidth limiting is not implemented**: `bytes_per_sec` /
+  `bytes_burst` are still accepted (old rules files must keep loading),
+  but the data path never consults the byte buckets, so they shape no
+  traffic and the loader logs a warning when they are set.
 
 - **Tox-thread watchdog** — `watchdog.enabled: true` by default. The Tox
   iteration thread bumps a heartbeat on every return from `tox_iterate`;
@@ -249,6 +257,7 @@ Manage the service:
 sudo systemctl start toxtunnel     # Start
 sudo systemctl enable toxtunnel    # Enable on boot
 sudo systemctl status toxtunnel    # Check status
+sudo systemctl reload toxtunnel    # Hot-reload rules / forwards / log level (SIGHUP)
 sudo systemctl stop toxtunnel      # Stop
 ```
 
@@ -285,15 +294,20 @@ The package installs:
 - Example config to `/usr/local/share/toxtunnel/config.yaml.example`
 - Sample launchd plist to `/usr/local/share/toxtunnel/com.toxtunnel.daemon.plist`
 
-The installer **postinstall** copies the plist into `/Library/LaunchDaemons/` and runs `launchctl bootstrap`. You still need to create `/usr/local/etc/toxtunnel/config.yaml` before the daemon can run.
+The installer **postinstall** seeds `/usr/local/etc/toxtunnel/config.yaml` from the example *if that file does not already exist*, copies the plist into `/Library/LaunchDaemons/`, and runs `launchctl bootstrap`. The seeded config is `mode: server` with `service.auto_start: true`, so a fresh package install comes up **online as a server** — it just has no access rules yet, so it accepts nothing until you add a `server.rules_file`.
 
-Set up the config (one-time):
+Edit the seeded file in place:
 
 ```bash
-sudo mkdir -p /usr/local/etc/toxtunnel
-sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
-# Edit the config for your role (server vs client) and service policy.
+sudo vi /usr/local/etc/toxtunnel/config.yaml     # already seeded by postinstall
+sudo launchctl kickstart -k system/com.toxtunnel.daemon   # apply
+
+# Only if the file is missing, or you deliberately want to start over:
+# sudo mkdir -p /usr/local/etc/toxtunnel
+# sudo cp /usr/local/share/toxtunnel/config.yaml.example /usr/local/etc/toxtunnel/config.yaml
 ```
+
+For a **client** install, change `mode: client`, fill in `client.server_id` and `client.forwards`, and set `service.allow_client_daemon: true` — a client config leaves the daemon idle (exit 0) until you do.
 
 Manage the job:
 
@@ -625,6 +639,7 @@ toxtunnel print-id [OPTIONS]
 toxtunnel servers {list|show|add|remove} [OPTIONS]
 toxtunnel inspect [tunnels|status] [OPTIONS]
 toxtunnel reload [OPTIONS]
+toxtunnel config check -c FILE [--strict]
 toxtunnel install-windows-service [OPTIONS]      # Windows only
 toxtunnel uninstall-windows-service              # Windows only
 ```
@@ -672,17 +687,43 @@ and reports that on stderr (so a freshly-generated key is never a surprise).
 
 Talks to a running daemon over local IPC (Unix socket
 `<data_dir>/toxtunnel.sock` or Windows named pipe
-`\\.\pipe\toxtunnel-inspect-<pid>`) and prints a snapshot of active tunnels or
+`\\.\pipe\toxtunnel-<pid>`) and prints a snapshot of active tunnels or
 the daemon's connection status. Read-only; nothing on the wire leaves the host.
+The daemon records its pid in `<data_dir>/toxtunnel.pid` (since v0.4.11), which
+is how the CLI finds the per-pid pipe on Windows; set `TOXTUNNEL_INSPECT_PID`
+to override. A Windows *service* daemon (LocalSystem) only admits SYSTEM and
+Administrators on its pipe — run `inspect` from an elevated prompt.
 
 | Form                                      | Description                                  |
 | ----------------------------------------- | -------------------------------------------- |
 | `toxtunnel inspect tunnels [--json]`      | List open tunnels (id, peer, idle, bytes)    |
-| `toxtunnel inspect status [--json]`       | Daemon status (mode, friends online, uptime) |
-| `-d, --data-dir DIR` / `-c, --config F`   | Where to find the IPC socket / pid file      |
+| `toxtunnel inspect status [--json]`       | Daemon status: `mode`, `version`, `friends_online`, `peer_online_seconds` (client), `tunnels_active`, `bytes_in`, `bytes_out` |
+| `-d, --data-dir DIR` / `-c, --config F`   | Where to find the IPC socket / `toxtunnel.pid` |
 
 The IPC endpoint is enabled by default (`inspect.enabled: true`). Set it to
 `false` in the YAML to disable per-host.
+
+### config check Subcommand
+
+Parses and validates a config file without starting anything, and lists keys the
+daemon would silently ignore — typos, or plausible-looking settings that are not
+settings at all.
+
+```bash
+toxtunnel config check -c /etc/toxtunnel/config.yaml
+# config check: unknown key 'tox.local_discovery_enabled' (ignored by this build)
+# config check: /etc/toxtunnel/config.yaml is valid (server mode, 1 unknown key)
+```
+
+| Flag | Description |
+| ---- | ----------- |
+| `-c, --config FILE` | Config file to check (required) |
+| `--strict` | Exit non-zero when unknown keys are present, not just on parse/validation errors — for CI |
+
+Exit codes: `0` usable, `1` unparseable or invalid (or, with `--strict`, carrying
+unknown keys). The daemon performs the same unknown-key check at startup and on
+reload, logging each one at WARN; it never refuses to start over them, so an
+older binary can still read a newer config.
 
 ### reload Subcommand
 
@@ -692,9 +733,10 @@ identity, bootstrap nodes, metrics binding) requires a restart.
 
 | Form                                      | Description                                  |
 | ----------------------------------------- | -------------------------------------------- |
+| `toxtunnel reload`                        | Reads `<data_dir>/toxtunnel.pid`, then: POSIX sends `SIGHUP` to that pid (refuses a stale pid that is no longer a toxtunnel process); Windows writes to `\\.\pipe\toxtunnel-reload-<pid>` |
 | `kill -HUP <pid>`                         | POSIX: same effect, no CLI involvement       |
-| `toxtunnel reload`                        | Windows: writes to `\\.\pipe\toxtunnel-reload-<pid>` |
-| `-d, --data-dir DIR` / `-c, --config F`   | Locate the daemon's pid file                 |
+| `-d, --data-dir DIR` / `-c, --config F`   | Locate the daemon's `toxtunnel.pid`          |
+| `TOXTUNNEL_RELOAD_PID=<pid>`              | Env override when the pid file is unreadable |
 
 ---
 
@@ -725,6 +767,10 @@ Then point a browser, `curl`, or any proxy-aware tool at it:
 curl --socks5-hostname 127.0.0.1:1080 http://10.0.0.5:8080/health
 curl --proxy 127.0.0.1:1080 https://internal.example.org    # HTTP CONNECT
 ```
+
+A destination the server's `rules.yaml` rejects comes back as SOCKS5 reply
+`0x02` ("connection not allowed by ruleset") / HTTP `403 Forbidden`, which is
+how you tell a policy denial from an unreachable host (`0x04` / `502`).
 
 ---
 
@@ -793,12 +839,19 @@ Edit the YAML and reapply rules, forwards, and log level on the live daemon
 without dropping existing connections.
 
 ```bash
-# POSIX (Linux / macOS):
-kill -HUP "$(cat /var/run/toxtunnel.pid)"
+# Any platform — resolves the pid from <data_dir>/toxtunnel.pid:
+toxtunnel reload -c /etc/toxtunnel/config.yaml          # POSIX: sends SIGHUP
+toxtunnel reload -c C:\ProgramData\ToxTunnel\config.yaml # Windows: per-pid named pipe
 
-# Windows (uses a per-pid named pipe under the hood):
-toxtunnel reload -c C:\ProgramData\ToxTunnel\config.yaml
+# POSIX equivalents without the CLI:
+kill -HUP "$(cat /var/lib/toxtunnel/toxtunnel.pid)"      # pid file lives in data_dir
+sudo systemctl reload toxtunnel                          # packaged install
 ```
+
+Confirm in the daemon log: `config reloaded (rules: N rules)` (server) or
+`config reloaded (forwards: +A -B)` (client). On Windows the
+service runs as LocalSystem, so run `toxtunnel reload` from an elevated
+(Administrator) prompt.
 
 Anything outside that subset (Tox identity, bootstrap nodes, `metrics.listen`,
 `socks5.listen`, `inspect.enabled`) requires a full restart.

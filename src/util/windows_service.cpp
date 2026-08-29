@@ -6,9 +6,46 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <string_view>
 
 namespace toxtunnel::util {
 namespace {
+
+#if defined(_WIN32)
+/// Reason the last install/uninstall failed, so the CLI can say what actually
+/// went wrong. "The service already exists" and "you are not an administrator"
+/// need completely different fixes, and reporting both as "run as
+/// Administrator" sends people down the wrong path.
+std::string& last_service_error() {
+    static std::string err;
+    return err;
+}
+
+void set_last_service_error(std::string_view what, unsigned long code) {
+    std::string msg(what);
+    msg += " (error " + std::to_string(code);
+    switch (code) {
+        case ERROR_ACCESS_DENIED:
+            msg += ": access denied — run from an elevated (Administrator) prompt";
+            break;
+        case ERROR_SERVICE_EXISTS:
+            msg +=
+                ": a service with this name is already registered — remove it first "
+                "(`uninstall-windows-service`, or `sc delete ToxTunnel`)";
+            break;
+        case ERROR_SERVICE_MARKED_FOR_DELETE:
+            msg += ": the previous service is still shutting down — retry in a moment";
+            break;
+        case ERROR_SERVICE_DOES_NOT_EXIST:
+            msg += ": no such service is registered";
+            break;
+        default:
+            break;
+    }
+    msg += ")";
+    last_service_error() = std::move(msg);
+}
+#endif
 
 // Global state for Windows service (guarded by being set before service start)
 std::atomic<bool> g_service_stopping{false};
@@ -100,6 +137,7 @@ bool install_windows_service(const std::string& service_name, const std::string&
 #if defined(_WIN32)
     SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
+        set_last_service_error("OpenSCManager failed", GetLastError());
         return false;
     }
 
@@ -114,9 +152,41 @@ bool install_windows_service(const std::string& service_name, const std::string&
                        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
                        bin_line.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!service) {
+        set_last_service_error("CreateService failed", GetLastError());
         CloseServiceHandle(scm);
         return false;
     }
+
+    // Configure recovery actions. Without them the SCM does nothing when the
+    // daemon stops with an error, so a startup failure that a retry would fix
+    // — most importantly "the data directory is still held by the previous
+    // instance" during a restart — leaves the service simply stopped. systemd
+    // (`Restart=on-failure`) and launchd (`KeepAlive{SuccessfulExit:false}`)
+    // already retry; this gives Windows the same behaviour.
+    //
+    // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG is required as well: by default the
+    // SCM only counts a *crash* as a failure, not a clean exit reporting an
+    // error code, which is exactly how this daemon reports one.
+    SC_ACTION actions[3];
+    actions[0].Type = SC_ACTION_RESTART;
+    actions[0].Delay = 10'000;  // 10 s
+    actions[1].Type = SC_ACTION_RESTART;
+    actions[1].Delay = 30'000;  // 30 s
+    actions[2].Type = SC_ACTION_RESTART;
+    actions[2].Delay = 60'000;  // then every minute
+    SERVICE_FAILURE_ACTIONSA failure_actions{};
+    failure_actions.dwResetPeriod = 86'400;  // forget the failure count after a day
+    failure_actions.lpRebootMsg = nullptr;
+    failure_actions.lpCommand = nullptr;
+    failure_actions.cActions = 3;
+    failure_actions.lpsaActions = actions;
+    // Best-effort: a service that runs but has no recovery policy is still far
+    // better than failing the whole installation over it.
+    (void)ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure_actions);
+
+    SERVICE_FAILURE_ACTIONS_FLAG failure_flag{};
+    failure_flag.fFailureActionsOnNonCrashFailures = TRUE;
+    (void)ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failure_flag);
 
     CloseServiceHandle(service);
     CloseServiceHandle(scm);
@@ -134,16 +204,21 @@ bool uninstall_windows_service(const std::string& service_name) {
 #if defined(_WIN32)
     SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) {
+        set_last_service_error("OpenSCManager failed", GetLastError());
         return false;
     }
 
     SC_HANDLE service = OpenServiceA(scm, service_name.c_str(), DELETE);
     if (!service) {
+        set_last_service_error("OpenService failed", GetLastError());
         CloseServiceHandle(scm);
         return false;
     }
 
     const bool ok = DeleteService(service) != 0;
+    if (!ok) {
+        set_last_service_error("DeleteService failed", GetLastError());
+    }
     CloseServiceHandle(service);
     CloseServiceHandle(scm);
     return ok;
@@ -208,6 +283,14 @@ int run_windows_service_main(const std::string& service_name, const std::functio
 #else
     (void)service_name;
     return run_fn ? run_fn() : 1;
+#endif
+}
+
+std::string last_windows_service_error() {
+#if defined(_WIN32)
+    return last_service_error();
+#else
+    return {};
 #endif
 }
 

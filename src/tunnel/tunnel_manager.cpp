@@ -8,6 +8,25 @@
 namespace toxtunnel::tunnel {
 
 // ===========================================================================
+// Outbound send-handler snapshot
+// ===========================================================================
+
+TunnelManager::SendSnapshot::SendSnapshot(TunnelManager& manager) {
+    // The whole point is that the gate test and the handler copy happen under
+    // ONE acquisition. Copying the handler first and checking the gate
+    // afterwards (or vice versa) is the check-to-call seam this replaces: a
+    // sender could otherwise ACQUIRE a copy after close_all_local() had closed
+    // the gate. A copy taken BEFORE the gate closed is still valid and may
+    // still be called — see close_all_local() for that residual.
+    std::lock_guard<std::mutex> lock(manager.handler_mutex_);
+    if (manager.send_gate_closed_) {
+        gate_closed_ = true;
+        return;
+    }
+    handler_ = manager.send_handler_;
+}
+
+// ===========================================================================
 // Construction
 // ===========================================================================
 
@@ -76,11 +95,19 @@ void TunnelManager::enable_reaper(uint32_t idle_timeout_seconds, uint32_t tick_s
     const auto idle_ns =
         std::chrono::nanoseconds(std::chrono::seconds(idle_timeout_seconds)).count();
     reaper_idle_timeout_ns_.store(static_cast<int64_t>(idle_ns), std::memory_order_relaxed);
-    reaper_tick_ = std::chrono::seconds(tick_seconds);
+    reaper_tick_ns_.store(std::chrono::nanoseconds(std::chrono::seconds(tick_seconds)).count(),
+                          std::memory_order_relaxed);
 
-    // Re-entering enable_reaper() while already armed is fine — schedule_reaper_tick()
-    // is idempotent in the sense that the new expiry replaces the old.
-    schedule_reaper_tick();
+    // Re-entering enable_reaper() while already armed is fine — the new expiry
+    // replaces the old. Bump the generation so any tick already dispatched from
+    // the previous arming retires instead of racing this one into a
+    // double-armed timer. Generation bump and arm happen under `timer_mutex_`
+    // as one step: a stale handler that is between its own epoch check and its
+    // re-arm must not be able to interleave here (see timer_mutex_'s docs).
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        schedule_reaper_tick_locked(reaper_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1);
+    }
 
     util::Logger::info("TunnelManager: idle reaper enabled (idle={}s, tick={}s)",
                        idle_timeout_seconds, tick_seconds);
@@ -96,12 +123,16 @@ void TunnelManager::enable_half_close_reaper(uint32_t half_close_timeout_seconds
         std::chrono::nanoseconds(std::chrono::seconds(half_close_timeout_seconds)).count();
     reaper_half_close_timeout_ns_.store(static_cast<int64_t>(half_close_ns),
                                         std::memory_order_relaxed);
-    reaper_tick_ = std::chrono::seconds(tick_seconds);
+    reaper_tick_ns_.store(std::chrono::nanoseconds(std::chrono::seconds(tick_seconds)).count(),
+                          std::memory_order_relaxed);
 
     // Shares reaper_timer_ with the idle reaper. Re-arming an already-armed
     // timer just replaces the expiry — harmless when both policies are enabled
     // back-to-back at startup.
-    schedule_reaper_tick();
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        schedule_reaper_tick_locked(reaper_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1);
+    }
 
     util::Logger::info("TunnelManager: half-close linger cap enabled (timeout={}s, tick={}s)",
                        half_close_timeout_seconds, tick_seconds);
@@ -109,28 +140,78 @@ void TunnelManager::enable_half_close_reaper(uint32_t half_close_timeout_seconds
 
 void TunnelManager::disable_reaper() {
     // Disables BOTH maintenance policies (idle reaper + half-close cap) — they
-    // share one timer. Production only calls this at teardown.
+    // share one timer. Production calls this at teardown and when a manager is
+    // parked for resume.
     reaper_idle_timeout_ns_.store(0, std::memory_order_relaxed);
     reaper_half_close_timeout_ns_.store(0, std::memory_order_relaxed);
+    // Retire the generation BEFORE cancelling: a handler already dispatched on
+    // the io_context is past `operation_aborted` and will only be stopped by
+    // the epoch gate, so the gate has to be closed first. Both steps run under
+    // `timer_mutex_` so a stale handler cannot re-arm between them (and so we
+    // are not touching the timer object concurrently with an arming thread).
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    reaper_epoch_.fetch_add(1, std::memory_order_acq_rel);
     if (reaper_active_.exchange(false, std::memory_order_acq_rel)) {
         reaper_timer_.cancel();
     }
 }
 
-void TunnelManager::schedule_reaper_tick() {
+bool TunnelManager::reaper_epoch_current(std::uint64_t epoch) const noexcept {
+    return reaper_epoch_.load(std::memory_order_acquire) == epoch;
+}
+
+std::uint64_t TunnelManager::reaper_epoch() const noexcept {
+    return reaper_epoch_.load(std::memory_order_acquire);
+}
+
+void TunnelManager::rearm_reaper_after_tick(std::uint64_t epoch) {
+    // The whole point of this function: the generation check and the arm are
+    // ONE critical section. Splitting them (the previous shape — check the
+    // epoch, then call an unconditional schedule_*_tick) let a stale handler
+    // that had already passed its check be preempted by disable_*() +
+    // enable_*(), and then overwrite the successor's wait with its own retired
+    // one. `expires_after` cancels the pending wait, so the successor's handler
+    // fired with operation_aborted and the stale wait was refused at the entry
+    // gate: no live chain at all.
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    if (!reaper_epoch_current(epoch)) {
+        return;
+    }
+    const bool maintenance_on = reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0 ||
+                                reaper_half_close_timeout_ns_.load(std::memory_order_relaxed) > 0;
+    if (!maintenance_on) {
+        // Only the live generation may clear the armed flag; a retired one
+        // would otherwise stomp a freshly armed successor. Guaranteed here by
+        // the epoch check above plus the lock.
+        reaper_active_.store(false, std::memory_order_release);
+        return;
+    }
+    schedule_reaper_tick_locked(epoch);
+}
+
+void TunnelManager::schedule_reaper_tick_locked(std::uint64_t epoch) {
     reaper_active_.store(true, std::memory_order_release);
-    reaper_timer_.expires_after(reaper_tick_);
+    reaper_timer_.expires_after(
+        std::chrono::nanoseconds(reaper_tick_ns_.load(std::memory_order_relaxed)));
     // S17 / 2026-05-20 follow-up: weak_ptr capture so the handler
     // gracefully bails out if the manager was destroyed between
     // `cancel()` (non-blocking) and dispatch.
     std::weak_ptr<TunnelManager> weak = weak_from_this();
-    reaper_timer_.async_wait([weak](const asio::error_code& ec) {
+    reaper_timer_.async_wait([weak, epoch](const asio::error_code& ec) {
         if (ec == asio::error::operation_aborted) {
             return;
         }
         auto self = weak.lock();
         if (!self) {
             return;  // Manager was destroyed before the timer fired.
+        }
+        // Generation gate: disable_reaper() may have run after this handler was
+        // dispatched but before it got to execute. The timeout re-reads below
+        // would catch a plain disable, but not a disable immediately followed by
+        // an enable (the resume pause/resurrect sequence) — that would leave two
+        // live tick chains on one timer.
+        if (!self->reaper_epoch_current(epoch)) {
+            return;
         }
         // Stash & re-read the timeouts: disable_reaper() may have raced in.
         // Either maintenance policy keeps the timer alive.
@@ -142,20 +223,17 @@ void TunnelManager::schedule_reaper_tick() {
             return;
         }
 
-        self->reap_idle_tunnels_once();
+        // Unlocked: reap_idle_tunnels_once() runs tunnel teardown, which
+        // re-enters application callbacks (and can disable us). `timer_mutex_`
+        // is a leaf and must never be held across it.
+        self->reap_idle_tunnels_once(epoch);
 
-        const bool still_on =
-            self->reaper_idle_timeout_ns_.load(std::memory_order_relaxed) > 0 ||
-            self->reaper_half_close_timeout_ns_.load(std::memory_order_relaxed) > 0;
-        if (still_on) {
-            self->schedule_reaper_tick();
-        } else {
-            self->reaper_active_.store(false, std::memory_order_release);
-        }
+        // Re-check the generation and re-arm as ONE step.
+        self->rearm_reaper_after_tick(epoch);
     });
 }
 
-std::size_t TunnelManager::reap_idle_tunnels_once() {
+std::size_t TunnelManager::reap_idle_tunnels_once(std::uint64_t epoch) {
     const int64_t idle_timeout_ns = reaper_idle_timeout_ns_.load(std::memory_order_relaxed);
     const int64_t half_close_ns = reaper_half_close_timeout_ns_.load(std::memory_order_relaxed);
     if (idle_timeout_ns <= 0 && half_close_ns <= 0) {
@@ -195,14 +273,38 @@ std::size_t TunnelManager::reap_idle_tunnels_once() {
 
     std::size_t closed = 0;
     for (uint16_t id : to_close) {
-        // remove_tunnel() invokes Tunnel::close() under its own lock, which
-        // emits TUNNEL_CLOSE to the peer before erasing the entry. A tunnel
-        // may have already been removed between the scan and now — that's
-        // fine; remove_tunnel() is a no-op on missing IDs.
+        // close_for_timeout() first: it books the close as reason="timeout"
+        // instead of "local", and — for a tunnel stuck in Disconnecting — tells
+        // the peer explicitly, so the linger cap does not trade our fd leak for
+        // one on the far side. remove_tunnel() then erases the entry; its own
+        // close() call is a no-op once we are already Closed, and it is a no-op
+        // on IDs that vanished between the scan and now.
+        std::shared_ptr<Tunnel> doomed;
+        {
+            std::shared_lock lock(mutex_);
+            auto it = tunnels_.find(id);
+            if (it != tunnels_.end()) {
+                doomed = it->second;
+            }
+        }
+        if (!doomed) {
+            continue;
+        }
+        // Re-check the generation before each close, not just once per pass:
+        // this loop runs unlocked (it must — close paths re-enter application
+        // callbacks), so a disable+enable can land in the middle of it. Without
+        // this, a retired pass could keep reaping tunnels belonging to a
+        // manager that has since been resumed.
+        if (epoch != kAnyReaperEpoch && !reaper_epoch_current(epoch)) {
+            break;
+        }
+        if (auto* impl = dynamic_cast<TunnelImpl*>(doomed.get())) {
+            impl->close_for_timeout();
+        }
         if (has_tunnel(id)) {
             remove_tunnel(id);
-            ++closed;
         }
+        ++closed;
     }
 
     if (closed > 0) {
@@ -231,49 +333,95 @@ void TunnelManager::enable_keepalive(uint32_t interval_seconds, uint32_t timeout
     if (interval_seconds == 0) {
         return;
     }
-    keepalive_interval_ = std::chrono::seconds(interval_seconds);
-    keepalive_timeout_ =
-        std::chrono::seconds(timeout_seconds == 0 ? interval_seconds * 3 : timeout_seconds);
+    keepalive_interval_ns_.store(
+        std::chrono::nanoseconds(std::chrono::seconds(interval_seconds)).count(),
+        std::memory_order_relaxed);
+    const uint32_t timeout = timeout_seconds == 0 ? interval_seconds * 3 : timeout_seconds;
+    keepalive_timeout_ns_.store(std::chrono::nanoseconds(std::chrono::seconds(timeout)).count(),
+                                std::memory_order_relaxed);
     // Reset the liveness baseline + the one-shot dead latch so re-enabling on a
     // reconnect starts fresh.
     last_pong_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                         std::memory_order_relaxed);
     peer_dead_latched_.store(false, std::memory_order_release);
-    schedule_keepalive_tick();
+    // New generation: retires any tick still in flight from a previous enable,
+    // so re-enabling on a reconnect cannot end up with two PING chains. Bump
+    // and arm under `timer_mutex_` — the "disable immediately followed by
+    // enable" sequence (resume pause/resurrect) is exactly where a stale
+    // handler used to squeeze in and clobber this arming.
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        schedule_keepalive_tick_locked(keepalive_epoch_.fetch_add(1, std::memory_order_acq_rel) +
+                                       1);
+    }
     util::Logger::info("TunnelManager: keepalive enabled (interval={}s, timeout={}s)",
-                       interval_seconds, static_cast<uint32_t>(keepalive_timeout_.count()));
+                       interval_seconds, timeout);
 }
 
 void TunnelManager::disable_keepalive() {
+    // Retire the generation FIRST. `cancel()` only aborts a wait that has not
+    // been dispatched yet; a handler already queued on the io_context (or one
+    // mid-execution, sitting inside send_frame) sails past the abort check.
+    // Before the epoch gate existed, such a handler still emitted its PING and
+    // then called schedule_keepalive_tick(), which set keepalive_active_ back
+    // to true — a manager that had been "stopped" (parked for resume, or
+    // abandoned by close_all_local) kept pinging the peer indefinitely.
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    keepalive_epoch_.fetch_add(1, std::memory_order_acq_rel);
     if (keepalive_active_.exchange(false, std::memory_order_acq_rel)) {
         keepalive_timer_.cancel();
     }
 }
 
-void TunnelManager::schedule_keepalive_tick() {
+bool TunnelManager::keepalive_epoch_current(std::uint64_t epoch) const noexcept {
+    return keepalive_epoch_.load(std::memory_order_acquire) == epoch;
+}
+
+std::uint64_t TunnelManager::keepalive_epoch() const noexcept {
+    return keepalive_epoch_.load(std::memory_order_acquire);
+}
+
+void TunnelManager::rearm_keepalive_after_tick(std::uint64_t epoch) {
+    // Generation check + arm as one indivisible step; see
+    // rearm_reaper_after_tick() for the interleaving this closes.
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    if (!keepalive_epoch_current(epoch)) {
+        return;
+    }
+    schedule_keepalive_tick_locked(epoch);
+}
+
+void TunnelManager::schedule_keepalive_tick_locked(std::uint64_t epoch) {
     keepalive_active_.store(true, std::memory_order_release);
-    keepalive_timer_.expires_after(keepalive_interval_);
+    keepalive_timer_.expires_after(
+        std::chrono::nanoseconds(keepalive_interval_ns_.load(std::memory_order_relaxed)));
     // weak_ptr capture so a teardown racing a dispatched tick bails gracefully
     // (mirrors the reaper).
     std::weak_ptr<TunnelManager> weak = weak_from_this();
-    keepalive_timer_.async_wait([weak](const asio::error_code& ec) {
+    keepalive_timer_.async_wait([weak, epoch](const asio::error_code& ec) {
         if (ec == asio::error::operation_aborted) {
             return;
         }
         auto self = weak.lock();
-        if (!self || !self->keepalive_active_.load(std::memory_order_acquire)) {
+        if (!self) {
+            return;
+        }
+        // Gate 1 — entry. Everything below this point sends or re-arms, so a
+        // retired generation must stop here.
+        if (!self->keepalive_epoch_current(epoch) ||
+            !self->keepalive_active_.load(std::memory_order_acquire)) {
             return;
         }
 
         // Liveness check: if no PONG within the timeout, declare the peer dead.
         const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
         const int64_t last_ns = self->last_pong_ns_.load(std::memory_order_relaxed);
-        const int64_t timeout_ns = std::chrono::nanoseconds(self->keepalive_timeout_).count();
+        const int64_t timeout_ns = self->keepalive_timeout_ns_.load(std::memory_order_relaxed);
         if (last_ns > 0 && now_ns - last_ns > timeout_ns) {
             if (!self->peer_dead_latched_.exchange(true, std::memory_order_acq_rel)) {
                 util::Logger::warn(
                     "TunnelManager: keepalive — no PONG for >{}s, declaring peer dead",
-                    static_cast<int64_t>(self->keepalive_timeout_.count()));
+                    timeout_ns / 1'000'000'000);
                 std::function<void()> cb;
                 {
                     std::lock_guard<std::mutex> lock(self->handler_mutex_);
@@ -284,15 +432,39 @@ void TunnelManager::schedule_keepalive_tick() {
                 }
             }
             // Stop pinging a peer we've given up on; re-enable on reconnect.
-            self->keepalive_active_.store(false, std::memory_order_release);
+            // Only if we are still the live generation — on_peer_dead_ runs
+            // application code that routinely calls enable_keepalive() on a
+            // replacement session, and clearing the flag then would silently
+            // stop the successor's chain. Under `timer_mutex_` so the check and
+            // the store cannot straddle a concurrent enable_keepalive().
+            {
+                std::lock_guard<std::mutex> lock(self->timer_mutex_);
+                if (self->keepalive_epoch_current(epoch)) {
+                    self->keepalive_active_.store(false, std::memory_order_release);
+                }
+            }
+            return;
+        }
+
+        // Gate 2 — before the send. The liveness branch above can invoke
+        // on_peer_dead_, i.e. arbitrary application code, which may disable us.
+        if (!self->keepalive_epoch_current(epoch)) {
             return;
         }
 
         // Send a PING and re-arm. send_frame is a no-op-ish false when the peer
         // is unreachable; we keep the timer running so the timeout still trips.
+        // Deliberately outside `timer_mutex_`: send_frame reaches into
+        // ToxAdapter, and `timer_mutex_` is a leaf.
         ProtocolFrame ping = ProtocolFrame::make_ping();
         self->send_frame(ping);
-        self->schedule_keepalive_tick();
+
+        // Gate 3 — the re-arm. The send handler itself is application code (it
+        // reaches into ToxAdapter and, on a permanent failure, the server tears
+        // the manager down), so the generation may have turned over while the
+        // PING was in flight. The check and the arm are one locked step; a
+        // split check-then-arm is precisely the H-1 race.
+        self->rearm_keepalive_after_tick(epoch);
     });
 }
 
@@ -482,6 +654,13 @@ bool TunnelManager::has_tunnel(uint16_t tunnel_id) const {
 }
 
 uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
+    // An abandoned manager must not mint a tunnel, let alone emit TUNNEL_OPEN
+    // on an id the peer has already recycled into a live session.
+    if (outbound_muted()) {
+        util::Logger::debug("TunnelManager::create_tunnel: manager is muted, refusing");
+        return 0;
+    }
+
     // Allocate an ID first
     auto allocated = allocate_tunnel_id();
     if (!allocated) {
@@ -493,20 +672,19 @@ uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
     // Send TUNNEL_OPEN frame to the remote peer
     ProtocolFrame open_frame = ProtocolFrame::make_tunnel_open(tunnel_id, host, port);
 
-    SendHandler handler;
-    {
-        std::lock_guard<std::mutex> lock(handler_mutex_);
-        handler = send_handler_;
-    }
-
-    if (!handler) {
-        // No send handler - cannot create tunnel
+    // Snapshot, not a bare handler copy: the mute check at the top of this
+    // function is only an entry gate, and close_all_local() could previously
+    // latch between it and the call below, letting a TUNNEL_OPEN for a recycled
+    // id reach the peer's live session.
+    SendSnapshot snapshot(*this);
+    if (snapshot.gate_closed() || !snapshot.handler()) {
+        // Abandoned session, or no send handler — cannot create a tunnel.
         release_tunnel_id(tunnel_id);
         return 0;
     }
 
     auto wire = open_frame.serialize();
-    const auto outcome = handler(wire);
+    const auto outcome = snapshot.handler()(wire);
     if (outcome == SendOutcome::PermanentFail) {
         util::Logger::warn("TunnelManager::create_tunnel: failed to send TUNNEL_OPEN for {}",
                            tunnel_id);
@@ -524,6 +702,137 @@ uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
     record_bytes_sent(open_frame.serialized_size());
 
     return tunnel_id;
+}
+
+bool TunnelManager::outbound_muted() const noexcept {
+    return outbound_muted_.load(std::memory_order_acquire);
+}
+
+void TunnelManager::close_all_local() {
+    // Step 1 — stop this manager's own frame generators. The keepalive tick
+    // emits PING and the maintenance tick can emit TUNNEL_ERROR / TUNNEL_CLOSE
+    // via close_for_timeout(); both are addressed at a session the peer has
+    // abandoned. Their epoch gates (see disable_keepalive) guarantee a tick
+    // already dispatched cannot re-arm behind us.
+    disable_keepalive();
+    disable_reaper();
+
+    // Step 2 — ONE critical section latches the mute and empties the retry
+    // queue. Doing both under `pending_mutex_` is what makes the contract hold:
+    // no thread can observe "muted" while frames are still parked, nor "queue
+    // empty" while the mute is not yet visible. A drain already in flight holds
+    // its own copy of the old send handler (it was copied before this call), so
+    // clearing the queue alone would not stop it — it re-checks the latch under
+    // this same mutex on every pop, and again immediately before each send.
+    std::size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        outbound_muted_.store(true, std::memory_order_release);
+        dropped = pending_outbound_.size();
+        pending_outbound_.clear();
+        pending_drain_armed_ = false;
+    }
+    if (dropped > 0) {
+        pending_dropped_total_.fetch_add(dropped, std::memory_order_relaxed);
+    }
+    // Outside the mutex: cancel() completes inline on some backends and the
+    // handler re-takes pending_mutex_.
+    pending_drain_timer_.cancel();
+
+    // Step 3 — close the manager's outbound gate.
+    //
+    // Dropping `send_handler_` alone was never enough: every send path copies
+    // the handler out from under `handler_mutex_` and calls it after the
+    // unlock, because the handler re-enters ToxAdapter and, on a permanent
+    // failure, the owning server — running that under one of this class's locks
+    // is the re-entrancy H-01 forbids. A sender holding a copy could therefore
+    // deliver its frame after this call returned.
+    //
+    // The gate flag is raised in the SAME critical section that hands out
+    // SendSnapshots and copies the handler, so from here on no send can be
+    // AUTHORISED. It does not stop a send already authorised: a sender that
+    // snapshotted the handler microseconds ago can be descheduled and start its
+    // call after this returns.
+    //
+    // We deliberately do NOT wait for those sends. That wait deadlocks: the
+    // data path holds coalesce_mutex_ across its callback, and this function
+    // goes on to force_close() every tunnel, whose flush_pending_writes()
+    // re-takes that same non-recursive mutex. force_close() now skips the flush
+    // once the gate is closed, which defuses the re-entrant route; the wait
+    // stays gone because it bought a guarantee this layer cannot honour anyway.
+    // See the contract on close_all_local() for the exact residual and why
+    // closing it is a design change.
+    {
+        std::lock_guard<std::mutex> lock(handler_mutex_);
+        send_gate_closed_ = true;
+        send_handler_ = nullptr;
+    }
+
+    // Step 4 — detach every tunnel from the manager and release its id, then
+    // (still under the same lock) close its outbound gate. The per-tunnel
+    // TUNNEL_DATA path bypasses the manager entirely — it runs
+    // Tunnel::on_send_to_tox straight into ToxAdapter — so the manager latch
+    // cannot cover it. Doing it here means a tunnel is gated at the very
+    // instant it stops being reachable through the manager, rather than in a
+    // second unsynchronised pass.
+    //
+    // `close_outbound_gate()` replaces the old pair of callback setters, which
+    // could not be made one atomic step and, worse, left a window in which a
+    // sender could still ACQUIRE a callback (that is the whole reason for the
+    // gate/snapshot design — see TunnelImpl::close_outbound_gate). A sender
+    // that had already acquired one is outside what either design covers.
+    //
+    // H-01 discipline: `close_outbound_gate()` is the only thing called under
+    // `mutex_`, and it is provably non-re-entrant — it takes just the tunnel's
+    // own mutex to raise a flag and null two std::functions, then returns. It
+    // never calls back into the manager and never blocks on a send. The lock
+    // order manager-mutex_ -> tunnel-mutex_ is the
+    // one snapshot() already uses, and no path takes them the other way round.
+    std::map<uint16_t, std::shared_ptr<Tunnel>> doomed;
+    TunnelClosedCallback closed_cb;
+    {
+        std::unique_lock lock(mutex_);
+        doomed.swap(tunnels_);
+        for (const auto& [id, tunnel] : doomed) {
+            used_ids_[id] = false;
+            if (auto* impl = dynamic_cast<TunnelImpl*>(tunnel.get())) {
+                impl->close_outbound_gate();
+            }
+        }
+        closed_cb = on_tunnel_closed_;
+    }
+
+    // Step 5 — release local resources OUTSIDE `mutex_`. force_close() (rather
+    // than close()) is what actually frees things: it drops the target TCP
+    // socket, drives the tunnel to Closed even from Disconnecting — where
+    // close() is a no-op and would leak the fd — and fires on_close_ so the
+    // owning server decrements its gauges.
+    //
+    // Must be outside the lock: force_close() fires on_close_, which re-enters
+    // the owning server (H-01). It also takes each tunnel's `coalesce_mutex_`
+    // — but only for the socket/state half: because we closed every outbound
+    // gate above, force_close() takes its local-abandon path and skips the
+    // coalesce flush entirely. That matters when this whole call is running
+    // inside a Tox send callback, which the data path invokes while holding
+    // that very mutex.
+    for (auto& [id, tunnel] : doomed) {
+        if (!tunnel) {
+            continue;
+        }
+        if (auto* impl = dynamic_cast<TunnelImpl*>(tunnel.get())) {
+            impl->force_close();
+        } else {
+            tunnel->close();
+        }
+        if (closed_cb) {
+            asio::post(io_ctx_, [closed_cb, id = id]() { closed_cb(id); });
+        }
+    }
+
+    util::Logger::info(
+        "TunnelManager: abandoned session locally — closed {} tunnel(s), dropped {} pending "
+        "outbound frame(s); no further send can be authorised",
+        doomed.size(), dropped);
 }
 
 void TunnelManager::close_all() {
@@ -702,11 +1011,22 @@ constexpr auto kPendingDrainDelay = std::chrono::milliseconds(20);
 }  // namespace
 
 bool TunnelManager::send_frame(const ProtocolFrame& frame) {
-    SendHandler handler;
-    {
-        std::lock_guard<std::mutex> lock(handler_mutex_);
-        handler = send_handler_;
+    // Cheap pre-check so a muted manager does no work at all; the authoritative
+    // check happens under `pending_mutex_` below, where it is ordered against
+    // close_all_local()'s queue flush.
+    if (outbound_muted()) {
+        return false;
     }
+
+    // Take the snapshot BEFORE anything else: it fuses the gate test with the
+    // handler copy, so close_all_local() cannot latch between them. It lives to
+    // the end of the function, and holds `handler_mutex_` only inside its own
+    // constructor — nothing here nests that mutex under `pending_mutex_`.
+    SendSnapshot snapshot(*this);
+    if (snapshot.gate_closed()) {
+        return false;
+    }
+    const SendHandler& handler = snapshot.handler();
 
     if (!handler) {
         util::Logger::warn("TunnelManager::send_frame: no send handler registered");
@@ -727,6 +1047,11 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     // and never traverse this queue.
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
+        // Authoritative mute check: same mutex close_all_local() latches under,
+        // so once it has run no frame can be parked behind its flush.
+        if (outbound_muted_.load(std::memory_order_relaxed)) {
+            return false;
+        }
         if (!pending_outbound_.empty()) {
             if (pending_outbound_.size() >= kMaxPendingOutbound) {
                 pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
@@ -740,6 +1065,16 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
             arm_pending_drain_timer_locked();
             return true;
         }
+    }
+
+    // Cheap early-out for the common case; correctness no longer rests on it.
+    // The snapshot taken at the top of this function is what forbids a send
+    // from being AUTHORISED after the gate closes. (The old code had only this
+    // check, one instruction before the call, and the review was right that the
+    // gap it leaves is a frame per concurrently-sending tunnel.) Note this does
+    // not make teardown wait: a send already authorised may still land.
+    if (outbound_muted()) {
+        return false;
     }
 
     const SendOutcome outcome = handler(wire);
@@ -761,6 +1096,11 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     // parked frame actually goes out (in drain_pending_outbound), so the
     // stats reflect wire activity.
     std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (outbound_muted_.load(std::memory_order_relaxed)) {
+        // Latched while the send was in flight — do not resurrect the queue
+        // close_all_local() just emptied.
+        return false;
+    }
     if (pending_outbound_.size() >= kMaxPendingOutbound) {
         pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
         util::Logger::warn("TunnelManager::send_frame: pending queue at cap ({}); dropping frame",
@@ -777,6 +1117,12 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
 
 bool TunnelManager::queue_outbound_for_retry(std::vector<uint8_t> wire) {
     std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (outbound_muted_.load(std::memory_order_relaxed)) {
+        // The per-tunnel senders park their SENDQ-full frames here. For an
+        // abandoned session those frames are addressed at recycled ids, so
+        // they must be dropped rather than retried.
+        return false;
+    }
     if (pending_outbound_.size() >= kMaxPendingOutbound) {
         pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
         util::Logger::warn("TunnelManager::queue_outbound_for_retry: queue at cap ({}); dropping",
@@ -795,7 +1141,8 @@ void TunnelManager::arm_pending_drain_timer_locked() {
     // Caller holds `pending_mutex_`. Idempotent: a single retry tick is
     // enough since drain_pending_outbound re-arms itself when the SENDQ
     // is still full.
-    if (pending_drain_armed_ || pending_outbound_.empty()) {
+    if (pending_drain_armed_ || pending_outbound_.empty() ||
+        outbound_muted_.load(std::memory_order_relaxed)) {
         return;
     }
     // The drain callback captures `weak_from_this()`. When the manager is
@@ -827,11 +1174,18 @@ void TunnelManager::arm_pending_drain_timer_locked() {
 }
 
 void TunnelManager::drain_pending_outbound() {
-    SendHandler handler;
-    {
-        std::lock_guard<std::mutex> lock(handler_mutex_);
-        handler = send_handler_;
+    // One snapshot for the whole drain. close_all_local() does NOT wait for this
+    // loop; the per-iteration mute re-check below is what stops it, so a drain
+    // that was already running when the session was abandoned emits at most the
+    // frame it had already popped.
+    SendSnapshot snapshot(*this);
+    if (snapshot.gate_closed()) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_outbound_.clear();
+        pending_drain_armed_ = false;
+        return;
     }
+    const SendHandler& handler = snapshot.handler();
     if (!handler) {
         // Handler was uninstalled between arming and firing — drop the
         // armed flag so a future send_frame can re-arm if needed.
@@ -844,6 +1198,15 @@ void TunnelManager::drain_pending_outbound() {
         std::vector<uint8_t> wire;
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
+            // Re-check the mute on EVERY iteration, under the same mutex
+            // close_all_local() latches it with. `handler` above is a copy
+            // taken before the latch, so this is the only thing that stops a
+            // drain that was already running when the session was abandoned.
+            if (outbound_muted_.load(std::memory_order_relaxed)) {
+                pending_outbound_.clear();
+                pending_drain_armed_ = false;
+                return;
+            }
             if (pending_outbound_.empty()) {
                 pending_drain_armed_ = false;
                 return;
@@ -852,6 +1215,14 @@ void TunnelManager::drain_pending_outbound() {
             // to the front to preserve FIFO order.
             wire = std::move(pending_outbound_.front());
             pending_outbound_.pop_front();
+        }
+
+        // The frame is now out of the queue and off the mutex; if the latch
+        // landed in between, drop it here rather than putting it on the wire.
+        // Best-effort: close_all_local() does NOT wait for this loop, so this
+        // re-check is the only thing that stops a drain already in flight.
+        if (outbound_muted()) {
+            return;
         }
 
         const SendOutcome outcome = handler(wire);

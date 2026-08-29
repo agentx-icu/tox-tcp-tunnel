@@ -97,22 +97,29 @@ than expanding this section.
 |-------|------------|
 | Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter`, `TunnelResumeStore` |
 | TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
-| Tox | `ToxAdapter`, `ToxConnection`, `ToxThread`, `ToxWatchdog` |
+| Tox | `ToxAdapter` (owns the iterate thread), `ToxConnection`, `ToxWatchdog`. NOTE: `ToxThread` is compiled but **nothing instantiates it** — the live loop is `ToxAdapter`'s. Wire new tox-thread work into `ToxAdapter`, not `ToxThread`. |
 | Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame`, `OwnedFrameBuffer`, `WriteCoalescer`, `BdpFlowControl`, `TunnelIdAllocator` |
-| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger`, `atomic_write_file` |
+| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger`, `atomic_write_file`, `PidFileGuard` |
 
 `TunnelClient` owns a `FailoverConfig`-driven state machine that promotes/demotes
 between primary and fallback Tox IDs. `InspectServer` accepts local IPC
 (Unix socket at `<data_dir>/toxtunnel.sock`; Windows named pipe
-`\\.\pipe\toxtunnel-inspect-<pid>`) and serves JSON snapshots gathered via the
-`InspectProviders` struct. `config_reload` computes the reloadable diff
+`\\.\pipe\toxtunnel-<pid>`, DACL = daemon user + SYSTEM + Administrators) and
+serves JSON snapshots gathered via the `InspectProviders` struct. The daemon
+publishes its pid in `<data_dir>/toxtunnel.pid` (`util::PidFileGuard`, constructed
+**before** `initialize()` — it doubles as the data-dir lock, and `initialize()`
+already opens `tox_save.dat`, the inspect socket and the resume store, none of
+which two daemons may share; removed on clean exit) — that is how `toxtunnel inspect`
+finds the pipe on Windows and how `toxtunnel reload` finds the process on both
+platforms (POSIX sends SIGHUP; a stale pid is refused via `pid_is_toxtunnel`). `config_reload` computes the reloadable diff
 (rules, forwards, log level) between an on-disk YAML and the live config.
 
 ### Threading Model
 
-- **I/O thread pool** — async TCP via asio; `MetricsServer`, `InspectServer`,
-  and `Socks5Listener` all run on this same `IoContext` (no new threads)
-- **Dedicated Tox thread** — all toxcore API calls funnel through one thread; **toxcore is not thread-safe**, so cross-thread calls must marshal through `ToxThread`
+- **I/O thread pool** — async TCP via asio; `MetricsServer` and `Socks5Listener`
+  run on this same `IoContext` (no new threads). `InspectServer` does too on
+  POSIX; on Windows it owns one dedicated named-pipe thread
+- **Dedicated Tox thread** — all toxcore API calls funnel through one thread owned by `ToxAdapter` (`iterate_thread_id_`); **toxcore is not thread-safe**, so cross-thread calls marshal through `ToxAdapter`'s task queue (`process_tox_tasks`)
 - **Main thread** — signal handling (`SIGHUP` triggers `config_reload`) and orchestration
 - **Windows reload pipe thread** — Windows lacks `SIGHUP`; a small dedicated
   thread serves `\\.\pipe\toxtunnel-reload-<pid>` and posts reload onto the
@@ -194,8 +201,8 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   `client.fallback_server_ids`). `FailoverConfig` controls timing.
   The client prefers the primary (index 0) once it has been continuously
   online for `prefer_primary_grace_seconds`.
-- **Hot-reload scope** — `SIGHUP` (POSIX) / `toxtunnel reload` (Windows
-  named-pipe IPC) reloads only: `server.rules_file` contents,
+- **Hot-reload scope** — `SIGHUP` (POSIX) / `toxtunnel reload` (any platform:
+  SIGHUP via the pid file on POSIX, named-pipe IPC on Windows) reloads only: `server.rules_file` contents,
   `client.forwards`, and `logging.level`. Everything else requires a restart.
 
 ## v0.4.0 Default Behavior (additions on top of v0.3.0)

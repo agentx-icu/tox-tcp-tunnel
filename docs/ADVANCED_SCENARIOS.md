@@ -746,9 +746,10 @@ failover events grep for `Failover:` in the journal.
 ### Grafana
 
 Import a panel keyed off the series above. A minimal dashboard usually
-includes: tunnels open (gauge), bytes_in / bytes_out (rate), tunnels_closed by
-reason (stacked counter), reloads (annotation), and `tox_self_connection_status`
-(state-timeline).
+includes: `toxtunnel_tunnels_active` (gauge), `toxtunnel_bytes_in_total` /
+`toxtunnel_bytes_out_total` (rate), `toxtunnel_tunnels_closed_total` by reason
+(stacked counter), and `toxtunnel_friends_online` (state-timeline — there is no
+`tox_self_connection_status` series; friend count is the closest signal).
 
 ---
 
@@ -795,8 +796,10 @@ online=$(printf 'GET /status\n' \
 ### When inspect is your only option
 
 - The daemon is running but `/metrics` is disabled.
-- You suspect a thread is stuck — `toxtunnel inspect status` will still answer
-  because the IPC accept loop runs on the I/O pool, not the Tox thread.
+- You suspect a thread is stuck — `toxtunnel inspect status` still answers when
+  the Tox thread is wedged, because the IPC listener is independent of it (the
+  asio I/O pool on POSIX, a dedicated named-pipe thread on Windows). It will
+  *not* answer if the I/O pool itself is wedged on POSIX.
 - You need a snapshot at the exact moment a tunnel hangs, before SIGHUP /
   restart loses the state.
 
@@ -810,8 +813,9 @@ dump (`gcore` / minidump) before restarting.
 The reloadable subset is intentionally tiny — see
 [`docs/CONFIGURATION.md`](CONFIGURATION.md) ("Hot Reload (`SIGHUP` / reload
 pipe)"). For `rules.yaml` specifically: edit the file, signal the daemon, and
-existing tunnels that are still allowed by the new rules **stay open**. Only
-tunnels that the new rules now deny are closed.
+**every existing tunnel stays open** — including ones the new rules now deny.
+The new rules apply to the next `TUNNEL_OPEN` only; to cut a live session you
+must restart the daemon (or have the client disconnect).
 
 ### Workflow (POSIX)
 
@@ -826,7 +830,7 @@ sudo kill -HUP $(pidof toxtunnel)
 
 # 3. Confirm in the logs.
 sudo journalctl -u toxtunnel -n 5 --no-pager | grep -i reload
-# Reload applied: rules_file=/etc/toxtunnel/rules.yaml (3 allow, 1 deny)
+# config reloaded (rules: 4 rules)
 
 # 4. Confirm via the running tunnels (existing connections should be intact).
 toxtunnel inspect tunnels
@@ -839,7 +843,7 @@ If you accidentally edit a non-reloadable field — say you bump `tox.tcp_port`
 in the same checkpoint — the reload is rejected as a whole:
 
 ```
-Reload rejected: field tox.tcp_port is not reloadable
+reload rejected: config reload rejected: field 'tox.tcp_port' requires a restart (not in the reloadable subset)
 ```
 
 The running daemon's config is untouched; revert the offending change, signal
@@ -860,9 +864,10 @@ toxtunnel inspect status
 
 ### What the daemon does internally
 
-`ConfigReload::apply()` parses the new file, diffs against the live `Config`,
-and either swaps just the reloadable subset under each consumer's strand or
-rejects the whole reload. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
+`reload_config_from_disk()` re-parses and validates the file, then
+`TunnelServer::reload()` / `TunnelClient::reload()` run `util::check_reloadable()`
+and either swap just the reloadable subset under each consumer's strand or
+reject the whole reload. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
 ("Operational Endpoints → SIGHUP / reload pipe") for the full flow.
 
 ### Recommended workflow for sensitive rule changes
@@ -874,11 +879,11 @@ sudoedit /etc/toxtunnel/rules.yaml.next
 
 # Atomically move it into place, then signal the daemon to reload.
 # If the new file fails to parse, the daemon logs
-#   `Reload rejected: …`
-# at WARN and keeps running the previous rules — no traffic interruption.
+#   `reload failed: …` / `reload rejected: …`
+# at ERROR and keeps running the previous rules — no traffic interruption.
 sudo mv /etc/toxtunnel/rules.yaml.next /etc/toxtunnel/rules.yaml
 sudo systemctl reload toxtunnel
-sudo journalctl -u toxtunnel -n 5 --no-pager   # confirm "Reload applied: …"
+sudo journalctl -u toxtunnel -n 5 --no-pager   # confirm "config reloaded (rules: N rules)"
 ```
 
 There is no dedicated `toxtunnel config check` subcommand — the
@@ -945,26 +950,27 @@ switches back.
 ### Verifying failover behaviour
 
 ```bash
-# Pre-flight: confirm all servers are registered as friends and at least one
-# is online.
-toxtunnel inspect friends --json | jq '.friends[] | {alias, online}'
+# Pre-flight: confirm the client has a server online. `inspect` has exactly two
+# subactions — `tunnels` (default) and `status`; there is no `inspect friends`.
+toxtunnel inspect status --json | jq '.friends_online, .peer_online_seconds'
 
 # Simulate a primary outage by shutting it down — watch the log line:
 sudo systemctl stop toxtunnel@prod-iad   # on the server host
 
-# On the client:
+# On the client (one line per switch, in either direction):
 sudo journalctl -u toxtunnel -f | grep -i failover
-# Failover: primary 'prod-iad' offline > 30s; promoting 'prod-fra'
+# Failover: switching active server 8380D0BC314F... -> EEB4742FEE81... (friend 1)
 
-# Bring the primary back:
+# Bring the primary back — after prefer_primary_grace_seconds of continuous
+# uptime the client switches back, logging the same line with the IDs swapped:
 sudo systemctl start toxtunnel@prod-iad
-# Failover: primary 'prod-iad' back online for 120s; switching back
+# Failover: switching active server EEB4742FEE81... -> 8380D0BC314F... (friend 0)
 ```
 
-`toxtunnel_failover_switchovers_total` (counter, exported via `/metrics`)
-should increment by 2 across that demo. Wire an Alertmanager rule on
-`increase(...)>N over 10m` to detect flapping primaries — see "Scraping
-Prometheus Metrics" above.
+There is **no** `toxtunnel_failover_switchovers_total` series — the log line
+above is the only record of a switchover. Alert on
+`toxtunnel_friends_online == 0` instead, and grep `Failover:` in the journal to
+spot a flapping primary.
 
 ### Switchover semantics (what your TCP clients see)
 
