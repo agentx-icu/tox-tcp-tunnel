@@ -48,6 +48,7 @@ add_executable(unit_tests
     unit/config_diagnostics_test.cpp
     unit/path_security_test.cpp
     unit/tunnel_id_allocator_test.cpp
+    unit/open_handshake_test.cpp
     unit/tunnel_resume_test.cpp
     unit/t8_data_race_test.cpp
     unit/t2_atomic_persistence_test.cpp

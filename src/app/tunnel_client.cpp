@@ -4,6 +4,7 @@
 #include <future>
 #include <span>
 
+#include "toxtunnel/app/tunnel_senders.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
@@ -20,24 +21,41 @@ namespace toxtunnel::app {
 
 namespace detail {
 
+// `LosslessPacketSendFn` returns a plain bool, which cannot express SendqFull —
+// it is the shape of the *legacy* `ToxAdapter::send_lossless_packet`, not of
+// `send_lossless_packet_typed`. Both helpers below therefore map true -> Sent
+// and false -> PermanentFail: a lost bool cannot be recovered, and reporting a
+// transient refusal as PermanentFail is the safe direction (the caller rolls
+// back rather than believing a frame reached the peer).
+//
+// Neither helper is used in production — the three live client tunnel paths
+// wire their callbacks inline so they can also drive TunnelManager's byte /
+// frame counters — and the only callers are in
+// tests/unit/client_failover_test.cpp. Do not reach for these from production
+// code without first giving them a typed send function.
+
 tunnel::TunnelImpl::SendToToxCallback make_fixed_friend_lossless_sender(
     LosslessPacketSendFn send_lossless, uint32_t friend_number) {
     return [send_lossless = std::move(send_lossless),
-            friend_number](std::span<const uint8_t> data) -> bool {
+            friend_number](std::span<const uint8_t> data) -> tunnel::SendOutcome {
         std::vector<uint8_t> packet;
         packet.reserve(1 + data.size());
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), data.begin(), data.end());
-        return send_lossless(friend_number, packet.data(), packet.size());
+        return send_lossless(friend_number, packet.data(), packet.size())
+                   ? tunnel::SendOutcome::Sent
+                   : tunnel::SendOutcome::PermanentFail;
     };
 }
 
 tunnel::TunnelImpl::SendOwnedToToxCallback make_fixed_friend_lossless_owned_sender(
     LosslessPacketSendFn send_lossless, uint32_t friend_number) {
     return [send_lossless = std::move(send_lossless),
-            friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
+            friend_number](tunnel::OwnedFrameBuffer buf) -> tunnel::SendOutcome {
         const auto wire = buf.wire_view();
-        return send_lossless(friend_number, wire.data(), wire.size());
+        return send_lossless(friend_number, wire.data(), wire.size())
+                   ? tunnel::SendOutcome::Sent
+                   : tunnel::SendOutcome::PermanentFail;
     };
 }
 
@@ -861,64 +879,21 @@ void TunnelClient::start_pipe_mode() {
     apply_coalesce_and_flow_control(*tunnel);
     const uint32_t tunnel_friend_number = server_friend_number_.load(std::memory_order_acquire);
 
-    // Inline lambdas with manager accounting (mirrors server / TCP-forward
-    // path). Capture `tunnel_mgr_` by shared_ptr value — NOT `tunnel_mgr_.get()`
-    // — so the lambda can safely run after a request_stop() that has begun
-    // tearing down TunnelClient. The raw-pointer form was H-S-2/H-S-4 in the
-    // fix-storm review (UAF) and the comment on `tunnel_mgr_` in
-    // tunnel_client.hpp explicitly warns against it.
+    // Shared with the server and the other two client tunnel paths; see
+    // detail::make_tunnel_senders() for the manager accounting and the outbound
+    // FIFO barrier it applies. Capture `tunnel_mgr_` by shared_ptr value — NOT
+    // `tunnel_mgr_.get()` — so the callbacks can safely run after a
+    // request_stop() that has begun tearing down TunnelClient. The raw-pointer
+    // form was H-S-2/H-S-4 in the fix-storm review (UAF), and the comment on
+    // `tunnel_mgr_` in tunnel_client.hpp explicitly warns against it.
     auto manager_ref = tunnel_mgr_;
-    tunnel->set_on_send_to_tox(
-        [this, manager_ref, tunnel_friend_number](std::span<const uint8_t> data) -> bool {
-            std::vector<uint8_t> packet;
-            packet.reserve(1 + data.size());
-            packet.push_back(tunnel::kLosslessPacketByte);
-            packet.insert(packet.end(), data.begin(), data.end());
-            const auto outcome = tox_adapter_->send_lossless_packet_typed(
-                tunnel_friend_number, packet.data(), packet.size());
-            if (outcome == tox::ToxAdapter::LosslessSendOutcome::Sent) {
-                manager_ref->record_frame_sent();
-                manager_ref->record_bytes_sent(data.size());
-                return true;
-            }
-            // PermanentFail (peer disconnected, frame malformed, etc.) is
-            // not retryable: surface the failure so e.g. TunnelImpl::open()
-            // rolls back to None instead of leaving the tunnel hung in
-            // Connecting waiting for a frame that will never deliver.
-            if (outcome == tox::ToxAdapter::LosslessSendOutcome::PermanentFail) {
-                return false;
-            }
-            // SendqFull. For control frames (OPEN, OPEN_ACK, CLOSE, ACK,
-            // PING/PONG, ERROR) park in the manager retry queue so the
-            // drain timer re-sends them. TUNNEL_DATA frames have their own
-            // per-tunnel coalesce-buffer retry; double-queueing them here
-            // would re-send the same bytes. Frame type byte is at offset
-            // 0 of the unprefixed wire (see ProtocolFrame layout).
-            constexpr std::uint8_t kFrameTypeTunnelData = 0x02;
-            if (!data.empty() && data[0] != kFrameTypeTunnelData) {
-                // Return the queue's outcome — false only when the retry
-                // queue itself is at its cap (drop). Callers treat false
-                // as "send failed permanently" (e.g. open() rolls back).
-                return manager_ref->queue_outbound_for_retry(
-                    std::vector<uint8_t>(data.begin(), data.end()));
-            }
-            return false;
-        });
-
-    // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
-    // lossless prefix + 5-byte tunnel header in its reserved prefix, so we
-    // hand `wire_view()` straight to toxcore with zero further copies.
-    tunnel->set_on_send_to_tox_owned(
-        [this, manager_ref, tunnel_friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
-            const auto wire = buf.wire_view();
-            const bool sent =
-                tox_adapter_->send_lossless_packet(tunnel_friend_number, wire.data(), wire.size());
-            if (sent) {
-                manager_ref->record_frame_sent();
-                manager_ref->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);
-            }
-            return sent;
-        });
+    auto senders = detail::make_tunnel_senders(
+        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        },
+        manager_ref, tunnel_friend_number);
+    tunnel->set_on_send_to_tox(std::move(senders.span));
+    tunnel->set_on_send_to_tox_owned(std::move(senders.owned));
 
     const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel;
 
@@ -985,7 +960,11 @@ void TunnelClient::start_pipe_mode() {
     // manager, not a raw pointer. request_stop() can race the on_close
     // lambda; without this the lambda could deref a destroyed manager.
     auto mgr = tunnel_mgr_;
-    tunnel->set_on_close([this, mgr, tunnel_id]() {
+    // weak, not shared: this callback is owned by the tunnel it names, so a
+    // strong capture would be a cycle. It exists so the removal below can say
+    // WHICH tunnel it means — ids are recycled per friend.
+    const std::weak_ptr<tunnel::TunnelImpl> weak_self = tunnel;
+    tunnel->set_on_close([this, mgr, weak_self, tunnel_id]() {
         // Move the bridge out under the lock, then stop()/destroy the local
         // copy outside it (stop() may join the read thread).
         std::shared_ptr<StdioPipeBridge> pb;
@@ -997,7 +976,9 @@ void TunnelClient::start_pipe_mode() {
             pb->stop();
         }
         pipe_mode_started_ = false;
-        mgr->remove_tunnel(tunnel_id);
+        if (auto self = weak_self.lock()) {
+            (void)mgr->remove_tunnel_if(tunnel_id, self.get());
+        }
         request_stop();
     });
 
@@ -1129,56 +1110,24 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     // Wire callback: when TunnelImpl wants to send data to Tox, prepend the
     // lossless packet prefix and forward to ToxAdapter. The frame is already
     // serialized — no need to round-trip through deserialize / re-serialize.
-    // Inline (rather than the make_fixed_friend_lossless_* helper) so the
-    // manager-level bytes_sent / frames_sent counters mirror the server's
-    // accounting at tunnel_server.cpp:856-883. Without these record_* calls,
-    // `inspect status --json` shows bytes_out=0 on the client even when data
-    // flows (the per-tunnel TunnelImpl counter still increments — but that
-    // tracks bytes offered to the coalescer, not bytes successfully sent).
+    // Built by detail::make_tunnel_senders() rather than the
+    // make_fixed_friend_lossless_* helpers, so the manager-level bytes_sent /
+    // frames_sent counters are maintained and the outbound FIFO barrier is
+    // applied. Without those record_* calls, `inspect status --json` shows
+    // bytes_out=0 on the client even when data flows (the per-tunnel TunnelImpl
+    // counter still increments — but that tracks bytes offered to the
+    // coalescer, not bytes successfully sent).
     //
     // Capture by shared_ptr value — `tunnel_mgr_.get()` is the UAF pattern
     // called out in tunnel_client.hpp:215-223 (H-S-2/H-S-4).
     auto manager_ref = tunnel_mgr_;
-    tunnel->set_on_send_to_tox(
-        [this, manager_ref, tunnel_friend_number](std::span<const uint8_t> data) -> bool {
-            std::vector<uint8_t> packet;
-            packet.reserve(1 + data.size());
-            packet.push_back(tunnel::kLosslessPacketByte);
-            packet.insert(packet.end(), data.begin(), data.end());
-            const auto outcome = tox_adapter_->send_lossless_packet_typed(
-                tunnel_friend_number, packet.data(), packet.size());
-            if (outcome == tox::ToxAdapter::LosslessSendOutcome::Sent) {
-                manager_ref->record_frame_sent();
-                manager_ref->record_bytes_sent(data.size());
-                return true;
-            }
-            if (outcome == tox::ToxAdapter::LosslessSendOutcome::PermanentFail) {
-                return false;
-            }
-            // SendqFull: park control frames in the manager retry queue so
-            // the drain timer re-sends them; let TUNNEL_DATA fall through
-            // to its own per-tunnel coalesce-buffer retry path.
-            constexpr std::uint8_t kFrameTypeTunnelData = 0x02;
-            if (!data.empty() && data[0] != kFrameTypeTunnelData) {
-                return manager_ref->queue_outbound_for_retry(
-                    std::vector<uint8_t>(data.begin(), data.end()));
-            }
-            return false;
-        });
-
-    // Wave B zero-copy outbound for TUNNEL_DATA frames.
-    tunnel->set_on_send_to_tox_owned(
-        [this, manager_ref, tunnel_friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
-            const auto wire = buf.wire_view();
-            const bool sent =
-                tox_adapter_->send_lossless_packet(tunnel_friend_number, wire.data(), wire.size());
-            if (sent) {
-                manager_ref->record_frame_sent();
-                // The lossless prefix byte is bookkeeping overhead, not payload.
-                manager_ref->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);
-            }
-            return sent;
-        });
+    auto senders = detail::make_tunnel_senders(
+        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        },
+        manager_ref, tunnel_friend_number);
+    tunnel->set_on_send_to_tox(std::move(senders.span));
+    tunnel->set_on_send_to_tox_owned(std::move(senders.owned));
 
     // Wire callback: when data arrives from Tox for this tunnel, write to TCP.
     // Prefer the zero-copy owned-buffer route so the payload buffer
@@ -1222,9 +1171,14 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     // capture shared_ptr — see the matching note on the pipe-mode
     // on_close above.
     auto mgr = tunnel_mgr_;
-    tunnel->set_on_close([mgr, tunnel_id]() {
+    // See the pipe-mode note: weak so the callback does not own its own tunnel,
+    // and identity-checked so a recycled id is not torn down by mistake.
+    const std::weak_ptr<tunnel::TunnelImpl> weak_self = tunnel;
+    tunnel->set_on_close([mgr, weak_self, tunnel_id]() {
         util::Logger::debug("Tunnel {} on_close, removing from manager", tunnel_id);
-        mgr->remove_tunnel(tunnel_id);
+        if (auto self = weak_self.lock()) {
+            (void)mgr->remove_tunnel_if(tunnel_id, self.get());
+        }
     });
 
     const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel;
@@ -1312,45 +1266,13 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     // Capture by shared_ptr value — same UAF concern as the other two sites
     // (see comment on `tunnel_mgr_` in tunnel_client.hpp:215-223).
     auto manager_ref = tunnel_mgr_;
-    tunnel->set_on_send_to_tox(
-        [this, manager_ref, tunnel_friend_number](std::span<const uint8_t> data) -> bool {
-            std::vector<uint8_t> packet;
-            packet.reserve(1 + data.size());
-            packet.push_back(tunnel::kLosslessPacketByte);
-            packet.insert(packet.end(), data.begin(), data.end());
-            const auto outcome = tox_adapter_->send_lossless_packet_typed(
-                tunnel_friend_number, packet.data(), packet.size());
-            if (outcome == tox::ToxAdapter::LosslessSendOutcome::Sent) {
-                manager_ref->record_frame_sent();
-                manager_ref->record_bytes_sent(data.size());
-                return true;
-            }
-            if (outcome == tox::ToxAdapter::LosslessSendOutcome::PermanentFail) {
-                return false;
-            }
-            // SendqFull: park control frames in the manager retry queue so
-            // the drain timer re-sends them; let TUNNEL_DATA fall through
-            // to its own per-tunnel coalesce-buffer retry path.
-            constexpr std::uint8_t kFrameTypeTunnelData = 0x02;
-            if (!data.empty() && data[0] != kFrameTypeTunnelData) {
-                return manager_ref->queue_outbound_for_retry(
-                    std::vector<uint8_t>(data.begin(), data.end()));
-            }
-            return false;
-        });
-
-    // Wave B zero-copy outbound for TUNNEL_DATA frames.
-    tunnel->set_on_send_to_tox_owned(
-        [this, manager_ref, tunnel_friend_number](tunnel::OwnedFrameBuffer buf) -> bool {
-            const auto wire = buf.wire_view();
-            const bool sent =
-                tox_adapter_->send_lossless_packet(tunnel_friend_number, wire.data(), wire.size());
-            if (sent) {
-                manager_ref->record_frame_sent();
-                manager_ref->record_bytes_sent(wire.size() > 1 ? wire.size() - 1 : 0);
-            }
-            return sent;
-        });
+    auto senders = detail::make_tunnel_senders(
+        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        },
+        manager_ref, tunnel_friend_number);
+    tunnel->set_on_send_to_tox(std::move(senders.span));
+    tunnel->set_on_send_to_tox_owned(std::move(senders.owned));
 
     tunnel->set_on_data_for_tcp([conn](std::span<const uint8_t> data) -> bool {
         return conn->write(data.data(), data.size());
@@ -1431,9 +1353,13 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     });
 
     auto mgr = tunnel_mgr_;
-    tunnel->set_on_close([mgr, tunnel_id]() {
+    // See the pipe-mode note: weak, and identity-checked.
+    const std::weak_ptr<tunnel::TunnelImpl> weak_self = tunnel;
+    tunnel->set_on_close([mgr, weak_self, tunnel_id]() {
         util::Logger::debug("SOCKS5 tunnel {} on_close, removing from manager", tunnel_id);
-        mgr->remove_tunnel(tunnel_id);
+        if (auto self = weak_self.lock()) {
+            (void)mgr->remove_tunnel_if(tunnel_id, self.get());
+        }
     });
     conn->set_on_data([weak_tunnel](const uint8_t* data, std::size_t length) {
         if (auto tunnel = weak_tunnel.lock()) {

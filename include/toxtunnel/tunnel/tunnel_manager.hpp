@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -18,16 +19,12 @@
 
 namespace toxtunnel::tunnel {
 
-/// Result of a single attempt to hand a frame to the toxcore lossless send
-/// path. Mirrors `tox::ToxAdapter::LosslessSendOutcome` but is declared at
-/// the tunnel layer so the public manager header doesn't have to pull in
-/// the full toxcore C header. The values stay in sync by construction in
-/// the per-tunnel callbacks (`tunnel_client.cpp` / `tunnel_server.cpp`).
-enum class SendOutcome : std::uint8_t {
-    Sent,           ///< Accepted by toxcore.
-    SendqFull,      ///< Transient backpressure — caller may retry on a timer.
-    PermanentFail,  ///< Caller should drop / roll back. Peer disconnected, etc.
-};
+// `SendOutcome` — the transport verdict every send path here reports — lives in
+// tunnel.hpp (included above) because the per-tunnel send callbacks need it
+// too. It mirrors `tox::ToxAdapter::LosslessSendOutcome` so this public header
+// need not pull in the toxcore C header; the values stay in sync by
+// construction in the per-tunnel callbacks (`tunnel_client.cpp` /
+// `tunnel_server.cpp`).
 
 // Forward declarations
 class ProtocolFrame;
@@ -289,6 +286,53 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// @param tunnel_id  The tunnel to remove.
     void remove_tunnel(uint16_t tunnel_id);
 
+    /// Remove @p tunnel_id, but only while it is still @p expected.
+    ///
+    /// Tunnel ids are recycled per friend, so a deferred cleanup that names only
+    /// an id can tear down whichever tunnel inherited it. Every teardown posted
+    /// from a tunnel's own callbacks must therefore say *which* tunnel it means.
+    ///
+    /// `expected == nullptr` removes NOTHING — the same contract as
+    /// `close_tunnel_if()`. A caller reaches that case when its `weak_ptr` has
+    /// lapsed, and a destroyed tunnel cannot still be registered, so whatever
+    /// holds the id belongs to someone else. `remove_tunnel()` is the way to say
+    /// "whatever is registered".
+    ///
+    /// ID-RELEASE RULE. The teardown a removal triggers runs unlocked (close
+    /// paths re-enter application callbacks) and can emit the tunnel's
+    /// TUNNEL_CLOSE. The id is therefore NOT returned to the allocator when the
+    /// map entry is erased — it stays reserved until that teardown resolves, so
+    /// no replacement can take the id while the previous owner is still
+    /// speaking for it. Both id sources honour the reservation:
+    /// `allocate_tunnel_id()` scans it, and `handle_incoming_open()` rejects a
+    /// peer-chosen id that is still reserved.
+    ///
+    /// RESIDUAL: `add_tunnel()` with an id that went through neither of those
+    /// gates bypasses the rule. No production caller does that — the server
+    /// reserves via `handle_incoming_open()` and the client via
+    /// `allocate_tunnel_id()` — but a test (or a future caller) that invents an
+    /// id can still collide with a teardown in flight.
+    ///
+    /// @return true if this call removed @p expected.
+    bool remove_tunnel_if(uint16_t tunnel_id, const Tunnel* expected);
+
+    /// Gracefully close @p tunnel_id, but only while it is still @p expected.
+    ///
+    /// The `get_tunnel(id)` + unlocked `close()` pattern this replaces let a
+    /// replacement land in between, so the old object emitted a TUNNEL_CLOSE
+    /// carrying the new tunnel's id. The lookup and the identity check happen
+    /// under one lock here; the close itself still runs unlocked (it invokes
+    /// send and close callbacks, which must never hold a manager lock — H-01).
+    /// The remaining window is bounded by the id-release rule documented on
+    /// `remove_tunnel_if()`: an id is not returned to the allocator until the
+    /// previous owner's teardown — including its TUNNEL_CLOSE — has completed,
+    /// so `allocate_tunnel_id()` cannot hand it out underneath this close. See
+    /// that comment for the one case that is NOT covered.
+    ///
+    /// Passing nullptr closes nothing.
+    /// @return true if @p expected was found and closed.
+    bool close_tunnel_if(uint16_t tunnel_id, const Tunnel* expected);
+
     /// Get a shared_ptr to a tunnel by ID.
     ///
     /// Returning a shared_ptr (rather than a raw pointer) lets the caller
@@ -306,13 +350,18 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// Check if a tunnel with the given ID exists.
     [[nodiscard]] bool has_tunnel(uint16_t tunnel_id) const;
 
-    /// Create a new tunnel connecting to the specified host:port.
+    /// Allocate a tunnel id and announce it to the peer with a TUNNEL_OPEN.
     ///
-    /// Allocates an ID, creates the tunnel, and adds it to the manager.
+    /// Succeeds only when toxcore actually accepted the frame. This entry point
+    /// registers no `Tunnel` object, so there is no driver to retain and retry a
+    /// backpressured OPEN the way `TunnelImpl::open()` does; a `SendqFull` here
+    /// therefore releases the id and reports failure rather than handing back an
+    /// id the peer has never heard of. `SendqFull` is transient, so the caller
+    /// may simply try again.
     ///
     /// @param host  Target hostname or IP address.
     /// @param port  Target TCP port.
-    /// @return      The allocated tunnel ID, or 0 on failure.
+    /// @return      The allocated tunnel ID, or 0 if nothing was sent.
     [[nodiscard]] uint16_t create_tunnel(const std::string& host, uint16_t port);
 
     /// Close all tunnels and clear the manager.
@@ -409,9 +458,31 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
 
     /// Send a frame to the Tox peer via the registered send handler.
     ///
+    /// On toxcore SENDQ-full the frame is PARKED in `pending_outbound_` and
+    /// this still returns true — "queued for sending", not "on the wire". That
+    /// is safe only for frames whose identity does not matter if they are
+    /// delivered late; see send_frame_typed() for the ones where it does.
+    ///
     /// @param frame  The frame to send.
     /// @return       true if the frame was queued for sending.
     bool send_frame(const ProtocolFrame& frame);
+
+    /// Send a frame and report the real transport verdict, WITHOUT parking it.
+    ///
+    /// `send_frame()`'s bool cannot distinguish "toxcore took it" from "we put
+    /// it in a retry queue", and for an identity-carrying handshake frame that
+    /// difference is a correctness bug rather than a fidelity one: the caller
+    /// reads parked-as-delivered, resolves the tunnel, releases the id, the id
+    /// is recycled, and the drain timer then delivers the stale frame against
+    /// the new tunnel. `pending_outbound_` holds bare wire bytes with no tunnel
+    /// identity and no generation, so the drain cannot detect this itself.
+    ///
+    /// A caller that gets `SendqFull` from here still owns the frame and is
+    /// expected to retry it (see tunnel/sendq_retry.hpp for the cadence). This
+    /// also reports `SendqFull` when the retry queue is merely non-empty:
+    /// sending past parked frames would reorder the stream, so the caller waits
+    /// its turn.
+    [[nodiscard]] SendOutcome send_frame_typed(const ProtocolFrame& frame);
 
     /// Park an already-serialized frame in the outbound retry queue.
     /// Use this when a per-tunnel send (TUNNEL_CLOSE, TUNNEL_OPEN, ...) hit
@@ -420,8 +491,16 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// frame (matching `send_handler_`'s contract) — the handler prepends
     /// the 0xA0 lossless byte before handing to toxcore.
     ///
-    /// @return true if queued (or the queue was already at the cap and the
-    ///         frame was dropped — see logs / pending_dropped_total_).
+    /// @return true ONLY when this queue took ownership of the bytes and will
+    ///         retry them. false means the caller still owns the frame and it
+    ///         will never be sent from here — either the outbound gate is
+    ///         closed, or the queue was at its cap and the frame was dropped
+    ///         (see logs / pending_dropped_total_).
+    ///
+    /// The doc previously said a cap-drop returned true. It does not, and the
+    /// implementation is the one that is right: "true" has to mean "ownership
+    /// transferred", because a caller that treats a dropped frame as sent will
+    /// happily tear down state that the frame was supposed to announce.
     bool queue_outbound_for_retry(std::vector<uint8_t> wire);
 
     /// Drop every frame currently parked in `pending_outbound_`. Used when
@@ -431,6 +510,34 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// *new* server (creating ghost tunnels) or wait indefinitely for a
     /// peer that has already gone away.
     void clear_pending_outbound();
+
+    /// True while this manager holds an outbound frame that has not yet reached
+    /// toxcore — either parked in `pending_outbound_` or popped by the drain and
+    /// still inside the transport call.
+    ///
+    /// This is the FIFO barrier for senders that do NOT go through
+    /// `send_frame()`. The per-tunnel callbacks hand their frames to toxcore
+    /// directly (they must: they carry manager byte/frame accounting and the
+    /// zero-copy owned path), so `send_frame_impl()`'s internal check cannot see
+    /// them. Without consulting this first, the design's central failure is live
+    /// on the production path:
+    ///
+    ///     CLOSE(id=7) -> SendqFull -> parked, reported Sent
+    ///       -> tunnel resolves -> id 7 released -> id 7 recycled
+    ///     OPEN(id=7) -> sent DIRECTLY, accepted
+    ///     drain timer -> stale CLOSE(id=7) -> kills the NEW tunnel 7
+    ///
+    /// Consulting it turns that into CLOSE-then-OPEN, which is the order the
+    /// peer needs.
+    ///
+    /// Best-effort, and deliberately so: the caller releases this mutex before
+    /// calling toxcore, so a frame parked by another thread in that gap is still
+    /// overtaken. That residual is *concurrent*, while the hazard above is
+    /// *causal* — the CLOSE is parked before the id is released, so any later
+    /// OPEN for the recycled id is ordered after it and sees a non-empty queue.
+    /// Closing the concurrent residual as well needs a single outbound owner,
+    /// which is the driver from later slices.
+    [[nodiscard]] bool outbound_queue_busy() const;
 
     // -----------------------------------------------------------------
     // Backpressure tracking
@@ -602,6 +709,25 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// just `send_frame` — this is the recovery path it kicks off.
     void drain_pending_outbound();
 
+    /// Shared body of `remove_tunnel()` and `remove_tunnel_if()`.
+    ///
+    /// @param expected     The tunnel the caller means, or nullptr.
+    /// @param match_any    When true (`remove_tunnel()`), @p expected is ignored
+    ///                     and whatever is registered is removed. When false
+    ///                     (`remove_tunnel_if()`), a null or mismatched
+    ///                     @p expected removes nothing.
+    bool remove_tunnel_impl(uint16_t tunnel_id, const Tunnel* expected, bool match_any);
+
+    /// Shared body of `send_frame()` and `send_frame_typed()`.
+    ///
+    /// @param park_on_backpressure  When true (the `send_frame` contract), a
+    ///        SENDQ-full frame is parked in `pending_outbound_` and reported as
+    ///        `Sent` — i.e. "this queue owns it now", which is exactly what
+    ///        `send_frame`'s historical `true` meant. When false (the
+    ///        `send_frame_typed` contract) nothing is parked and `SendqFull` is
+    ///        returned to the caller, who still owns the frame.
+    SendOutcome send_frame_impl(const ProtocolFrame& frame, bool park_on_backpressure);
+
     /// Arm `pending_drain_timer_` to fire after a short delay; idempotent
     /// while a drain is already pending. Caller must hold `pending_mutex_`.
     void arm_pending_drain_timer_locked();
@@ -731,6 +857,16 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     mutable std::mutex pending_mutex_;
     asio::steady_timer pending_drain_timer_;
     bool pending_drain_armed_{false};
+    /// True while `drain_pending_outbound()` has popped an entry and is inside
+    /// the transport call with `pending_mutex_` released.
+    ///
+    /// Without it the FIFO barrier has a hole exactly one frame wide: the
+    /// drained frame is no longer in `pending_outbound_`, so a concurrent
+    /// `send_frame()` / `send_frame_typed()` sees an empty queue and sends
+    /// directly, overtaking a frame that is still on its way to toxcore. The
+    /// in-flight entry is therefore part of the queue for barrier purposes even
+    /// though it is not in the deque. Guarded by `pending_mutex_`.
+    bool pending_drain_in_flight_{false};
     /// Counter for diagnostics / metrics: total frames that hit the retry path.
     std::atomic<std::uint64_t> pending_enqueued_total_{0};
     /// Counter for diagnostics / metrics: frames dropped because the queue
@@ -763,5 +899,54 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// Fired once when the peer is declared dead. Guarded by handler_mutex_.
     std::function<void()> on_peer_dead_;
 };
+
+/// Decide what a per-tunnel `SendToToxCallback` reports — and whether it parks
+/// anything — when toxcore refuses @p wire with SENDQ-full.
+///
+/// @param wire  The *unprefixed* frame; the type byte is at offset 0.
+///
+/// The routing is per frame type because ownership of the retry differs:
+///
+///  * TUNNEL_OPEN / TUNNEL_ACK — returned as `SendqFull`, NOT parked. These are
+///    the identity-carrying handshake frames, and their drivers (TunnelImpl's
+///    OPEN retry, TunnelServer's OPEN_ACK gate) retain and re-send them
+///    themselves. Parking them is precisely the bug: `pending_outbound_` holds
+///    bare wire bytes with no tunnel identity and no generation, the caller
+///    reads the park as a delivery, resolves the tunnel and releases the id,
+///    and the drain timer later delivers the stale frame against whatever
+///    tunnel recycled that id.
+///
+///  * TUNNEL_DATA — returned as `SendqFull`, NOT parked. The per-tunnel
+///    coalesce buffer already owns DATA retry; parking here would put the same
+///    bytes on the wire twice.
+///
+///  * Everything else (CLOSE 0x03, ERROR 0x05, INFO 0x06/0x07, RESUME
+///    0x08/0x09, PING 0x10, PONG 0x11) — parked in the manager retry queue and
+///    reported as `Sent`. A queue at its cap reports `PermanentFail`, since
+///    nothing took ownership of the frame.
+///
+///    KNOWN AND DELIBERATE: those frame types still carry the
+///    stale-frame-onto-a-recycled-id hazard described above. Fixing them means
+///    moving each to driver ownership the way OPEN and OPEN_ACK now are, which
+///    is a separate change.
+///
+///    This is *policy* preservation, not behaviour preservation. Parked frames
+///    now coexist with driver-retained ones, which is a new arrangement: the
+///    two classes retry on different clocks and against different owners, so
+///    their relative order is no longer whatever the single queue imposed.
+///    `TunnelManager::send_frame_typed()` keeps the barrier honest in the one
+///    direction that matters — a driver-owned frame never overtakes a parked or
+///    mid-drain one — but the converse is not claimed, and a parked frame can
+///    still be delivered after a driver-owned frame that was issued later.
+[[nodiscard]] SendOutcome route_sendq_full(TunnelManager& manager,
+                                           std::span<const std::uint8_t> wire);
+
+/// True for the frame types that must consult `TunnelManager::outbound_queue_busy()`
+/// before being handed to toxcore on the direct per-tunnel path.
+///
+/// Only TUNNEL_OPEN and TUNNEL_ACK — see the definition for why TUNNEL_DATA is
+/// covered transitively and why the still-parked control frames are not covered
+/// at all.
+[[nodiscard]] bool frame_must_respect_outbound_barrier(FrameType type) noexcept;
 
 }  // namespace toxtunnel::tunnel

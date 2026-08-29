@@ -1319,9 +1319,9 @@ TEST_F(ConfigTest, RoundTripInspectDisabled) {
 TEST_F(ConfigTest, DefaultInspectIsOmittedFromEncodedYaml) {
     // Same conditional-emit policy `to_yaml()` applies to `metrics`: a default
     // block is noise in a generated file. Its absence must still decode to
-    // enabled. (Not `watchdog` — `to_yaml()` is a hand-rolled emitter separate
-    // from convert<Config>::encode and never emits watchdog/tunnel/flow_control
-    // at all. That duplication is pre-existing follow-up debt.)
+    // enabled. `tunnel`, `flow_control` and `watchdog` follow the same rule now
+    // that `to_yaml()` shares convert<Config>::encode — see the round-trip
+    // tests at the end of this file for the non-default half of that contract.
     Config original = Config::default_server();
     const std::string yaml = original.to_yaml();
     EXPECT_TRUE(yaml.find("inspect:") == std::string::npos) << yaml;
@@ -1518,4 +1518,394 @@ TEST_F(ConfigTest, RoundTripFallbackServerIds) {
     ASSERT_TRUE(result.value().client.has_value());
     EXPECT_EQ(result.value().client->server_id, original.client->server_id);
     EXPECT_EQ(result.value().client->fallback_server_ids, original.client->fallback_server_ids);
+}
+
+// ---------------------------------------------------------------------------
+// Single-source-of-truth serialization tests
+//
+// `Config::to_yaml()` used to be a second, hand-rolled emitter alongside
+// `convert<Config>::encode`, and it had drifted to omitting `tunnel`,
+// `flow_control` and `watchdog` entirely — so every `save()` silently
+// discarded those blocks. The tests below are parser-effect tests: they assert
+// values survive the real serialize -> parse path. A structural "is the key
+// spelled right" check cannot see this class of loss, which is how it survived.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A server Config with a non-default value in every block that has one.
+/// `server->{tcp_port,udp_enabled,bootstrap_nodes}` are set to mirror `tox`
+/// because the parser re-derives them from the canonical `tox:` block, and
+/// `Config::operator==` compares the mirror.
+Config make_populated_server_config() {
+    Config cfg = Config::default_server();
+    cfg.data_dir = "/populated/server";
+    cfg.logging.level = util::LogLevel::Trace;
+    cfg.logging.file = "/var/log/toxtunnel-populated.log";
+    cfg.service.auto_start = false;
+    cfg.service.allow_client_daemon = true;
+    cfg.metrics.enabled = true;
+    cfg.metrics.listen = "127.0.0.1:9333";
+    cfg.metrics.path = "/m";
+    cfg.inspect.enabled = false;
+
+    cfg.tox.udp_enabled = false;
+    cfg.tox.ipv6_enabled = false;
+    cfg.tox.tcp_port = 44444;
+    cfg.tox.bootstrap_mode = BootstrapMode::Lan;
+    cfg.tox.bootstrap_nodes.push_back(
+        {"192.168.1.77", 33445,
+         "4444444444444444444444444444444444444444444444444444444444444444"});
+
+    cfg.tunnel.coalesce_max_delay_us = 900;
+    cfg.tunnel.coalesce_max_bytes = 4096;
+    cfg.tunnel.coalesce_mode = "adaptive";
+    cfg.tunnel.idle_timeout_seconds = 600;
+    cfg.tunnel.reaper_tick_seconds = 7;
+    cfg.tunnel.half_close_timeout_seconds = 45;
+    cfg.tunnel.keepalive_interval_seconds = 20;
+    cfg.tunnel.resume.enabled = true;
+    cfg.tunnel.resume.state_path = "/populated/server/resume.yaml";
+    cfg.tunnel.resume.max_age_seconds = 900;
+    cfg.tunnel.resume.on_gap = "close";
+
+    cfg.flow_control.mode = "fixed";
+    cfg.flow_control.send_window_min_bytes = 32768;
+    cfg.flow_control.send_window_max_bytes = 8 * 1024 * 1024;
+    cfg.flow_control.safety_factor_x100 = 210;
+    cfg.flow_control.fixed_window_bytes = 131072;
+
+    cfg.watchdog.enabled = false;
+    cfg.watchdog.deadline_seconds = 90;
+    cfg.watchdog.systemd_notify = false;
+
+    cfg.server->rules_file = "/etc/toxtunnel/populated-rules.yaml";
+    cfg.server->disclose.hostname = true;
+    cfg.server->disclose.uptime = true;
+    cfg.server->tcp_port = cfg.tox.tcp_port;
+    cfg.server->udp_enabled = cfg.tox.udp_enabled;
+    cfg.server->bootstrap_nodes = cfg.tox.bootstrap_nodes;
+    return cfg;
+}
+
+/// A client Config with a non-default value in every block that has one.
+Config make_populated_client_config() {
+    Config cfg = Config::default_client();
+    cfg.data_dir = "/populated/client";
+    cfg.logging.level = util::LogLevel::Error;
+    cfg.logging.file = "/var/log/toxtunnel-client.log";
+    cfg.service.auto_start = true;
+    cfg.service.allow_client_daemon = true;
+    cfg.metrics.enabled = true;
+    cfg.metrics.listen = "127.0.0.1:9444";
+    cfg.metrics.path = "/mc";
+    cfg.inspect.enabled = false;
+
+    cfg.tox.udp_enabled = false;
+    cfg.tox.ipv6_enabled = false;
+    cfg.tox.tcp_port = 45555;
+    cfg.tox.bootstrap_mode = BootstrapMode::Lan;
+
+    cfg.tunnel.coalesce_max_delay_us = 111;
+    cfg.tunnel.coalesce_mode = "bypass";
+    cfg.tunnel.idle_timeout_seconds = 300;
+    cfg.tunnel.keepalive_interval_seconds = 15;
+    cfg.tunnel.resume.enabled = true;
+    cfg.tunnel.resume.on_gap = "close";
+
+    cfg.flow_control.mode = "fixed";
+    cfg.flow_control.fixed_window_bytes = 65536;
+
+    cfg.watchdog.enabled = false;
+    cfg.watchdog.deadline_seconds = 120;
+
+    cfg.client->server_id =
+        "0000000000000000000000000000000000000000000000000000000000000000000000000000";
+    cfg.client->fallback_server_ids = {
+        "1111111111111111111111111111111111111111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222222222222222222222222222222222222222"};
+    cfg.client->forwards.push_back({2222, "localhost", 22});
+    cfg.client->forwards.push_back({8080, "10.0.0.5", 80});
+    cfg.client->pipe_target = PipeTarget{"pipe.example", 4444};
+    cfg.client->failover.timeout_seconds = 12;
+    cfg.client->failover.prefer_primary_grace_seconds = 34;
+    cfg.client->socks5.enabled = true;
+    cfg.client->socks5.listen = "127.0.0.1:1085";
+    return cfg;
+}
+
+}  // namespace
+
+TEST_F(ConfigTest, RoundTripPreservesTunnelBlock) {
+    const Config original = make_populated_server_config();
+
+    auto result = Config::from_string(original.to_yaml());
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& loaded = result.value();
+
+    EXPECT_EQ(loaded.tunnel.coalesce_max_delay_us, 900u);
+    EXPECT_EQ(loaded.tunnel.coalesce_max_bytes, 4096u);
+    EXPECT_EQ(loaded.tunnel.coalesce_mode, "adaptive");
+    EXPECT_EQ(loaded.tunnel.idle_timeout_seconds, 600u);
+    EXPECT_EQ(loaded.tunnel.reaper_tick_seconds, 7u);
+    EXPECT_EQ(loaded.tunnel.half_close_timeout_seconds, 45u);
+    EXPECT_EQ(loaded.tunnel.keepalive_interval_seconds, 20u);
+    EXPECT_TRUE(loaded.tunnel.resume.enabled);
+    EXPECT_EQ(loaded.tunnel.resume.state_path, "/populated/server/resume.yaml");
+    EXPECT_EQ(loaded.tunnel.resume.max_age_seconds, 900u);
+    EXPECT_EQ(loaded.tunnel.resume.on_gap, "close");
+    EXPECT_EQ(loaded.tunnel, original.tunnel);
+}
+
+TEST_F(ConfigTest, RoundTripPreservesFlowControlBlock) {
+    const Config original = make_populated_server_config();
+
+    auto result = Config::from_string(original.to_yaml());
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& loaded = result.value();
+
+    EXPECT_EQ(loaded.flow_control.mode, "fixed");
+    EXPECT_EQ(loaded.flow_control.send_window_min_bytes, 32768u);
+    EXPECT_EQ(loaded.flow_control.send_window_max_bytes, 8u * 1024u * 1024u);
+    EXPECT_EQ(loaded.flow_control.safety_factor_x100, 210u);
+    EXPECT_EQ(loaded.flow_control.fixed_window_bytes, 131072u);
+    EXPECT_EQ(loaded.flow_control, original.flow_control);
+}
+
+TEST_F(ConfigTest, RoundTripPreservesWatchdogBlock) {
+    const Config original = make_populated_server_config();
+
+    auto result = Config::from_string(original.to_yaml());
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& loaded = result.value();
+
+    EXPECT_FALSE(loaded.watchdog.enabled);
+    EXPECT_EQ(loaded.watchdog.deadline_seconds, 90u);
+    EXPECT_FALSE(loaded.watchdog.systemd_notify);
+    EXPECT_EQ(loaded.watchdog, original.watchdog);
+}
+
+TEST_F(ConfigTest, RoundTripPopulatedServerConfigIsLossless) {
+    const Config original = make_populated_server_config();
+
+    auto result = Config::from_string(original.to_yaml());
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result.value(), original) << original.to_yaml();
+}
+
+TEST_F(ConfigTest, RoundTripPopulatedClientConfigIsLossless) {
+    const Config original = make_populated_client_config();
+
+    auto result = Config::from_string(original.to_yaml());
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result.value(), original) << original.to_yaml();
+}
+
+TEST_F(ConfigTest, SavePreservesTunnelFlowControlAndWatchdog) {
+    // The file path is the one that actually loses data in production: an
+    // operator edits `watchdog.enabled: false`, some code path calls save(),
+    // and the setting is gone from the file on disk.
+    const Config original = make_populated_server_config();
+
+    const auto path = test_dir_ / "populated_save.yaml";
+    auto saved = original.save(path);
+    ASSERT_TRUE(saved.has_value()) << saved.error();
+
+    auto loaded = Config::from_file(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    EXPECT_EQ(loaded.value().tunnel, original.tunnel);
+    EXPECT_EQ(loaded.value().flow_control, original.flow_control);
+    EXPECT_EQ(loaded.value().watchdog, original.watchdog);
+    EXPECT_EQ(loaded.value(), original);
+}
+
+TEST_F(ConfigTest, SavePreservesPopulatedClientConfig) {
+    const Config original = make_populated_client_config();
+
+    const auto path = test_dir_ / "populated_client_save.yaml";
+    auto saved = original.save(path);
+    ASSERT_TRUE(saved.has_value()) << saved.error();
+
+    auto loaded = Config::from_file(path);
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    EXPECT_EQ(loaded.value(), original);
+}
+
+TEST_F(ConfigTest, EncodeSpecializationAndToYamlAgree) {
+    // `to_yaml()` is now defined as "emit convert<Config>::encode". Pin that so
+    // a future edit cannot quietly reintroduce a second field list.
+    for (const Config& cfg : {make_populated_server_config(), make_populated_client_config(),
+                              Config::default_server(), Config::default_client()}) {
+        YAML::Emitter out;
+        out << YAML::convert<Config>::encode(cfg);
+        EXPECT_EQ(cfg.to_yaml(), std::string(out.c_str()));
+    }
+}
+
+TEST_F(ConfigTest, EncodeSpecializationCarriesServerDisclose) {
+    // `convert<Config>::encode` used to drop `server.disclose` while the
+    // hand-rolled emitter kept it — the same drift in the other direction.
+    Config cfg = Config::default_server();
+    cfg.server->disclose.os = true;
+    cfg.server->disclose.toxtunnel_version = true;
+
+    const YAML::Node node = YAML::convert<Config>::encode(cfg);
+    ASSERT_TRUE(node["server"]["disclose"]) << cfg.to_yaml();
+    EXPECT_TRUE(node["server"]["disclose"]["os"].as<bool>());
+    EXPECT_TRUE(node["server"]["disclose"]["toxtunnel_version"].as<bool>());
+    EXPECT_FALSE(node["server"]["disclose"]["hostname"].as<bool>());
+}
+
+// ---------------------------------------------------------------------------
+// Decoder-agreement tests
+//
+// `convert<ClientConfig>::decode` and the client branch of
+// `convert<Config>::decode` were separate hand-maintained readers of the same
+// field list; `fallback_server_ids` was readable through one and a silent
+// no-op through the other. These tests decode identical bodies through every
+// entry point and assert the resulting ClientConfig matches.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Indent every non-empty line of @p body by two spaces, so a client body can
+/// be spliced under a `client:` key.
+std::string indent_two(const std::string& body) {
+    std::string out;
+    std::size_t pos = 0;
+    while (pos <= body.size()) {
+        const std::size_t eol = body.find('\n', pos);
+        const std::string line =
+            body.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        if (!line.empty()) {
+            out += "  ";
+            out += line;
+        }
+        out += '\n';
+        if (eol == std::string::npos) {
+            break;
+        }
+        pos = eol + 1;
+    }
+    return out;
+}
+
+/// Decode @p body through all three entry points: the standalone
+/// `convert<ClientConfig>` specialisation, the nested `client:` layout, and the
+/// legacy flat layout. Asserts all three agree and returns the value.
+ClientConfig decode_client_every_way(const std::string& body) {
+    const ClientConfig standalone = YAML::Load(body).as<ClientConfig>();
+
+    const std::string preamble = "mode: client\ndata_dir: /tmp/decoder-agreement\n";
+    auto nested = Config::from_string(preamble + "client:\n" + indent_two(body));
+    EXPECT_TRUE(nested.has_value()) << (nested.has_value() ? std::string{} : nested.error());
+    auto flat = Config::from_string(preamble + body);
+    EXPECT_TRUE(flat.has_value()) << (flat.has_value() ? std::string{} : flat.error());
+
+    if (nested.has_value() && nested.value().client.has_value()) {
+        EXPECT_EQ(*nested.value().client, standalone) << "nested `client:` layout disagrees";
+    }
+    if (flat.has_value() && flat.value().client.has_value()) {
+        EXPECT_EQ(*flat.value().client, standalone) << "legacy flat layout disagrees";
+    }
+    return standalone;
+}
+
+constexpr const char* kId0 =
+    "0000000000000000000000000000000000000000000000000000000000000000000000000000";
+constexpr const char* kId1 =
+    "1111111111111111111111111111111111111111111111111111111111111111111111111111";
+constexpr const char* kId2 =
+    "2222222222222222222222222222222222222222222222222222222222222222222222222222";
+
+}  // namespace
+
+TEST_F(ConfigTest, DecodersAgreeOnScalarServerId) {
+    const auto client = decode_client_every_way(std::string("server_id: ") + kId0 + "\n");
+    EXPECT_EQ(client.server_id, kId0);
+    EXPECT_TRUE(client.fallback_server_ids.empty());
+}
+
+TEST_F(ConfigTest, DecodersAgreeOnSequenceServerId) {
+    const auto client = decode_client_every_way(std::string("server_id:\n  - ") + kId0 + "\n  - " +
+                                                kId1 + "\n  - " + kId2 + "\n");
+    EXPECT_EQ(client.server_id, kId0);
+    ASSERT_EQ(client.fallback_server_ids.size(), 2u);
+    EXPECT_EQ(client.fallback_server_ids[0], kId1);
+    EXPECT_EQ(client.fallback_server_ids[1], kId2);
+}
+
+TEST_F(ConfigTest, DecodersAgreeOnFallbackSequence) {
+    const auto client =
+        decode_client_every_way(std::string("server_id: ") + kId0 + "\nfallback_server_ids:\n  - " +
+                                kId1 + "\n  - " + kId2 + "\n");
+    EXPECT_EQ(client.server_id, kId0);
+    ASSERT_EQ(client.fallback_server_ids.size(), 2u);
+    EXPECT_EQ(client.fallback_server_ids[1], kId2);
+}
+
+TEST_F(ConfigTest, DecodersAgreeOnFallbackScalar) {
+    const auto client = decode_client_every_way(std::string("server_id: ") + kId0 +
+                                                "\nfallback_server_ids: " + kId1 + "\n");
+    ASSERT_EQ(client.fallback_server_ids.size(), 1u);
+    EXPECT_EQ(client.fallback_server_ids[0], kId1);
+}
+
+TEST_F(ConfigTest, DecodersAgreeOnFallbackNull) {
+    const auto client =
+        decode_client_every_way(std::string("server_id: ") + kId0 + "\nfallback_server_ids:\n");
+    EXPECT_EQ(client.server_id, kId0);
+    EXPECT_TRUE(client.fallback_server_ids.empty());
+}
+
+TEST_F(ConfigTest, DecodersAgreeOnMixedSequenceAndExplicitFallbacks) {
+    // The explicit key is additive on top of the list form; both readers must
+    // append rather than one of them replacing.
+    const auto client =
+        decode_client_every_way(std::string("server_id:\n  - ") + kId0 + "\n  - " + kId1 +
+                                "\nfallback_server_ids:\n  - " + kId2 + "\n");
+    EXPECT_EQ(client.server_id, kId0);
+    ASSERT_EQ(client.fallback_server_ids.size(), 2u);
+    EXPECT_EQ(client.fallback_server_ids[0], kId1);
+    EXPECT_EQ(client.fallback_server_ids[1], kId2);
+}
+
+TEST_F(ConfigTest, DecodersAgreeOnFullClientBody) {
+    const auto client = decode_client_every_way(
+        std::string("server_id: ") + kId0 + "\nfallback_server_ids:\n  - " + kId1 +
+        "\npipe:\n  remote_host: pipe.example\n  remote_port: 4444\n"
+        "forwards:\n  - local_port: 2222\n    remote_host: localhost\n    remote_port: 22\n"
+        "  - local_port: 8080\n    remote_host: 10.0.0.5\n    remote_port: 80\n"
+        "failover:\n  timeout_seconds: 12\n  prefer_primary_grace_seconds: 34\n"
+        "socks5:\n  enabled: true\n  listen: 127.0.0.1:1085\n");
+
+    ASSERT_TRUE(client.pipe_target.has_value());
+    EXPECT_EQ(client.pipe_target->remote_host, "pipe.example");
+    EXPECT_EQ(client.pipe_target->remote_port, 4444);
+    ASSERT_EQ(client.forwards.size(), 2u);
+    EXPECT_EQ(client.forwards[1].remote_host, "10.0.0.5");
+    EXPECT_EQ(client.failover.timeout_seconds, 12u);
+    EXPECT_EQ(client.failover.prefer_primary_grace_seconds, 34u);
+    EXPECT_TRUE(client.socks5.enabled);
+    EXPECT_EQ(client.socks5.listen, "127.0.0.1:1085");
+}
+
+TEST_F(ConfigTest, DecodersAgreeOnRejectingMapValuedFallback) {
+    // Both readers must fail the same way, not one silently ignoring it.
+    const std::string body =
+        std::string("server_id: ") + kId0 + "\nfallback_server_ids:\n  some_key: " + kId1 + "\n";
+    EXPECT_THROW((void)YAML::Load(body).as<ClientConfig>(), YAML::Exception);
+    EXPECT_FALSE(Config::from_string("mode: client\ndata_dir: /tmp/decoder-agreement\nclient:\n" +
+                                     indent_two(body))
+                     .has_value());
+    EXPECT_FALSE(
+        Config::from_string("mode: client\ndata_dir: /tmp/decoder-agreement\n" + body).has_value());
+}
+
+TEST_F(ConfigTest, ClientEncodeRoundTripsThroughStandaloneDecoder) {
+    // The `client:` block that convert<Config>::encode writes is produced by
+    // convert<ClientConfig>::encode, so the standalone pair must round-trip.
+    const Config populated = make_populated_client_config();
+    const YAML::Node node = YAML::convert<ClientConfig>::encode(*populated.client);
+    EXPECT_EQ(node.as<ClientConfig>(), *populated.client);
 }

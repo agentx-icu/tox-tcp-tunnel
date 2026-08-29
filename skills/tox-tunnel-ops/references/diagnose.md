@@ -198,7 +198,7 @@ bash scripts/verify.sh <local_port> [ssh|http|postgres|mysql|redis|mongo|tcp]
 Tox-thread watchdog fires when `tox_iterate` stalls past
 `watchdog.deadline_seconds`. Check:
 
-1. `journalctl -u toxtunnel | grep tox_thread_wedge` — the FATAL line
+1. `journalctl -u toxtunnel | grep "tox_thread wedge"` — the FATAL line
    carries `delta_ms` and `last_heartbeat_counter`.
 2. `cat <data_dir>/abort_count` — persistent count across restarts.
 3. `curl 127.0.0.1:9100/metrics | grep watchdog_aborts` — same value

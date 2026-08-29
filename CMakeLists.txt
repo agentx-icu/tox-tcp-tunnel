@@ -140,7 +140,6 @@ target_sources(toxtunnel_lib PRIVATE
     src/tox/types.cpp
     src/tox/tox_ptr.cpp
     src/tox/tox_save.cpp
-    src/tox/tox_thread.cpp
     src/tox/tox_connection.cpp
     src/tox/tox_adapter.cpp
     src/tox/tox_watchdog.cpp
@@ -152,6 +151,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/app/socks5_listener.cpp
     src/app/stdio_pipe_bridge.cpp
     src/app/tunnel_client.cpp
+    src/app/tunnel_senders.cpp
     src/app/tunnel_server.cpp
     src/util/config.cpp
     src/util/atomic_file.cpp

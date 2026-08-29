@@ -2,21 +2,27 @@
 
 #include <asio.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "toxtunnel/app/inspect_server.hpp"
+#include "toxtunnel/app/rate_limiter.hpp"
 #include "toxtunnel/app/rules_engine.hpp"
 #include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tox/tox_adapter.hpp"
 #include "toxtunnel/tox/tox_watchdog.hpp"
+#include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
 #include "toxtunnel/util/config.hpp"
 #include "toxtunnel/util/metrics.hpp"
@@ -90,6 +96,450 @@ enum class ConnectedManagerAction {
 [[nodiscard]] std::vector<std::string> friend_keys_to_preseed(
     const std::vector<std::string>& rule_public_keys,
     const std::vector<std::string>& existing_friend_public_keys);
+
+/// True for inbound frame types that must NOT queue behind a friend's
+/// byte-throttle backlog.
+///
+/// The throttle preserves per-friend arrival order, because a TUNNEL_CLOSE that
+/// overtook deferred TUNNEL_DATA would tear the tunnel down and strand those
+/// bytes — silent truncation, the exact failure the deferral exists to avoid.
+/// Three frame classes are exempt because they carry no stream position and
+/// delaying them causes real harm:
+///  * PING / PONG — the liveness channel. Held behind a throttled stream, the
+///    keepalive would declare a perfectly healthy peer dead and tear down every
+///    tunnel it has, losing far more than the throttle ever saved.
+///  * TUNNEL_ACK — send-window credit for the *opposite* direction. Deferring
+///    it would throttle server->client traffic as collateral of a
+///    client->server limit.
+///  * INFO_REQUEST / INFO_REPLY and unrecognised opcodes — per-friend control
+///    with no tunnel ordering to preserve.
+[[nodiscard]] bool frame_bypasses_byte_throttle(tunnel::FrameType type) noexcept;
+
+/// Order-preserving admission gate for one friend's inbound TUNNEL_DATA bytes.
+///
+/// This is the mechanism that makes `rate_limit.bytes_per_sec` real. A tunnel
+/// carries TCP semantics, so an over-budget frame can neither be dropped (that
+/// corrupts a lossless stream) nor waited on in place (that would block the
+/// shared Tox thread and the inbound strand). Instead the frame is parked in a
+/// FIFO and replayed once the bucket refills.
+///
+/// The queue is self-limiting, which is why deferral is safe: a parked frame is
+/// never handed to its tunnel, so no TUNNEL_ACK is generated for it, so the
+/// peer's send window fills and the peer stops sending. The throttle therefore
+/// propagates all the way back to the origin TCP socket instead of being
+/// absorbed here — the same receiver-side backpressure the C-03 slow-target
+/// path already relies on.
+///
+/// TWO RAILS BOUND HOW FAR DEFERRAL CAN GO, and both of them FAIL OPEN — they
+/// release the backlog early rather than dropping it or killing the peer,
+/// because "the configured rate was briefly exceeded" is a far better outcome
+/// than either a corrupted stream or a disconnected friend:
+///
+///  * `max_backlog_bytes` bounds memory, for a peer that ignores flow control
+///    and keeps sending past its unacknowledged window. It is deliberately NOT
+///    treated as proof of misbehaviour: a friend with a high
+///    `max_concurrent_tunnels` can reach it legitimately (200 tunnels x a
+///    256 KiB seed window is already 50 MiB), so closing its tunnels on the
+///    strength of this number would punish ordinary traffic.
+///  * A per-frame **release deadline** bounds how long a frame may sit. This
+///    one is not a nicety: the idle reaper and the half-close linger cap judge
+///    a tunnel by when it last saw TUNNEL_DATA, and a parked frame has not
+///    reached its tunnel, so deferring makes an actively-receiving tunnel look
+///    idle. The reaper would then close it and release its id — and the replay
+///    would deliver bytes to a tunnel that no longer exists, or worse, to a
+///    recycled id.
+///
+///    The deadline is supplied per frame by the caller (see
+///    `TunnelServer::inbound_deferral_budget`), because "how long is safe" is a
+///    property of the frame's TUNNEL, not of the queue: a tunnel that was
+///    ALREADY nearly idle when the frame arrived can afford almost no wait,
+///    while a busy one can afford the full budget. The throttle keeps the
+///    EARLIEST deadline any queued frame asked for and releases the whole
+///    backlog at that point — a frame near the back of the queue is exactly the
+///    one whose tunnel may be closest to being reaped, so taking the minimum
+///    (rather than judging by the head) is what makes the bound sound.
+///
+/// NOT thread-safe by design: `TunnelServer` owns one per friend and touches it
+/// exclusively from `inbound_strand_` handlers, so it needs no lock of its own
+/// and — crucially for H-01 — holds none while the caller re-enters the manager
+/// to dispatch.
+class InboundByteThrottle {
+   public:
+    /// Memory rail on deferred bytes per friend. See the class comment: this
+    /// bounds the queue, it does not accuse the peer of anything.
+    static constexpr std::size_t kDefaultMaxBacklogBytes = 32u * 1024u * 1024u;
+
+    /// Fallback deferral ceiling used when no reaper timeout is configured to
+    /// derive one from. Generous — nothing forces a release at this point
+    /// except the principle that an unboundedly lagging stream is worse than a
+    /// briefly unenforced budget.
+    static constexpr std::chrono::seconds kDefaultMaxDeferral{60};
+
+    enum class Admission : std::uint8_t {
+        Dispatch,  ///< Within budget (or exempt): route this packet now.
+        Parked,    ///< Deferred in arrival order; arm a timer for `retry_after()`.
+        /// Deferred, AND a rail was hit: the caller must drain immediately
+        /// instead of waiting. The drain ignores the budget until the backlog
+        /// is empty, so ordering and loss-freedom both hold.
+        Release,
+    };
+
+    InboundByteThrottle(RateLimiter& limiter, std::string friend_pk,
+                        std::size_t max_backlog_bytes = kDefaultMaxBacklogBytes)
+        : limiter_(&limiter),
+          friend_pk_(std::move(friend_pk)),
+          max_backlog_bytes_(max_backlog_bytes) {}
+
+    /// Whether this friend's effective spec engages a byte budget. Recomputed
+    /// on connect and after every rules reload, so the (overwhelmingly common)
+    /// unlimited friend never touches the limiter's mutex on the data path.
+    void set_active(bool active) noexcept { active_ = active; }
+    [[nodiscard]] bool active() const noexcept { return active_; }
+
+    /// Override the monotonic clock (nanoseconds) used for release deadlines,
+    /// so tests can assert the deadline rail without sleeping.
+    void set_clock(std::function<std::int64_t()> now) { clock_ = std::move(now); }
+
+    /// Decide what to do with one inbound packet.
+    ///
+    /// @param packet      The whole lossless packet, prefix byte included, so a
+    ///                    replay goes through the same decode as a live one.
+    ///                    Copied only when the packet is actually parked.
+    /// @param type        The decoded frame type.
+    /// @param data_bytes  TUNNEL_DATA payload size, 0 for every other type.
+    /// @param max_wait    Longest this packet may safely be deferred — the
+    ///                    caller's judgement of when its tunnel becomes
+    ///                    reapable. Tightens the queue's release deadline; see
+    ///                    the class comment.
+    [[nodiscard]] Admission admit(std::span<const std::uint8_t> packet, tunnel::FrameType type,
+                                  std::size_t data_bytes,
+                                  std::chrono::nanoseconds max_wait = kDefaultMaxDeferral);
+
+    /// Move the next packet out of the backlog if its bytes now fit the budget
+    /// (or if a rail has forced the backlog open). Returns false when the
+    /// backlog is empty or its head is still short — in the latter case
+    /// `retry_after()` has been refreshed.
+    [[nodiscard]] bool next_ready(std::vector<std::uint8_t>& out);
+
+    [[nodiscard]] std::chrono::nanoseconds retry_after() const noexcept { return retry_after_; }
+    [[nodiscard]] bool empty() const noexcept { return backlog_.empty(); }
+    [[nodiscard]] std::size_t backlog_bytes() const noexcept { return backlog_bytes_; }
+    [[nodiscard]] std::size_t backlog_frames() const noexcept { return backlog_.size(); }
+    /// True while a rail has forced the backlog open. Cleared once it drains.
+    [[nodiscard]] bool releasing() const noexcept { return releasing_; }
+
+    /// Time left before the release deadline, or `nanoseconds::max()` when the
+    /// queue is empty. The caller's retry timer MUST NOT sleep past this — a
+    /// timer scheduled purely from `retry_after()` (which only knows about the
+    /// refill rate) would happily wait a second while a tunnel whose deadline
+    /// is 50 ms away gets reaped.
+    [[nodiscard]] std::chrono::nanoseconds time_until_release() const;
+
+    /// True once since the deadline rail last latched; reading it clears the
+    /// notice. The caller logs from this rather than from `releasing()`,
+    /// because a drain that empties the queue clears the latch before it
+    /// returns — so by the time the caller looks, `releasing()` is false again
+    /// and the release would go unreported.
+    [[nodiscard]] bool take_deadline_release_notice() noexcept;
+
+    /// Non-consuming peek at the same notice, so the caller can tell which rail
+    /// produced an `Admission::Release` before it drains.
+    [[nodiscard]] bool deadline_release_pending() const noexcept {
+        return deadline_release_notice_;
+    }
+
+    /// Drop the backlog. Used when the friend goes away: the packets belong to
+    /// a session the peer has abandoned. Bytes discarded here are NOT lost
+    /// silently — they were never acknowledged, so the peer still counts them
+    /// as unsent, and tunnel resume's offset reconciliation reports the gap.
+    void clear() noexcept;
+
+   private:
+    struct Deferred {
+        std::vector<std::uint8_t> packet;
+        std::size_t data_bytes;
+    };
+
+    [[nodiscard]] std::int64_t now_nanos() const;
+
+    RateLimiter* limiter_;
+    std::string friend_pk_;
+    std::size_t max_backlog_bytes_;
+    /// Earliest moment any queued packet asked to be released by; 0 when the
+    /// queue is empty. Only ever tightened while the queue is non-empty — a
+    /// popped packet's (later) deadline is not given back, which errs towards
+    /// releasing early, the safe direction.
+    std::int64_t release_deadline_ns_{0};
+    std::function<std::int64_t()> clock_;
+    bool active_{false};
+    /// Latched by either rail; cleared when the backlog empties. Latching (as
+    /// opposed to re-testing per packet) is what guarantees the whole queue
+    /// drains in one pass instead of releasing the head and re-parking the rest.
+    bool releasing_{false};
+    /// Set when the deadline rail latches; consumed by
+    /// `take_deadline_release_notice()`.
+    bool deadline_release_notice_{false};
+    std::deque<Deferred> backlog_;
+    std::size_t backlog_bytes_{0};
+    std::chrono::nanoseconds retry_after_{0};
+};
+
+// ---------------------------------------------------------------------------
+// Server tunnel publication / abandonment
+// ---------------------------------------------------------------------------
+//
+// Everything below exists because of one asymmetry: the OPEN_ACK gate
+// deliberately leaves a server tunnel in `Tunnel::State::None` until its ACK is
+// on the wire, and `Tunnel::close()` is a documented no-op in `None`. So every
+// teardown that routes through `close()` — including `TunnelManager::
+// remove_tunnel()` and `close_all()` — silently does nothing for an unpublished
+// tunnel, leaving its target socket open and its accounting unbalanced. These
+// helpers own the two transitions out of that state explicitly, and are free
+// functions rather than lambdas inside `wire_tcp_to_tunnel()` so they can be
+// tested against a real socket.
+
+/// Whether the server's `tunnels_active` gauge has been counted for a tunnel.
+///
+/// The gauge is incremented at publication (inside the gate's commit) but
+/// decremented from a state-change callback that can fire at any time,
+/// including before publication ever happens. A plain "already decremented"
+/// latch therefore gets it wrong in both directions: it decrements a gauge that
+/// was never incremented when a tunnel is abandoned, and it misses the
+/// decrement when a terminal transition beats the increment.
+enum class ActiveGaugeState : std::uint8_t {
+    NotCounted,  ///< Never published.
+    Counted,     ///< Published; the gauge owes one decrement.
+    Released,    ///< Settled — no further increment or decrement may happen.
+};
+
+/// The latch guards the metric SIDE EFFECT, not just the state word.
+///
+/// A lock-free version of this was wrong in a way that only shows up under
+/// concurrency: after the compare-exchange published `Counted`, a release could
+/// run before the matching increment had happened. Its decrement saturated at
+/// zero and did nothing, and the delayed increment then left the gauge stuck at
+/// +1 with nobody left to give it back. Ordering the state word is not enough —
+/// the increment and decrement have to be inside the same critical section as
+/// the transition that authorises them. The mutex is only ever held across a
+/// lock-free atomic counter update, never across a tunnel or manager callback.
+struct ActiveGauge {
+    std::mutex mutex;
+    ActiveGaugeState state{ActiveGaugeState::NotCounted};
+};
+
+using ActiveGaugeLatch = std::shared_ptr<ActiveGauge>;
+
+[[nodiscard]] inline ActiveGaugeLatch make_active_gauge_latch() {
+    return std::make_shared<ActiveGauge>();
+}
+
+/// Current latch state. Test observability only — production code must act
+/// through count/release so the side effect stays serialised.
+[[nodiscard]] ActiveGaugeState active_gauge_state(const ActiveGaugeLatch& latch);
+
+/// Count this tunnel as active, at most once and never after release.
+/// @return true if this call incremented the gauge.
+bool active_gauge_count(const ActiveGaugeLatch& latch);
+
+/// Settle the latch, decrementing only if it had actually been counted. Safe to
+/// call on a tunnel that was never published; safe to call repeatedly.
+void active_gauge_release(const ActiveGaugeLatch& latch);
+
+/// Install every hook that must settle a server tunnel's active-gauge count.
+///
+/// There are two, and both are needed. A terminal transition covers the paths
+/// that reach `Closed`/`Error` directly. `on_close_` covers the one that does
+/// not: a graceful close of a published tunnel stops at `Disconnecting`, fires
+/// `on_close_`, and then waits for the peer — so a release wired only to
+/// terminal states holds the count for as long as the tunnel sits half-closed,
+/// and forever when the half-close reaper is disabled.
+///
+/// @param extra_on_close  The caller's own on_close work, run after the gauge
+///                        is settled. May be null.
+void wire_active_gauge(tunnel::TunnelImpl& tunnel, ActiveGaugeLatch gauge,
+                       std::function<void()> extra_on_close);
+
+/// What `commit_open_ack()` did.
+enum class OpenAckCommit : std::uint8_t {
+    Published,  ///< Connected, gauge counted, read loop started.
+    Detached,   ///< The manager no longer owns this tunnel; resources released.
+    Gone,       ///< The tunnel or its socket had already been destroyed.
+};
+
+/// Publish a server tunnel, now that its OPEN_ACK is on the wire.
+///
+/// Verifies that @p weak_manager still owns *this exact tunnel* before
+/// publishing anything. A concurrent `close_all()` / `remove_tunnel()` can
+/// detach an unpublished tunnel while the ACK is still in flight, and because
+/// `close()` no-ops in `None` that detachment leaves the tunnel un-torn-down —
+/// so committing afterwards would strand a `Connected` tunnel nobody routes to,
+/// with a leaked active-gauge count, an open target socket and a read loop
+/// delivering into a manager that has forgotten it. On that path this releases
+/// the local resources instead of publishing.
+[[nodiscard]] OpenAckCommit commit_open_ack(
+    const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+    const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+    const std::weak_ptr<core::TcpConnection>& weak_tcp, std::uint16_t tunnel_id,
+    std::uint32_t friend_number, const ActiveGaugeLatch& gauge);
+
+/// Resolve a server tunnel whose OPEN_ACK DID reach the peer but which could
+/// not be published after all (detached or destroyed mid-flight).
+///
+/// Deliberately separate from `abandon_open_ack()`, because the obligation is
+/// different. Before the ACK the peer is still in `Connecting` and has never
+/// been told the tunnel exists; after it, the peer believes it has a working
+/// tunnel and will wait on it indefinitely. Silence is therefore not an option
+/// here — the peer has to be told the tunnel is over, with an identity-checked
+/// removal so a replacement that recycled the id is untouched.
+void abort_open_ack_after_send(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                               const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                               const std::weak_ptr<core::TcpConnection>& weak_tcp,
+                               std::uint16_t tunnel_id, std::uint32_t friend_number,
+                               const ActiveGaugeLatch& gauge);
+
+/// Resolve a server tunnel whose OPEN_ACK will never be delivered, or whose
+/// target died before it was.
+///
+/// Sends the terminal TUNNEL_ERROR the waiting client needs (a TUNNEL_CLOSE
+/// does not complete its `Connecting` state), then releases the local resources
+/// EXPLICITLY rather than via `remove_tunnel()` — which would delegate to
+/// `close()` and no-op on an unpublished tunnel, leaving the target socket open
+/// for as long as the target keeps it open.
+void abandon_open_ack(const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                      const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                      const std::weak_ptr<core::TcpConnection>& weak_tcp, std::uint16_t tunnel_id,
+                      std::uint32_t friend_number, const ActiveGaugeLatch& gauge);
+
+/// Causal barrier between the server's OPEN_ACK and everything that means
+/// "this tunnel is usable".
+///
+/// THE BUG THIS EXISTS TO PREVENT
+///
+/// The server used to publish the tunnel as `Connected`, count it opened, and
+/// call `start_read()` on the target socket immediately after handing the
+/// OPEN_ACK to `TunnelManager::send_frame()` — whose bool return says "queued",
+/// not "sent". If toxcore was backpressured, the ACK went into the manager's
+/// retry queue while TCP reads started at once, and TUNNEL_DATA travels the
+/// *per-tunnel* path, not that queue. So data could reach the peer before the
+/// ACK that opens it. The client, still in `Connecting`, discards TUNNEL_DATA
+/// (see TunnelImpl::handle_tunnel_data_frame) — silent data loss at connection
+/// setup, presenting as a peer bug.
+///
+/// Delaying only `start_read()` while still publishing `Connected` early was
+/// considered and rejected: `Connected` is itself an admission signal (it is
+/// what lets `send_data_to_tox` accept bytes, and what the resume path reads to
+/// decide a tunnel is live), so it has to sit behind the same edge. Everything
+/// here is therefore driven by ONE transition: the OPEN_ACK actually being
+/// accepted by toxcore.
+///
+/// The gate holds no strong references — the caller wires it with weak handles
+/// — because the connection it is arming owns the callback that owns the gate.
+///
+/// Thread safety: `start()` runs on the caller's thread, retries on an
+/// io_context thread, and `target_gone()` on the TCP strand. All three resolve
+/// through one mutex-guarded phase, and no callback is invoked while that mutex
+/// is held (H-01).
+class OpenAckGate : public std::enable_shared_from_this<OpenAckGate> {
+   public:
+    /// One attempt to hand the OPEN_ACK to the transport.
+    using AckSender = std::function<tunnel::SendOutcome()>;
+
+    /// Publish the tunnel: `Connected`, the open metrics, and `start_read()`.
+    /// Invoked at most once, and only after the ACK reached toxcore.
+    ///
+    /// Returns false when publication did not happen after all — the tunnel was
+    /// detached or destroyed while the ACK was in flight. The gate must not then
+    /// report itself `Committed`: nothing was published, so a later target death
+    /// has no live tunnel for the ordinary close path to act on. A failed commit
+    /// has already released its own resources, so the gate does not additionally
+    /// run the abandon callback (and the ACK did reach the peer, so there is no
+    /// undelivered handshake left to report).
+    using CommitFn = std::function<bool()>;
+
+    /// The ACK will never arrive, or the target died before it did. Resolve the
+    /// waiting client with a terminal TUNNEL_ERROR and drop the tunnel.
+    /// Invoked at most once, and never together with the commit.
+    using AbandonFn = std::function<void()>;
+
+    /// Run the ordinary graceful close of an already-published tunnel.
+    ///
+    /// Needed for exactly one situation: the target died while the commit
+    /// callback was still running. `target_gone()` cannot truthfully answer
+    /// "the tunnel is live, run your close" at that instant — the tunnel may
+    /// still be in `None`, where `Tunnel::close()` is a no-op, and the commit
+    /// would then go on to publish `Connected` and start reading a socket that
+    /// is already dead. So the gate defers, and calls this once commit has
+    /// actually finished.
+    using PostCommitCloseFn = std::function<void()>;
+
+    OpenAckGate(asio::io_context& io_ctx, AckSender send_ack, CommitFn commit, AbandonFn abandon,
+                PostCommitCloseFn post_commit_close);
+
+    OpenAckGate(const OpenAckGate&) = delete;
+    OpenAckGate& operator=(const OpenAckGate&) = delete;
+    OpenAckGate(OpenAckGate&&) = delete;
+    OpenAckGate& operator=(OpenAckGate&&) = delete;
+
+    /// Attempt the OPEN_ACK now, and keep retrying on the SENDQ backoff
+    /// schedule (tunnel/sendq_retry.hpp — deliberately not the coalesce delay,
+    /// which is legally 0) until it is sent, permanently fails, or the target
+    /// goes away.
+    void start();
+
+    /// The target TCP connection died. Returns true when the gate has taken
+    /// ownership of the teardown — i.e. the tunnel was never published, so the
+    /// caller must NOT run its ordinary `Tunnel::close()` path. Returns false
+    /// once the tunnel is live, where the ordinary close is exactly right.
+    bool target_gone();
+
+    /// True once the tunnel has been published. Test observability.
+    [[nodiscard]] bool committed() const;
+
+    /// OPEN_ACK send attempts made so far (initial + retries). Test
+    /// observability: asserts that the retry cadence is not a spin.
+    [[nodiscard]] unsigned attempts() const noexcept {
+        return attempts_.load(std::memory_order_relaxed);
+    }
+
+   private:
+    /// Both intermediate phases exist because a resolution is not instantaneous
+    /// and the gap is observable to `target_gone()` running on the TCP strand.
+    ///
+    ///  * `Sending` — a send is inside the transport. Resolving to `Abandoned`
+    ///    here would let that send emit an OPEN_ACK *after* the TUNNEL_ERROR
+    ///    and after the tunnel was removed, so the peer would see an ACK for a
+    ///    tunnel it had just been told had failed. The sender resolves instead.
+    ///  * `Committing` — the commit callback is running but has not finished.
+    ///    Reporting `Committed` here would send the caller down the ordinary
+    ///    close path against a tunnel that is still `None`, where close() is a
+    ///    no-op — and commit would then publish `Connected` and start reading a
+    ///    dead socket.
+    enum class Phase : std::uint8_t {
+        Pending,     ///< Idle between attempts; a retry may be armed.
+        Sending,     ///< An ACK send is in flight on some thread right now.
+        Committing,  ///< ACK accepted; the commit callback is running.
+        Committed,   ///< Commit finished; the tunnel is published.
+        Abandoned,   ///< Resolved with a TUNNEL_ERROR instead.
+    };
+
+    void attempt(unsigned retry);
+    void arm_retry(unsigned retry);
+
+    /// Drop every callback and cancel the retry timer. Caller holds `mutex_`.
+    void release_callbacks_locked();
+
+    asio::steady_timer timer_;
+    mutable std::mutex mutex_;
+    Phase phase_{Phase::Pending};
+    /// Set when `target_gone()` arrives during `Sending` or `Committing`; the
+    /// thread that owns that phase consumes it when it finishes.
+    bool target_gone_requested_{false};
+    AckSender send_ack_;
+    CommitFn commit_;
+    AbandonFn abandon_;
+    PostCommitCloseFn post_commit_close_;
+    std::atomic<unsigned> attempts_{0};
+};
 
 }  // namespace detail
 
@@ -188,6 +638,42 @@ class TunnelServer {
 
     /// Handle self connection status changes (DHT connectivity).
     void on_self_connection(bool connected);
+
+    // -----------------------------------------------------------------
+    // Inbound byte throttle (rate_limit.bytes_per_sec)
+    // -----------------------------------------------------------------
+
+    /// Route one decoded inbound frame: OPEN, RESUME_REQUEST, or the friend's
+    /// TunnelManager. Split out of `on_lossless_packet()` so a frame the byte
+    /// throttle deferred is replayed through exactly the same path it would
+    /// have taken had it arrived within budget.
+    ///
+    /// Runs on `inbound_strand_` with no server lock held (H-01).
+    void dispatch_inbound_frame(uint32_t friend_number, const tunnel::ProtocolFrame& frame);
+
+    /// Replay a friend's deferred packets as its byte bucket refills, then
+    /// re-arm the retry timer if any remain. Strand-confined.
+    void drain_inbound_backlog(uint32_t friend_number);
+
+    /// Schedule the next backlog drain for a friend, if one is not already
+    /// scheduled. Strand-confined.
+    void arm_inbound_retry(uint32_t friend_number);
+
+    /// Longest one inbound frame may safely sit in a friend's throttle backlog.
+    ///
+    /// Computed per frame from ITS tunnel's remaining reaper slack — the
+    /// idle-reaper and half-close timeouts minus how long that tunnel has
+    /// already been idle, minus reaper-tick margin — because a tunnel that was
+    /// nearly idle when the frame arrived can afford almost no wait. A fixed
+    /// budget cannot express that, and getting it wrong means the reaper closes
+    /// a tunnel with bytes still queued for it.
+    [[nodiscard]] std::chrono::nanoseconds inbound_deferral_budget(uint32_t friend_number,
+                                                                   uint16_t tunnel_id) const;
+
+    /// Recompute `active()` on every known friend's throttle from the current
+    /// limiter specs. Posted onto `inbound_strand_` after a rules reload so a
+    /// newly added (or removed) byte budget takes effect without a reconnect.
+    void refresh_inbound_throttles();
 
     /// Apply the v0.4 adaptive coalescer mode + BDP flow control config to a
     /// freshly-built server-side tunnel.
@@ -300,6 +786,33 @@ class TunnelServer {
     /// dropped. The strand preserves arrival order while keeping the rest
     /// of the IO pool parallel.
     std::optional<asio::strand<asio::any_io_executor>> inbound_strand_;
+
+    /// Per-friend inbound byte-throttle state.
+    ///
+    /// STRAND-CONFINED, not mutex-protected: every member is created, read,
+    /// mutated and destroyed inside an `inbound_strand_` handler. That is what
+    /// lets the data-path gate run without acquiring any server lock, so it
+    /// cannot participate in the re-entrancy H-01 warns about.
+    struct FriendInbound {
+        detail::InboundByteThrottle throttle;
+        /// Cached hex public key. Resolved once on the friend-connected event
+        /// (where the lookup runs inline on the Tox thread) rather than per
+        /// frame: `get_friend_pk_hex()` marshals to the Tox thread and blocks
+        /// until its next tick, which on the data path would cost ~50 ms per
+        /// frame and stall the whole strand.
+        std::string pk_hex;
+        std::shared_ptr<asio::steady_timer> retry_timer;
+        /// True while a drain is scheduled. Re-arming a pending timer would
+        /// cancel it, and the cancelled handler would then clear this flag
+        /// after the new arm set it.
+        bool retry_armed{false};
+        /// Whether this friend's mode is `enforce` (as opposed to `report`,
+        /// which meters but never defers). Only an enforcing friend can park a
+        /// frame, so only it needs a release deadline computed — and computing
+        /// one costs a managers_mutex_ lookup per frame.
+        bool enforcing{false};
+    };
+    std::unordered_map<uint32_t, FriendInbound> inbound_;
 
     /// Tox network adapter.
     std::unique_ptr<tox::ToxAdapter> tox_adapter_;

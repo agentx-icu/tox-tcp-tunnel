@@ -914,8 +914,8 @@ void ToxAdapter::run_loop() {
                 wd->heartbeat();
             }
             // Feed the iterate-lag summary. This observation used to live only
-            // in ToxThread::run_loop(), a class nothing ever instantiates, so
-            // toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max} were
+            // in a second, never-instantiated Tox event loop (since deleted),
+            // so toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max} were
             // permanently 0 — and the alert rule documented in
             // docs/ADVANCED_SCENARIOS.md (`..._max > 100`) could never fire.
             // This is the loop that actually runs.

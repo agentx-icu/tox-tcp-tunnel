@@ -98,11 +98,13 @@ const char* to_string(Tunnel::State state) noexcept {
 TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t friend_number,
                        std::size_t send_window)
     : Tunnel(tunnel_id, io_ctx),
+      open_retry_timer_(io_ctx),
       friend_number_(friend_number),
       send_window_size_(send_window),
       last_activity_ns_(std::chrono::steady_clock::now().time_since_epoch().count()),
       coalesce_timer_(io_ctx),
-      ack_retry_timer_(io_ctx) {
+      ack_retry_timer_(io_ctx),
+      close_retry_timer_(io_ctx) {
     util::Logger::debug("Tunnel created: id={}, friend={}, window={}", tunnel_id_, friend_number_,
                         send_window_size_);
 }
@@ -112,6 +114,33 @@ TunnelImpl::~TunnelImpl() {
     // and bail out if destruction won the race.
     coalesce_timer_.cancel();
     ack_retry_timer_.cancel();
+    open_retry_timer_.cancel();
+    close_retry_timer_.cancel();
+    // Backstop: a destroyed tunnel can no longer emit anything, whatever it may
+    // still have owed. Without this an owner waiting on set_on_id_releasable()
+    // would hold the id reserved forever.
+    {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        if (close_frame_state_ == CloseFrameState::Owed ||
+            close_frame_state_ == CloseFrameState::InFlight) {
+            // A destroyed tunnel cannot emit anything, whatever it owed.
+            close_frame_state_ = CloseFrameState::Abandoned;
+        }
+    }
+    {
+        std::function<void()> cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!id_releasable_notified_ && on_id_releasable_) {
+                id_releasable_notified_ = true;
+                cb = std::move(on_id_releasable_);
+                on_id_releasable_ = nullptr;
+            }
+        }
+        if (cb) {
+            cb();
+        }
+    }
     util::Logger::debug("Tunnel destroyed: id={}", tunnel_id_);
 }
 
@@ -167,22 +196,74 @@ void TunnelImpl::set_state(State new_state) {
     transition_state(new_state);
 }
 
+void TunnelImpl::notify_state_change(State new_state) {
+    StateChangedCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cb = on_state_change_;
+    }
+    if (cb) {
+        cb(new_state);
+    }
+}
+
+bool TunnelImpl::transition_state_if(State expected, State desired) {
+    State observed = expected;
+    if (!state_.compare_exchange_strong(observed, desired, std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        util::Logger::debug("Tunnel {} declined {} -> {}: state is {}", tunnel_id_,
+                            to_string(expected), to_string(desired), to_string(observed));
+        return false;
+    }
+    if (expected == desired) {
+        return true;
+    }
+
+    util::Logger::debug("Tunnel {} state: {} -> {}", tunnel_id_, to_string(expected),
+                        to_string(desired));
+    notify_state_change(desired);
+    maybe_notify_id_releasable();
+    return true;
+}
+
 void TunnelImpl::transition_state(State new_state) {
-    State old_state = state_.exchange(new_state, std::memory_order_acq_rel);
-    if (old_state != new_state) {
-        util::Logger::debug("Tunnel {} state: {} -> {}", tunnel_id_, to_string(old_state),
-                            to_string(new_state));
-
-        StateChangedCallback cb;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cb = on_state_change_;
+    // A claim, not a blind store. The CAS-based writers — open(),
+    // try_publish_connected(), transition_state_if() and force_close()'s
+    // exchange — all arbitrate on this word, but the remaining writers reach it
+    // through here, and a blind store from one of them silently undoes whatever
+    // a concurrent resolver had already published. Two real cases:
+    //
+    //  * a graceful close beginning from Connected races force_close(): without
+    //    this the close overwrites Closed with Disconnecting, resurrecting a
+    //    tunnel whose socket is already gone;
+    //  * an inbound TUNNEL_ACK loads Connecting, loses to force_close(), and
+    //    then publishes Connected over the terminal state.
+    //
+    // Terminal states are therefore final: Closed and Error absorb every later
+    // transition. Nothing legitimately leaves them — every path that reaches a
+    // terminal state has already run notify_close_once() and booked its close.
+    State current = state_.load(std::memory_order_acquire);
+    for (;;) {
+        if (current == State::Closed || current == State::Error) {
+            if (current != new_state) {
+                util::Logger::debug("Tunnel {} declined {} -> {}: already terminal", tunnel_id_,
+                                    to_string(current), to_string(new_state));
+            }
+            return;
         }
-
-        if (cb) {
-            cb(new_state);
+        if (current == new_state) {
+            return;
+        }
+        if (state_.compare_exchange_weak(current, new_state, std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+            break;
         }
     }
+
+    util::Logger::debug("Tunnel {} state: {} -> {}", tunnel_id_, to_string(current),
+                        to_string(new_state));
+    notify_state_change(new_state);
+    maybe_notify_id_releasable();
 }
 
 // ===========================================================================
@@ -210,29 +291,743 @@ bool TunnelImpl::open(const std::string& host, uint16_t port) {
     // M-08: record target + move to Connecting BEFORE sending TUNNEL_OPEN, so a
     // synchronous send callback or a fast ACK observes a coherent target and
     // state (the old order left a window where state was still None / target
-    // empty). On send failure we roll back to None so the caller can release
-    // the id without the tunnel lingering in Connecting.
+    // empty). On a PERMANENT send failure we roll back to None so the caller can
+    // release the id without the tunnel lingering in Connecting.
+    //
+    // Claiming the None -> Connecting edge and writing the target are ONE
+    // critical section, and only the winner writes. Two concurrent open() calls
+    // can both pass the fast-path state check above; if both wrote the target
+    // and the loser then cleared it, the winner would serialize a TUNNEL_OPEN
+    // for an empty or foreign host. The state check is only a fast path in the
+    // other direction too: a close or force_close can resolve this tunnel
+    // between it and here, which is why this is a compare-exchange rather than
+    // a store. The state callback is fired afterwards, with the lock released
+    // (H-01).
+    bool claimed = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        target_host_ = host;
-        target_port_ = port;
-    }
-    transition_state(State::Connecting);
+        State expected = State::None;
+        claimed = state_.compare_exchange_strong(
+            expected, State::Connecting, std::memory_order_acq_rel, std::memory_order_acquire);
+        if (claimed) {
+            target_host_ = host;
+            target_port_ = port;
 
-    auto frame = ProtocolFrame::make_tunnel_open(tunnel_id_, host, port);
-    if (!send_frame_to_tox(frame)) {
+            // The handshake-phase reset lives INSIDE the claim, so a losing
+            // open() touches none of it. Resetting before the claim let a stale
+            // loser overwrite the winner's Sending/Sent phase and only then lose
+            // the CAS — after which cancel_open_retry() would read Pending and
+            // suppress a TUNNEL_CLOSE the peer actually needed, because the
+            // winner's OPEN had in fact gone out.
+            //
+            // A tunnel sitting in None may carry a resolved phase from an
+            // earlier attempt that rolled back (PermanentFail); reopening is
+            // legitimate, so the winner clears it. Ordering against
+            // force_close(), which does NOT ignore None: if it lands before this
+            // claim the CAS fails and nothing is reset; if it lands after, it
+            // sets OpenPhase::Abandoned and attempt_open_send() declines.
+            //
+            // Lock order is mutex_ -> open_retry_mutex_. Nothing takes them the
+            // other way round: attempt_open_send() acquires them one at a time,
+            // never nested, and open_sent() takes only open_retry_mutex_.
+            // cancel_open_retry() takes close_frame_mutex_ first and then
+            // open_retry_mutex_ under it, which keeps the whole graph acyclic:
+            // coalesce_mutex_ -> {mutex_, close_frame_mutex_} -> open_retry_mutex_.
+            std::lock_guard<std::mutex> phase_lock(open_retry_mutex_);
+            open_phase_ = OpenPhase::Pending;
+            open_abandon_requested_ = false;
+        }
+    }
+    if (!claimed) {
+        util::Logger::debug("Tunnel {} open declined: resolved before the handshake started",
+                            tunnel_id_);
+        return false;
+    }
+    util::Logger::debug("Tunnel {} state: None -> Connecting", tunnel_id_);
+    notify_state_change(State::Connecting);
+
+    // attempt_open_send() reads the target back out under mutex_ and owns both
+    // the retry decision and the question of whether this attempt may still
+    // drive terminal state.
+    const auto result = attempt_open_send(/*attempt=*/0);
+    const auto outcome = result.outcome;
+
+    if (outcome == SendOutcome::PermanentFail) {
+        if (!result.owns_resolution) {
+            // A close won the race and has already resolved this tunnel.
+            // Rolling back to None here would overwrite its Closed. Report the
+            // failed open and touch nothing.
+            util::Logger::debug(
+                "Tunnel {} open failed but was already resolved by a concurrent close", tunnel_id_);
+            return false;
+        }
+        // Claiming the rollback edge is what makes the ownership atomic: the
+        // phase claim above only excludes the *other* OPEN attempt, while a
+        // close() that publishes Closed in the gap between that claim and this
+        // transition is excluded here and nowhere else.
+        if (!transition_state_if(State::Connecting, State::None)) {
+            util::Logger::debug(
+                "Tunnel {} open failed but was already resolved by a concurrent close", tunnel_id_);
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             target_host_.clear();
             target_port_ = 0;
         }
-        transition_state(State::None);
+        // Back at None, so a later open() must be able to try again: clear the
+        // Failed phase this attempt just recorded (see the reset at the top).
+        {
+            std::lock_guard<std::mutex> lock(open_retry_mutex_);
+            open_phase_ = OpenPhase::Pending;
+            open_abandon_requested_ = false;
+        }
         util::Logger::warn("Tunnel {} open failed: initial TUNNEL_OPEN send rejected", tunnel_id_);
         return false;
     }
 
+    if (!outcome) {
+        // No attempt was made: a concurrent close resolved the tunnel between
+        // the state transition above and the phase claim.
+        util::Logger::debug("Tunnel {} open abandoned before TUNNEL_OPEN was attempted",
+                            tunnel_id_);
+        return false;
+    }
+
+    if (result.close_owed) {
+        // A close landed while the OPEN was inside the transport. The OPEN is
+        // now definitively on the wire, so the CLOSE can follow it — in that
+        // order, which is the whole reason the obligation was deferred to here.
+        (void)emit_close_frame_once();
+        util::Logger::info("Tunnel {} opened and immediately closed; both frames sent in order",
+                           tunnel_id_);
+        return false;
+    }
+
+    if (outcome == SendOutcome::SendqFull) {
+        // Transient backpressure is NOT a failure and NOT a delivery. The
+        // tunnel keeps the frame, stays in Connecting, and retries on its own
+        // timer (armed by attempt_open_send). Rolling back here would race the
+        // caller into releasing an id whose OPEN is still on its way out;
+        // reporting success would let the same caller believe the peer has been
+        // told about a tunnel it has never heard of.
+        util::Logger::info("Tunnel {} opening: {}:{} (TUNNEL_OPEN backpressured; retrying)",
+                           tunnel_id_, host, port);
+        return true;
+    }
+
     util::Logger::info("Tunnel {} opening: {}:{}", tunnel_id_, host, port);
     return true;
+}
+
+bool TunnelImpl::try_publish_connected() {
+    return transition_state_if(State::None, State::Connected);
+}
+
+bool TunnelImpl::open_sent() const noexcept {
+    std::lock_guard<std::mutex> lock(open_retry_mutex_);
+    return open_phase_ == OpenPhase::Sent;
+}
+
+TunnelImpl::OpenAttemptResult TunnelImpl::attempt_open_send(unsigned attempt) {
+    {
+        std::lock_guard<std::mutex> lock(open_retry_mutex_);
+        if (open_phase_ != OpenPhase::Pending) {
+            // Delivered, permanently failed, abandoned by a concurrent close,
+            // or another attempt is already in flight. Nothing to do.
+            return {};
+        }
+        // Also require the tunnel to still be Connecting. A force_close() that
+        // claimed the state can be racing open()'s phase reset: if its
+        // cancel_open_retry() ran before that reset, the reset would clear the
+        // abandonment and this attempt would put a TUNNEL_OPEN on the wire for
+        // a tunnel that is already Closed — with no CLOSE to follow it, because
+        // force_close() had already decided the peer knew nothing. Checking the
+        // state here means either we see Closed and send nothing, or
+        // force_close() sees OpenPhase::Sending and announces the close.
+        if (state_.load(std::memory_order_acquire) != State::Connecting) {
+            return {};
+        }
+        open_phase_ = OpenPhase::Sending;
+    }
+
+    // OpenPhase::Sending is latched across a serialization and a callback, and
+    // either can throw. Without this guard an exception leaves it latched
+    // forever: no retry can start, cancel_open_retry() keeps answering
+    // DeferredToSender for a CLOSE nobody will ever emit, and the tunnel id
+    // stays reserved for the life of the manager. On an exceptional exit the
+    // phase is resolved to Failed and any owed CLOSE is abandoned — the OPEN
+    // demonstrably did not reach the peer, so nothing is owed.
+    struct SendingPhaseGuard {
+        TunnelImpl* self;
+        bool resolved{false};
+        ~SendingPhaseGuard() {
+            if (resolved) {
+                return;
+            }
+            try {
+                bool owed = false;
+                {
+                    std::lock_guard<std::mutex> lock(self->open_retry_mutex_);
+                    if (self->open_phase_ == OpenPhase::Sending) {
+                        self->open_phase_ = OpenPhase::Failed;
+                    }
+                    owed = self->open_close_owed_;
+                    self->open_close_owed_ = false;
+                }
+                if (owed) {
+                    self->abandon_close_obligation();
+                }
+                self->maybe_notify_id_releasable();
+            } catch (...) {
+                // A destructor must not propagate. The phase write above is the
+                // part that matters and has already happened or thrown trying.
+            }
+        }
+    } phase_guard{this};
+
+    std::string host;
+    std::uint16_t port = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        host = target_host_;
+        port = target_port_;
+    }
+
+    open_attempts_.fetch_add(1, std::memory_order_relaxed);
+    auto frame = ProtocolFrame::make_tunnel_open(tunnel_id_, host, port);
+    // No lock held: the send callback re-enters ToxAdapter and the manager, and
+    // holding a tunnel lock across that deadlocks (H-01).
+    const SendOutcome outcome = send_frame_to_tox_typed(frame);
+
+    bool rearm = false;
+    bool abandon_obligation = false;
+    OpenAttemptResult result;
+    result.outcome = outcome;
+    {
+        // ONE critical section decides the phase AND who owns the tunnel's
+        // terminal state. Splitting them is what let this attempt overwrite a
+        // resolution a concurrent close had already published: an abandoned
+        // tunnel is Closed, and writing None (initial attempt) or Error plus a
+        // second tunnels_closed sample (retry) on top of that is a real,
+        // observable corruption, not just untidy bookkeeping.
+        std::lock_guard<std::mutex> lock(open_retry_mutex_);
+        if (outcome == SendOutcome::Sent) {
+            // Record the truth even if a close is racing us: the frame really
+            // did reach toxcore. No terminal action follows a Sent, so there is
+            // nothing here that could overwrite the close's resolution, and
+            // cancel_open_retry() has already answered "announce a CLOSE" for
+            // exactly this case (it saw OpenPhase::Sending).
+            open_phase_ = OpenPhase::Sent;
+        } else if (open_abandon_requested_) {
+            // A close ran while this send was in flight and owns the
+            // resolution. Do not resurrect the OPEN behind it, and — the point
+            // of checking this BEFORE the PermanentFail branch — do not let a
+            // permanent failure drive a second terminal transition.
+            open_phase_ = OpenPhase::Abandoned;
+        } else if (outcome == SendOutcome::PermanentFail) {
+            open_phase_ = OpenPhase::Failed;
+            // Still ours: nobody else has resolved this tunnel, so the caller
+            // may roll back (initial attempt) or terminate (retry).
+            result.owns_resolution = true;
+        } else {
+            open_phase_ = OpenPhase::Pending;
+            rearm = true;
+        }
+
+        // A close landed while we were inside the transport and deferred its
+        // TUNNEL_CLOSE to us. Owe it only if the OPEN was actually accepted:
+        // a backpressured or permanently failed OPEN never reached the peer,
+        // so there is nothing to retract.
+        if (open_close_owed_) {
+            open_close_owed_ = false;
+            // Owed only if the OPEN actually reached the peer. Otherwise there
+            // is nothing to retract, and the obligation is released so the id
+            // can be reused.
+            result.close_owed = (outcome == SendOutcome::Sent);
+            abandon_obligation = !result.close_owed;
+        }
+    }
+
+    phase_guard.resolved = true;
+
+    if (abandon_obligation) {
+        abandon_close_obligation();
+    }
+
+    if (rearm) {
+        arm_open_retry_timer(attempt);
+    }
+    return result;
+}
+
+void TunnelImpl::retry_open_send(unsigned attempt) {
+    // Cheap pre-checks; attempt_open_send()'s phase CAS is the authoritative
+    // one. A tunnel that left Connecting has been resolved by some other path
+    // (ACK, error, close) and no longer wants its OPEN on the wire, and a
+    // closed outbound gate means the whole session was abandoned.
+    if (state_.load(std::memory_order_acquire) != State::Connecting || outbound_gate_closed()) {
+        return;
+    }
+
+    const auto result = attempt_open_send(attempt);
+    if (!result.outcome) {
+        return;
+    }
+    if (*result.outcome == SendOutcome::Sent) {
+        if (result.close_owed) {
+            // See open(): the CLOSE is emitted here so it cannot overtake the
+            // OPEN it retracts.
+            (void)emit_close_frame_once();
+        }
+        util::Logger::debug("Tunnel {} TUNNEL_OPEN delivered on retry {}", tunnel_id_, attempt);
+        return;
+    }
+    if (*result.outcome == SendOutcome::PermanentFail && result.owns_resolution) {
+        // Unlike the initial attempt, there is no caller left holding this
+        // tunnel's id to notice a rollback to None — open() has long since
+        // returned true. Leaving it in Connecting would strand both the object
+        // and the id (the idle reaper deliberately skips Connecting tunnels).
+        // Drive a terminal state instead, which fires on_close_ and lets the
+        // manager reclaim the id. No TUNNEL_CLOSE: the peer never saw the OPEN.
+        //
+        // Claim the edge: `owns_resolution` excludes the other OPEN attempt,
+        // but a close() can still publish Closed between that claim and this
+        // transition. Losing the compare-exchange means somebody else already
+        // resolved this tunnel — do not overwrite their state and, just as
+        // importantly, do not book a second tunnels_closed sample for it.
+        if (!transition_state_if(State::Connecting, State::Error)) {
+            util::Logger::debug("Tunnel {} TUNNEL_OPEN failed but was already resolved",
+                                tunnel_id_);
+            return;
+        }
+        util::Logger::warn("Tunnel {} TUNNEL_OPEN permanently failed on retry {}; giving up",
+                           tunnel_id_, attempt);
+        util::MetricsRegistry::instance().inc_tunnels_closed(
+            util::MetricsRegistry::CloseReason::Error);
+        notify_close_once();
+        return;
+    }
+    // SendqFull: attempt_open_send() already re-armed the timer.
+}
+
+void TunnelImpl::arm_open_retry_timer(unsigned attempt) {
+    std::weak_ptr<Tunnel> weak = weak_from_this();
+    if (weak.expired()) {
+        // Not owned by a shared_ptr (stack- or unique_ptr-constructed fixtures).
+        // The handler could never resolve its weak_ptr, and the outstanding
+        // async_wait would force the io_context destructor to service a pending
+        // op — the hazard TunnelManager::arm_pending_drain_timer_locked()
+        // documents for the Windows IOCP backend. Without an owner there is no
+        // retry, so say so rather than failing silently.
+        util::Logger::warn(
+            "Tunnel {} cannot retry a backpressured TUNNEL_OPEN: tunnel is not shared-owned",
+            tunnel_id_);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(open_retry_mutex_);
+    if (open_retry_armed_ || open_abandon_requested_) {
+        return;
+    }
+    open_retry_armed_ = true;
+    const auto epoch = ++open_retry_epoch_;
+    // Dedicated cadence, never coalesce_max_delay_us_ — that value is legally
+    // 0 (the effective Windows default) and would spin. See sendq_retry.hpp.
+    open_retry_timer_.expires_after(sendq_retry_delay(attempt));
+    // async_wait stays inside the lock so every touch of open_retry_timer_ is
+    // serialised against cancel_open_retry(); asio never runs the handler
+    // inline, so no callback fires under this mutex.
+    open_retry_timer_.async_wait([weak, epoch, attempt](const std::error_code& ec) {
+        if (ec) {
+            return;  // Cancelled.
+        }
+        auto self = std::static_pointer_cast<TunnelImpl>(weak.lock());
+        if (!self) {
+            return;  // Tunnel destroyed before the timer fired.
+        }
+        {
+            std::lock_guard<std::mutex> lock(self->open_retry_mutex_);
+            // Reject stale firings (cancel-and-rearm races).
+            if (epoch != self->open_retry_epoch_) {
+                return;
+            }
+            self->open_retry_armed_ = false;
+        }
+        self->retry_open_send(attempt + 1);
+    });
+}
+
+TunnelImpl::CloseObligation TunnelImpl::cancel_open_retry() {
+    std::lock_guard<std::mutex> close_lock(close_frame_mutex_);
+    return cancel_open_retry_locked();
+}
+
+TunnelImpl::CloseObligation TunnelImpl::cancel_open_retry_locked() {
+    std::lock_guard<std::mutex> lock(open_retry_mutex_);
+    open_abandon_requested_ = true;
+    ++open_retry_epoch_;  // Invalidate any handler already dispatched.
+    open_retry_armed_ = false;
+    open_retry_timer_.cancel();
+
+    switch (open_phase_) {
+        case OpenPhase::Pending:
+            // The OPEN never reached toxcore and now never will.
+            open_phase_ = OpenPhase::Abandoned;
+            return CloseObligation::None;
+        case OpenPhase::Sending:
+            // A send is inside the transport on another thread. Emitting a
+            // CLOSE here would race it onto the wire FIRST, leaving the OPEN
+            // that follows unmatched — so hand the obligation to the thread
+            // that can order it correctly. It also knows something we do not:
+            // whether the OPEN was accepted at all.
+            open_close_owed_ = true;
+            // Recorded HERE, not by the caller. close() used to receive this
+            // answer, drop open_retry_mutex_ and only then record it — long
+            // enough for the sender to emit and resolve, after which the late
+            // record pinned the id forever. force_close() received the same
+            // answer and recorded nothing at all, so the id was recycled while
+            // the sender still had a CLOSE to emit. Same split, opposite
+            // failures; owning it here removes the split.
+            note_close_owed_locked();
+            return CloseObligation::DeferredToSender;
+        case OpenPhase::Sent:
+            return CloseObligation::Immediate;
+        case OpenPhase::Abandoned:
+        case OpenPhase::Failed:
+            return CloseObligation::None;
+    }
+    return CloseObligation::None;
+}
+
+TunnelImpl::TerminalClaim TunnelImpl::claim_terminal() {
+    TerminalClaim result;
+    // Both writes under close_frame_mutex_, which is what makes the pair atomic
+    // to every observer — see the declaration for the interleaving this closes.
+    std::lock_guard<std::mutex> close_lock(close_frame_mutex_);
+
+    // Terminal states are final: blindly exchanging used to turn Error into
+    // Closed, overwriting a resolution another path had already published.
+    State previous = state_.load(std::memory_order_acquire);
+    while (previous != State::Closed && previous != State::Error) {
+        if (state_.compare_exchange_weak(previous, State::Closed, std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+            result.claimed = true;
+            break;
+        }
+    }
+    result.previous = previous;
+
+    // Test seam. Deliberately INSIDE close_frame_mutex_: pausing here holds the
+    // claimant still without opening the atomicity boundary, so a concurrent
+    // id_releasable() observer blocks rather than sampling. See
+    // set_terminal_claim_test_hook(). Null in production.
+    if (terminal_claim_test_hook_) {
+        terminal_claim_test_hook_();
+    }
+
+    // Stop any TUNNEL_OPEN retry and learn who owes the peer a CLOSE — still
+    // holding close_frame_mutex_, so the answer is published with the claim.
+    const CloseObligation obligation = cancel_open_retry_locked();
+
+    // "Abrupt" is not a licence to strand the peer. If it can already know this
+    // tunnel it is holding half of one (and its target fd) until its own reaper
+    // fires, so it has to be told:
+    //  * Connecting — the OPEN may have reached it; the obligation decides.
+    //  * Connected  — it has the OPEN_ACK, so it definitely knows.
+    // Disconnecting is excluded: our half-close is already on the wire, and
+    // close_for_timeout() owns the "peer abandoned the handshake" case with a
+    // TUNNEL_ERROR. DeferredToSender is excluded from *announcing* because that
+    // send is still inside the transport and a CLOSE from here would overtake
+    // the OPEN it retracts — but cancel_open_retry_locked() has already recorded
+    // the obligation for it, so the id stays pinned until the sender emits.
+    result.must_announce =
+        result.claimed &&
+        ((result.previous == State::Connecting && obligation == CloseObligation::Immediate) ||
+         result.previous == State::Connected);
+    if (result.must_announce) {
+        note_close_owed_locked();
+    }
+    return result;
+}
+
+void TunnelImpl::cancel_close_retry() {
+    {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        ++close_retry_epoch_;  // Invalidate any handler already dispatched.
+        close_retry_armed_ = false;
+        close_retry_timer_.cancel();
+        // Fences an attempt that is already inside the transport: its verdict is
+        // recorded under this same lock, and will see this.
+        close_retry_cancelled_ = true;
+        if (close_frame_state_ == CloseFrameState::Owed) {
+            // Give the obligation up rather than pin the id on a retry that is
+            // never going to run again.
+            close_frame_state_ = CloseFrameState::Abandoned;
+        }
+    }
+    maybe_notify_id_releasable();
+}
+
+void TunnelImpl::set_terminal_claim_test_hook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(close_frame_mutex_);
+    terminal_claim_test_hook_ = std::move(hook);
+}
+
+bool TunnelImpl::id_releasable() const {
+    std::lock_guard<std::mutex> lock(close_frame_mutex_);
+    return id_releasable_locked();
+}
+
+TunnelImpl::IdReleasableProbe TunnelImpl::probe_id_releasable() const {
+    std::unique_lock<std::mutex> lock(close_frame_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return IdReleasableProbe::Blocked;
+    }
+    return id_releasable_locked() ? IdReleasableProbe::Releasable
+                                  : IdReleasableProbe::NotReleasable;
+}
+
+bool TunnelImpl::emit_close_frame_once() {
+    {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        if (close_retry_cancelled_) {
+            // Shut down. With the outbound gate closed every send is a no-op
+            // anyway, so there is nothing to gain by starting one.
+            return false;
+        }
+        if (close_frame_state_ != CloseFrameState::NotOwed &&
+            close_frame_state_ != CloseFrameState::Owed) {
+            // Already claimed, resolved or abandoned — there is only ever one.
+            return false;
+        }
+        // InFlight pins the id for the whole transport call. It also discharges
+        // any owed-ness in the same step, so no owner has to balance anything.
+        close_frame_state_ = CloseFrameState::InFlight;
+    }
+
+    // Fallback for an exit that records no verdict — a throwing serializer or
+    // callback. Retaining the frame there would pin the id forever, because the
+    // same serialization would throw again on every retry, so this resolves.
+    struct ClaimGuard {
+        TunnelImpl* self;
+        bool recorded{false};
+        ~ClaimGuard() {
+            if (recorded) {
+                return;
+            }
+            try {
+                {
+                    std::lock_guard<std::mutex> lock(self->close_frame_mutex_);
+                    if (self->close_frame_state_ == CloseFrameState::InFlight) {
+                        self->close_frame_state_ = CloseFrameState::Resolved;
+                    }
+                }
+                self->maybe_notify_id_releasable();
+            } catch (...) {
+                // A destructor must not propagate.
+            }
+        }
+    } claim_guard{this};
+
+    auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
+    // TYPED, not the bool wrapper. Collapsing the outcome here threw away the
+    // one distinction eleven rounds of this slice exist to preserve: SendqFull
+    // means the transport did NOT take the frame and this tunnel still owns it.
+    // Resolving on it dropped the CLOSE and released the id, with no retry.
+    const SendOutcome outcome = send_frame_to_tox_typed(frame);
+
+    bool rearm = false;
+    {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        if (close_retry_cancelled_) {
+            // Teardown fenced this attempt while it was inside the transport.
+            // Whatever the transport said, no further attempt may be armed — a
+            // late SendqFull restoring Owed here would arm a fresh strong-self
+            // timer after cancellation and keep this object alive past shutdown.
+            close_frame_state_ = outcome == SendOutcome::Sent ? CloseFrameState::Resolved
+                                                              : CloseFrameState::Abandoned;
+        } else if (outcome == SendOutcome::SendqFull) {
+            // Transient backpressure. Back to Owed, which keeps the id pinned,
+            // and this tunnel is the retry owner — the same arrangement the
+            // TUNNEL_OPEN driver uses, for the same reason (the manager's queue
+            // carries no tunnel identity).
+            close_frame_state_ = CloseFrameState::Owed;
+            rearm = true;
+        } else {
+            // Sent, or PermanentFail: either way this object is done trying.
+            close_frame_state_ = CloseFrameState::Resolved;
+        }
+    }
+    claim_guard.recorded = true;
+
+    if (rearm) {
+        // Attempt counter advances across retries so the backoff actually grows;
+        // re-arming from the handler with a fresh 0 would pin it at the base
+        // delay forever.
+        unsigned attempt = 0;
+        {
+            std::lock_guard<std::mutex> lock(close_frame_mutex_);
+            attempt = close_retry_attempt_++;
+        }
+        arm_close_retry_timer(attempt);
+    } else {
+        maybe_notify_id_releasable();
+    }
+    return true;
+}
+
+void TunnelImpl::arm_close_retry_timer(unsigned attempt) {
+    std::shared_ptr<Tunnel> self_ref;
+    try {
+        self_ref = shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        // Not shared-owned; handled below exactly as an expired weak_ptr was.
+    }
+    if (!self_ref) {
+        // Not shared-owned (stack / unique_ptr fixtures): the handler could
+        // never resolve its weak_ptr, and an outstanding async_wait would force
+        // the io_context destructor to service a pending op — the hazard
+        // TunnelManager::arm_pending_drain_timer_locked() documents. Resolve
+        // instead of pinning the id on a retry that can never run.
+        util::Logger::warn(
+            "Tunnel {} cannot retry a backpressured TUNNEL_CLOSE: tunnel is not shared-owned",
+            tunnel_id_);
+        {
+            std::lock_guard<std::mutex> lock(close_frame_mutex_);
+            if (close_frame_state_ == CloseFrameState::Owed) {
+                close_frame_state_ = CloseFrameState::Resolved;
+            }
+        }
+        maybe_notify_id_releasable();
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(close_frame_mutex_);
+    if (close_retry_cancelled_ || close_frame_state_ != CloseFrameState::Owed ||
+        close_retry_armed_) {
+        return;
+    }
+    close_retry_armed_ = true;
+    const auto epoch = ++close_retry_epoch_;
+    // Dedicated cadence, never coalesce_max_delay_us_ — see sendq_retry.hpp.
+    close_retry_timer_.expires_after(sendq_retry_delay(attempt));
+    // STRONG capture: the retry owner keeps itself alive until the obligation
+    // resolves. A weak one let removal destroy the tunnel and silently drop the
+    // frame. Released when the handler returns without re-arming.
+    close_retry_timer_.async_wait([self_ref, epoch, attempt](const std::error_code& ec) {
+        if (ec) {
+            return;  // Cancelled — see cancel_close_retry().
+        }
+        auto self = std::static_pointer_cast<TunnelImpl>(self_ref);
+        {
+            std::lock_guard<std::mutex> lock(self->close_frame_mutex_);
+            if (epoch != self->close_retry_epoch_) {
+                return;  // Stale firing.
+            }
+            self->close_retry_armed_ = false;
+        }
+        // Re-claims from Owed and re-attempts. A further SendqFull re-arms
+        // from inside emit_close_frame_once(), with the next backoff step.
+        (void)attempt;
+        (void)self->emit_close_frame_once();
+    });
+}
+
+bool TunnelImpl::id_releasable_locked() const {
+    switch (close_frame_state_) {
+        case CloseFrameState::Owed:
+        case CloseFrameState::InFlight:
+            // Somebody will emit, or is emitting right now. Either way a frame
+            // naming this id can still appear on the wire.
+            return false;
+        case CloseFrameState::Resolved:
+            // This object owes no further emission, whether or not the peer
+            // got the frame. Scoped to this tunnel — a manager-parked copy is
+            // not covered; see CloseFrameState::Resolved.
+            return true;
+        case CloseFrameState::NotOwed:
+        case CloseFrameState::Abandoned:
+            break;
+    }
+    // No CLOSE is coming — but only a terminal tunnel is finished with its id;
+    // a live one can still start owing one. Read under the same lock as the
+    // CLOSE state so the pair cannot be observed half-updated.
+    const State current = state_.load(std::memory_order_acquire);
+    return current == State::Closed || current == State::Error;
+}
+
+void TunnelImpl::note_close_owed() {
+    std::lock_guard<std::mutex> lock(close_frame_mutex_);
+    note_close_owed_locked();
+}
+
+void TunnelImpl::note_close_owed_locked() {
+    if (close_frame_state_ != CloseFrameState::NotOwed) {
+        // Any other state already pins the id (Owed/InFlight) or already
+        // resolved it (Resolved/Abandoned); a second owner adds nothing,
+        // because there is only ever one CLOSE.
+        return;
+    }
+    if (close_retry_cancelled_) {
+        // Cancelled. Recording Owed here would pin the id for the rest of this
+        // object's life: emission is refused once fenced, so nothing could ever
+        // discharge the obligation and only destruction would release the id.
+        // A claim that arrives after teardown owes nothing.
+        close_frame_state_ = CloseFrameState::Abandoned;
+        return;
+    }
+    close_frame_state_ = CloseFrameState::Owed;
+}
+
+void TunnelImpl::abandon_close_obligation() {
+    {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        if (close_frame_state_ != CloseFrameState::Owed) {
+            // Only an owed-but-unclaimed CLOSE can be given up. An InFlight or
+            // Resolved one has already been dealt with.
+            return;
+        }
+        close_frame_state_ = CloseFrameState::Abandoned;
+    }
+    maybe_notify_id_releasable();
+}
+
+void TunnelImpl::set_on_id_releasable(std::function<void()> cb) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        on_id_releasable_ = std::move(cb);
+    }
+    maybe_notify_id_releasable();
+}
+
+void TunnelImpl::maybe_notify_id_releasable() {
+    // Releasable once the CLOSE is on the transport, or once the tunnel is
+    // terminal and owes none. Anything short of that and a frame naming this id
+    // can still appear on the wire.
+    {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        if (!id_releasable_locked()) {
+            return;
+        }
+    }
+
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Consume the latch ONLY when there is something to run. The condition
+        // is typically already true by the time the owner installs its hook —
+        // remove_tunnel_impl() installs it and then triggers the teardown that
+        // emits the CLOSE — so burning the latch on an empty callback would
+        // mean the owner is never told and the id is never released.
+        if (id_releasable_notified_ || !on_id_releasable_) {
+            return;
+        }
+        id_releasable_notified_ = true;
+        cb = std::move(on_id_releasable_);
+        on_id_releasable_ = nullptr;
+    }
+    cb();  // Outside the lock: it re-enters the manager (H-01).
 }
 
 void TunnelImpl::close() {
@@ -242,15 +1037,46 @@ void TunnelImpl::close() {
     // local TCP side disconnected before the peer ACKed our TUNNEL_OPEN).
     // Without handling this, the tunnel stays in Connecting forever — the
     // reaper deliberately skips Connecting tunnels — leaking both the object
-    // and its tunnel id. Send a best-effort TUNNEL_CLOSE so the peer can
-    // release its half, then move straight to Closed and notify so the manager
+    // and its tunnel id. Move straight to Closed and notify so the manager
     // reclaims the id. No coalesce buffer can hold data here (send_data_to_tox
     // refuses while not Connected), so there is nothing to drain.
     if (current == State::Connecting) {
-        auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
-        send_frame_to_tox(frame);
+        // Stop any TUNNEL_OPEN retry and learn, atomically with stopping it,
+        // who owes the peer a TUNNEL_CLOSE.
+        const CloseObligation obligation = cancel_open_retry();
+
+        if (obligation == CloseObligation::Immediate) {
+            // The peer owns half a tunnel; it needs to be told to let go.
+            (void)emit_close_frame_once();
+        } else if (obligation == CloseObligation::DeferredToSender) {
+            // A send is inside the transport; it will emit the CLOSE after its
+            // OPEN, so that the two cannot reach the peer out of order. Until it
+            // does, this id must not be reused — cancel_open_retry() has already
+            // recorded that, under the same lock that decided it.
+            util::Logger::debug(
+                "Tunnel {} closed during handshake while its TUNNEL_OPEN was in flight; "
+                "the sender will announce the close",
+                tunnel_id_);
+        } else {
+            // The OPEN never reached toxcore, so this id means nothing to the
+            // peer. Emitting TUNNEL_CLOSE anyway is not merely redundant: ids
+            // are recycled per friend and notify_close_once() below releases
+            // this one immediately, so a CLOSE still sitting in a retry queue
+            // would be delivered against whichever tunnel inherits the id.
+            util::Logger::debug(
+                "Tunnel {} closed during handshake before TUNNEL_OPEN reached the peer; "
+                "no TUNNEL_CLOSE emitted",
+                tunnel_id_);
+        }
+        // Claim the terminal edge, for the same reason open()/retry_open_send()
+        // do: an OPEN attempt that failed permanently may be about to roll this
+        // tunnel back to None or drive it to Error. Exactly one of the three
+        // wins, and only the winner books the close.
+        if (!transition_state_if(State::Connecting, State::Closed)) {
+            util::Logger::debug("Tunnel {} close during handshake: already resolved", tunnel_id_);
+            return;
+        }
         util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
-        transition_state(State::Closed);
         notify_close_once();
         util::Logger::info("Tunnel {} closed during handshake", tunnel_id_);
         return;
@@ -274,6 +1100,13 @@ void TunnelImpl::close() {
             close_pending_ = true;
             close_pending_full_ = true;
             coalesce_arm_timer_locked();
+            // close() is about to RETURN with the CLOSE still owed — the retry
+            // timer emits it once the buffer drains. The id stays reserved
+            // until then; releasing it on this return is what let a replacement
+            // take an id the deferred CLOSE was still going to name. Recorded
+            // inside this critical section, so no emit can slip between the
+            // decision and the record.
+            note_close_owed();
             util::Logger::debug("Tunnel {} close deferred until coalesce buffer drains",
                                 tunnel_id_);
             return;
@@ -294,9 +1127,10 @@ void TunnelImpl::emit_close_and_transition() {
         }
     }
 
-    if (should_send_close) {
-        auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
-        send_frame_to_tox(frame);
+    // Through the shared latch, not a bare send: a force_close() racing this
+    // graceful close can already have announced, and a second TUNNEL_CLOSE
+    // names an id that may by then belong to a different tunnel.
+    if (should_send_close && emit_close_frame_once()) {
         util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
     }
 
@@ -349,9 +1183,10 @@ void TunnelImpl::close_for_timeout() {
 }
 
 void TunnelImpl::emit_local_close_only() {
-    auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
-    send_frame_to_tox(frame);
-    util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
+    // Shared single-shot latch; see emit_close_and_transition().
+    if (emit_close_frame_once()) {
+        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
+    }
     transition_state(State::Disconnecting);
     util::Logger::info("Tunnel {} sent local half-close", tunnel_id_);
 }
@@ -434,9 +1269,33 @@ void TunnelImpl::finalize_remote_close() {
 }
 
 void TunnelImpl::force_close() {
-    State current = state_.load(std::memory_order_acquire);
-    if (current == State::Closed) {
+    // ONE step claims the terminal edge AND publishes whether a TUNNEL_CLOSE is
+    // owed. They used to be two, in different synchronization domains, and the
+    // instant between them was observable as "terminal, owes nothing" — which is
+    // precisely the state that says the id is free. See claim_terminal().
+    const TerminalClaim claim = claim_terminal();
+    const bool claimed_terminal = claim.claimed;
+    const bool announce = claim.must_announce;
+
+    // The resource release is a SEPARATE one-shot, and the two are INDEPENDENT:
+    // each gates only its own work, and it is taken AFTER the claim above so the
+    // reservation is already published.
+    //
+    // Returning early on a lost resource latch was wrong, because the two can be
+    // won by different threads. Thread A claims Connected -> Closed while thread
+    // B wins the resource latch; A then bailed out, so nobody announced the
+    // CLOSE and nobody published the state change — the peer was stranded and
+    // every state observer missed the transition. Whoever wins the state claim
+    // must always finish its announce and its notification, whether or not it
+    // also owns the cleanup.
+    const bool owns_resources = !resources_released_.exchange(true, std::memory_order_acq_rel);
+    if (!claimed_terminal && !owns_resources) {
+        // Pure duplicate call: another thread owns both halves.
         return;
+    }
+
+    if (announce && emit_close_frame_once()) {
+        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
     }
 
     // Local-abandon path: skip the flush once the outbound gate is closed.
@@ -447,10 +1306,11 @@ void TunnelImpl::force_close() {
     // same plain non-recursive mutex, so ANY route from inside a send callback
     // back into force_close() self-deadlocks the thread.
     //
-    // No production send callback does that today — all six (tunnel_server.cpp
-    // and tunnel_client.cpp) return a bool and defer teardown, and the
-    // disconnect handlers go through close_all(), posted, not from inside a
-    // send. The guard is here because the coupling is invisible at both call
+    // No production send callback does that today — they all come from
+    // app::detail::make_tunnel_senders(), which reports a typed SendOutcome and
+    // defers teardown, and the disconnect handlers go through close_all(),
+    // posted, not from inside a send. The guard is here because the coupling
+    // is invisible at both call
     // sites: nothing at the callback end hints that a close re-enters a mutex
     // the caller already holds. Do not remove it on the grounds that the
     // deadlock is currently unreachable.
@@ -461,12 +1321,14 @@ void TunnelImpl::force_close() {
     // destroying the tunnel. When the gate is still open (an ordinary
     // force_close, e.g. reaping a half-closed tunnel) the best-effort flush
     // still runs, because there it can genuinely deliver.
-    if (!outbound_gate_closed()) {
-        flush_pending_writes();
-    }
+    if (owns_resources) {
+        if (!outbound_gate_closed()) {
+            flush_pending_writes();
+        }
 
-    // Close TCP connection if any
-    {
+        // Close TCP connection if any. Runs even when another thread claimed the
+        // state first: a tunnel driven to Error by send_error() never closed its
+        // socket, so skipping the cleanup on terminality would leak the fd.
         std::lock_guard<std::mutex> lock(mutex_);
         if (tcp_conn_) {
             tcp_conn_->force_close();
@@ -474,7 +1336,12 @@ void TunnelImpl::force_close() {
         }
     }
 
-    transition_state(State::Closed);
+    // The state itself was published by the claim at the top; this is the
+    // observer half of that transition, and only the claimant owes it.
+    if (claimed_terminal) {
+        notify_state_change(State::Closed);
+    }
+    maybe_notify_id_releasable();
     // M-07: force_close() drives a terminal state just like the remote-close /
     // error paths, so it must fire the close callback too. Otherwise a caller
     // that uses force_close() directly would bypass manager cleanup and the
@@ -1155,13 +2022,38 @@ bool TunnelImpl::send_ack() {
         const uint32_t ack_value = static_cast<uint32_t>(
             std::min<std::size_t>(bytes_to_ack, std::numeric_limits<uint32_t>::max()));
         auto frame = ProtocolFrame::make_tunnel_ack(tunnel_id_, ack_value);
-        if (!send_frame_to_tox(frame)) {
+        const SendOutcome outcome = send_frame_to_tox_typed(frame);
+
+        if (outcome == SendOutcome::SendqFull) {
+            // Transient. Restore the whole outstanding credit — including the
+            // part this frame would have carried — and retry from the
+            // accumulator rather than replaying a serialized frame, so bytes
+            // that arrive during the attempt simply add to it.
             bytes_received_since_ack_.fetch_add(bytes_to_ack, std::memory_order_relaxed);
             util::Logger::debug("Tunnel {} ACK send backpressured; {} bytes still pending",
                                 tunnel_id_, bytes_to_ack);
             arm_ack_retry_timer();
             return false;
         }
+
+        if (outcome == SendOutcome::PermanentFail) {
+            // Abort WITHOUT restoration — the two non-Sent outcomes are not
+            // interchangeable here. Restoring an unsendable credit leaves an
+            // accumulator that can never be flushed: every later ACK attempt
+            // re-reads it, fails again, restores again, and every
+            // notify_tcp_writable() re-arms the retry timer for a peer that is
+            // gone. Drop the credit instead. The tunnel itself is torn down by
+            // the friend-disconnect path (this outcome means toxcore has no
+            // route to the peer at all); publishing a terminal state from here
+            // is slice 3's `Abort` machinery, not this one's.
+            //
+            // Report "nothing left pending" so TcpConnection stops re-arming
+            // its low-water watermark on our behalf.
+            util::Logger::warn("Tunnel {} ACK send failed permanently; dropping {} byte credit",
+                               tunnel_id_, bytes_to_ack);
+            return true;
+        }
+
         bytes_to_ack -= ack_value;
         util::Logger::debug("Tunnel {} sent ACK for {} bytes", tunnel_id_, ack_value);
     }
@@ -1289,6 +2181,12 @@ TunnelImpl::OutboundSnapshot::OutboundSnapshot(TunnelImpl& tunnel) {
 }
 
 void TunnelImpl::close_outbound_gate() {
+    // Stop the CLOSE retry first: it holds a strong self-reference, and with the
+    // gate closed every send it could make is a no-op, so retrying could only
+    // keep this object alive spinning. Done before taking mutex_ — it takes
+    // close_frame_mutex_, and the lock order is mutex_ -> ... not the reverse.
+    cancel_close_retry();
+
     std::lock_guard<std::mutex> lock(mutex_);
     outbound_gate_closed_.store(true, std::memory_order_release);
     // Belt and braces: drop the callbacks too, so any future code path that
@@ -1302,20 +2200,20 @@ void TunnelImpl::close_outbound_gate() {
 // Internal helpers
 // ===========================================================================
 
-bool TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
+SendOutcome TunnelImpl::send_frame_to_tox_typed(const ProtocolFrame& frame) {
     // The snapshot fuses "is the gate open?" with "copy the callback" into one
     // critical section, so close_outbound_gate() can never slip between them.
     OutboundSnapshot snapshot(*this);
     if (snapshot.gate_closed()) {
-        // Report success: a false here would refund the send window and park
+        // Report success: SendqFull here would refund the send window and park
         // the frame for a retry that keeps this tunnel alive. See
         // close_outbound_gate().
-        return true;
+        return SendOutcome::Sent;
     }
 
     const auto& cb = snapshot.span_callback();
     if (!cb) {
-        return false;
+        return SendOutcome::PermanentFail;
     }
     auto wire = frame.serialize();
     // Called with NO lock held — the callback re-enters ToxAdapter and the
@@ -1324,17 +2222,25 @@ bool TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
     return cb(std::span<const uint8_t>(wire.data(), wire.size()));
 }
 
+bool TunnelImpl::send_frame_to_tox(const ProtocolFrame& frame) {
+    return send_frame_to_tox_typed(frame) == SendOutcome::Sent;
+}
+
 bool TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
     OutboundSnapshot snapshot(*this);
     if (snapshot.gate_closed()) {
-        return true;  // Discarded; see send_frame_to_tox().
+        return true;  // Discarded; see send_frame_to_tox_typed().
     }
 
     const auto& owned_cb = snapshot.owned_callback();
     const auto& span_cb = snapshot.span_callback();
 
+    // TUNNEL_DATA only. SendqFull and PermanentFail both mean "not on the wire",
+    // and the caller's response is identical for both: retain the bytes in the
+    // coalesce buffer and retry on the flush timer. Collapsing them here loses
+    // nothing.
     if (owned_cb) {
-        return owned_cb(std::move(buf));
+        return owned_cb(std::move(buf)) == SendOutcome::Sent;
     }
     // Fallback: surface the bytes through the span callback so a partially
     // configured tunnel (e.g. tests that only wire the legacy callback) still
@@ -1344,7 +2250,8 @@ bool TunnelImpl::send_owned_data_to_tox(OwnedFrameBuffer buf) {
         const auto wire = buf.wire_view();
         // Skip the lossless prefix byte that the legacy callback will re-prepend.
         if (wire.size() > 1) {
-            return span_cb(std::span<const std::uint8_t>(wire.data() + 1, wire.size() - 1));
+            return span_cb(std::span<const std::uint8_t>(wire.data() + 1, wire.size() - 1)) ==
+                   SendOutcome::Sent;
         }
     }
     return false;

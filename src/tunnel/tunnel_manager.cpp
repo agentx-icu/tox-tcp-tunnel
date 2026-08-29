@@ -301,9 +301,12 @@ std::size_t TunnelManager::reap_idle_tunnels_once(std::uint64_t epoch) {
         if (auto* impl = dynamic_cast<TunnelImpl*>(doomed.get())) {
             impl->close_for_timeout();
         }
-        if (has_tunnel(id)) {
-            remove_tunnel(id);
-        }
+        // Name the tunnel we actually reaped. `has_tunnel(id)` followed by an
+        // id-only remove_tunnel(id) was check-then-act across an unlocked
+        // close: the reap can release the id and a replacement can take it
+        // before the removal runs, and the removal would then take out the
+        // replacement.
+        (void)remove_tunnel_if(id, doomed.get());
         ++closed;
     }
 
@@ -495,7 +498,21 @@ std::optional<uint16_t> TunnelManager::find_available_id() {
 
     // Every id in [1, 65535] is in use. Return nullopt so the caller refuses
     // the new tunnel instead of falling back to id 0 (the control-plane id).
-    util::Logger::error("TunnelManager: no available tunnel IDs");
+    //
+    // Distinguish "genuinely full" from "reserved but not registered". Ids stay
+    // reserved across a teardown until the tunnel discharges its TUNNEL_CLOSE
+    // obligation (see remove_tunnel_if), so a teardown that never resolves shows
+    // up here as exhaustion rather than as a hang. The gap also counts ids that
+    // are merely mid-registration (handle_incoming_open reserves before
+    // add_tunnel inserts), so it is deliberately NOT labelled as stuck work —
+    // only a gap that stays high over time is.
+    const std::size_t registered = tunnels_.size();
+    util::Logger::error(
+        "TunnelManager: no available tunnel IDs ({} registered; {} reserved but unregistered). "
+        "A reserved-but-unregistered count that stays high is a stuck close obligation; a "
+        "transient one is normal (ids are reserved before registration and released after "
+        "teardown).",
+        registered, 65535 - registered);
     return std::nullopt;
 }
 
@@ -582,6 +599,21 @@ bool TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
 }
 
 void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
+    (void)remove_tunnel_impl(tunnel_id, nullptr, /*match_any=*/true);
+}
+
+bool TunnelManager::remove_tunnel_if(uint16_t tunnel_id, const Tunnel* expected) {
+    if (expected == nullptr) {
+        // Same contract as close_tunnel_if(): naming nothing removes nothing.
+        // Callers land here when their weak_ptr has lapsed, and a destroyed
+        // tunnel cannot still be registered — so anything under this id is
+        // somebody else's.
+        return false;
+    }
+    return remove_tunnel_impl(tunnel_id, expected, /*match_any=*/false);
+}
+
+bool TunnelManager::remove_tunnel_impl(uint16_t tunnel_id, const Tunnel* expected, bool match_any) {
     TunnelClosedCallback closed_cb;
     std::shared_ptr<Tunnel> doomed;
 
@@ -590,7 +622,16 @@ void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
 
         auto it = tunnels_.find(tunnel_id);
         if (it == tunnels_.end()) {
-            return;
+            return false;
+        }
+        // Identity check under the same lock that owns the map, so a caller
+        // naming a specific tunnel can never take out the replacement that
+        // recycled its id.
+        if (!match_any && it->second.get() != expected) {
+            util::Logger::debug(
+                "TunnelManager: skipping removal of tunnel {}; it now belongs to another tunnel",
+                tunnel_id);
+            return false;
         }
 
         // Snapshot + erase BEFORE running teardown. The tunnel's on_close_
@@ -602,7 +643,12 @@ void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
         // reaper (the only caller that removes a still-live tunnel) was wired in.
         doomed = std::move(it->second);
         tunnels_.erase(it);
-        used_ids_[tunnel_id] = false;
+        // NOTE: used_ids_[tunnel_id] stays TRUE here. The teardown below runs
+        // unlocked (it must — close paths re-enter application callbacks) and
+        // can emit this tunnel's TUNNEL_CLOSE. Releasing the id now would let
+        // allocate_tunnel_id() hand it to a replacement while that CLOSE was
+        // still on its way out, and the CLOSE would then name the replacement.
+        // The id is returned to the allocator after the teardown resolves.
 
         // Copy callback to invoke outside the lock
         closed_cb = on_tunnel_closed_;
@@ -617,8 +663,53 @@ void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
         // tunnel keeps the graceful close() (drain pending bytes + emit
         // TUNNEL_CLOSE). force_close() lives on TunnelImpl, not the abstract
         // base, so reach it via dynamic_cast (mirrors reap_idle_tunnels_once).
-        if (doomed->state() == Tunnel::State::Disconnecting) {
-            if (auto* impl = dynamic_cast<TunnelImpl*>(doomed.get())) {
+        // The state read below only PICKS a path; it is not a decision that has
+        // to hold. force_close() claims the state word atomically and announces
+        // a TUNNEL_CLOSE if what it claimed turns out to be Connected, so a
+        // publication that wins between this read and that claim is still
+        // announced to the peer rather than silently dropped — the ordering
+        // that used to strand a peer holding our OPEN_ACK.
+        //
+        // close() is a no-op outside Connected, so two states need force_close()
+        // to actually release anything:
+        //  * Disconnecting — we sent our half-close and the peer never
+        //    reciprocated; close() would leave the local TCP fd pinned.
+        //  * None — an unpublished tunnel, which the server's OPEN_ACK gate
+        //    leaves sitting there until its ACK is on the wire. close() would
+        //    drop it from this map while its target socket stayed open and its
+        //    on_close_ never fired. This is also what gives
+        //    TunnelImpl::try_publish_connected() something to lose against: a
+        //    removal moves the state out of None, so a publication racing it
+        //    fails its compare-exchange instead of publishing a detached tunnel.
+        // A Connected tunnel keeps the graceful close (drain pending bytes +
+        // emit TUNNEL_CLOSE). force_close() lives on TunnelImpl, not the
+        // abstract base, so reach it via dynamic_cast.
+        auto* impl = dynamic_cast<TunnelImpl*>(doomed.get());
+
+        // Hand the id release to the tunnel BEFORE tearing it down. `close()`
+        // returning is not the moment the id becomes reusable: it can return
+        // with the CLOSE still owed — deferred behind a backpressured coalesce
+        // buffer, or handed to a send still inside the transport — and a
+        // replacement taking the id then would be named by that CLOSE when it
+        // finally goes out. TunnelImpl fires this when it can no longer put any
+        // frame on the wire for the id, which may be during the teardown below
+        // (the common case, synchronously) or later.
+        std::weak_ptr<TunnelManager> weak_self = weak_from_this();
+        const bool defer_release = impl != nullptr && !weak_self.expired();
+        if (defer_release) {
+            impl->set_on_id_releasable([weak_self, tunnel_id]() {
+                // weak, never raw: this can fire long after the teardown, from
+                // a coalesce timer or a send thread, by which time the manager
+                // may be gone.
+                if (auto self = weak_self.lock()) {
+                    self->release_tunnel_id(tunnel_id);
+                }
+            });
+        }
+
+        const auto state = doomed->state();
+        if (state == Tunnel::State::Disconnecting || state == Tunnel::State::None) {
+            if (impl != nullptr) {
                 impl->force_close();
             } else {
                 doomed->close();
@@ -626,6 +717,15 @@ void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
         } else {
             doomed->close();
         }
+
+        if (!defer_release) {
+            // No obligation tracking available — an abstract Tunnel, or a
+            // manager that is not shared-owned (test fixtures, where a deferred
+            // callback could outlive the object). Release now, as before.
+            release_tunnel_id(tunnel_id);
+        }
+    } else {
+        release_tunnel_id(tunnel_id);
     }
 
     util::Logger::debug("TunnelManager: removed tunnel {}", tunnel_id);
@@ -634,6 +734,26 @@ void TunnelManager::remove_tunnel(uint16_t tunnel_id) {
     if (closed_cb) {
         asio::post(io_ctx_, [closed_cb, tunnel_id]() { closed_cb(tunnel_id); });
     }
+    return true;
+}
+
+bool TunnelManager::close_tunnel_if(uint16_t tunnel_id, const Tunnel* expected) {
+    if (expected == nullptr) {
+        return false;
+    }
+    std::shared_ptr<Tunnel> doomed;
+    {
+        std::shared_lock lock(mutex_);
+        auto it = tunnels_.find(tunnel_id);
+        if (it == tunnels_.end() || it->second.get() != expected) {
+            return false;
+        }
+        doomed = it->second;
+    }
+    // Outside the lock: close() runs the tunnel's send and close callbacks,
+    // which re-enter this manager (H-01).
+    doomed->close();
+    return true;
 }
 
 std::shared_ptr<Tunnel> TunnelManager::get_tunnel(uint16_t tunnel_id) {
@@ -683,17 +803,40 @@ uint16_t TunnelManager::create_tunnel(const std::string& host, uint16_t port) {
         return 0;
     }
 
-    auto wire = open_frame.serialize();
-    const auto outcome = snapshot.handler()(wire);
-    if (outcome == SendOutcome::PermanentFail) {
-        util::Logger::warn("TunnelManager::create_tunnel: failed to send TUNNEL_OPEN for {}",
-                           tunnel_id);
+    // Same FIFO barrier the per-tunnel senders consult: this is an OPEN, and an
+    // OPEN sent past a parked stale frame for a recycled id is the exact hazard
+    // the barrier exists for. Without this check the rule "OPEN is barriered"
+    // would have a public exception, even though nothing in production calls
+    // this entry point today.
+    if (outbound_queue_busy()) {
+        util::Logger::debug(
+            "TunnelManager::create_tunnel: an outbound frame is still queued; refusing tunnel {}",
+            tunnel_id);
         release_tunnel_id(tunnel_id);
         return 0;
     }
-    // outcome == Sent OR SendqFull: in the SendqFull case the frame is now
-    // in toxcore's local queue but not yet on the wire; the caller treats
-    // both as "open in flight".
+
+    auto wire = open_frame.serialize();
+    const auto outcome = snapshot.handler()(wire);
+    if (outcome != SendOutcome::Sent) {
+        // Anything but Sent means the peer was NOT told about this id, so
+        // returning it would be a lie: the caller would treat the tunnel as
+        // opening and eventually release an id the peer never allocated, while
+        // no retry exists to put the OPEN on the wire (this entry point builds
+        // no Tunnel object, so there is no driver to retain the frame — unlike
+        // TunnelImpl::open(), which does).
+        //
+        // The previous code accepted SendqFull with a comment claiming the
+        // frame was "in toxcore's local queue". It is not: SendqFull means
+        // toxcore refused it outright. SendqFull is transient, so failing here
+        // leaves the caller free to call create_tunnel() again — an unrefined
+        // recovery, but a truthful one.
+        util::Logger::warn("TunnelManager::create_tunnel: TUNNEL_OPEN for {} not sent ({})",
+                           tunnel_id,
+                           outcome == SendOutcome::SendqFull ? "SENDQ full" : "permanent failure");
+        release_tunnel_id(tunnel_id);
+        return 0;
+    }
 
     util::Logger::info("TunnelManager: created tunnel {} -> {}:{}", tunnel_id, host, port);
 
@@ -845,18 +988,42 @@ void TunnelManager::close_all() {
         // Swap out the tunnels map to close outside the lock
         tunnels_to_close.swap(tunnels_);
 
-        // Release all IDs
-        for (auto& [id, tunnel] : tunnels_to_close) {
-            used_ids_[id] = false;
-        }
-
+        // IDs stay reserved across the teardown below, for the same reason as
+        // remove_tunnel_impl(): a tunnel being closed may still emit its
+        // TUNNEL_CLOSE, and that frame must not be able to name a replacement.
         closed_cb = on_tunnel_closed_;
     }
 
     // Close all tunnels outside the lock
     for (auto& [id, tunnel] : tunnels_to_close) {
         if (tunnel) {
-            tunnel->close();
+            // Same reasoning as remove_tunnel_impl(): close() no-ops for a
+            // tunnel that is still None or already Disconnecting, which would
+            // detach it here while leaving its socket open and its on_close_
+            // unfired — and the id release is coupled to the tunnel discharging
+            // its CLOSE obligation, not to close() returning.
+            const auto state = tunnel->state();
+            auto* impl = dynamic_cast<TunnelImpl*>(tunnel.get());
+            std::weak_ptr<TunnelManager> weak_self = weak_from_this();
+            const bool defer_release = impl != nullptr && !weak_self.expired();
+            if (defer_release) {
+                const uint16_t id_copy = id;
+                impl->set_on_id_releasable([weak_self, id_copy]() {
+                    if (auto self = weak_self.lock()) {
+                        self->release_tunnel_id(id_copy);
+                    }
+                });
+            } else {
+                release_tunnel_id(id);
+            }
+            if (impl != nullptr &&
+                (state == Tunnel::State::None || state == Tunnel::State::Disconnecting)) {
+                impl->force_close();
+            } else {
+                tunnel->close();
+            }
+        } else {
+            release_tunnel_id(id);
         }
 
         // Invoke callback
@@ -1011,11 +1178,21 @@ constexpr auto kPendingDrainDelay = std::chrono::milliseconds(20);
 }  // namespace
 
 bool TunnelManager::send_frame(const ProtocolFrame& frame) {
+    // Historical contract preserved exactly: true means "queued for sending",
+    // which includes "parked in pending_outbound_ for the drain timer".
+    return send_frame_impl(frame, /*park_on_backpressure=*/true) == SendOutcome::Sent;
+}
+
+SendOutcome TunnelManager::send_frame_typed(const ProtocolFrame& frame) {
+    return send_frame_impl(frame, /*park_on_backpressure=*/false);
+}
+
+SendOutcome TunnelManager::send_frame_impl(const ProtocolFrame& frame, bool park_on_backpressure) {
     // Cheap pre-check so a muted manager does no work at all; the authoritative
     // check happens under `pending_mutex_` below, where it is ordered against
     // close_all_local()'s queue flush.
     if (outbound_muted()) {
-        return false;
+        return SendOutcome::PermanentFail;
     }
 
     // Take the snapshot BEFORE anything else: it fuses the gate test with the
@@ -1024,46 +1201,61 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     // constructor — nothing here nests that mutex under `pending_mutex_`.
     SendSnapshot snapshot(*this);
     if (snapshot.gate_closed()) {
-        return false;
+        return SendOutcome::PermanentFail;
     }
     const SendHandler& handler = snapshot.handler();
 
     if (!handler) {
         util::Logger::warn("TunnelManager::send_frame: no send handler registered");
-        return false;
+        return SendOutcome::PermanentFail;
     }
 
     auto wire = frame.serialize();
 
-    // Best-effort FIFO: if anything is parked in pending_outbound_ already,
-    // this frame queues *behind* it. The strict guarantee only holds for
-    // serial callers; a concurrent send_frame can still slip past a drain
-    // that already popped the only parked entry (it observes empty queue
-    // between pop and handler call). This is acceptable for the frames
-    // that route through send_frame today — PING/PONG and TUNNEL_OPEN_ACK
-    // / TUNNEL_ERROR have no required relative order across tunnels, and
-    // within a tunnel each of those is emitted at most once. Per-tunnel
-    // TUNNEL_DATA / TUNNEL_CLOSE go through the per-tunnel callback path
-    // and never traverse this queue.
+    // FIFO barrier: if anything is parked in pending_outbound_, or popped and
+    // mid-drain, this frame queues *behind* it. `pending_drain_in_flight_` is
+    // what covers the mid-drain case — the frame has left the deque but has not
+    // reached toxcore, and without it a concurrent sender observing an empty
+    // queue would overtake it.
+    //
+    // What remains best-effort is the gap between this check and the handler
+    // call below, which happens with the mutex released (it must: the handler
+    // re-enters ToxAdapter). A frame parked by another thread in that gap is
+    // still overtaken. That residual is purely concurrent — it needs two
+    // unrelated senders racing — whereas the hazard this barrier exists for is
+    // causal: a frame parked before a tunnel id is released is necessarily
+    // visible to any later send for that recycled id. Closing the concurrent
+    // residual too requires a single outbound owner, i.e. the driver from the
+    // later slices.
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         // Authoritative mute check: same mutex close_all_local() latches under,
         // so once it has run no frame can be parked behind its flush.
         if (outbound_muted_.load(std::memory_order_relaxed)) {
-            return false;
+            return SendOutcome::PermanentFail;
         }
-        if (!pending_outbound_.empty()) {
+        // `pending_drain_in_flight_` counts as a non-empty queue: the drain has
+        // popped its entry but has not yet handed it to toxcore, so sending
+        // past it here would reorder the stream just as visibly as jumping the
+        // deque would.
+        if (!pending_outbound_.empty() || pending_drain_in_flight_) {
+            if (!park_on_backpressure) {
+                // A typed caller owns its frame, so it must not overtake what is
+                // already parked ahead of it. Report backpressure and let it
+                // retry once the queue has drained.
+                return SendOutcome::SendqFull;
+            }
             if (pending_outbound_.size() >= kMaxPendingOutbound) {
                 pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
                 util::Logger::warn(
                     "TunnelManager::send_frame: pending queue at cap ({}); dropping frame",
                     kMaxPendingOutbound);
-                return false;
+                return SendOutcome::PermanentFail;
             }
             pending_outbound_.push_back(std::move(wire));
             pending_enqueued_total_.fetch_add(1, std::memory_order_relaxed);
             arm_pending_drain_timer_locked();
-            return true;
+            return SendOutcome::Sent;
         }
     }
 
@@ -1074,7 +1266,7 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     // gap it leaves is a frame per concurrently-sending tunnel.) Note this does
     // not make teardown wait: a send already authorised may still land.
     if (outbound_muted()) {
-        return false;
+        return SendOutcome::PermanentFail;
     }
 
     const SendOutcome outcome = handler(wire);
@@ -1082,37 +1274,107 @@ bool TunnelManager::send_frame(const ProtocolFrame& frame) {
     if (outcome == SendOutcome::Sent) {
         record_frame_sent();
         record_bytes_sent(frame.serialized_size());
-        return true;
+        return SendOutcome::Sent;
     }
     if (outcome == SendOutcome::PermanentFail) {
         // Peer disconnected, frame malformed, etc. Retrying would either burn
         // CPU or, on the client under multi-server failover, eventually
         // replay against the wrong server. Surface the failure.
-        return false;
+        return SendOutcome::PermanentFail;
     }
 
-    // SendqFull. Park the frame and retry on the drain timer instead of
-    // dropping. record_frame_sent / record_bytes_sent fire only after the
-    // parked frame actually goes out (in drain_pending_outbound), so the
-    // stats reflect wire activity.
+    // SendqFull.
+    if (!park_on_backpressure) {
+        // The typed caller keeps the frame and retries it itself, which is the
+        // whole point: this queue would strip the tunnel identity off it.
+        return SendOutcome::SendqFull;
+    }
+
+    // Park the frame and retry on the drain timer instead of dropping.
+    // record_frame_sent / record_bytes_sent fire only after the parked frame
+    // actually goes out (in drain_pending_outbound), so the stats reflect wire
+    // activity.
     std::lock_guard<std::mutex> lock(pending_mutex_);
     if (outbound_muted_.load(std::memory_order_relaxed)) {
         // Latched while the send was in flight — do not resurrect the queue
         // close_all_local() just emptied.
-        return false;
+        return SendOutcome::PermanentFail;
     }
     if (pending_outbound_.size() >= kMaxPendingOutbound) {
         pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
         util::Logger::warn("TunnelManager::send_frame: pending queue at cap ({}); dropping frame",
                            kMaxPendingOutbound);
-        return false;
+        return SendOutcome::PermanentFail;
     }
     pending_outbound_.push_back(std::move(wire));
     pending_enqueued_total_.fetch_add(1, std::memory_order_relaxed);
     util::Logger::debug("TunnelManager::send_frame: SENDQ-full, parked frame (queue depth={})",
                         pending_outbound_.size());
     arm_pending_drain_timer_locked();
-    return true;
+    return SendOutcome::Sent;
+}
+
+namespace {
+
+/// Frame types whose backpressure retry belongs to a driver (the tunnel, the
+/// server's OPEN_ACK gate, or the per-tunnel coalesce buffer) rather than to
+/// this manager's queue.
+bool driver_owns_retry(FrameType type) noexcept {
+    switch (type) {
+        case FrameType::TUNNEL_OPEN:
+        case FrameType::TUNNEL_ACK:
+        case FrameType::TUNNEL_DATA:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+SendOutcome route_sendq_full(TunnelManager& manager, std::span<const std::uint8_t> wire) {
+    if (wire.empty()) {
+        // Not a frame at all; nothing sensible to retry.
+        return SendOutcome::PermanentFail;
+    }
+
+    // ProtocolFrame layout: [type:1][tunnel_id:2][length:2]. See the header for
+    // why each class of frame is routed the way it is.
+    if (driver_owns_retry(static_cast<FrameType>(wire[0]))) {
+        // Reporting the backpressure verbatim is the whole point of the typed
+        // seam: the caller still owns the frame.
+        return SendOutcome::SendqFull;
+    }
+
+    return manager.queue_outbound_for_retry(std::vector<std::uint8_t>(wire.begin(), wire.end()))
+               ? SendOutcome::Sent
+               : SendOutcome::PermanentFail;
+}
+
+bool frame_must_respect_outbound_barrier(FrameType type) noexcept {
+    // OPEN and OPEN_ACK only. These are the identity-carrying handshake frames
+    // this slice moved to driver ownership, and they are what the recycled-id
+    // hazard turns on: holding an OPEN behind a parked CLOSE for the same id
+    // restores close-then-open ordering at the peer.
+    //
+    // TUNNEL_DATA is deliberately NOT here, and does not need to be. DATA only
+    // flows once the tunnel is Connected, which on the client requires its OPEN
+    // to have been sent and ACKed and on the server requires the OPEN_ACK to
+    // have been sent — both of which are barriered — so DATA is already ordered
+    // behind them transitively. Adding DATA would instead stall a live stream
+    // behind an unrelated parked PING for up to a drain interval.
+    //
+    // CLOSE / ERROR / PING / PONG / INFO / RESUME are not here either: they are
+    // still owned by TunnelManager's retry queue, and a direct send of one that
+    // toxcore happens to accept can still overtake a parked frame. That is the
+    // documented residual of leaving them parked, and it goes away when they
+    // move to driver ownership (see route_sendq_full's contract).
+    return type == FrameType::TUNNEL_OPEN || type == FrameType::TUNNEL_ACK;
+}
+
+bool TunnelManager::outbound_queue_busy() const {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    return !pending_outbound_.empty() || pending_drain_in_flight_;
 }
 
 bool TunnelManager::queue_outbound_for_retry(std::vector<uint8_t> wire) {
@@ -1215,7 +1477,24 @@ void TunnelManager::drain_pending_outbound() {
             // to the front to preserve FIFO order.
             wire = std::move(pending_outbound_.front());
             pending_outbound_.pop_front();
+            // Keep the barrier closed across the unlocked transport call: the
+            // frame has left the deque but has not reached toxcore, and a
+            // concurrent sender that saw an empty queue would overtake it.
+            pending_drain_in_flight_ = true;
         }
+
+        // Clear the in-flight barrier on EVERY exit from this iteration — the
+        // two `continue`s, the SENDQ-full `return` and the muted-latch `return`
+        // below. A missed clear would latch the barrier shut for the manager's
+        // lifetime and turn every later typed send into a permanent SendqFull,
+        // so this is RAII rather than four hand-written resets.
+        struct DrainInFlightGuard {
+            TunnelManager* manager;
+            ~DrainInFlightGuard() {
+                std::lock_guard<std::mutex> lock(manager->pending_mutex_);
+                manager->pending_drain_in_flight_ = false;
+            }
+        } in_flight_guard{this};
 
         // The frame is now out of the queue and off the mutex; if the latch
         // landed in between, drop it here rather than putting it on the wire.
