@@ -1,7 +1,8 @@
 # Outbound send driver — approved design
 
 Status: **approved, partially implemented.** Slice 1 (typed seam + handshake)
-is in progress; the remaining slices are specified here and not yet built.
+shipped in v0.4.13. Slices 2-5 are specified here and not yet built — tracked as
+https://github.com/agentx-icu/tox-tcp-tunnel/issues/24.
 
 This document exists because the design took nine rounds of independent review
 to converge, and eight of those rounds were rejections that each found a real
@@ -207,7 +208,7 @@ state/error callback, because those callbacks can re-enter admission.
 
 ## Slices
 
-1. **Handshake (in progress).** Typed seam; driver-owned OPEN and OPEN_ACK;
+1. **Handshake — shipped in v0.4.13.** Typed seam; driver-owned OPEN and OPEN_ACK;
    OPEN retry off the coalesce cadence; the OPEN_ACK causal barrier (`Connected`,
    open metrics, `start_read()` and DATA admission all behind the same `Sent`);
    terminal ERROR when the target dies while OPEN_ACK is backpressured.
