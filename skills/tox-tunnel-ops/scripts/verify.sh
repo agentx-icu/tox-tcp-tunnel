@@ -97,8 +97,9 @@ if [ -n "$LISTENER" ]; then
     # interface. This check reports what the socket actually shows either way.
     if printf '%s\n' "$BIND_ADDRS" | grep -qE '(^|[^0-9.])(0\.0\.0\.0|\*|\[?::\]?):?'"$LOCAL_PORT"'$|^\*:'"$LOCAL_PORT"'$'; then
         warn "Listener is bound to a WILDCARD address (0.0.0.0 / *), not loopback."
-        echo "       Static \`client.forwards\` always bind all IPv4 interfaces — there is no"
-        echo "       local_host / bind-address key in ToxTunnel. Any host that can reach this"
+        echo "       On v0.4.13+ set \`local_address: 127.0.0.1\` on this forward; on older"
+        echo "       daemons no such key exists, so firewall the port. Any host that can reach this"
+
         echo "       machine on port $LOCAL_PORT gets the forwarded service, with no auth."
         echo "       Mitigate with a host firewall rule, e.g.:"
         echo "         Linux (nftables): nft add rule inet filter input tcp dport $LOCAL_PORT iif != lo drop"

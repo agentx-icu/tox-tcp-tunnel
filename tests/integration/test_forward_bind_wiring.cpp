@@ -57,8 +57,13 @@ constexpr const char* kValidToxId =
 /// not hold and the test must say so rather than assert something false.
 [[nodiscard]] bool unassigned_address_refuses_bind() {
     asio::io_context io;
-    core::TcpListener probe(io, kUnassignedAddress, borrow_free_port());
-    return !probe.is_bound();
+    // shared_ptr, not a stack object: TcpListener documents that it must be
+    // held that way because it relies on enable_shared_from_this, and
+    // shared_from_this() on a stack instance is undefined behaviour even if
+    // this probe never reaches an accept.
+    const auto probe =
+        std::make_shared<core::TcpListener>(io, kUnassignedAddress, borrow_free_port());
+    return !probe->is_bound();
 }
 
 class ForwardBindWiringTest : public ::testing::Test {

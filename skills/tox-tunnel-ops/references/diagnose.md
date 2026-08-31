@@ -41,18 +41,22 @@ unloadable / invalid / (with `--strict`) carrying keys the daemon would silently
 ignore. Anything it reports is authoritative — fix it before investigating
 anything else, and do not hand-audit YAML that it has not seen.
 
-Two blind spots you must cover by hand (both verified against v0.4.12):
+Blind spots you must cover by hand (verified against v0.4.12; the alias one is
+closed from v0.4.13):
 
 1. **It never opens `server.rules_file`.** A server config pointing at a
    nonexistent or malformed rules file still prints `is valid`. Rules problems
    surface only when the daemon loads them (Layer 3).
-2. **It does not resolve known-servers aliases.** An alias-form
-   `client.server_id` always fails with
+2. **On v0.4.12 and older it does not resolve known-servers aliases.** There an
+   alias-form `client.server_id` fails with
    `Server ID must be 76 characters, got N`, even when the alias is registered
-   and the daemon runs fine. Confirm with `toxtunnel servers list -c <config>`
-   before treating that one message as an error.
+   and the daemon runs fine — confirm with `toxtunnel servers list -c <config>`
+   before treating that one message as an error. **v0.4.13+ resolves aliases**
+   at startup, on reload and in `config check`, so this gap does not apply
+   there.
 
-`bash scripts/diagnose.sh <config>` runs the validator and then covers both gaps.
+`bash scripts/diagnose.sh <config>` runs the validator and then covers whichever
+of these gaps apply to the daemon in front of you.
 
 Then check by hand:
 
@@ -143,8 +147,9 @@ Report risk level: LOW / MEDIUM / HIGH.
 ### Layer 5: Port & Tunnel Connectivity
 
 - Is the local listening port open? (`lsof -nP -i TCP:PORT -sTCP:LISTEN`).
-  Expect `0.0.0.0:PORT` — static forwards bind every IPv4 interface and there is
-  no `local_address` set. If the operator believed it was loopback-only, that is
+  Expect whatever `local_address` says: `127.0.0.1:PORT` for a v0.4.13+ config
+  that sets it, `0.0.0.0:PORT` when the key is absent or the daemon predates it.
+  If the operator believed it was loopback-only and it is not, that is
   a finding in itself: the service is reachable from the whole subnet.
 - Can TCP connect to it? (`nc -z -w 5 127.0.0.1 PORT`) — **but this proves almost
   nothing.** The client binds and accepts the forward port before it attempts any
@@ -224,7 +229,7 @@ These layers only apply when the corresponding feature is enabled.
 | Periodic disconnects | Unstable Tox friend connectivity | Raise log level and check network stability |
 | Crashes on startup with `std::bad_alloc` (huge `mmap`) | A non-regular file — usually a **directory** — sits at `<data_dir>/tox_save.dat` (or it is corrupt), so the loader read a garbage size. The v0.4.8 Linux packaging bug created the directory case | **Do not `rm -rf` it — that destroys the Tox identity, which cannot be recovered.** Stop the daemon, then: if it is an **empty directory**, `rmdir` it (v0.4.9+ self-heals this on the next write anyway). If it is a **file**, move it aside rather than deleting: `mv <data_dir>/tox_save.dat <data_dir>/tox_save.dat.bak-$(date +%s)`. Only then restart, which mints a **new identity with a new public key** — so every server's `rules.yaml` needs the new key, and the peer's `known_servers.yaml` entry is stale. Get the user's explicit agreement to that before doing it. Hardened to fail gracefully in builds after v0.4.7 |
 | Both peers reach DHT but `friends_online` stays 0 **across different machines** | Tox friend-discovery (onion) blocked by the network — a local HTTP/SOCKS proxy or VPN in TUN mode (e.g. Clash) degrades onion routing; a corporate switch usually filters the multicast that `bootstrap_mode: lan` needs | Same LAN allowing multicast → `lan`. Else the path must pass Tox UDP/onion (don't proxy the daemon's traffic), or pin a mutually-reachable bootstrap node. Same-host loopback (`lan`) always works |
-| `TcpListener: failed to bind 0.0.0.0:<port>: Address already in use` (Windows: `Only one usage of each socket address … is normally permitted`) | Local forward port taken (often a second toxtunnel) | At startup the client refuses to run: `Failed to initialize client: cannot listen on configured forward port(s): local port N: …` and exits 1. On reload it is per-forward: `Reload: not forwarding local port N -> …` plus `reload applied with warnings: …`, everything else stays live. Free the port (`ss -tlnp \| grep :N`) or pick another |
+| `TcpListener: failed to bind <addr>:<port>: Address already in use` (Windows: `Only one usage of each socket address … is normally permitted`) | Local forward port taken (often a second toxtunnel) | At startup the client refuses to run: `Failed to initialize client: cannot listen on configured forward port(s): …` and exits 1. On reload it is per-forward: `Reload: not forwarding <addr>:<port> -> …` plus `reload applied with warnings: …`, everything else stays live. v0.4.13+ reports the bind address alongside the port; older builds print the port alone. Free the port (`ss -tlnp \| grep :N`) or pick another |
 | `failed to create Tox instance: could not bind Tox TCP relay port <N>` | Another toxtunnel (or anything else) holds that port. The Tox **UDP** port auto-walks to the next free one; the **TCP relay** port does not, and server mode will not accept `tcp_port: 0` | Give this daemon its own `tox.tcp_port` |
 | `data directory <dir> is already in use by toxtunnel pid <N>` | A second daemon tried to take a `data_dir` another one owns. Sharing it would mean sharing the Tox identity, the inspect socket and `known_servers.yaml`, so startup refuses with exit 1 — including under `--service`, so `Restart=on-failure` retries once the holder exits | Stop the other instance, or give this one its own `data_dir` |
 | `Could not claim the data directory: … Refusing to start without it` | The lock could not be taken for a reason other than a live holder (unwritable dir, filesystem without working locks) | Fix the permissions/filesystem. If the data_dir genuinely cannot host a lock, `TOXTUNNEL_ALLOW_UNLOCKED_DATA_DIR=1` starts anyway — at the cost of nothing preventing a second daemon |

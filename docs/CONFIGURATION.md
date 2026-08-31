@@ -467,9 +467,11 @@ tunnel:
                                     # each peer every interval and declares it
                                     # dead after 3× of no PONG.
 
-  # Recommendation: set `idle_timeout_seconds: 60` (or longer) on the SERVER
-  # to reclaim tunnels whose peer abandoned the TCP connection without a
-  # clean close. Otherwise a tunnel can linger in "Disconnecting" state
+  # Note: a tunnel stuck in "Disconnecting" is already covered by
+  # `half_close_timeout_seconds`, which is ON by default (120s). Set
+  # `idle_timeout_seconds` only to reclaim tunnels that are idle in a
+  # non-terminal state — it is a broader policy, not the fix for a half-close.
+  # Historically a tunnel could linger in "Disconnecting" state
   # indefinitely while waiting for the reciprocal close that never arrives —
   # observable in `toxtunnel inspect tunnels` with a growing `idle_seconds`.
 

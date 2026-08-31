@@ -418,10 +418,12 @@ toxtunnel config check -c FILE [--strict]                       # validate a con
 generate, before starting anything. Exit `0` = usable, `1` = unloadable, invalid,
 or (with `--strict`) carrying keys the daemon would silently ignore. Two blind
 spots to know: it **never opens `server.rules_file`** (a config pointing at a
-missing or malformed rules file still reports "is valid"), and it **does not
-resolve known-servers aliases**, so an alias-form `client.server_id` always fails
-it with `Server ID must be 76 characters, got N`. Both verified against v0.4.12.
-`scripts/diagnose.sh` runs it and then covers those two gaps.
+missing or malformed rules file still reports "is valid" — verified against
+v0.4.12 and still true), and on **v0.4.12 and older** it **does not resolve
+known-servers aliases**, so an alias-form `client.server_id` fails it with
+`Server ID must be 76 characters, got N`. **v0.4.13+ resolves aliases**, so that
+second gap is closed on current daemons. `scripts/diagnose.sh` runs it and
+covers whichever gaps apply.
 
 Key flags:
 - `-m, --mode`: server | client
@@ -790,9 +792,10 @@ Numbered step-by-step:
 3. **Validate every config you just wrote, before starting anything:**
    `toxtunnel config check -c <file> --strict` on each. This is the product's own
    validator and it is not optional — it catches unknown/typo keys the daemon
-   would silently ignore. Remember its two blind spots: it does not open
-   `rules_file`, and it fails on alias-form `server_id`. Follow it with
-   `bash scripts/diagnose.sh <file>`, which covers both.
+   would silently ignore. Remember its blind spots: it never opens
+   `rules_file` (any version), and on **v0.4.12 and older** it fails on
+   alias-form `server_id` — v0.4.13+ resolves aliases. Follow it with
+   `bash scripts/diagnose.sh <file>`, which covers whichever apply.
 4. Start server, note the Tox ID from output (or use `toxtunnel print-id -c <server.yaml> --qr` to display the same identity as a QR code)
 5. Paste Tox ID into client config (scan QR code with phone to transfer ID between machines)
 6. Start client
@@ -811,9 +814,11 @@ Numbered step-by-step:
 
 ### Scenario-Specific Design Guidance
 
-**Applies to every scenario below:** without `local_address` the `local_port` in
-each mapping binds `0.0.0.0`, not loopback (and on v0.4.12 and older there is no
-such key). The verification commands target `127.0.0.1` because
+**Applies to every scenario below:** generate each mapping with
+`local_address: 127.0.0.1` on **v0.4.13+**, so it binds loopback. Without that
+key — and on every v0.4.12-and-older daemon, where it does not exist — the
+`local_port` binds `0.0.0.0` and needs a firewall rule instead. The verification
+commands target `127.0.0.1` because
 that is where *you* connect from — not because that is the only place the port
 answers. Include the exposure warning and a firewall rule (or steer to SOCKS5)
 every time you emit one of these mappings. This matters most for the SSH and
@@ -821,7 +826,8 @@ database scenarios, where the forwarded service is a direct route into a
 production host.
 
 **SSH:**
-- Default mapping: local 2222 → remote 22 (binds `0.0.0.0:2222` — firewall it)
+- Default mapping: local 2222 → remote 22 with `local_address: 127.0.0.1`
+  (without it, binds `0.0.0.0:2222` — firewall it)
 - Verification: `ssh -p 2222 user@127.0.0.1`, or `bash scripts/verify.sh 2222 ssh <client.yaml>`
 - Always mention SSH ProxyCommand / pipe mode as alternative (POSIX only — not available on Windows)
 - ProxyCommand: `ssh -o ProxyCommand="toxtunnel -m client --server-id <ID> --pipe 127.0.0.1:22" user@remote`
@@ -901,8 +907,9 @@ Execution checklist:
    Use **absolute** paths for `data_dir` and `server.rules_file`.
 3. **Run `toxtunnel config check -c <file> --strict` on every generated config
    before anything is started.** Treat a non-zero exit as a blocker and fix it.
-   The two known blind spots — it never opens `rules_file`, and it rejects an
-   alias-form `server_id` even when the alias is registered — are covered by
+   The known blind spots — it never opens `rules_file` on any version, and on
+   **v0.4.12 and older** it rejects an alias-form `server_id` even when the
+   alias is registered (v0.4.13+ resolves it) — are covered by
    `scripts/diagnose.sh`, so run that too.
 4. Prefer GitHub Releases packages over source builds unless no package fits.
 5. Start direct processes only when the user explicitly wants them run here.
@@ -957,9 +964,10 @@ Diagnostic checklist:
 2. **Run `toxtunnel config check -c <file> --strict` first.** It is the daemon's
    own validator; anything it reports is authoritative and should be fixed before
    any deeper investigation. Only then hand-check what it does not cover:
-   `rules_file` contents (it never opens them) and alias resolution (it always
-   rejects a non-76-char `server_id`). `scripts/diagnose.sh` does exactly this
-   sequence.
+   `rules_file` contents (it never opens them, on any version) and, on
+   **v0.4.12 and older only**, alias resolution — those builds reject a
+   non-76-char `server_id`, while v0.4.13+ resolves it.
+   `scripts/diagnose.sh` does exactly this sequence.
 3. Review `rules.yaml` for over-broad access, bad friend keys, deny/allow
    mistakes, **unknown keys inside allow/deny entries** (silently ignored, and a
    missing `ports` then means all ports) and **duplicate `friend:` entries**

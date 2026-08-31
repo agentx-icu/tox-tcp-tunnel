@@ -32,6 +32,18 @@ note()  { echo -e "${CYAN}[NOTE]${NC}  $1"; }          # informational, not an i
 skip()  { echo -e "${YELLOW}[SKIP]${NC}  $1"; }        # could not check — not a pass
 section() { echo -e "\n${CYAN}--- $1 ---${NC}"; }
 
+# Portable timeout wrapper, same shape as verify.sh: coreutils `timeout` where
+# available, GNU `gtimeout` on a macOS box with coreutils installed, else run
+# bare. Calling `timeout` directly turns every probe below into a false warning
+# on a stock macOS, which has neither.
+if command -v timeout &>/dev/null; then
+    tmo() { timeout "$@"; }
+elif command -v gtimeout &>/dev/null; then
+    tmo() { gtimeout "$@"; }
+else
+    tmo() { shift; "$@"; }
+fi
+
 # Values discovered by the structured parse (Layer 2), consumed by later layers.
 MODE=""
 DATA_DIR=""
@@ -293,11 +305,38 @@ if mode == "client":
             # A specific non-loopback address (192.168.1.10) binds ONE interface,
             # not all of them. Both are exposure worth flagging, but calling a
             # single-interface bind "every interface" is simply wrong.
-            wildcard = [str(p) for p, a in wide_binds
-                        if not a or str(a).strip() in ("0.0.0.0", "::", "*")]
+            # Keep the three provenances apart: an absent key is the legacy
+            # default, an explicit IPv4 wildcard is a deliberate choice, and ::
+            # is the IPv6 wildcard — calling that one "every IPv4 interface" is
+            # simply the wrong family.
+            implicit = [str(p) for p, a in wide_binds if not a]
+            # Only numeric literals are valid local_address values -- validation
+            # uses asio::ip::make_address. `*` and `[::]` are how listeners are
+            # DISPLAYED (ss/lsof), never what a config can contain.
+            explicit_v4 = [str(p) for p, a in wide_binds
+                           if a and str(a).strip() == "0.0.0.0"]
+            explicit_v6 = [str(p) for p, a in wide_binds
+                           if a and str(a).strip() == "::"]
+            if explicit_v6:
+                emit("WARN", f"{len(explicit_v6)} forward(s) bind the IPv6 wildcard (::): "
+                             + ", ".join(explicit_v6) + ". Reachable on every IPv6 interface.")
+            if explicit_v4:
+                emit("NOTE", f"{len(explicit_v4)} forward(s) set local_address explicitly to the "
+                             "IPv4 wildcard: " + ", ".join(explicit_v4) + ". Deliberate, so this "
+                             "is not flagged as a mistake — but it is still open to the network.")
+            wildcard = implicit
+            # Anything left that is not a valid numeric literal is a config
+            # error, not a bind to report: `*` and `[::]` are ss/lsof display
+            # forms and make_address rejects them.
+            invalid = [f"{a}" for p, a in wide_binds
+                       if a and str(a).strip() in ("*", "[::]")]
+            if invalid:
+                emit("FAIL", "local_address must be a numeric IP literal; "
+                             + ", ".join(sorted(set(invalid)))
+                             + " is listener-display syntax and the daemon will reject it.")
             specific = [f"{a}:{p}" for p, a in wide_binds
                         if a and not _is_loopback(a)
-                        and str(a).strip() not in ("0.0.0.0", "::", "*")]
+                        and str(a).strip() not in ("0.0.0.0", "::", "*", "[::]")]
             if specific:
                 emit("WARN", f"{len(specific)} forward(s) bind a specific non-loopback "
                              "interface: " + ", ".join(specific) + ". Reachable by any host "
@@ -305,7 +344,8 @@ if mode == "client":
                              "serve other machines.")
             wide = wildcard
             if wide:
-                emit("WARN", f"{len(wide)} static forward(s) bind every IPv4 interface, "
+                emit("WARN", f"{len(wide)} static forward(s) have no local_address and so "
+                             f"bind every IPv4 interface, "
                              "not loopback: " + ", ".join(wide) + ". Any host that can "
                              "reach this machine gets the forwarded service "
                              "unauthenticated. On v0.4.13+ set `local_address: 127.0.0.1`; "
@@ -640,7 +680,7 @@ if command -v ping &>/dev/null; then
 fi
 
 if [ -n "$TOXTUNNEL_BIN" ] && [ -n "$DATA_DIR" ] && [ -S "$DATA_DIR/toxtunnel.sock" ]; then
-    STATUS=$(timeout 10 toxtunnel inspect status -d "$DATA_DIR" --json 2>/dev/null || true)
+    STATUS=$(tmo 10 toxtunnel inspect status -d "$DATA_DIR" --json 2>/dev/null || true)
     if [ -n "$STATUS" ]; then
         FRIENDS=$(printf '%s' "$STATUS" | tr ',{}' '\n\n\n' | grep '"friends_online"' \
                   | head -1 | grep -oE '[0-9]+$' || true)
@@ -811,10 +851,10 @@ PYEOF
         fail "Another daemon owns this data_dir — give this one its own, or stop the other:"
         grep "already in use by toxtunnel pid" "$LOG_FILE" 2>/dev/null | tail -2 | sed 's/^/       /'
     fi
-    if grep -qiE "failed to bind|cannot listen on configured forward port|Reload: not forwarding local port" \
+    if grep -qiE "failed to bind|cannot listen on configured forward port|Reload: not forwarding" \
             "$LOG_FILE" 2>/dev/null; then
         fail "A local port could not be bound (usually already in use):"
-        grep -iE "failed to bind|cannot listen on configured forward port|Reload: not forwarding local port" \
+        grep -iE "failed to bind|cannot listen on configured forward port|Reload: not forwarding" \
             "$LOG_FILE" 2>/dev/null | tail -3 | sed 's/^/       /'
     fi
     if grep -q "tox_thread wedge" "$LOG_FILE" 2>/dev/null; then

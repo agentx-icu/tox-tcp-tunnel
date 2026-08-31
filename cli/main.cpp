@@ -718,6 +718,16 @@ std::optional<toxtunnel::Config> reload_config_from_disk(const std::string& conf
                                        result.error());
         return std::nullopt;
     }
+    // Resolve aliases BEFORE validating, exactly as startup and `config check`
+    // do. Without this a client whose server_id is a known-servers alias starts
+    // fine and then fails every SIGHUP: validate() only understands a 76-hex id,
+    // so the reload is refused before any forward or log-level change is
+    // applied, and the operator sees a config they can see is correct being
+    // rejected by a daemon already running it.
+    if (auto alias_err = resolve_client_aliases(result.value())) {
+        toxtunnel::util::Logger::error("reload failed: {} in {}", *alias_err, config_path);
+        return std::nullopt;
+    }
     auto validation = result.value().validate();
     if (!validation.has_value()) {
         toxtunnel::util::Logger::error("reload failed: invalid config in {}: {}", config_path,
