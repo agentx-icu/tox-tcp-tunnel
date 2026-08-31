@@ -2,7 +2,19 @@
 
 ## Scenario
 
-A DBA needs a secure tunnel to a production or staging database for a migration, data transfer, or bulk operation. The tunnel should be strictly time-limited with full audit capability.
+A DBA needs a secure tunnel to a production or staging database for a migration,
+data transfer, or bulk operation. The tunnel should be strictly time-limited and
+logged.
+
+> **What "audited" means here.** ToxTunnel logs *tunnel* activity: which friend
+> opened a tunnel, to which `host:port`, when it closed, and how many bytes
+> flowed. Even at `level: debug` it never sees inside the stream — the payload is
+> an opaque TCP byte stream to it, so **no SQL statement, table name, row count
+> or transaction is ever recorded**. If the migration needs statement-level
+> accountability, turn on the database's own auditing (`pgaudit` or
+> `log_statement = 'all'` for PostgreSQL, the audit plugin / general query log
+> for MySQL) — that is the only place query-level evidence exists. Say this to
+> anyone who asks for "an audit trail of the migration".
 
 ## Topology
 
@@ -30,9 +42,9 @@ pg_dump / migration tool              PostgreSQL on :5432
 
 ```yaml
 mode: server
-data_dir: /etc/toxtunnel/server
+data_dir: /var/lib/toxtunnel        # mutable state — NOT under /etc
 logging:
-  level: debug                       # verbose for audit
+  level: debug                       # verbose TUNNEL-level record; not SQL
   file: /var/log/toxtunnel/migration.log
 tox:
   udp_enabled: true
@@ -40,6 +52,20 @@ tox:
 server:
   rules_file: /etc/toxtunnel/rules.yaml
 ```
+
+> **`data_dir` holds mutable state, so keep it out of `/etc`.** That directory
+> carries the Tox identity (`tox_save.dat`), the pid file, the data-directory
+> lock and the inspect socket — all written at runtime. `/var/lib/toxtunnel` is
+> what the packaged Linux unit uses (`StateDirectory=toxtunnel`,
+> `StateDirectoryMode=0750`), owned by the dedicated `toxtunnel` user; macOS
+> equivalent is `/usr/local/var/toxtunnel`. Keep `/etc/toxtunnel` for
+> `server.yaml` and `rules.yaml` only.
+>
+> **Run the daemon as that unprivileged account, not as root.** Nothing here
+> needs root once the package is installed: the Tox port is 33445 and the targets
+> are ordinary services. The packaged unit already does this; a hand-written one
+> must set `User=`, `Group=` and `StateDirectory=` itself.
+
 
 ## Rules (DBA's friend key, DB port only)
 
@@ -71,9 +97,17 @@ client:
   server_id: <PASTE_SERVER_TOX_ID_HERE>
   forwards:
     - local_port: 15432
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5432
 ```
+
+> ### ⚠️ `local_port: 15432` binds `0.0.0.0` without `local_address` on the DBA workstation
+>
+> Without `local_address` (v0.4.13+) a forward has no bind restriction — the listener binds every IPv4
+> interface, so anyone on the DBA's network can reach the production database
+> through that port. On **v0.4.13+** set `local_address: 127.0.0.1` (the config above does); on v0.4.12 and older no such key exists — firewall it instead. Firewall it to loopback for
+> the duration of the migration window.
 
 ## Migration Workflow
 
@@ -134,5 +168,13 @@ If the migration fails:
 ## Verification
 
 ```bash
-bash verify.sh 15432 postgres
+bash scripts/verify.sh 15432 postgres client.yaml
 ```
+
+Run this from the skill root (the script lives at `scripts/verify.sh`).
+Passing the client config lets it read `friends_online` from the running
+daemon instead of guessing from a local TCP accept.
+
+**Judge it by the exit code:** `0` = the remote service answered through the
+tunnel, `2` = local checks passed but end-to-end was **not** proven (do not
+report this as working), `1` = a check failed.

@@ -44,7 +44,7 @@ Browser/curl → 127.0.0.1:1080  ─────┐
 
 ```yaml
 mode: server
-data_dir: /etc/toxtunnel/server
+data_dir: /var/lib/toxtunnel        # mutable state — NOT under /etc
 logging:
   level: info
   file: /var/log/toxtunnel/server.log
@@ -54,6 +54,20 @@ tox:
 server:
   rules_file: /etc/toxtunnel/rules.yaml
 ```
+
+> **`data_dir` holds mutable state, so keep it out of `/etc`.** That directory
+> carries the Tox identity (`tox_save.dat`), the pid file, the data-directory
+> lock and the inspect socket — all written at runtime. `/var/lib/toxtunnel` is
+> what the packaged Linux unit uses (`StateDirectory=toxtunnel`,
+> `StateDirectoryMode=0750`), owned by the dedicated `toxtunnel` user; macOS
+> equivalent is `/usr/local/var/toxtunnel`. Keep `/etc/toxtunnel` for
+> `server.yaml` and `rules.yaml` only.
+>
+> **Run the daemon as that unprivileged account, not as root.** Nothing here
+> needs root once the package is installed: the Tox port is 33445 and the targets
+> are ordinary services. The packaged unit already does this; a hand-written one
+> must set `User=`, `Group=` and `StateDirectory=` itself.
+
 
 ## Server Rules (the actual trust boundary)
 
@@ -113,7 +127,9 @@ toxtunnel -m client --server-id homelab --socks5 127.0.0.1:1080
 ## Steps
 
 1. Start server: `sudo systemctl start toxtunnel` (or `toxtunnel -m server -c server.yaml`)
-2. Note the server's Tox ID (`toxtunnel print-id --data-dir /etc/toxtunnel/server` on the server, or the ID printed at startup)
+2. Note the server's Tox ID (`toxtunnel print-id -c /etc/toxtunnel/server.yaml` on
+   the server, which resolves the same `data_dir` the daemon uses, or read the ID
+   printed at startup)
 3. Paste into client config, start client: `toxtunnel -m client -c client.yaml`
 4. Wait for `Server friend 0 is now online` in the client log (on a Tox relay
    path this can take minutes, not seconds)
@@ -172,10 +188,19 @@ curl --socks5-hostname 127.0.0.1:1080 -v http://not-in-rules.lan/ 2>&1 | grep -i
 The server's `rules.yaml` is hot-reloadable:
 
 ```bash
-# On the server, after editing rules.yaml:
-toxtunnel reload                                  # or kill -HUP $(pidof toxtunnel)
+# On the server, after editing rules.yaml. Pass -c (or -d) so reload finds the
+# right daemon: bare `toxtunnel reload` looks in the DEFAULT data_dir
+# (~/.config/toxtunnel), which is not where this server keeps its pid file.
+toxtunnel reload -c /etc/toxtunnel/server.yaml
+# Equivalent, explicit:
+kill -HUP "$(cat /var/lib/toxtunnel/toxtunnel.pid)"
+
 journalctl -u toxtunnel -n 5 | grep 'config reloaded'
 ```
+
+**Do not use `kill -HUP $(pidof toxtunnel)`.** `pidof` returns *every* toxtunnel
+process on the host, so on a machine also running a client you would signal both.
+The pid file names exactly one daemon.
 
 No client restart needed — the next SOCKS5 CONNECT picks up the new rules.
 

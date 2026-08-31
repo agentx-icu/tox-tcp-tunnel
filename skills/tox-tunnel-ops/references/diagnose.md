@@ -30,7 +30,32 @@ takes only `tunnels` / `status`.)
 
 ### Layer 2: Configuration Static Check
 
-- Is the YAML syntactically valid?
+**Start here, always:**
+
+```bash
+toxtunnel config check -c /path/to/config.yaml --strict
+```
+
+This is the daemon's own validator (v0.4.11+). Exit `0` = usable, `1` =
+unloadable / invalid / (with `--strict`) carrying keys the daemon would silently
+ignore. Anything it reports is authoritative — fix it before investigating
+anything else, and do not hand-audit YAML that it has not seen.
+
+Two blind spots you must cover by hand (both verified against v0.4.12):
+
+1. **It never opens `server.rules_file`.** A server config pointing at a
+   nonexistent or malformed rules file still prints `is valid`. Rules problems
+   surface only when the daemon loads them (Layer 3).
+2. **It does not resolve known-servers aliases.** An alias-form
+   `client.server_id` always fails with
+   `Server ID must be 76 characters, got N`, even when the alias is registered
+   and the daemon runs fine. Confirm with `toxtunnel servers list -c <config>`
+   before treating that one message as an error.
+
+`bash scripts/diagnose.sh <config>` runs the validator and then covers both gaps.
+
+Then check by hand:
+
 - Is `mode` set correctly?
 - Does `data_dir` exist and is it writable?
 - Does `tox_save.dat` exist? (first run creates it)
@@ -45,26 +70,63 @@ takes only `tunnels` / `status`.)
     the daemon will fail validation at startup.
   - Are `forwards` entries present with valid port numbers?
 - Server-specific:
-  - If `rules_file` is set, does the file exist?
-  - Is the rules YAML valid?
+  - Is `rules_file` an **absolute** path? ToxTunnel expands `~` and nothing else,
+    then hands the string to the rules loader, so a relative path resolves
+    against the **daemon's working directory** — not the config's directory.
+    Verified on v0.4.12: the same config loads from one cwd and dies with
+    `Failed to load rules file: Rules file not found: rules.yaml` from another.
+    Do **not** test existence by rebasing the path against the config directory;
+    that reports "the file exists" while the daemon cannot open it.
+  - Does the file exist at the path the *daemon* will resolve?
+  - Is the rules YAML valid? (Nothing checks this until the daemon loads it.)
 
 ### Layer 3: Rules Risk Analysis
 
-Parse `rules.yaml` and check for:
+The rules loader has **no unknown-key detection** — unlike the main config, which
+`config check --strict` scans. Parse `rules.yaml` yourself and check for:
 
-- Overly broad allow rules: host `*` with empty ports
-- Missing deny coverage: friend rules with only allow, no deny
-- Stale friend keys: `friend_pk` entries that do not match known friends
-- Port `0` in rules
-- Friend key format: must be exactly 64 hex characters
+**Silent-widening bugs (these are the dangerous ones):**
+
+- **Unrecognised keys inside an allow/deny entry.** Only `host` and `ports` are
+  read; anything else is ignored with no warning.
+- **A missing `ports` key**, which the engine reads as **all ports**. Together
+  with the previous item, a `port: 22` typo (singular) parses as "allow every
+  port on that host". Confirmed on v0.4.12: the daemon logs `Loaded access rules`
+  and nothing else.
+- **Duplicate `friend:` entries.** Lookup is a linear first-match, so the second
+  and later blocks for one key are dead config and their allows never apply —
+  which can read as "I allowed it and it is still denied".
+- `friend_public_key` as a key name — not recognised (use `friend` / `friend_pk`).
+
+**Scope:**
+
+- Overly broad allow rules: host `*`, or `ports: []`
+- Host patterns with more than one `*` (e.g. `192.168.*.*`): the matcher handles
+  one prefix and one suffix only, so these never match anything
+- Friend key format: exactly 64 hex characters (the first 64 of the 76-char Tox ID)
+- Port `0` or out-of-range ports
+
+**Not a risk:** a friend rule with `allow:` and no `deny:`. The engine is
+default-deny, so anything not explicitly allowed is already refused; an empty
+`deny` list adds nothing. Do not report missing deny coverage as a finding.
 
 Report risk level: LOW / MEDIUM / HIGH.
 
 ### Layer 4: Network & Tox Connection
 
-- Does the machine have internet access? (`ping -c 1 -W 2 1.1.1.1`)
-  - If `bootstrap_mode: lan`, internet is not required, but both machines must be on the same subnet
-  - If `bootstrap_mode: auto`, internet is required for DHT bootstrap
+- **ICMP is not a test of Tox reachability.** `ping -c 1 -W 2 1.1.1.1` is a weak
+  hint at best: Tox bootstraps over UDP and falls back to TCP relays, and plenty
+  of networks drop ICMP while passing both (and vice versa — ICMP can succeed
+  through a captive portal or a proxy that blocks everything Tox needs). Never
+  conclude "the network is down" from a failed ping, or "the network is fine"
+  from a successful one. The signals that mean something:
+  - `Connected to Tox DHT` / `Self connection status: connected (UDP|TCP)` in the log
+  - `toxtunnel inspect status --json | jq .friends_online`
+  - `last_connection_type` in `known_servers.yaml` for the actual peer path
+  - If `bootstrap_mode: lan`, no internet is required at all, but both machines
+    must be on the same subnet and the network must pass multicast
+  - If `bootstrap_mode: auto`, reachability to the public DHT nodes is required
+    — which is about UDP/TCP to those nodes, not about ICMP to a resolver
 - Is UDP blocked?
 - Is `tox.tcp_port` (default `33445`) available?
 - Check logs for (exact strings the daemon emits):
@@ -80,8 +142,17 @@ Report risk level: LOW / MEDIUM / HIGH.
 
 ### Layer 5: Port & Tunnel Connectivity
 
-- Is the local listening port open? (`lsof -i :PORT -sTCP:LISTEN`)
-- Can TCP connect to it? (`nc -z -w 5 127.0.0.1 PORT`)
+- Is the local listening port open? (`lsof -nP -i TCP:PORT -sTCP:LISTEN`).
+  Expect `0.0.0.0:PORT` — static forwards bind every IPv4 interface and there is
+  no `local_address` set. If the operator believed it was loopback-only, that is
+  a finding in itself: the service is reachable from the whole subnet.
+- Can TCP connect to it? (`nc -z -w 5 127.0.0.1 PORT`) — **but this proves almost
+  nothing.** The client binds and accepts the forward port before it attempts any
+  `TUNNEL_OPEN`, so the connect succeeds with the Tox link down, the friend
+  offline, and the rules denying everything. Never treat a successful `nc -z` as
+  evidence the tunnel works; it only rules out "the listener is missing".
+  Use a service-level probe (`scripts/verify.sh <port> <service> <config>`) or
+  `toxtunnel inspect tunnels` for real evidence.
 - Is the target service reachable from the server? (`nc -zv target_host target_port`)
 - Check logs for `TUNNEL_OPEN`, `TUNNEL_ERROR`, `TUNNEL_CLOSE`
 - `toxtunnel inspect tunnels` shows live tunnels with their target host:port, bytes in/out, and age — if your tunnel never shows up here, the open was denied or never reached the server
@@ -101,7 +172,7 @@ These layers only apply when the corresponding feature is enabled.
 - Verify the listener is actually enabled: `socks5.enabled: true` in YAML, OR `--socks5 host:port` on the CLI
 - SOCKS5 and `client.pipe` are mutually exclusive; the validator emits `socks5.enabled and client.pipe cannot be used together`
 - If listener bound but CONNECTs are refused with SOCKS5 reply 0x02 ("connection not allowed") — or `403 Forbidden` when the client spoke HTTP CONNECT — the request was denied by **server policy**: `rules.yaml`, the rate limiter, or the concurrent-tunnel cap. Widen the allow list or the limits on the server, not the client. A `0x04` / `0x05` / `0x01` reply (all `502 Bad Gateway` over HTTP CONNECT) means policy allowed the request and the *target* was unreachable, refused, or the open failed — a different problem entirely
-- Reading the reply byte back to a cause (v0.4.12+): `0x02` = policy denial (`TUNNEL_ERROR` code 1) · `0x05` = the target actively refused the connection (code 3) · `0x04` = every other open failure — DNS, connect timeout, target lost mid-open (code 2). Before v0.4.12 the server sent code 3 for policy denials too, so a rate-limited OPEN arrived as `0x04` "host unreachable", indistinguishable from a dead target; if you are diagnosing an **older server**, check `toxtunnel_rate_limit_open_rejected_total` on it before chasing the target. A v0.4.12+ client still reports that older server's rate limit correctly as `0x02`
+- Reading the reply byte back to a cause (v0.4.12+): `0x02` = policy denial (`TUNNEL_ERROR` code 1) · `0x05` = the target actively refused the connection (code 3) · `0x04` = every other open failure — DNS, connect timeout, target lost mid-open (code 2). Before v0.4.12 the server sent code 3 for policy denials too, so a rate-limited OPEN arrived as `0x04` "host unreachable", indistinguishable from a dead target. But a v0.4.12+ **client** carries a shim that re-maps that older server's `"Rate limit exceeded"` / `"Tunnel limit exceeded"` back to `0x02`, so you only actually see the misleading `0x04` when **both** ends predate v0.4.12 — see the version matrix under "a friend is denied with Rate limit exceeded" below. On that combination, check `toxtunnel_rate_limit_open_rejected_total` on the server before chasing the target
 
 **Multi-server failover not switching:**
 - Tail the log for `Failover: switching active server X... -> Y... (friend N)` — absence means no switch decision has fired
@@ -119,10 +190,20 @@ These layers only apply when the corresponding feature is enabled.
 - `toxtunnel_friends_online` stuck at 0 → friend connectivity broken (back to Layer 4)
 - `toxtunnel_tunnels_opened_total{result="denied"}` climbing → rules.yaml is rejecting opens; cross-reference with `inspect tunnels` to see what's actually getting through
 
-**Idle reaper closed a tunnel unexpectedly:**
-- Look for `toxtunnel_tunnels_closed_total{reason="timeout"}` increment or a log line about idle close
-- `tunnel.idle_timeout_seconds: 0` disables the reaper entirely; non-zero values reap tunnels idle that long
-- If a long-lived but quiet protocol (e.g. SSH session with no traffic) is being reaped, increase `idle_timeout_seconds` or set `0`
+**A reaper closed a tunnel unexpectedly:**
+- Look for a `toxtunnel_tunnels_closed_total{reason="timeout"}` increment — but
+  note **both** reapers book that same label, so identify which one fired from
+  the tunnel's state before it went
+- `tunnel.idle_timeout_seconds: 0` (the default) disables the general reaper;
+  a non-zero value reaps any non-`Connecting` tunnel idle that long, healthy
+  `Connected` ones included
+- `tunnel.half_close_timeout_seconds: 120` is **on by default** and reaps only
+  `Disconnecting` tunnels. A tunnel that vanished ~2 minutes after one side
+  closed was almost certainly this, not the idle reaper
+- If a long-lived but quiet protocol (an SSH session with no traffic, a
+  connection pool) is being reaped, raise `idle_timeout_seconds` or set it to `0`
+- Set `tunnel.keepalive_interval_seconds` if you want application-level traffic
+  to keep otherwise-silent tunnels marked live
 
 ### Layer 6: Application Layer Smoke Test
 
@@ -141,7 +222,7 @@ These layers only apply when the corresponding feature is enabled.
 | `Rules file not found` | Bad `server.rules_file` path | Use an absolute path and verify permissions |
 | Slow transfer speed (≈5–10 KB/s; a tiny request takes seconds while a bulk transfer runs) | Tox **TCP relay** instead of direct UDP — `toxtunnel servers list` / `known_servers.yaml` shows `last_connection_type: tcp`. toxcore's congestion control over relays tops out at a few packets/s; interactive SSH / DB queries are fine, bulk copies are not | Get the peers onto direct UDP: same LAN → `bootstrap_mode: lan` (that is what turns on toxcore local discovery — there is no separate `local_discovery_enabled` YAML key); otherwise make sure UDP 33445+ is reachable on at least one side. On a relay-only path keep payloads small (compress) and avoid concurrent bulk flows — every tunnel to one friend shares a single toxcore send queue, so one bulk copy starves the others |
 | Periodic disconnects | Unstable Tox friend connectivity | Raise log level and check network stability |
-| Crashes on startup with `std::bad_alloc` (huge `mmap`) | A non-regular file — usually a **directory** — sits at `<data_dir>/tox_save.dat` (or it's corrupt), so the loader read a garbage size | `rm -rf <data_dir>/tox_save.dat` (the daemon recreates a fresh identity). Hardened to fail gracefully in builds after v0.4.7 |
+| Crashes on startup with `std::bad_alloc` (huge `mmap`) | A non-regular file — usually a **directory** — sits at `<data_dir>/tox_save.dat` (or it is corrupt), so the loader read a garbage size. The v0.4.8 Linux packaging bug created the directory case | **Do not `rm -rf` it — that destroys the Tox identity, which cannot be recovered.** Stop the daemon, then: if it is an **empty directory**, `rmdir` it (v0.4.9+ self-heals this on the next write anyway). If it is a **file**, move it aside rather than deleting: `mv <data_dir>/tox_save.dat <data_dir>/tox_save.dat.bak-$(date +%s)`. Only then restart, which mints a **new identity with a new public key** — so every server's `rules.yaml` needs the new key, and the peer's `known_servers.yaml` entry is stale. Get the user's explicit agreement to that before doing it. Hardened to fail gracefully in builds after v0.4.7 |
 | Both peers reach DHT but `friends_online` stays 0 **across different machines** | Tox friend-discovery (onion) blocked by the network — a local HTTP/SOCKS proxy or VPN in TUN mode (e.g. Clash) degrades onion routing; a corporate switch usually filters the multicast that `bootstrap_mode: lan` needs | Same LAN allowing multicast → `lan`. Else the path must pass Tox UDP/onion (don't proxy the daemon's traffic), or pin a mutually-reachable bootstrap node. Same-host loopback (`lan`) always works |
 | `TcpListener: failed to bind 0.0.0.0:<port>: Address already in use` (Windows: `Only one usage of each socket address … is normally permitted`) | Local forward port taken (often a second toxtunnel) | At startup the client refuses to run: `Failed to initialize client: cannot listen on configured forward port(s): local port N: …` and exits 1. On reload it is per-forward: `Reload: not forwarding local port N -> …` plus `reload applied with warnings: …`, everything else stays live. Free the port (`ss -tlnp \| grep :N`) or pick another |
 | `failed to create Tox instance: could not bind Tox TCP relay port <N>` | Another toxtunnel (or anything else) holds that port. The Tox **UDP** port auto-walks to the next free one; the **TCP relay** port does not, and server mode will not accept `tcp_port: 0` | Give this daemon its own `tox.tcp_port` |
@@ -187,12 +268,23 @@ These layers only apply when the corresponding feature is enabled.
 ## Helper Scripts
 
 ```bash
-# Full diagnostic
+# Full diagnostic. Runs `toxtunnel config check --strict` first, then covers
+# what that misses: rules.yaml structure, alias resolution, forward exposure,
+# per-server transport. Exit 1 if any issue was found.
 bash scripts/diagnose.sh /path/to/config.yaml
 
-# Verify a specific port
-bash scripts/verify.sh <local_port> [ssh|http|postgres|mysql|redis|mongo|tcp]
+# Verify a specific port end to end.
+bash scripts/verify.sh <local_port> [ssh|http|postgres|mysql|redis|mongo|rdp|tcp] [client.yaml]
 ```
+
+Read both scripts by exit code:
+
+- `diagnose.sh`: `0` = clean, `1` = at least one WARN/FAIL. A `[SKIP]` line means
+  the check **could not run** (missing PyYAML, missing binary) — it is not a pass,
+  and it must not be summarised as one.
+- `verify.sh`: `0` = the remote service answered (end-to-end proven), `2` = local
+  checks passed but end-to-end was **not** proven, `1` = failed. Never report a
+  `2` as a working tunnel; say what remains unverified and why.
 
 ## v0.4 Stability + Performance Diagnostics
 
@@ -201,14 +293,26 @@ bash scripts/verify.sh <local_port> [ssh|http|postgres|mysql|redis|mongo|tcp]
 Tox-thread watchdog fires when `tox_iterate` stalls past
 `watchdog.deadline_seconds`. Check:
 
-1. `journalctl -u toxtunnel | grep "tox_thread wedge"` — the FATAL line
-   carries `delta_ms` and `last_heartbeat_counter`.
-2. `cat <data_dir>/abort_count` — persistent count across restarts.
-3. `curl 127.0.0.1:9100/metrics | grep watchdog_aborts` — same value
-   as the abort file once metrics scrape resumes.
-4. `toxtunnel_tox_iterate_lag_milliseconds_max` rising over time indicates
-   a slow toxcore but not yet a wedge — a useful early warning. The
-   summary is also exposed as `_count` / `_sum` for rate-style queries.
+1. `journalctl -u toxtunnel | grep "tox_thread wedge"` — logged at **critical**
+   level, verbatim:
+   `tox_thread wedge detected: lag_ms=<N> deadline_ms=<N> heartbeat_count=<N>`.
+   Those are the three values in the message text (there are no `delta_ms` or
+   `last_heartbeat_counter` fields).
+2. `cat <data_dir>/abort_count` — **the only durable count.** Written at abort
+   time; nothing reads it back at startup.
+3. `curl 127.0.0.1:9100/metrics | grep watchdog_aborts` —
+   `toxtunnel_watchdog_aborts_total` is the **in-process** view and **resets to
+   0 on every restart**, so after the abort-and-restart it reads 0 while the file
+   reads N. They agree only within a single process lifetime. Alert on
+   `increase(...)`, and reconcile history against the file.
+4. `toxtunnel_tox_iterate_lag_ms` — the gauge that actually tracks a wedge:
+   milliseconds since the last `tox_iterate()` **returned**. It climbs toward
+   `deadline_seconds` while the thread is stuck.
+5. `toxtunnel_tox_iterate_lag_milliseconds_max` — the maximum *completed* call
+   duration since process start. Useful as a slow-toxcore trend, useless as a
+   wedge alarm: it latches on one old slow call and, because a hung call has not
+   completed, it cannot move during the wedge you are chasing. The summary is
+   also exposed as `_count` / `_sum` for rate-style queries.
 
 The watchdog calls `std::abort()` precisely because in-process recovery
 of a wedged toxcore is unsafe. systemd / launchd / Windows SCM
@@ -225,8 +329,22 @@ Rate limiter rejected the TUNNEL_OPEN. Check:
    levels — the WARN log line and the counter above are the only signals.
 
 On the client side this surfaces as `TUNNEL_ERROR` code 1 and a SOCKS5
-`0x02` / HTTP `403` — a denial, not an unreachable host. If the client is
-reporting `0x04` instead, the **server** predates v0.4.12.
+`0x02` / HTTP `403` — a denial, not an unreachable host.
+
+Seeing `0x04` instead takes **both** ends being old, not just the server:
+
+| Server | Client | Rate-limit / cap denial surfaces as |
+|--------|--------|-------------------------------------|
+| ≥ v0.4.12 | ≥ v0.4.12 | `0x02` / `403` |
+| ≥ v0.4.12 | ≤ v0.4.11 | `0x02` / `403` (server already sends code 1) |
+| ≤ v0.4.11 | ≥ v0.4.12 | `0x02` / `403` (client-side compatibility shim) |
+| ≤ v0.4.11 | ≤ v0.4.11 | **`0x04` / `502`** — looks like an unreachable host |
+
+The v0.4.12+ client shim re-maps code 3 to a denial when the description matches
+`"Rate limit exceeded"` or `"Tunnel limit exceeded"` **exactly**. So check both
+versions before concluding, and on the last row read
+`toxtunnel_rate_limit_open_rejected_total` on the server rather than chasing the
+target.
 
 Loosen `rate_limit_defaults` or add a per-friend override block in
 `rules.yaml` and `kill -HUP` to reload.
@@ -271,7 +389,16 @@ every state-machine move. If it climbs fast under steady traffic, the
 EWMA is flapping. Workarounds:
 
 1. Pin the mode: `tunnel.coalesce_mode: fixed` to lock to the v0.3.0 cadence.
-2. For bulk-only workloads pin `bypass`; for trickle-only pin `batch`.
+   This is the right answer for a flapping EWMA in almost every case.
+2. For bulk-only workloads pin `bypass`; for trickle-only, where you want every
+   small write batched, pin `drain`.
+
+The **only** valid values for `tunnel.coalesce_mode` are `fixed`, `adaptive`,
+`bypass`, `drain`. `batch` is an internal state the adaptive machine selects at
+runtime (and a metric label) — it is **not** a config value, and setting it makes
+the daemon refuse to start:
+`Invalid tunnel.coalesce_mode 'batch': must be one of 'fixed', 'adaptive', 'bypass', 'drain'`.
+`toxtunnel config check -c <file>` catches it before you find out the hard way.
 
 ### Symptom: high BDP link still capped at 256 KiB
 
@@ -374,10 +501,22 @@ If you see a wedge anyway:
 3. Pair with `toxtunnel_tox_iterate_lag_milliseconds_max`: a sustained
    spike there usually precedes a backpressure pulse.
 
-Operational hardening: set `tunnel.idle_timeout_seconds` to a positive
-value (e.g. `300`–`600`) so the reaper reclaims tunnels that genuinely
-got abandoned. The default of `0` keeps stale tunnels around forever
-— fine for low-traffic deployments, surprising under stress. Under
+Operational hardening — **check the tunnel state before choosing a knob**:
+
+- Tunnels stuck in **`Disconnecting`** are already covered by
+  `tunnel.half_close_timeout_seconds`, which is **on by default at 120 s** and
+  force-closes exactly this case. If they are still lingering, lower that value.
+  It is not true that the defaults leave stale tunnels around forever; that was
+  only so before the half-close cap existed.
+- Tunnels stuck in **`Connected`** but genuinely abandoned are what the opt-in
+  `tunnel.idle_timeout_seconds` (default `0`) is for. Enable it deliberately:
+  it reaps any non-`Connecting` tunnel purely on inactivity, so an idle-but-alive
+  SSH session or DB pool is killed just as readily as an abandoned one. Pick a
+  timeout longer than the longest legitimate silence in the workload.
+
+Both fire from the same `reaper_tick_seconds` timer and book
+`tunnels_closed_total{reason="timeout"}`, so the counter alone will not tell you
+which one acted — look at `toxtunnel inspect tunnels`. Under
 sustained *bidirectional* bulk transfer the close handshake can still
 be slow because TUNNEL_DATA frames continuously fill the same shared
 toxcore SENDQ that control frames need; bytes flow correctly but
@@ -406,11 +545,26 @@ will never arrive again. The two sides deadlock permanently.
   key into its Tox friend list at startup and after every reload, so `kill -HUP`
   (or `toxtunnel reload`) is enough. Confirm with `Pre-seeded friend <PK> from
   rules` in the server log; the client comes online within ~50 s.
-- On an affected older build, the only recovery is to destroy the client's
-  identity — `rm -rf <client data_dir>` — which mints a **new public key**, so the
-  `rules.yaml` entry has to be rewritten with the new PK. Order matters on those
-  builds: put the client's PK in `rules.yaml` and reload the server *before*
-  starting the client for the first time.
+- On an affected older build the escape is destructive, so **upgrade instead if
+  you possibly can** — the pre-seed fix removes the need entirely. If you cannot:
+  the client's Tox identity has to be replaced. **Quarantine, never delete**, and
+  only with the user's explicit agreement, having told them it mints a **new
+  public key**:
+
+  ```bash
+  # 1. Stop the client. 2. Move the whole data dir aside — do not rm -rf it.
+  mv <client data_dir> <client data_dir>.bak-$(date +%s)
+  # 3. Start the client once to mint the new identity, note the new PK.
+  # 4. Replace the OLD PK with the NEW one in the server's rules.yaml.
+  # 5. Reload the server BEFORE starting the client again.
+  ```
+
+  Order matters on those builds: the client's PK must be in `rules.yaml` and the
+  server reloaded *before* the client's first connection attempt, or you
+  reproduce the same deadlock. The backup directory also preserves
+  `known_servers.yaml` and any aliases, which you will want to copy back.
+  Note that discarding the identity invalidates **every** server's `rules.yaml`
+  entry for this client, not just the one you are fixing.
 
 Note the pre-seed is deliberately one-way: removing a key from `rules.yaml` does
 **not** delete the friend. The rules engine default-denies every `TUNNEL_OPEN`

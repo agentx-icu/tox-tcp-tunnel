@@ -34,7 +34,16 @@ default `auto`.
 host client  --127.0.0.1:<fwd>-->  toxtunnel client --Tox(lan)--> toxtunnel server --127.0.0.1:<target>--> service
 ```
 
-- One server, one client, distinct `data_dir`s (each daemon has its own Tox identity).
+- One server, one client, distinct `data_dir`s (each daemon has its own Tox
+  identity). Distinct is **required**, not merely tidy: since v0.4.11 a daemon
+  takes an exclusive lock on its data directory, so a shared one makes the second
+  process exit 1 with `data directory <dir> is already in use by toxtunnel pid <N>`.
+- The forwards below set `local_address: 127.0.0.1`, so on **v0.4.13+** they
+  bind loopback only. On v0.4.12 and older that key does not exist and these
+  ports bind **`0.0.0.0`** — on a laptop on a
+  shared network this test briefly exposes the local sshd, web server and
+  databases to the whole subnet. Run it on an isolated machine, or firewall
+  those ports first.
 - `client.server_id` = the **server's** 76-char Tox ID.
 - `rules.yaml` `friend:` = the **first 64 hex chars** of the **client's** 76-char Tox ID.
   Get IDs without starting the daemon: `toxtunnel print-id --data-dir <data_dir>`.
@@ -66,10 +75,10 @@ tox: { udp_enabled: true, bootstrap_mode: lan, bootstrap_nodes: [] }
 client:
   server_id: "<PASTE server's 76-char Tox ID>"
   forwards:
-    - { local_port: 13022, remote_host: 127.0.0.1, remote_port: 2222 }   # ssh
-    - { local_port: 13080, remote_host: 127.0.0.1, remote_port: 8080 }   # web
-    - { local_port: 13432, remote_host: 127.0.0.1, remote_port: 5432 }   # postgres
-    - { local_port: 13379, remote_host: 127.0.0.1, remote_port: 6379 }   # redis
+    - { local_port: 13022, local_address: 127.0.0.1, remote_host: 127.0.0.1, remote_port: 2222 }   # ssh
+    - { local_port: 13080, local_address: 127.0.0.1, remote_host: 127.0.0.1, remote_port: 8080 }   # web
+    - { local_port: 13432, local_address: 127.0.0.1, remote_host: 127.0.0.1, remote_port: 5432 }   # postgres
+    - { local_port: 13379, local_address: 127.0.0.1, remote_host: 127.0.0.1, remote_port: 6379 }   # redis
 inspect: { enabled: true }
 ```
 
@@ -90,9 +99,18 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory ./webroot &        # we
 docker run -d --name pg    -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=x postgres:16-alpine
 docker run -d --name redis -p 127.0.0.1:6379:6379 redis:7-alpine
 
-# Tunnel (capture each Tox ID, fill server_id + rules friend, then start both):
+# Tunnel (capture each Tox ID, fill server_id + rules friend, then start both).
+# print-id CREATES and persists the identity if the data dir is empty — that is
+# the supported way to learn a key before the daemon has ever run. Starting the
+# daemon with a placeholder server_id does NOT work: it exits 1 during ID
+# resolution, before Tox is initialised, leaving an empty data dir.
 toxtunnel print-id --data-dir /tmp/tt-server
 toxtunnel print-id --data-dir /tmp/tt-client
+
+# Validate both configs before starting (catches typo keys the daemon ignores):
+toxtunnel config check -c server.yaml --strict
+toxtunnel config check -c client.yaml --strict
+
 toxtunnel -m server -c server.yaml &
 toxtunnel -m client -c client.yaml &
 # Wait for "Server friend 0 is now online" in the client log (~10 s).

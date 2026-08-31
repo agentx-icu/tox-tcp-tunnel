@@ -3,13 +3,25 @@
 #
 # Usage: toxtunnel -m server -c server.yaml
 # After starting, note the Tox ID printed in the log — the client needs it.
+#
+# Validate before starting:  toxtunnel config check -c server.yaml --strict
+# NOTE: config check does NOT open or validate server.rules_file. A config
+# pointing at a missing or malformed rules file still reports "is valid" and
+# then fails at daemon startup. Run `bash scripts/diagnose.sh server.yaml`
+# to check the rules file too.
 
 mode: server
 
-# Directory for Tox identity (tox_save.dat) and bootstrap cache
-# macOS:  ~/Library/Application Support/toxtunnel/server
-# Linux:  ~/.config/toxtunnel/server
-# Windows: %APPDATA%\toxtunnel\server
+# Directory for MUTABLE daemon state: the Tox identity (tox_save.dat), the pid
+# file, the data-directory lock, the inspect socket, known_servers.yaml.
+# Use an ABSOLUTE path, and NOT a subdirectory of /etc — /etc is for config.
+#   Linux (system service): /var/lib/toxtunnel     <- what the packaged unit uses
+#   macOS (system daemon):  /usr/local/var/toxtunnel
+#   Linux/macOS (user):     ~/.config/toxtunnel/server
+#   Windows:                %APPDATA%\toxtunnel\server  (service: C:\ProgramData\ToxTunnel\data)
+# Run the daemon as a dedicated unprivileged account that owns this directory,
+# not as root. Since v0.4.11 the daemon takes an exclusive lock on it, so no two
+# daemons may share one data_dir.
 data_dir: {{DATA_DIR}}
 
 # Service / daemon policy when run under `--service` (systemd, launchd, SCM).
@@ -43,14 +55,29 @@ logging:
 #   coalesce_mode: fixed          # v0.4: fixed (default) | adaptive | bypass | drain
 #   keepalive_interval_seconds: 0 # v0.4: 0=off; >0 sends PING/PONG every Ns,
 #                                 # declares peer dead after 3× of no PONG.
-#   idle_timeout_seconds: 0       # 0 = disabled; SERVER deployments are
-#                                 # encouraged to set this (e.g. 600–1800) to
-#                                 # reap tunnels whose peer abandoned the TCP
-#                                 # connection without a clean close.
-#   reaper_tick_seconds: 10       # reaper wake-up interval
+#   half_close_timeout_seconds: 120
+#                                 # DEFAULT-ON. Force-closes a tunnel left in
+#                                 # Disconnecting (peer never sent its
+#                                 # reciprocal TUNNEL_CLOSE) after this long
+#                                 # idle. This is what handles half-closed
+#                                 # "zombie" tunnels — lower it if they linger.
+#                                 # 0 disables.
+#   idle_timeout_seconds: 0       # 0 = disabled (default). Opt-in, and DISTINCT
+#                                 # from the half-close cap above: it reaps ANY
+#                                 # non-Connecting tunnel purely on inactivity,
+#                                 # so it will also kill a legitimately quiet
+#                                 # SSH session or an idle DB pool. Enable it
+#                                 # only after confirming with
+#                                 # `toxtunnel inspect tunnels` that the stuck
+#                                 # tunnels are Connected, not Disconnecting.
+#   reaper_tick_seconds: 10       # shared wake-up interval for both policies
 #   resume:                       # v0.4: tunnel fast-reattach (opt-in)
 #     enabled: false              # opcodes wire-inactive when false
-#     max_age_seconds: 300        # drop saved entries older than this
+#     max_age_seconds: 300        # how long this server holds a disconnected
+#                                 # friend's IN-MEMORY tunnels (and their target
+#                                 # TCP connections) waiting for a reconnect.
+#                                 # Nothing is written to disk; resume cannot
+#                                 # survive a process restart on either side.
 #     on_gap: passthrough         # passthrough | close
 
 # v0.4 stability + performance blocks. Defaults preserve v0.3.0 semantics
@@ -80,6 +107,11 @@ tox:
 
 {{#RULES_FILE}}
 server:
+  # MUST be an absolute path. ToxTunnel expands `~` and nothing else, then hands
+  # the string straight to the rules loader, so a relative path resolves against
+  # the DAEMON's working directory — not this file's directory. Under systemd or
+  # launchd that is somewhere you did not choose, and startup dies with
+  # "Failed to load rules file: Rules file not found".
   rules_file: {{RULES_FILE}}
   # System-info disclosure to clients via INFO_REQUEST/INFO_REPLY.
   # Defaults are all false (server discloses nothing). Opt in per field if
@@ -93,9 +125,12 @@ server:
   #   toxtunnel_version: false
 {{/RULES_FILE}}
 {{^RULES_FILE}}
-# Access control rules (recommended for production use)
+# Access control rules (REQUIRED for any real deployment — with no rules_file
+# the server is default-deny and refuses every friend request).
+# Use an ABSOLUTE path: a relative one resolves against the daemon's working
+# directory, not this file's directory.
 # server:
-#   rules_file: rules.yaml
+#   rules_file: /etc/toxtunnel/rules.yaml
 #   disclose:
 #     hostname: false
 #     os: false

@@ -15,22 +15,47 @@
 # "192.168.*.*" will NOT match — use "192.168.*".
 # Ports: list specific ports, or use empty list [] to mean "all ports"
 #
+# ############################################################################
+# # THE PARSER FAILS OPEN. Three behaviours that all WIDEN access:           #
+# ############################################################################
+#  1. Unknown keys inside an allow/deny entry are SILENTLY IGNORED. The
+#     decoder reads `host` and `ports` by name and never enumerates keys.
+#  2. A MISSING `ports` key means ALL PORTS. Combine 1 and 2 and a `port: 22`
+#     typo (singular) parses as "allow every port on that host", with no
+#     warning anywhere.
+#  3. DUPLICATE `friend:` entries are not merged — lookup is a linear
+#     first-match, so a second block for the same key is dead config.
+#
+# And nothing validates this file until the daemon loads it:
+# `toxtunnel config check --strict` validates the main config ONLY and never
+# opens rules_file. Use `bash scripts/diagnose.sh <server.yaml>` instead — it
+# checks all three of the above.
+#
+# So, when filling this in:
+#   * use ONLY `host` and `ports` inside an allow/deny entry;
+#   * give every allow entry an EXPLICIT, NON-EMPTY `ports:` list, unless all
+#     ports were deliberately requested (then write `ports: []` and say so);
+#   * list each friend public key EXACTLY ONCE.
+#
 # Template variables:
-#   {{FRIEND_PK}}    — 64-char hex public key (required)
+#   {{FRIEND_PK}}    — 64-char hex public key (required; the FIRST 64 chars of
+#                      the peer's 76-char Tox ID, not the whole ID)
 #   {{FRIEND_LABEL}} — comment label for the friend (optional, human-readable)
 #   {{HOST}}         — target hostname or IP pattern
 #   {{PORTS}}        — YAML list: [22, 80, 443] for specific ports, or [] for all ports
 #
-# Place this file alongside server.yaml and reference it with:
+# Reference this file from server.yaml with an ABSOLUTE path. A relative
+# rules_file resolves against the daemon's working directory, not the config's
+# directory, so "put it next to server.yaml" is not sufficient:
 #   server:
-#     rules_file: rules.yaml
+#     rules_file: /etc/toxtunnel/rules.yaml
 #
 # v0.4: anti-DoS rate-limit defaults — the baseline for every friend.
-# Uncomment to enable. Start with `mode: report` to size the limits against
-# real traffic, then flip to `mode: enforce`.
+# Uncomment to enable. Start in `report` (as written below) to size the limits
+# against real traffic, then flip to `mode: enforce`.
 #
 # rate_limit_defaults:
-#   mode: enforce
+#   mode: report                  # measure first; change to `enforce` when tuned
 #   open_per_sec: 10
 #   open_burst: 50
 #   max_concurrent_tunnels: 100
@@ -69,6 +94,8 @@ rules:
     #   max_concurrent_tunnels: 200
     #   bytes_per_sec: 262144        # 256 KiB/s inbound for this friend only
     #   bytes_burst: 1048576
+    # Only `host` and `ports` are recognised here. `ports` is REQUIRED in
+    # practice: omit it and the entry silently means every port on that host.
     allow:
 {{#ALLOW}}
       - host: "{{HOST}}"

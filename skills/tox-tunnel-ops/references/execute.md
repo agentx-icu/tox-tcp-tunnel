@@ -15,14 +15,65 @@ which toxtunnel 2>/dev/null || where toxtunnel 2>nul
 
 If not found, prefer package installation over source builds.
 
-#### One-line install (recommended)
+#### Preferred: version-pinned native package
 
 The canonical, always-current install instructions are the "Installation"
-section of the repo's [`README.md`](https://github.com/agentx-icu/tox-tcp-tunnel#installation).
-The commands below mirror it; if the two ever disagree, the README wins. None of
-them pin a version — the installer and the `-latest` asset aliases resolve to the
-newest release (**v0.4.11** at the time of writing). Pin an older one with
-`TOXTUNNEL_VERSION=vX.Y.Z` if you must.
+section of the repo's [`README.md`](https://github.com/agentx-icu/tox-tcp-tunnel#installation);
+if this file and the README ever disagree, the README wins. The newest release
+at the time of writing is **v0.4.12** — check the Releases page for the current
+one rather than trusting this number.
+
+**When you are installing on an operator's machine, do not pipe a script from a
+mutable branch into `sudo sh`.** You have already detected OS and architecture,
+so you can do the installer's actual job — pick the right asset, hand it to the
+package manager — from a version-pinned URL. This avoids piping a mutable remote
+script into a root shell. It is **not** "no remote code as root": installing a
+DEB/RPM/PKG/MSI still runs that package's maintainer scripts with privileges.
+What changes is that the code executed is the released package, pinned to a
+version you chose, rather than whatever `master` holds at that moment:
+
+```bash
+VER=0.4.12; ARCH=x86_64          # or aarch64
+BASE="https://github.com/agentx-icu/tox-tcp-tunnel/releases/download/v${VER}"
+
+# Linux (DEB - Ubuntu/Debian)
+curl -fsSL -o "/tmp/toxtunnel-${VER}.deb" "${BASE}/toxtunnel-${VER}-Linux-${ARCH}.deb"
+sudo apt-get install -y "/tmp/toxtunnel-${VER}.deb"
+
+# Linux (RPM - Fedora/RHEL/CentOS)
+curl -fsSL -o "/tmp/toxtunnel-${VER}.rpm" "${BASE}/toxtunnel-${VER}-Linux-${ARCH}.rpm"
+sudo rpm -i "/tmp/toxtunnel-${VER}.rpm"
+
+# macOS (ARCH=arm64 or x86_64)
+curl -fsSL -o "/tmp/toxtunnel-${VER}.pkg" "${BASE}/toxtunnel-${VER}-Darwin-${ARCH}.pkg"
+sudo installer -pkg "/tmp/toxtunnel-${VER}.pkg" -target /
+```
+
+```powershell
+# Windows (Administrator PowerShell); ARM: toxtunnel-$VER-Windows-ARM64.msi
+$VER='0.4.12'
+irm "https://github.com/agentx-icu/tox-tcp-tunnel/releases/download/v$VER/toxtunnel-$VER-Windows-AMD64.msi" -OutFile "$env:TEMP\toxtunnel.msi"
+msiexec /i "$env:TEMP\toxtunnel.msi" /qn
+```
+
+**Integrity, stated accurately.** No `.sha256` or signature assets are
+published — the release carries the packages and their `-latest` aliases. But
+GitHub exposes a SHA-256 digest for every release asset regardless, so there IS
+something to verify against: compare the downloaded file's digest with the one
+GitHub reports for that asset. What is missing is independent
+signature/provenance — the digest and the file come from the same party, so it
+detects corruption and truncation, not a compromised release. Note also that a
+release URL is only immutable if the repository enabled immutable releases;
+otherwise the tag is a convention, not a guarantee. Say exactly this if the
+operator asks about integrity, rather than implying either more or less
+assurance than exists.
+
+Each release also publishes stable `-latest` aliases
+(`toxtunnel-<System>-<arch>-latest.<ext>`). They are convenient but unpinned, and
+what they resolve to changes under you — prefer the versioned asset when the
+install needs to be reproducible.
+
+#### The one-line installer (only when the user asks for it)
 
 The repo ships installer scripts that auto-detect arch, download the matching
 native package from GitHub Releases, install it, and seed `config.yaml`
@@ -30,16 +81,24 @@ based on `--mode`. Client mode writes a config scaffold and leaves the system
 service idled (exit 0) until the user fills in `client.server_id` and sets
 `service.allow_client_daemon: true`.
 
+If the user explicitly wants this path, **pin it to a release tag, download it,
+let them read it, and only then run it.** `master` is mutable: the `| sudo sh`
+form executes whatever landed on that branch today, as root, unreviewed.
+
 ```bash
-# macOS / Linux (DEB / RPM / .pkg auto-detected)
-curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh                       # server
-curl -fsSL https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.sh | sudo sh -s -- --mode client   # client scaffold
+# Download a pinned copy (tag URLs resolve; verified for v0.4.12)
+curl -fsSL -o /tmp/toxtunnel-install.sh \
+  https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.4.12/scripts/install.sh
+less /tmp/toxtunnel-install.sh            # <- show the operator what will run as root
+sudo sh /tmp/toxtunnel-install.sh                        # server
+sudo sh /tmp/toxtunnel-install.sh --mode client          # client scaffold
 ```
 
 ```powershell
 # Windows (Administrator PowerShell)
-irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex                                       # server
-$env:TOXTUNNEL_MODE='client'; irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/master/scripts/install.ps1 | iex         # client scaffold
+irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.4.12/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
+Get-Content "$env:TEMP\install.ps1" | more     # review first
+$env:TOXTUNNEL_MODE='client'; & "$env:TEMP\install.ps1"
 ```
 
 Env vars / flags: `TOXTUNNEL_MODE`, `TOXTUNNEL_VERSION`, `TOXTUNNEL_REPO`. The
@@ -47,42 +106,21 @@ installer is idempotent on the same mode and refuses to overwrite a
 user-customized config (only rewrites the freshly seeded server template
 when switching to client).
 
-#### Manual install per platform
+Do not run the `curl … | sudo sh` or `irm … | iex` form on the user's behalf.
 
-Each release also publishes both versioned assets
-(`toxtunnel-<VERSION>-<System>-<arch>.<ext>`) and a stable `-latest` alias
-(`toxtunnel-<System>-<arch>-latest.<ext>`). Use the alias URLs below for the
-newest release.
+#### Unpinned `-latest` aliases (convenience only)
 
-#### Linux (DEB - Ubuntu/Debian)
+If reproducibility does not matter, the `-latest` aliases save looking up a
+version number:
 
 ```bash
-ARCH=x86_64      # or aarch64
-wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.deb"
-sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
+ARCH=x86_64      # or aarch64 (Darwin: arm64 / x86_64)
+BASE=https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download
+wget "$BASE/toxtunnel-Linux-${ARCH}-latest.deb"  && sudo dpkg -i "toxtunnel-Linux-${ARCH}-latest.deb"
+wget "$BASE/toxtunnel-Linux-${ARCH}-latest.rpm"  && sudo rpm -i  "toxtunnel-Linux-${ARCH}-latest.rpm"
+wget "$BASE/toxtunnel-Darwin-${ARCH}-latest.pkg" && sudo installer -pkg "toxtunnel-Darwin-${ARCH}-latest.pkg" -target /
+# Windows: $BASE/toxtunnel-Windows-AMD64-latest.msi (ARM64 variant available), run as Administrator
 ```
-
-#### Linux (RPM - Fedora/RHEL/CentOS)
-
-```bash
-ARCH=x86_64      # or aarch64
-wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Linux-${ARCH}-latest.rpm"
-sudo rpm -i "toxtunnel-Linux-${ARCH}-latest.rpm"
-```
-
-#### macOS
-
-```bash
-ARCH=arm64       # or x86_64
-wget "https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Darwin-${ARCH}-latest.pkg"
-sudo installer -pkg "toxtunnel-Darwin-${ARCH}-latest.pkg" -target /
-```
-
-#### Windows
-
-Download the MSI from
-`https://github.com/agentx-icu/tox-tcp-tunnel/releases/latest/download/toxtunnel-Windows-AMD64-latest.msi`
-(use `toxtunnel-Windows-ARM64-latest.msi` for ARM) and run it as Administrator.
 
 #### Build from source (only if no package fits)
 
@@ -112,7 +150,7 @@ netstat -an | findstr :PORT   # Windows
 - macOS (manual/source build): `data_dir: ~/Library/Application Support/toxtunnel/` or `~/.config/toxtunnel/`, service: launchd user agent
 - Linux (from DEB/RPM): `binary: /usr/bin/toxtunnel`, `config: /etc/toxtunnel/config.yaml`, `data_dir: /var/lib/toxtunnel`, service: `toxtunnel.service` (Type=notify, `RemainAfterExit=yes`, enabled and started by postinst).
 - Linux (manual): `data_dir: ~/.config/toxtunnel/`, service: custom systemd unit
-- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **The MSI does NOT auto-register the SCM service** — the WiX patch is shelved (`cmake/Packaging.cmake` has the rationale). The user creates `C:\ProgramData\ToxTunnel\config.yaml`, then runs `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'` from an Administrator PowerShell, then `sc start ToxTunnel`. The bundled `scripts/install.ps1` one-liner does all of this automatically.
+- Windows (from MSI): `binary: C:\Program Files\ToxTunnel\bin\toxtunnel.exe`. **The MSI does NOT auto-register the SCM service** — the WiX patch is shelved (`cmake/Packaging.cmake` has the rationale). The user creates `C:\ProgramData\ToxTunnel\config.yaml`, then runs `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service -c 'C:\ProgramData\ToxTunnel\config.yaml'` from an Administrator PowerShell, then `sc start ToxTunnel`. The repo's own `scripts/install.ps1` (in the tox-tcp-tunnel repository, not this skill's `scripts/`) does all of this automatically — download and review it first.
 - Windows (manual): `data_dir: %APPDATA%\toxtunnel\`, service: NSSM or Task Scheduler
 
 ## Step 1: Write Config Files
@@ -124,7 +162,28 @@ Generate and write:
 - `rules.yaml` when access control is needed
 
 Use the templates under `templates/` and enforce the minimum-privilege rules from
-the main skill.
+the main skill. Three things to get right at write time:
+
+1. **`server.rules_file` must be absolute.** A relative path resolves against the
+   daemon's working directory, not the config's directory, so a service unit
+   fails to start with `Rules file not found`.
+2. **`data_dir` must be absolute, writable by the service account, and not under
+   `/etc`** — it holds mutable state (identity, pid, lock, inspect socket). Use
+   `/var/lib/toxtunnel` on Linux.
+3. **A forward binds `0.0.0.0` unless `local_address` says otherwise.** On
+   **v0.4.13+** set `local_address: 127.0.0.1` unless it must serve other
+   machines; on v0.4.12 and older there is no such key, so emit the exposure
+   warning with the config and give the
+   operator either a host firewall rule for that port or a loopback-only SOCKS5
+   listener instead.
+
+Then validate before starting anything:
+
+```bash
+toxtunnel config check -c server.yaml --strict
+toxtunnel config check -c client.yaml --strict
+bash scripts/diagnose.sh server.yaml    # covers rules.yaml, which config check never opens
+```
 
 ## Step 2: Startup Commands
 
@@ -195,7 +254,8 @@ sc query ToxTunnel
 sc stop ToxTunnel
 ```
 
-> The one-line installer `scripts/install.ps1` automates all of the above. Use
+> The repo's one-line installer (`scripts/install.ps1` in the tox-tcp-tunnel
+> repository, not this skill's `scripts/`) automates all of the above. Use
 > it unless the user explicitly needs the manual flow. Remove the service with
 > `& 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' uninstall-windows-service`.
 >
@@ -210,6 +270,9 @@ sc stop ToxTunnel
 
 #### Linux systemd
 
+Model it on the packaged unit (`packaging/linux/toxtunnel.service`), which runs
+as a dedicated account with systemd-managed state — never as root:
+
 ```ini
 [Unit]
 Description=ToxTunnel %i
@@ -219,14 +282,32 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/toxtunnel -m %i -c /etc/toxtunnel/%i.yaml --service
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
+RemainAfterExit=yes
+# Never run this as root. StateDirectory creates and chowns
+# /var/lib/toxtunnel to the service account; point data_dir there.
 User=toxtunnel
+Group=toxtunnel
+StateDirectory=toxtunnel
+StateDirectoryMode=0750
 WorkingDirectory=/etc/toxtunnel
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+`WorkingDirectory` is set here only as a belt-and-braces measure — do **not**
+rely on it to resolve a relative `server.rules_file`. Write that path absolute
+(`/etc/toxtunnel/rules.yaml`); the daemon does no config-relative resolution and
+any change to the unit's working directory would break startup.
+
+The packaged unit carries no sandboxing directives. If you are writing a unit
+from scratch for an exposed host, consider adding `NoNewPrivileges=yes`,
+`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
+`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX` and
+`CapabilityBoundingSet=` — but test them, they are not what ships.
 
 Install with:
 `sudo cp toxtunnel@.service /etc/systemd/system/ && sudo systemctl enable --now toxtunnel@server`
@@ -252,8 +333,15 @@ Install with:
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- Match the packaged plist: restart on failure, but NOT after a clean
+         exit. An unconditional <true/> here respawn-loops a daemon that has
+         gated itself off on purpose (client mode without allow_client_daemon,
+         or a missing config under --service), because those exit 0. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>/usr/local/var/log/toxtunnel-MODE.log</string>
     <key>StandardErrorPath</key>
@@ -405,9 +493,27 @@ CONNECT returns `403 Forbidden`. Everything else the open can fail with maps
 elsewhere — SOCKS5 `0x04` (host unreachable), `0x05` (connection refused),
 `0x01` (general failure), and `502 Bad Gateway` for all three over HTTP CONNECT
 — so the code tells you whether the **server** refused the request or simply
-could not reach the target. (Servers before v0.4.12 reported rate-limit and
-tunnel-cap denials as `0x04`, indistinguishable from an unreachable host.) SOCKS5 and `client.pipe` cannot be enabled at
-the same time (validator error).
+could not reach the target. SOCKS5 and `client.pipe` cannot be enabled at the
+same time (validator error).
+
+**Reading a rate-limit / tunnel-cap denial depends on BOTH versions.** Before
+v0.4.12 the server sent `TUNNEL_ERROR` code 3 for those denials; from v0.4.12 it
+sends code 1. Independently, a v0.4.12+ client carries a compatibility shim that
+re-classifies code 3 as a denial when the description is exactly
+`"Rate limit exceeded"` or `"Tunnel limit exceeded"`. So:
+
+| Server | Client | Rate-limit / cap denial surfaces as |
+|--------|--------|-------------------------------------|
+| ≥ v0.4.12 | ≥ v0.4.12 | `0x02` / `403` — correct |
+| ≥ v0.4.12 | ≤ v0.4.11 | `0x02` / `403` — correct (the server already sends code 1) |
+| ≤ v0.4.11 | ≥ v0.4.12 | `0x02` / `403` — correct, via the client-side shim |
+| ≤ v0.4.11 | ≤ v0.4.11 | **`0x04` / `502`** — looks like an unreachable host |
+
+Only the last row is misleading, and it needs *both* ends to be old. The shim
+matches those two strings exactly, so a server that reworded them would fall
+back to `0x04` as well. When you are on that last row, check
+`toxtunnel_rate_limit_open_rejected_total` on the server before blaming the
+target.
 
 ### Multi-server failover (production HA)
 
@@ -423,7 +529,7 @@ client:
     timeout_seconds: 60               # primary offline this long -> promote next online candidate
     prefer_primary_grace_seconds: 30  # primary must be online this long before we switch back
   forwards:
-    - { local_port: 2222, remote_host: 127.0.0.1, remote_port: 22 }
+    - { local_port: 2222, local_address: 127.0.0.1, remote_host: 127.0.0.1, remote_port: 22 }
 ```
 
 CLI flag form (one primary + repeated fallback):
@@ -509,19 +615,30 @@ If the new config has a parse error or validation failure, the daemon
 `reload failed: <reason>` / `reload rejected: <reason>` — no downtime, no
 partial state.
 
-### Idle tunnel reaper
-
-Set a non-zero `tunnel.idle_timeout_seconds` to close tunnels that have
-seen no data in that many seconds. Default `0` disables it.
+### Tunnel reapers — two distinct policies
 
 ```yaml
 tunnel:
-  idle_timeout_seconds: 900   # 15 minutes
-  reaper_tick_seconds: 10     # how often the reaper wakes up
+  half_close_timeout_seconds: 120   # DEFAULT-ON. Disconnecting tunnels only.
+  idle_timeout_seconds: 0           # opt-in. ANY non-Connecting tunnel.
+  reaper_tick_seconds: 10           # shared wake-up interval
 ```
 
-Closed-by-reaper events show up as `toxtunnel_tunnels_closed_total{reason="timeout"}`
-in the metrics endpoint.
+- **`half_close_timeout_seconds` (default 120, on)** reaps only tunnels in state
+  `Disconnecting` — a one-sided TCP close whose peer never sent the reciprocal
+  `TUNNEL_CLOSE`, which would otherwise pin a half-open fd forever. This is the
+  policy that already handles "zombie" tunnels. If half-closed tunnels linger,
+  **lower this**; do not enable the idle reaper for them.
+- **`idle_timeout_seconds` (default 0, off)** reaps *any* tunnel that is not in
+  `Connecting`, purely on time since the last `TUNNEL_DATA` in either direction.
+  That includes healthy `Connected` tunnels, so it will kill a quiet SSH session
+  or an idle connection pool. Enable it only after confirming with
+  `toxtunnel inspect tunnels` that the accumulating tunnels really are
+  `Connected` and genuinely abandoned, and pick a timeout longer than the
+  longest legitimate silence in your workload.
+
+Both book `toxtunnel_tunnels_closed_total{reason="timeout"}`, so that counter
+does not tell you which one fired — check the tunnel states instead.
 
 ## Step 4.5: Known-Servers Registry (client side)
 
@@ -544,7 +661,7 @@ fields under `server.disclose:` in `server.yaml`:
 
 ```yaml
 server:
-  rules_file: rules.yaml
+  rules_file: /etc/toxtunnel/rules.yaml   # absolute — see Step 1
   disclose:
     hostname: true
     os: true
@@ -557,8 +674,26 @@ sends an `INFO_REQUEST` (frame 0x06) on first reaching online state.
 ## Step 5: Post-Deploy Verification
 
 ```bash
-bash scripts/verify.sh <local_port> <service_type>
+bash scripts/verify.sh <local_port> <service_type> <client.yaml>
 ```
+
+`service_type` is one of `ssh | http | postgres | mysql | redis | mongo | rdp |
+tcp`; an unrecognised value is rejected rather than silently treated as generic
+TCP. Passing the client config lets the script read `friends_online` from the
+running daemon instead of inferring liveness from a local TCP accept.
+
+**Judge it by the exit code, not the text:**
+
+| Exit | Meaning | What to report |
+|------|---------|----------------|
+| `0` | The remote service replied through the tunnel | Working |
+| `2` | Local checks passed, end-to-end **NOT** proven (no probe tool installed, or `tcp` has no protocol probe) | **Not** working-confirmed. Say what is still unverified |
+| `1` | A check failed | Broken; the output names the layer |
+
+A successful TCP connect to `127.0.0.1:<port>` is **not** evidence the tunnel
+works: the client binds and accepts the local port before any `TUNNEL_OPEN` is
+attempted, so the port answers even with the Tox link down and the rules denying
+everything. Only a reply from the real remote service proves the path.
 
 ## Output Format
 
@@ -599,8 +734,35 @@ is on.
 ```yaml
 watchdog:
   enabled: true                # default
-  deadline_seconds: 30         # min 5; raise on flaky-network deployments
+  deadline_seconds: 30         # min 5 (validator-enforced)
   systemd_notify: true         # ignored outside Linux
+```
+
+The watchdog measures **one thing**: how long since the Tox thread last returned
+from `tox_iterate()`. It knows nothing about network reachability, so "the
+network is flaky" is not a reason to raise `deadline_seconds` — a peer being
+unreachable does not stall `tox_iterate`. Raise it only when the *host* is slow
+enough that a legitimate iterate can exceed the deadline: heavy CPU oversubscription,
+a frozen or swapping VM, a stalled disk. Otherwise leave it at 30.
+
+Monitoring it — mind the two similarly named metrics:
+
+- **`toxtunnel_tox_iterate_lag_ms`** — gauge, milliseconds since the last
+  successful `tox_iterate()` return. **This is the wedge signal.** Alert when it
+  approaches `deadline_seconds` (e.g. `> 5000`).
+- **`toxtunnel_tox_iterate_lag_milliseconds_max`** (plus `_count` / `_sum`) —
+  the maximum *completed* call duration since process start. It latches on one
+  historical slow call and can never move while a call is actually hung, so it
+  is a trend indicator, not an alarm.
+- **`toxtunnel_watchdog_aborts_total`** — **resets to 0 at every process start.**
+  It is not seeded from `<data_dir>/abort_count`; that file is the durable
+  count, written only at abort time. Alert on `increase(...)` over a window, and
+  read the file for history.
+
+The fatal line is logged at **critical** level and reads:
+
+```text
+tox_thread wedge detected: lag_ms=<N> deadline_ms=<N> heartbeat_count=<N>
 ```
 
 ### Adaptive coalescing (opt-in)
@@ -715,7 +877,21 @@ tunnel:
   resume:
     enabled: false             # opt-in; default off. Live in v0.4.x: opcodes
                                 # 0x08 / 0x09 are wire-active only when enabled.
-    max_age_seconds: 300
+    max_age_seconds: 300        # in-memory hold window (see below)
     on_gap: passthrough
 ```
+
+**What `max_age_seconds` actually governs:** when a friend disconnects, the
+server keeps that friend's `TunnelManager` — its tunnels *and* their live target
+TCP connections — parked in memory behind a timer of this length, logged as
+`Holding tunnel manager for friend N for resume (up to Ns)`. If the friend
+reconnects inside the window, `TUNNEL_RESUME_REQUEST` reattaches to those live
+objects. If the timer expires first, the manager is dropped and every held
+tunnel closed. It is **not** a pruning window over persisted entries.
+
+**Nothing about resume is written to disk.** There is no on-disk resume state,
+which is exactly why the feature cannot survive a process restart on either side
+— a restart destroys the held sockets along with the process. Live-reconnect
+only. If a user wants an SSH session to survive a server restart, no ToxTunnel
+setting delivers that; point them at `tmux`/`screen` or `mosh` instead.
 
