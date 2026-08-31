@@ -72,9 +72,9 @@ client:
       remote_port: 22
 ```
 
-> ### ⚠️ `local_port: 2222` binds `0.0.0.0` without `local_address` on the contractor's machine
+> ### ⚠️ `local_port: 2222` binds `0.0.0.0` without `local_address` (pre-v0.5.0) on the contractor's machine
 >
-> Without `local_address` the listener binds every IPv4
+> Before v0.5.0, without `local_address` the listener binds every IPv4
 > interface. Anyone on the contractor's network can reach your sshd through their
 > machine. On **v0.4.13+** set `local_address: 127.0.0.1` (the config above does); on v0.4.12 and older no such key exists — firewall it instead. Make firewalling the port to loopback
 > part of the onboarding instructions.

@@ -5,10 +5,11 @@
 # After starting, note the Tox ID printed in the log — the client needs it.
 #
 # Validate before starting:  toxtunnel config check -c server.yaml --strict
-# NOTE: config check does NOT open or validate server.rules_file. A config
-# pointing at a missing or malformed rules file still reports "is valid" and
-# then fails at daemon startup. Run `bash scripts/diagnose.sh server.yaml`
-# to check the rules file too.
+# NOTE: on v0.4.13 and older, config check does NOT open or validate
+# server.rules_file — a config pointing at a missing or malformed rules file
+# still reports "is valid" and then fails at daemon startup. v0.5.0+ loads and
+# parses the rules file. Run `bash scripts/diagnose.sh server.yaml` either way
+# — it also checks rule semantics that no version of config check covers.
 
 mode: server
 

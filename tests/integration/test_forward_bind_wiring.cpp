@@ -160,6 +160,50 @@ TEST_F(ForwardBindWiringTest, ReloadBindsTheConfiguredAddressOnAnAddedForward) {
         << "the warning must name the address: " << reloaded.value().warnings;
 }
 
+// ---------------------------------------------------------------------------
+// Rebind rollback (issue #26)
+// ---------------------------------------------------------------------------
+//
+// A changed `local_address` arrives as a remove/add pair, and the remove runs
+// first — so before the rollback existed, a typo'd new address left the
+// forward with NO listener at all: old one stopped, new one never bound.
+
+TEST_F(ForwardBindWiringTest, RebindToUnbindableAddressRestoresThePreviousListener) {
+    client_ = std::make_unique<app::TunnelClient>();
+    const auto port = borrow_free_port();
+    const ForwardRule original{port, "127.0.0.1", 22, std::string("127.0.0.1")};
+    ASSERT_TRUE(client_->initialize(config_with({original})).has_value());
+
+    // Same local port, same target, new (unbindable) bind address: a rebind.
+    const ForwardRule rebind{port, "127.0.0.1", 22, std::string(kUnassignedAddress)};
+    auto reloaded = client_->reload(config_with({rebind}));
+
+    ASSERT_TRUE(reloaded.has_value()) << reloaded.error();
+    EXPECT_NE(reloaded.value().warnings.find(kUnassignedAddress), std::string::npos)
+        << "the failed new bind must be reported: " << reloaded.value().warnings;
+    EXPECT_NE(reloaded.value().warnings.find("restored"), std::string::npos)
+        << "the operator must be told the previous listener was restored: "
+        << reloaded.value().warnings;
+
+    // The proof that the port is actually serving again: the old endpoint must
+    // be occupied, so our own attempt to take it must fail. Without the
+    // rollback this bind SUCCEEDS, because the remove/add pair left it free.
+    asio::io_context probe_io;
+    asio::ip::tcp::acceptor probe(probe_io);
+    probe.open(asio::ip::tcp::v4());
+    std::error_code ec;
+    probe.bind(asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), port), ec);
+    EXPECT_TRUE(ec) << "127.0.0.1:" << port
+                    << " was free after the failed rebind — the previous listener was not "
+                       "restored";
+
+    // And the restored rule is recorded as the live one: reloading back to the
+    // original config is a no-op, not another remove/add cycle.
+    auto second = client_->reload(config_with({original}));
+    ASSERT_TRUE(second.has_value()) << second.error();
+    EXPECT_TRUE(second.value().warnings.empty()) << second.value().warnings;
+}
+
 TEST_F(ForwardBindWiringTest, ReloadAddsAForwardOnAnAvailableAddressWithoutWarnings) {
     // Control for the reload path.
     client_ = std::make_unique<app::TunnelClient>();

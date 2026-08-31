@@ -509,38 +509,94 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
                 }
             }
 
-            for (const auto& added : diff.added) {
+            // Bind a rule and, on success, register its listener + rule in the
+            // live vectors. Returns the bind error message on failure. Shared
+            // by the add loop and the rebind rollback below.
+            auto bind_and_register = [this](const ForwardRule& rule) -> std::optional<std::string> {
                 auto listener = std::make_shared<core::TcpListener>(
-                    io_ctx_->get_io_context(), added.effective_local_address(), added.local_port);
+                    io_ctx_->get_io_context(), rule.effective_local_address(), rule.local_port);
                 if (!listener->is_bound()) {
-                    // Reload is best-effort per forward: a busy port must not
-                    // take down a daemon that is happily serving the others.
-                    // The rule is NOT recorded, so a later reload retries it.
-                    if (!bind_failures->empty()) {
-                        *bind_failures += "; ";
+                    return listener->bind_error().message();
+                }
+                const auto captured = rule;
+                listener->start_accept(
+                    [this, captured](std::shared_ptr<core::TcpConnection> conn) {
+                        on_tcp_connection_accepted(std::move(conn), captured);
+                    });
+                listeners_.push_back(std::move(listener));
+                forward_rules_.push_back(rule);
+                return std::nullopt;
+            };
+
+            // Rollback pairing is one-to-one: each failed add restores at most
+            // ONE removed counterpart, and each removed rule gets at most one
+            // restore ATTEMPT (marked before binding, so a failed attempt is
+            // not retried by a later failed add and warned about twice).
+            std::vector<bool> restore_attempted(diff.removed.size(), false);
+
+            for (const auto& added : diff.added) {
+                const auto bind_err = bind_and_register(added);
+                if (!bind_err.has_value()) {
+                    if (auto advisory = forward_bind_advisory(added)) {
+                        // Same rule on the reload path: a forward added by
+                        // reload is just as exposed as one added at startup,
+                        // and this is the only moment its operator is told.
+                        util::Logger::warn("Reload: {}", *advisory);
                     }
-                    *bind_failures +=
-                        added.local_endpoint_label() + ": " + listener->bind_error().message();
-                    ++*failed_count;
-                    util::Logger::error("Reload: not forwarding {} -> {}:{} ({})",
-                                        added.local_endpoint_label(), added.remote_host,
-                                        added.remote_port, listener->bind_error().message());
+                    util::Logger::info("Started listener on {} -> {}:{}",
+                                       added.local_endpoint_label(), added.remote_host,
+                                       added.remote_port);
                     continue;
                 }
-                if (auto advisory = forward_bind_advisory(added)) {
-                    // Same rule on the reload path: a forward added by reload
-                    // is just as exposed as one added at startup, and this is
-                    // the only moment its operator is told.
-                    util::Logger::warn("Reload: {}", *advisory);
+
+                // Reload is best-effort per forward: a busy port must not
+                // take down a daemon that is happily serving the others.
+                // The rule is NOT recorded, so a later reload retries it.
+                ++*failed_count;
+                util::Logger::error("Reload: not forwarding {} -> {}:{} ({})",
+                                    added.local_endpoint_label(), added.remote_host,
+                                    added.remote_port, *bind_err);
+                std::string note = added.local_endpoint_label() + ": " + *bind_err;
+
+                // A changed `local_address` arrives as a remove/add pair, and
+                // the remove loop above has already torn down the old
+                // listener — so without a rollback, a typo in the new address
+                // silently takes the forward out of service (issue #26).
+                // Restore the previous listener for the first unhandled
+                // removed rule that is this add's rebind counterpart: same
+                // local port, same target.
+                for (std::size_t i = 0; i < diff.removed.size(); ++i) {
+                    const auto& old_rule = diff.removed[i];
+                    if (restore_attempted[i] || old_rule.local_port != added.local_port ||
+                        old_rule.remote_host != added.remote_host ||
+                        old_rule.remote_port != added.remote_port) {
+                        continue;
+                    }
+                    restore_attempted[i] = true;
+                    const auto restore_err = bind_and_register(old_rule);
+                    if (!restore_err.has_value()) {
+                        util::Logger::warn(
+                            "Reload: restored previous listener on {} -> {}:{} (the new bind "
+                            "failed; fix local_address and reload again)",
+                            old_rule.local_endpoint_label(), old_rule.remote_host,
+                            old_rule.remote_port);
+                        note += "; previous listener on " + old_rule.local_endpoint_label() +
+                                " restored";
+                    } else {
+                        util::Logger::error(
+                            "Reload: previous listener on {} was stopped and could not be "
+                            "restored ({}) — port {} is NOT serving",
+                            old_rule.local_endpoint_label(), *restore_err, old_rule.local_port);
+                        note += "; previous listener on " + old_rule.local_endpoint_label() +
+                                " was stopped and could not be restored (" + *restore_err + ")";
+                    }
+                    break;
                 }
-                const auto rule = added;
-                listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
-                    on_tcp_connection_accepted(std::move(conn), rule);
-                });
-                listeners_.push_back(std::move(listener));
-                forward_rules_.push_back(added);
-                util::Logger::info("Started listener on {} -> {}:{}", added.local_endpoint_label(),
-                                   added.remote_host, added.remote_port);
+
+                if (!bind_failures->empty()) {
+                    *bind_failures += "; ";
+                }
+                *bind_failures += note;
             }
         }
 
@@ -548,7 +604,7 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
         //
         // This deliberately runs OUTSIDE the `!diff.empty()` guard above.
         // `operator==` compares the *effective* bind address, so adding or
-        // removing an explicit `0.0.0.0` yields an EMPTY diff — which is the
+        // removing an explicit `127.0.0.1` yields an EMPTY diff — which is the
         // behaviour we want for the listener, since rebinding an unchanged
         // socket would drop live connections for nothing, but it also means the
         // block above never runs for exactly this case.
@@ -857,9 +913,9 @@ util::Expected<void, std::string> TunnelClient::create_listeners(
         } else if (auto advisory = forward_bind_advisory(rule)) {
             // COLLECTED, not emitted yet. Startup is all-or-nothing: if a later
             // forward fails to bind, every listener is torn down and the daemon
-            // exits, so a warning already printed would claim a forward "is
-            // listening on all interfaces" when in fact nothing is listening at
-            // all. Held until every bind has succeeded.
+            // exits, so a notice already printed would claim a forward is
+            // listening when in fact nothing is listening at all. Held until
+            // every bind has succeeded.
             advisories.push_back(std::move(*advisory));
         }
         listeners_.push_back(std::move(listener));

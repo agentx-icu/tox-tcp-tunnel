@@ -185,10 +185,11 @@ client:
   # fallback_server_ids:
   #   - hetzner-fallback
   #   - <full-76-char-tox-id>
-  # Without local_address a forward binds 0.0.0.0 (all IPv4). See below.
+  # Without local_address a forward binds 127.0.0.1 on v0.5.0+, but 0.0.0.0
+  # (all IPv4) on every version before it. Always set it. See below.
   forwards:
     - local_port: 2222
-      local_address: 127.0.0.1     # v0.4.13+; drop only to serve other machines
+      local_address: 127.0.0.1     # v0.4.13+; use 0.0.0.0 to serve other machines
       remote_host: 127.0.0.1
       remote_port: 22
 
@@ -210,13 +211,20 @@ client:
   #   remote_port: 22
 ```
 
-> ### ⚠️ A forward binds `0.0.0.0` unless you set `local_address`
+> ### ⚠️ What a forward binds without `local_address` depends on the version
 >
-> **From v0.4.13** a forward takes an optional `local_address`. Set it to
-> `127.0.0.1` unless the forward is genuinely meant to serve other machines.
-> The daemon warns at startup when the key is absent and the bind is not
-> loopback; writing `local_address: 0.0.0.0` explicitly is a supported,
-> silent choice.
+> **From v0.5.0** an absent `local_address` binds `127.0.0.1` — other
+> machines cannot reach the forward unless the config says
+> `local_address: 0.0.0.0` explicitly. **On v0.4.13 and v0.4.x before the
+> flip, absent means `0.0.0.0`** (all interfaces), with a startup warning
+> from v0.4.13. This is THE upgrade trap for v0.5.0: a deployment relying on
+> LAN reach with no key keeps starting cleanly and stops being reachable.
+> The fix (`local_address: 0.0.0.0`) is accepted and silent on v0.4.13+, so
+> apply it before upgrading.
+>
+> Whatever the version, set the key explicitly: `127.0.0.1` unless the
+> forward is genuinely meant to serve other machines. Writing any address —
+> the wildcard included — is a supported, silent choice.
 >
 > **On v0.4.12 and older there is no such key**, and the paragraph below is the
 > whole story — check the daemon version before advising, because a config
@@ -263,7 +271,7 @@ client:
 | `tunnel.coalesce_*` | **default-on** | Tiny latency cost (≤200 µs) in exchange for fewer Tox frames; safe to leave alone. **Windows:** a delay below the ~15.6 ms system timer tick — which includes the 200 µs default — is treated as `0`, so writes go out immediately and nothing is batched (the daemon warns once). Set ≥ `15600` if you actually want batching there |
 | `tunnel.idle_timeout_seconds` | **opt-in** (default `0` = disabled) | Set non-zero to reap silently abandoned tunnels |
 | `client.socks5.enabled` | **opt-in** (default `false`) | `listen` MUST be loopback (`127.0.0.1`, `::1`, `localhost`); validator rejects others |
-| `client.forwards[].local_address` | **v0.4.13+; absent means `0.0.0.0`** | Set `127.0.0.1` unless the forward must serve other machines. On v0.4.12 and older the key does not exist and the bind is always `0.0.0.0` — firewall it or use SOCKS5 |
+| `client.forwards[].local_address` | **v0.4.13+; absent means `127.0.0.1` on v0.5.0+, `0.0.0.0` on v0.4.13** | Set it explicitly either way: `127.0.0.1` unless the forward must serve other machines, `0.0.0.0` if it must. On v0.4.12 and older the key does not exist and the bind is always `0.0.0.0` — firewall it or use SOCKS5 |
 | `client.failover` | **applies when more than one server ID resolves** | i.e. `server_id` is a list, and/or `client.fallback_server_ids` is set. A single ID ignores this block |
 | `tunnel.half_close_timeout_seconds` | **default-on** (`120`) | Force-closes tunnels stuck in `Disconnecting`. Distinct from the opt-in idle reaper |
 
@@ -315,10 +323,14 @@ all hit this. Always generate an absolute path.
 
 > ### ⚠️ The rules parser fails open — generate rules defensively
 >
-> `toxtunnel config check --strict` validates the **main config only**. It never
-> opens `rules_file` (verified: a config pointing at a nonexistent rules file
-> still reports "is valid"). Nothing validates `rules.yaml` until the daemon
-> loads it, and the loader is lenient in three ways that all **widen** access:
+> On **v0.4.13 and older**, `toxtunnel config check --strict` validates the
+> **main config only**. It never opens `rules_file` (verified: a config
+> pointing at a nonexistent rules file still reports "is valid"). **From
+> v0.5.0 it loads and parses the rules file** (issue #23), so a missing or
+> malformed `rules.yaml` fails the check with the daemon's own error message.
+> The *semantic* leniencies below are still not flagged on any version —
+> nothing validates what the rules **mean** until the daemon enforces them,
+> and the loader is lenient in three ways that all **widen** access:
 >
 > - **Unknown keys inside an allow/deny entry are silently ignored.** The decoder
 >   reads `host` and `ports` by positive lookup and never enumerates keys.
@@ -416,11 +428,12 @@ toxtunnel config check -c FILE [--strict]                       # validate a con
 
 `config check` is the product's own validator — run it on every config you
 generate, before starting anything. Exit `0` = usable, `1` = unloadable, invalid,
-or (with `--strict`) carrying keys the daemon would silently ignore. Two blind
-spots to know: it **never opens `server.rules_file`** (a config pointing at a
-missing or malformed rules file still reports "is valid" — verified against
-v0.4.12 and still true), and on **v0.4.12 and older** it **does not resolve
-known-servers aliases**, so an alias-form `client.server_id` fails it with
+or (with `--strict`) carrying keys the daemon would silently ignore. Two
+version-dependent blind spots to know: on **v0.4.13 and older** it **never
+opens `server.rules_file`** (a config pointing at a missing or malformed rules
+file still reports "is valid"; **v0.5.0+ loads and parses it**, closing issue
+#23), and on **v0.4.12 and older** it **does not resolve known-servers
+aliases**, so an alias-form `client.server_id` fails it with
 `Server ID must be 76 characters, got N`. **v0.4.13+ resolves aliases**, so that
 second gap is closed on current daemons. `scripts/diagnose.sh` runs it and
 covers whichever gaps apply.
@@ -607,7 +620,9 @@ Output must include:
     which drops every tunnel for every friend
 - Suggested access window (e.g., "remove rule after maintenance is done")
 - Recommend read-only accounts for DB scenarios
-- The `0.0.0.0` exposure warning for the contractor's own forwarded port
+- The bind-address note for the contractor's own forwarded port
+  (`local_address` explicit; absent = `0.0.0.0` exposure before v0.5.0,
+  loopback-only from v0.5.0)
 
 ### Template: HomeLab / NAS
 
@@ -763,9 +778,11 @@ For **server.yaml**:
 
 For **client.yaml**:
 - Map `local_port` → `remote_host:remote_port`, and on **v0.4.13+** set
-  `local_address: 127.0.0.1` unless the forward must serve other machines. On
-  v0.4.12 and older **state that `local_port` binds `0.0.0.0`**, with a firewall
-  rule or a SOCKS5 alternative
+  `local_address` explicitly: `127.0.0.1` unless the forward must serve other
+  machines, `0.0.0.0` if it must (mandatory to state on **v0.5.0+**, where an
+  absent key binds loopback and silently loses LAN reach). On v0.4.12 and
+  older **state that `local_port` binds `0.0.0.0`**, with a firewall rule or a
+  SOCKS5 alternative
 - Leave `server_id` as placeholder `<PASTE_SERVER_TOX_ID_HERE>` with instructions
   (the daemon refuses to start on the placeholder, which is the intended
   behaviour — it exits before creating an identity)
@@ -781,8 +798,10 @@ For **rules.yaml** (when access control is needed):
 - `deny:` list if there are specific exclusions
 - **Never use friend wildcards** — friend_pk must be exact 64-char hex
 - Remind user: if they don't know the friend key yet, they can get it after the friend's toxtunnel starts
-- Nothing validates this file until the daemon loads it — `config check` does not
-  open it. Run `bash scripts/diagnose.sh <server.yaml>` to check its structure.
+- On v0.4.13 and older nothing validates this file until the daemon loads it —
+  `config check` does not open it there (v0.5.0+ does, for existence and
+  syntax, but not for the widening leniencies above). Run
+  `bash scripts/diagnose.sh <server.yaml>` to check its structure.
 
 #### 3. Execution Steps
 
@@ -793,8 +812,9 @@ Numbered step-by-step:
    `toxtunnel config check -c <file> --strict` on each. This is the product's own
    validator and it is not optional — it catches unknown/typo keys the daemon
    would silently ignore. Remember its blind spots: it never opens
-   `rules_file` (any version), and on **v0.4.12 and older** it fails on
-   alias-form `server_id` — v0.4.13+ resolves aliases. Follow it with
+   `rules_file` on **v0.4.13 and older** (v0.5.0+ loads and parses it), and on
+   **v0.4.12 and older** it fails on alias-form `server_id` — v0.4.13+
+   resolves aliases. Follow it with
    `bash scripts/diagnose.sh <file>`, which covers whichever apply.
 4. Start server, note the Tox ID from output (or use `toxtunnel print-id -c <server.yaml> --qr` to display the same identity as a QR code)
 5. Paste Tox ID into client config (scan QR code with phone to transfer ID between machines)
@@ -815,15 +835,16 @@ Numbered step-by-step:
 ### Scenario-Specific Design Guidance
 
 **Applies to every scenario below:** generate each mapping with
-`local_address: 127.0.0.1` on **v0.4.13+**, so it binds loopback. Without that
-key — and on every v0.4.12-and-older daemon, where it does not exist — the
-`local_port` binds `0.0.0.0` and needs a firewall rule instead. The verification
-commands target `127.0.0.1` because
-that is where *you* connect from — not because that is the only place the port
-answers. Include the exposure warning and a firewall rule (or steer to SOCKS5)
-every time you emit one of these mappings. This matters most for the SSH and
-database scenarios, where the forwarded service is a direct route into a
-production host.
+`local_address: 127.0.0.1` on **v0.4.13+**, so it binds loopback on every
+version. Without that key the bind depends on the version: loopback on
+v0.5.0+, `0.0.0.0` on v0.4.13/v0.4.x, and always `0.0.0.0` on v0.4.12 and
+older (where the key does not exist) — those wildcard binds need a firewall
+rule instead. The verification commands target `127.0.0.1` because
+that is where *you* connect from — not necessarily the only place the port
+answers. On pre-v0.5.0 daemons include the exposure warning and a firewall
+rule (or steer to SOCKS5) every time you emit one of these mappings. This
+matters most for the SSH and database scenarios, where the forwarded service
+is a direct route into a production host.
 
 **SSH:**
 - Default mapping: local 2222 → remote 22 with `local_address: 127.0.0.1`
@@ -964,7 +985,8 @@ Diagnostic checklist:
 2. **Run `toxtunnel config check -c <file> --strict` first.** It is the daemon's
    own validator; anything it reports is authoritative and should be fixed before
    any deeper investigation. Only then hand-check what it does not cover:
-   `rules_file` contents (it never opens them, on any version) and, on
+   `rules_file` contents (never opened on v0.4.13 and older; v0.5.0+ opens
+   and parses them, but still does not flag the widening leniencies) and, on
    **v0.4.12 and older only**, alias resolution — those builds reject a
    non-76-char `server_id`, while v0.4.13+ resolves it.
    `scripts/diagnose.sh` does exactly this sequence.
@@ -1082,7 +1104,8 @@ Read on demand:
 16. **SOCKS5 vs `forwards` choice.** Recommend SOCKS5 when the destination set is
     *dynamic* (browsing, ad-hoc curl, multi-host debugging) **or when the host is
     on an untrusted network** — its listener is validated loopback-only, whereas
-    a static forward binds `0.0.0.0` unless `local_address` is set, and on
+    a static forward binds `0.0.0.0` before v0.5.0 unless `local_address` is
+    set (loopback by default from v0.5.0), and on
     v0.4.12 and older cannot be told otherwise at all. Recommend
     explicit `forwards` when the destination set is *static* and known (SSH to
     one host, one DB) and for tools that do not speak SOCKS — but pair it with a

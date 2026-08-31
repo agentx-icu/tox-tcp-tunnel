@@ -64,9 +64,9 @@ client:
       remote_port: 5432
 ```
 
-> ### ⚠️ `local_port: 15432` binds `0.0.0.0` without `local_address` on the contractor's laptop
+> ### ⚠️ `local_port: 15432` binds `0.0.0.0` without `local_address` (pre-v0.5.0) on the contractor's laptop
 >
-> Without `local_address` the listener binds every IPv4
+> Before v0.5.0, without `local_address` the listener binds every IPv4
 > interface, so every host on whatever network the contractor is using can reach
 > your database through their machine, with only the DB's own authentication in
 > front of it. On **v0.4.13+** set `local_address: 127.0.0.1` (the config above does); on v0.4.12 and older no such key exists — firewall it instead.

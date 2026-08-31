@@ -170,10 +170,12 @@ the main skill. Three things to get right at write time:
 2. **`data_dir` must be absolute, writable by the service account, and not under
    `/etc`** — it holds mutable state (identity, pid, lock, inspect socket). Use
    `/var/lib/toxtunnel` on Linux.
-3. **A forward binds `0.0.0.0` unless `local_address` says otherwise.** On
-   **v0.4.13+** set `local_address: 127.0.0.1` unless it must serve other
-   machines; on v0.4.12 and older there is no such key, so emit the exposure
-   warning with the config and give the
+3. **Always write `local_address` explicitly.** An absent key binds
+   `127.0.0.1` on v0.5.0+ but `0.0.0.0` on every version before it, so an
+   implicit bind changes meaning across the upgrade. On **v0.4.13+** set
+   `local_address: 127.0.0.1` unless it must serve other machines (then
+   `0.0.0.0`); on v0.4.12 and older there is no such key and the bind is
+   always wide, so emit the exposure warning with the config and give the
    operator either a host firewall rule for that port or a loopback-only SOCKS5
    listener instead.
 
@@ -182,7 +184,8 @@ Then validate before starting anything:
 ```bash
 toxtunnel config check -c server.yaml --strict
 toxtunnel config check -c client.yaml --strict
-bash scripts/diagnose.sh server.yaml    # covers rules.yaml, which config check never opens
+bash scripts/diagnose.sh server.yaml    # covers rules.yaml semantics (config check opens
+                                        # the file only on v0.5.0+, and syntax-only there)
 ```
 
 ## Step 2: Startup Commands

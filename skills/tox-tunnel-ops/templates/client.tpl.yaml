@@ -95,13 +95,18 @@ client:
   # on the server side.
   #
   # ############################################################################
-  # # WARNING: without local_address a forward binds 0.0.0.0 — EVERY IPv4      #
-  # # INTERFACE, not loopback.                                                 #
+  # # WARNING: without local_address the bind depends on the version —        #
+  # # 127.0.0.1 on v0.5.0+, but 0.0.0.0 (EVERY IPv4 interface) before that.   #
+  # # Always write the key explicitly.                                        #
   # ############################################################################
-  # v0.4.13+ : set `local_address: 127.0.0.1` (as below) unless the forward is
-  # genuinely meant to serve other machines. The daemon warns at startup when
-  # the key is absent and the bind is not loopback; writing `0.0.0.0`
-  # explicitly is supported and silences that warning.
+  # v0.5.0+ : an absent key binds loopback and the daemon prints a notice.
+  # A deployment that needs other machines to reach the forward MUST say
+  # `local_address: 0.0.0.0` (accepted and silent since v0.4.13 — set it
+  # before upgrading across v0.5.0 and there is no behaviour change).
+  #
+  # v0.4.13 : absent means 0.0.0.0; the daemon warns at startup when the key
+  # is absent and the bind is not loopback. Writing any address explicitly is
+  # supported and silences the warning.
   #
   # v0.4.12 and older: there is NO such key. ForwardRule has exactly three
   # fields and the client constructs TcpListener(io, local_port), which binds
@@ -128,8 +133,9 @@ client:
   forwards:
 {{#FORWARDS}}
     - local_port: {{LOCAL_PORT}}
-      # Drop this line only for a forward that must serve other machines
-      # (and only on v0.4.13+, where the key exists at all).
+      # For a forward that must serve other machines, change this to 0.0.0.0
+      # (v0.4.13+, where the key exists at all) — do NOT just drop the line:
+      # on v0.5.0+ an absent key binds loopback.
       local_address: 127.0.0.1
       remote_host: {{REMOTE_HOST}}
       remote_port: {{REMOTE_PORT}}

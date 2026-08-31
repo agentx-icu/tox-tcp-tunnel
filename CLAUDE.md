@@ -108,7 +108,7 @@ between primary and fallback Tox IDs. `InspectServer` accepts local IPC
 serves JSON snapshots gathered via the `InspectProviders` struct. The daemon
 publishes its pid in `<data_dir>/toxtunnel.pid` (`util::PidFileGuard`, constructed
 **before** `initialize()` — it doubles as the data-dir lock, and `initialize()`
-already opens `tox_save.dat`, the inspect socket and the resume store, none of
+already opens `tox_save.dat` and the inspect socket, none of
 which two daemons may share; removed on clean exit) — that is how `toxtunnel inspect`
 finds the pipe on Windows and how `toxtunnel reload` finds the process on both
 platforms (POSIX sends SIGHUP; a stale pid is refused via `pid_is_toxtunnel`). `config_reload` computes the reloadable diff

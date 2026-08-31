@@ -44,9 +44,13 @@ anything else, and do not hand-audit YAML that it has not seen.
 Blind spots you must cover by hand (verified against v0.4.12; the alias one is
 closed from v0.4.13):
 
-1. **It never opens `server.rules_file`.** A server config pointing at a
-   nonexistent or malformed rules file still prints `is valid`. Rules problems
-   surface only when the daemon loads them (Layer 3).
+1. **On v0.4.13 and older it never opens `server.rules_file`.** A server
+   config pointing at a nonexistent or malformed rules file still prints
+   `is valid`; rules problems surface only when the daemon loads them
+   (Layer 3). **v0.5.0+ loads and parses the rules file**, so existence and
+   syntax are covered there — the widening semantic leniencies (unknown keys
+   ignored, missing `ports` = all ports, duplicate friends) still are not,
+   on any version.
 2. **On v0.4.12 and older it does not resolve known-servers aliases.** There an
    alias-form `client.server_id` fails with
    `Server ID must be 76 characters, got N`, even when the alias is registered
@@ -148,9 +152,13 @@ Report risk level: LOW / MEDIUM / HIGH.
 
 - Is the local listening port open? (`lsof -nP -i TCP:PORT -sTCP:LISTEN`).
   Expect whatever `local_address` says: `127.0.0.1:PORT` for a v0.4.13+ config
-  that sets it, `0.0.0.0:PORT` when the key is absent or the daemon predates it.
+  that sets it. When the key is absent the answer is version-dependent —
+  `127.0.0.1:PORT` on v0.5.0+, `0.0.0.0:PORT` on anything older (including
+  every v0.4.12-and-older daemon, which predates the key entirely).
   If the operator believed it was loopback-only and it is not, that is
-  a finding in itself: the service is reachable from the whole subnet.
+  a finding in itself: the service is reachable from the whole subnet. The
+  inverse on v0.5.0+ — "other machines could reach it before the upgrade and
+  now cannot" — means the config needs an explicit `local_address: 0.0.0.0`.
 - Can TCP connect to it? (`nc -z -w 5 127.0.0.1 PORT`) — **but this proves almost
   nothing.** The client binds and accepts the forward port before it attempts any
   `TUNNEL_OPEN`, so the connect succeeds with the Tox link down, the friend

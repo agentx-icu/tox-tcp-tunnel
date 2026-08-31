@@ -89,33 +89,40 @@ on the *server* side, so a hostname is fine there.)
 | A specific interface address | Anything that can reach that interface |
 | `0.0.0.0` / `::` | Anything that can route to this host |
 
-**If you omit the key the forward binds `0.0.0.0`** — every interface — which
-is what every ToxTunnel before v0.4.13 did unconditionally. That default is
-kept only so existing deployments do not change behaviour on upgrade; it is a
-compatibility fallback, not a recommendation. A forward is a hole into the
-remote network, and on a laptop on a café network the wildcard means anyone on
-that network can use it.
+**If you omit the key the forward binds `127.0.0.1`** — only this machine.
+This is the default **since v0.5.0** (issue #27). Every ToxTunnel before
+v0.4.13 bound `0.0.0.0` unconditionally; v0.4.13 added the key and a warning
+release so wildcard-by-default deployments could write their intent down
+before the flip. A forward is a hole into the remote network, and on a laptop
+on a café network the wildcard meant anyone on that network could use it —
+serving other machines is the rarer, deliberate case, so it is the one that
+has to say so.
 
-So from v0.4.13 a client that omits the key logs a warning at startup naming
-the forward, and `toxtunnel config check` reports the same thing:
+**Upgrading across v0.5.0:** a deployment that relied on LAN reach and never
+set the key must add `local_address: 0.0.0.0` (accepted and silent since
+v0.4.13, so this can be done *before* the upgrade — no flag day). Nothing else
+changes.
+
+A client that omits the key logs a notice at startup naming the forward and
+what was bound, and `toxtunnel config check` reports the same thing:
 
 ```
-forward 0.0.0.0:2222 -> 127.0.0.1:22 is listening on all interfaces because no
-'local_address' was set; anything that can reach this host can use it. Set
-'local_address: 127.0.0.1' on this forward to accept only local connections, or
-set it explicitly to silence this warning.
+forward 127.0.0.1:2222 -> 127.0.0.1:22 binds 127.0.0.1 because no
+'local_address' was set (the default since v0.5.0; earlier versions bound
+0.0.0.0). Other machines cannot reach this forward. Set 'local_address:
+0.0.0.0' to serve other machines as before, or 'local_address: 127.0.0.1' to
+record this choice and silence this notice.
 ```
 
-Writing `local_address: 0.0.0.0` explicitly is a supported choice and silences
-the warning — the warning is for operators who did not know, not for those who
-decided. Set it explicitly either way; a future release may change the default
-to loopback.
+Writing any address explicitly — the wildcard included — is a supported choice
+and silences the notice: it exists for operators who did not choose, not for
+those who decided.
 
 Changing `local_address` on a running daemon takes effect on reload: the
-listener is stopped and rebound. Adding `local_address: 0.0.0.0` to a forward
-that was already binding the wildcard is a no-op and does *not* disturb the
-live listener. See [Hot Reload](#hot-reload) for the failure mode when the new
-address is not available on the host.
+listener is stopped and rebound. Adding `local_address: 127.0.0.1` to a
+forward that was already binding loopback by default is a no-op and does *not*
+disturb the live listener. See [Hot Reload](#hot-reload) for the failure mode
+when the new address is not available on the host.
 
 ### Multi-Server Failover
 
@@ -538,7 +545,6 @@ byte-for-byte. Non-reloadable.
 tunnel:
   resume:
     enabled: false                  # OPT-IN. Default false.
-    state_path: ""                  # default: <data_dir>/tunnel_resume_state.yaml
     max_age_seconds: 300            # how long the server holds a disconnected
                                     # friend's tunnels for reattach
     on_gap: passthrough             # passthrough (default) | close
@@ -561,13 +567,14 @@ When `enabled: true`, the live hold-across-reconnect handshake runs:
 
 Resume covers the **live-reconnect** case (a brief Tox-network blip with both
 processes still running). It cannot survive a process restart, because the local
-TCP sockets do not — the persistent `state_path` store is reserved for that
-future use and is not consulted by the live path.
+TCP sockets do not. (Versions before v0.5.0 accepted a `tunnel.resume.state_path`
+key reserved for restart-surviving resume; nothing ever read it, so v0.5.0
+removed it. It will return with the feature.)
 
 With `enabled: false` the new opcodes (`0x08` / `0x09`) are wire-inactive and
 v0.3.0 peers see no change.
 
-The reaper, coalescer, BDP flow control, and resume store all live in
+The reaper, coalescer, and BDP flow control all live in
 the existing I/O pool — none start new threads. See
 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)
 ("Operational Endpoints" and the rows in "Components") for the dataflow.
@@ -868,7 +875,7 @@ writes to the pipe (Windows). `TOXTUNNEL_RELOAD_PID` overrides the pid file.
 | Field | Effect on reload |
 |---|---|
 | `logging.level` | Swapped atomically — next log line uses the new level. |
-| `client.forwards` | New listeners are bound, removed listeners are closed, unchanged listeners keep their open tunnels. A rule is "unchanged" by its *effective* `local_address` plus `local_port`/`remote_host`/`remote_port`, so adding `local_address: 0.0.0.0` to a forward that already bound the wildcard disturbs nothing; changing it to a different address stops and rebinds that listener. |
+| `client.forwards` | New listeners are bound, removed listeners are closed, unchanged listeners keep their open tunnels. A rule is "unchanged" by its *effective* `local_address` plus `local_port`/`remote_host`/`remote_port`, so adding `local_address: 127.0.0.1` to a forward that already bound loopback by default disturbs nothing; changing it to a different address stops and rebinds that listener. |
 | `server.rules_file` | File is re-read, the parsed `RulesEngine` is swapped in, rate-limit buckets are synced and per-friend tunnel caps re-applied. **Already-open tunnels are not touched** — even ones the new rules would now deny; only the next `TUNNEL_OPEN` is evaluated against them. Drop the friend (or restart) to cut live traffic. |
 
 ### Non-reloadable fields (reload is rejected, running config untouched)
@@ -891,25 +898,28 @@ A successful reload is logged at INFO (`config reloaded (rules: N rules)` on the
 server, `config reloaded (forwards: +A -B)` on the client). There is no reload
 counter in the metrics endpoint — the log is the record.
 
-### A forward whose new bind address is unavailable stays down
+### A forward whose new bind address is unavailable falls back to the old one
 
-Reload rebinds a changed forward by **stopping the old listener first**, then
-binding the new one. If the new `local_address` parses but is not usable on
-this host — not assigned to any interface, or that port is already taken on it
-— the new bind fails and **that forward is left down**: the old listener is
-already gone.
-
-This is contained rather than fatal, and deliberately so. Reload is
-best-effort *per forward*: the daemon keeps running, every other forward keeps
-serving, and tunnels already established through the old listener are
-unaffected (they are accepted connections, not listeners). The failure is
-logged at ERROR and reported in the reload result, and because the rule is not
-recorded as active, a later reload retries it — so fixing the address and
-reloading again is enough, with no restart.
+Reload rebinds a changed forward by stopping the old listener first, then
+binding the new one (the order matters: the old and new address may share the
+port, e.g. `0.0.0.0` → `127.0.0.1`). If the new `local_address` parses but is
+not usable on this host — not assigned to any interface, or that port is
+already taken on it — the new bind fails, and since v0.5.0 the daemon
+**restores the previous listener** rather than leaving the forward down
+(issue #26): the forward keeps serving on its *old* address, the failure is
+logged at ERROR and reported in the reload result, and because the new rule is
+not recorded as active, fixing the address and reloading again completes the
+rebind. Only if the restore itself also fails (something grabbed the port in
+the window) is the forward down, and the log says so explicitly:
 
 ```
 Reload: not forwarding 10.1.2.3:2222 -> 127.0.0.1:22 (Can't assign requested address)
+Reload: restored previous listener on 127.0.0.1:2222 -> 127.0.0.1:22 (the new bind failed; fix local_address and reload again)
 ```
+
+The rest stays best-effort *per forward*: the daemon keeps running, every
+other forward keeps serving, and tunnels already established through the old
+listener are unaffected (they are accepted connections, not listeners).
 
 Verify with `toxtunnel config check` before reloading a live daemon.
 

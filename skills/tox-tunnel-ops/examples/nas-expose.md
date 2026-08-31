@@ -90,9 +90,9 @@ client:
       remote_port: 445
 ```
 
-> ### ⚠️ Every forward here binds `0.0.0.0` without `local_address`
+> ### ⚠️ Every forward here binds `0.0.0.0` without `local_address` (pre-v0.5.0)
 >
-> Without `local_address` (v0.4.13+) a forward has no bind restriction — Ports 8080, 2222 and 4450 all
+> Before v0.5.0, without `local_address` a forward has no bind restriction — Ports 8080, 2222 and 4450 all
 > bind every IPv4 interface on the laptop, so any host on the network the laptop
 > happens to be on reaches your NAS web UI, SSH and SMB. On v0.4.13+ the
 > `local_address: 127.0.0.1` lines above prevent that; on v0.4.12 and older

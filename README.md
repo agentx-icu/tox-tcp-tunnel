@@ -104,11 +104,10 @@ Forward any TCP port through Tox with end-to-end encryption, no central server, 
   launchd / Windows SCM handles the restart; the in-process detector
   preserves a core dump for postmortem.
 
-- **Stability hardening** — `tox_save.dat`, `known_servers.yaml`, and
-  the new `tunnel_resume_state.yaml` go through a shared atomic-write
-  helper (tmp + fsync + rename + parent-dir fsync; `F_FULLFSYNC` on
-  macOS for the identity file). A new `TunnelIdAllocator` exposes
-  `reserve(id)` for the resume protocol.
+- **Stability hardening** — `tox_save.dat` and `known_servers.yaml` go
+  through a shared atomic-write helper (tmp + fsync + rename +
+  parent-dir fsync; `F_FULLFSYNC` on macOS for the identity file). A new
+  `TunnelIdAllocator` exposes `reserve(id)` for the resume protocol.
 
 - **Tunnel resume (opt-in)** — wire opcodes `TUNNEL_RESUME_REQUEST` (0x08)
   and `TUNNEL_RESUME_ACK` (0x09). Default off (`tunnel.resume.enabled: false`);
@@ -451,10 +450,11 @@ Start the client:
 ```
 
 `local_address` controls which interface the forward listens on. **Omit it and
-the forward binds `0.0.0.0`** — reachable by anything that can route to your
-machine — which is what every release before v0.4.13 did. Set it to `127.0.0.1`
-unless you intend other machines to use the forward; ToxTunnel warns at startup
-when it is missing. Numeric IP literals only (`127.0.0.1`, `::1`), not
+the forward binds `127.0.0.1`** — only your machine — the default since
+v0.5.0. (Releases before v0.4.13 bound `0.0.0.0` unconditionally; a
+deployment that relies on other machines reaching the forward must set
+`local_address: 0.0.0.0` explicitly.) ToxTunnel prints a notice at startup
+when the key is missing. Numeric IP literals only (`127.0.0.1`, `::1`), not
 hostnames. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the details.
 
 Output:

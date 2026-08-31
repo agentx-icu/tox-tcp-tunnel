@@ -133,8 +133,9 @@ else
             echo "       Fix these before looking at anything else — the daemon"
             echo "       applies the same validation at startup."
         fi
-        echo "       (Scope: config check validates the main config only. It does NOT"
-        echo "        open or validate server.rules_file — see Layer 3.)"
+        echo "       (Scope: on v0.4.13 and older, config check validates the main config"
+        echo "        only and does NOT open server.rules_file; v0.5.0+ loads and parses"
+        echo "        it. Layer 3 covers the semantics no version checks.)"
     else
         skip "toxtunnel binary unavailable — cannot run the authoritative validator"
         echo "       Install toxtunnel and re-run; the checks below are a weaker substitute."
@@ -286,7 +287,8 @@ if mode == "client":
                 if stray in fw:
                     emit("FAIL", f"client.forwards[{i}] has '{stray}', which ToxTunnel "
                                  "does not implement. It is silently ignored and the "
-                                 "port still binds 0.0.0.0.")
+                                 "port binds the version default instead (0.0.0.0 "
+                                 "before v0.5.0, 127.0.0.1 from v0.5.0).")
         if ports:
             setv("FWD_PORTS", ",".join(ports))
             # Only the forwards that actually bind wide are worth warning about.
@@ -305,8 +307,9 @@ if mode == "client":
             # A specific non-loopback address (192.168.1.10) binds ONE interface,
             # not all of them. Both are exposure worth flagging, but calling a
             # single-interface bind "every interface" is simply wrong.
-            # Keep the three provenances apart: an absent key is the legacy
-            # default, an explicit IPv4 wildcard is a deliberate choice, and ::
+            # Keep the three provenances apart: an absent key means the
+            # version default (wildcard before v0.5.0, loopback after), an
+            # explicit IPv4 wildcard is a deliberate choice, and ::
             # is the IPv6 wildcard — calling that one "every IPv4 interface" is
             # simply the wrong family.
             implicit = [str(p) for p, a in wide_binds if not a]
@@ -344,13 +347,16 @@ if mode == "client":
                              "serve other machines.")
             wide = wildcard
             if wide:
-                emit("WARN", f"{len(wide)} static forward(s) have no local_address and so "
-                             f"bind every IPv4 interface, "
-                             "not loopback: " + ", ".join(wide) + ". Any host that can "
-                             "reach this machine gets the forwarded service "
-                             "unauthenticated. On v0.4.13+ set `local_address: 127.0.0.1`; "
-                             "on older daemons there is no such key, so use a host "
-                             "firewall rule or a loopback-only SOCKS5 listener instead.")
+                emit("WARN", f"{len(wide)} static forward(s) have no local_address: "
+                             + ", ".join(wide) + ". What they bind depends on the daemon "
+                             "version: every IPv4 interface before v0.5.0 (any host that "
+                             "can reach this machine gets the forwarded service "
+                             "unauthenticated), loopback only from v0.5.0 (other machines "
+                             "silently lose access). Set the key explicitly — "
+                             "`local_address: 127.0.0.1` or `0.0.0.0` (v0.4.13+); on "
+                             "v0.4.12 and older there is no such key and the bind is "
+                             "always wide, so use a host firewall rule or a "
+                             "loopback-only SOCKS5 listener instead.")
     elif has_socks:
         emit("OK", "No static forwards; SOCKS5 listener is enabled instead")
     elif pipe:
@@ -472,8 +478,9 @@ fi
 # =========================================================================
 # Layer 3: Rules File
 #
-# config check --strict does NOT open rules_file, so everything here is
-# additional coverage, not a repeat.
+# config check --strict does NOT open rules_file on v0.4.13 and older (v0.5.0+
+# parses it for existence/syntax), so most of this layer is additional
+# coverage, not a repeat — and the semantic checks are extra on every version.
 # =========================================================================
 section "Layer 3: Rules File"
 

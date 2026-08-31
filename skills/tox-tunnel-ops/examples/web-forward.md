@@ -57,9 +57,9 @@ client:
       remote_port: 3000             # adjust to your web app's port
 ```
 
-> ### ⚠️ `local_port: 8080` binds `0.0.0.0` without `local_address`
+> ### ⚠️ `local_port: 8080` binds `0.0.0.0` without `local_address` (pre-v0.5.0)
 >
-> Without `local_address` a forward has no bind restriction: the client calls
+> Before v0.5.0, without `local_address` a forward has no bind restriction: the client calls
 > `TcpListener(io, 8080)`, which binds the IPv4 wildcard. Anyone on the same
 > network reaches the internal web app through this port — and an admin panel or
 > Grafana instance usually assumes it is behind something. On **v0.4.13+** set `local_address: 127.0.0.1` (the config above

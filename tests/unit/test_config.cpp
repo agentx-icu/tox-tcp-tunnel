@@ -1565,7 +1565,6 @@ Config make_populated_server_config() {
     cfg.tunnel.half_close_timeout_seconds = 45;
     cfg.tunnel.keepalive_interval_seconds = 20;
     cfg.tunnel.resume.enabled = true;
-    cfg.tunnel.resume.state_path = "/populated/server/resume.yaml";
     cfg.tunnel.resume.max_age_seconds = 900;
     cfg.tunnel.resume.on_gap = "close";
 
@@ -1651,7 +1650,6 @@ TEST_F(ConfigTest, RoundTripPreservesTunnelBlock) {
     EXPECT_EQ(loaded.tunnel.half_close_timeout_seconds, 45u);
     EXPECT_EQ(loaded.tunnel.keepalive_interval_seconds, 20u);
     EXPECT_TRUE(loaded.tunnel.resume.enabled);
-    EXPECT_EQ(loaded.tunnel.resume.state_path, "/populated/server/resume.yaml");
     EXPECT_EQ(loaded.tunnel.resume.max_age_seconds, 900u);
     EXPECT_EQ(loaded.tunnel.resume.on_gap, "close");
     EXPECT_EQ(loaded.tunnel, original.tunnel);

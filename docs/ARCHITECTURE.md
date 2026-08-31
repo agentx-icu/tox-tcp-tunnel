@@ -46,8 +46,7 @@
 | `RateLimiter`       | Per-friend token-bucket layer that runs before `RulesEngine` on TUNNEL_OPEN. Modes: `off \| report \| enforce`. Hot-reloadable via the rules file. Defaults to `off` (no v0.3.0 behaviour change). A per-friend `rate_limit:` block **overrides only the fields it names**, inheriting the rest from `rate_limit_defaults`. Byte limiting (`bytes_per_sec` / `bytes_burst`) is live since v0.4.11: inbound `TUNNEL_DATA` from the friend is metered per friend, and `enforce` defers and replays over-budget frames in arrival order rather than dropping them. It is self-bounding — a parked frame emits no `TUNNEL_ACK`, so the peer's window fills and it stops sending. A receiver-side deferral cannot hold an average rate against a peer that ignores flow control; `max_concurrent_tunnels` / `open_per_sec` remain the anti-DoS knobs. |
 | `ToxWatchdog`       | Heartbeat-based detector for a stalled `tox_iterate`. The Tox thread bumps the counter on every return; a 1 Hz observer on the main IO context calls `std::abort()` if the deadline is exceeded. Persistent abort count lives at `<data_dir>/abort_count`. |
 | `TunnelIdAllocator` | Bitset-backed 1..65535 allocator with a roving cursor and an explicit `reserve(id)` API for the tunnel-resume path. |
-| `TunnelResumeStore` | **Not wired up.** Client-side `<data_dir>/tunnel_resume_state.yaml` persistence (schema-versioned, age-pruned), written against the day resume survives a process restart. Nothing constructs it today: resume is live-reconnect only, so there is no restart for it to survive, and `tunnel.resume.state_path` is parsed but never read. Kept deliberately — see `docs/CONFIGURATION.md`, which already calls the store reserved. |
-| `atomic_write_file` | Shared helper: write to `<path>.tmp.<pid>`, fsync, rename, optional parent-dir fsync (`F_FULLFSYNC` on macOS). Used by `ToxSave::persist` and `KnownServersStore::save` (and by `TunnelResumeStore::save`, which nothing calls). |
+| `atomic_write_file` | Shared helper: write to `<path>.tmp.<pid>`, fsync, rename, optional parent-dir fsync (`F_FULLFSYNC` on macOS). Used by `ToxSave::persist` and `KnownServersStore::save`. |
 
 ## Configuration Model
 
@@ -475,7 +474,11 @@ untouched. On the client, an added forward whose local port cannot bind is not
 a rejection: the rest of the reload is applied and the daemon logs
 `reload applied with warnings: <address>:<port>: <reason>` (the address is
 the forward's effective `local_address`, so the message identifies which
-forward failed when several share a port number across interfaces).
+forward failed when several share a port number across interfaces). When the
+failed bind was a *rebind* — the same port and target under a changed
+`local_address` — the old listener has already been stopped by the
+remove/add pair, so the client re-binds the previous rule and reports it as
+`restored` rather than leaving the forward dead (issue #26).
 
 ## Inbound Copy Path
 

@@ -69,9 +69,9 @@ client:
       remote_port: 5900            # VNC default
 ```
 
-> ### ⚠️ `local_port: 13389` binds `0.0.0.0` without `local_address`
+> ### ⚠️ `local_port: 13389` binds `0.0.0.0` without `local_address` (pre-v0.5.0)
 >
-> Without `local_address` (v0.4.13+) a forward has no bind restriction — the listener binds the IPv4
+> Before v0.5.0, without `local_address` a forward has no bind restriction — the listener binds the IPv4
 > wildcard, so every host on your network can reach the remote desktop through
 > this port, with only RDP's own authentication in front of it. On **v0.4.13+**
 > set `local_address: 127.0.0.1` (the config above does). On v0.4.12 and older

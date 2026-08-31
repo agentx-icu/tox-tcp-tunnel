@@ -42,7 +42,12 @@ const KeySet& tox_keys() {
     return k;
 }
 const KeySet& resume_keys() {
-    static const KeySet k{"enabled", "max_age_seconds", "on_gap", "state_path"};
+    // `state_path` was removed in v0.5.0 (issue #22): it was parsed and
+    // validated but never read, so a config setting it was being told a lie.
+    // Leaving it out of the allowlist makes `config check` surface it as an
+    // unknown key, which is the honest answer until restart-surviving resume
+    // exists.
+    static const KeySet k{"enabled", "max_age_seconds", "on_gap"};
     return k;
 }
 const KeySet& tunnel_keys() {

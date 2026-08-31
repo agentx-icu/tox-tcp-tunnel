@@ -102,9 +102,9 @@ client:
       remote_port: 5432
 ```
 
-> ### ⚠️ `local_port: 15432` binds `0.0.0.0` without `local_address` on the DBA workstation
+> ### ⚠️ `local_port: 15432` binds `0.0.0.0` without `local_address` (pre-v0.5.0) on the DBA workstation
 >
-> Without `local_address` (v0.4.13+) a forward has no bind restriction — the listener binds every IPv4
+> Before v0.5.0, without `local_address` a forward has no bind restriction — the listener binds every IPv4
 > interface, so anyone on the DBA's network can reach the production database
 > through that port. On **v0.4.13+** set `local_address: 127.0.0.1` (the config above does); on v0.4.12 and older no such key exists — firewall it instead. Firewall it to loopback for
 > the duration of the migration window.

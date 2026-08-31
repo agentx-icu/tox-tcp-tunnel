@@ -26,10 +26,11 @@
 #  3. DUPLICATE `friend:` entries are not merged — lookup is a linear
 #     first-match, so a second block for the same key is dead config.
 #
-# And nothing validates this file until the daemon loads it:
-# `toxtunnel config check --strict` validates the main config ONLY and never
-# opens rules_file. Use `bash scripts/diagnose.sh <server.yaml>` instead — it
-# checks all three of the above.
+# And on v0.4.13 and older nothing validates this file until the daemon loads
+# it: `toxtunnel config check --strict` validates the main config ONLY and
+# never opens rules_file there. v0.5.0+ opens and parses it, but the three
+# semantic leniencies above are not flagged on any version. Use
+# `bash scripts/diagnose.sh <server.yaml>` — it checks all three.
 #
 # So, when filling this in:
 #   * use ONLY `host` and `ports` inside an allow/deny entry;

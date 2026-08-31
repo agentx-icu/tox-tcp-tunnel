@@ -22,13 +22,13 @@ namespace toxtunnel {
 
 /// The address a forward binds when the operator did not name one.
 ///
-/// A LEGACY COMPATIBILITY FALLBACK, not a recommendation: it is the wildcard,
-/// so the forward is reachable from anything that can route to this host. It
-/// stays the default only because changing it would silently break existing
-/// deployments that rely on it. New configs should set `local_address`
-/// explicitly — `127.0.0.1` unless the forward is genuinely meant to serve
-/// other machines.
-inline constexpr std::string_view kLegacyForwardBindAddress = "0.0.0.0";
+/// Loopback since v0.5.0 (issue #27). Before that the fallback was the
+/// wildcard `0.0.0.0` — kept through v0.4.x so no existing deployment broke,
+/// with v0.4.13 as the warning release that told wildcard-by-default operators
+/// to write the key down. A deployment that genuinely serves other machines
+/// sets `local_address: 0.0.0.0` explicitly (accepted since v0.4.13, so the
+/// migration can happen before the upgrade with no flag day).
+inline constexpr std::string_view kDefaultForwardBindAddress = "127.0.0.1";
 
 /// Represents a port forwarding rule for client mode.
 struct ForwardRule {
@@ -59,9 +59,9 @@ struct ForwardRule {
     std::optional<std::string> local_address = std::nullopt;
 
     /// The address this rule actually binds: the explicit value, or the
-    /// legacy wildcard fallback.
+    /// loopback default.
     [[nodiscard]] std::string effective_local_address() const {
-        return local_address.value_or(std::string(kLegacyForwardBindAddress));
+        return local_address.value_or(std::string(kDefaultForwardBindAddress));
     }
 
     /// "127.0.0.1:2222", or "[::1]:2222" for IPv6. The brackets are not
@@ -78,9 +78,9 @@ struct ForwardRule {
     }
 
     /// Compares the EFFECTIVE address, so an absent value and an explicit
-    /// `0.0.0.0` are equal. `diff_forwards()` turns inequality into a
+    /// `127.0.0.1` are equal. `diff_forwards()` turns inequality into a
     /// stop-and-rebind, and adding the key to a config that was already
-    /// binding the wildcard changes nothing observable — it must not drop a
+    /// binding loopback changes nothing observable — it must not drop a
     /// live listener. A genuinely different address still compares unequal
     /// and does rebind.
     bool operator==(const ForwardRule& other) const {
@@ -90,14 +90,16 @@ struct ForwardRule {
     }
 };
 
-/// Migration advisory for a forward that is about to bind, or is bound, to a
-/// non-loopback address WITHOUT the operator having asked for one.
+/// Migration advisory for a forward whose operator did not name a bind
+/// address.
 ///
-/// Returns the message to show, or `std::nullopt` when there is nothing to say
-/// — which includes every rule that names an address explicitly, `0.0.0.0`
-/// included. An operator who wrote the wildcard made an informed choice and
-/// gets silence; the warning exists for the operator who does not know their
-/// forward is exposed.
+/// Since v0.5.0 the absent-key default is loopback where it used to be the
+/// wildcard, so the notice tells the operator which address the forward
+/// actually bound and how to write their intent down — that is what turns
+/// "why can nothing reach this port after the upgrade" into a log line that
+/// answers itself. Returns `std::nullopt` for every rule that names an
+/// address explicitly, `0.0.0.0` included: an operator who wrote the key
+/// made an informed choice and gets silence.
 [[nodiscard]] std::optional<std::string> forward_bind_advisory(const ForwardRule& rule);
 
 /// Represents a pipe-mode target for client stdio forwarding.
@@ -184,8 +186,8 @@ struct InspectConfig {
 /// inactive when `enabled: false` and v0.3.0 peers see no change.
 struct TunnelResumeConfig {
     bool enabled = false;
-    std::string state_path;              ///< default: <data_dir>/tunnel_resume_state.yaml
-    uint32_t max_age_seconds = 300;      ///< entries older than this are dropped on load
+    uint32_t max_age_seconds = 300;      ///< how long the server holds a disconnected
+                                         ///< friend's tunnels for reattach
     std::string on_gap = "passthrough";  ///< passthrough | close
 
     bool operator==(const TunnelResumeConfig& other) const = default;

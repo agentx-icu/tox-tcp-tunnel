@@ -71,9 +71,9 @@ client:
       remote_port: 3000
 ```
 
-> ### ⚠️ `local_port: 8080` binds `0.0.0.0` without `local_address` on the tester's machine
+> ### ⚠️ `local_port: 8080` binds `0.0.0.0` without `local_address` (pre-v0.5.0) on the tester's machine
 >
-> Without `local_address` the listener binds every IPv4
+> Before v0.5.0, without `local_address` the listener binds every IPv4
 > interface. Combined with the warning above — dev servers have no auth and
 > expose debug endpoints — this means anyone on the tester's network reaches your
 > dev server, not just the tester. On **v0.4.13+** set `local_address: 127.0.0.1` (the config above does); on v0.4.12 and older no such key exists — firewall it instead.

@@ -58,7 +58,7 @@ client:
       remote_port: 22
 ```
 
-> ### ⚠️ `local_port: 2222` binds `0.0.0.0` without `local_address`
+> ### ⚠️ `local_port: 2222` binds `0.0.0.0` without `local_address` (pre-v0.5.0)
 >
 > On v0.4.12 and older `ForwardRule` has no bind-address field and the client calls
 > `TcpListener(io, 2222)`, which binds `asio::ip::tcp::v4()`. Verified on

@@ -356,21 +356,17 @@ std::optional<std::string> forward_bind_advisory(const ForwardRule& rule) {
         return std::nullopt;
     }
 
-    // Only the exposed outcome is worth a warning. An unparseable address
-    // cannot be the default, so this only ever inspects the fallback; if that
-    // ever changes, an address we cannot parse is not something to speculate
-    // about in a warning.
-    asio::error_code ec;
-    const auto addr = asio::ip::make_address(rule.effective_local_address(), ec);
-    if (ec || addr.is_loopback()) {
-        return std::nullopt;
-    }
-
+    // v0.5.0 flipped the absent-key default from the wildcard to loopback
+    // (issue #27). A deployment upgrading across that boundary loses LAN reach
+    // on this forward without any config change of its own, so the notice must
+    // say what was bound and how to get the old behaviour back — not merely
+    // suggest a best practice.
     return "forward " + rule.local_endpoint_label() + " -> " + rule.remote_host + ":" +
            std::to_string(rule.remote_port) +
-           " is listening on all interfaces because no 'local_address' was set; anything that can "
-           "reach this host can use it. Set 'local_address: 127.0.0.1' on this forward to accept "
-           "only local connections, or set it explicitly to silence this warning.";
+           " binds 127.0.0.1 because no 'local_address' was set (the default since v0.5.0; "
+           "earlier versions bound 0.0.0.0). Other machines cannot reach this forward. Set "
+           "'local_address: 0.0.0.0' to serve other machines as before, or "
+           "'local_address: 127.0.0.1' to record this choice and silence this notice.";
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,9 +1083,6 @@ bool convert<toxtunnel::InspectConfig>::decode(const Node& node, toxtunnel::Insp
 Node convert<toxtunnel::TunnelResumeConfig>::encode(const toxtunnel::TunnelResumeConfig& rhs) {
     Node node;
     node["enabled"] = rhs.enabled;
-    if (!rhs.state_path.empty()) {
-        node["state_path"] = rhs.state_path;
-    }
     node["max_age_seconds"] = rhs.max_age_seconds;
     node["on_gap"] = rhs.on_gap;
     return node;
@@ -1102,8 +1095,6 @@ bool convert<toxtunnel::TunnelResumeConfig>::decode(const Node& node,
     }
     if (node["enabled"])
         rhs.enabled = node["enabled"].as<bool>();
-    if (node["state_path"])
-        rhs.state_path = node["state_path"].as<std::string>();
     if (node["max_age_seconds"])
         rhs.max_age_seconds = node["max_age_seconds"].as<uint32_t>();
     if (node["on_gap"])

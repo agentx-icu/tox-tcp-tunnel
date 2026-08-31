@@ -12,13 +12,14 @@
 // default string, because two states that produce the same bind must still be
 // told apart:
 //
-//   absent          -> binds 0.0.0.0 AND earns a migration warning
-//   explicit 0.0.0.0 -> binds 0.0.0.0 and is met with SILENCE
+//   absent            -> binds 127.0.0.1 (since v0.5.0; 0.0.0.0 before) AND
+//                        earns a migration notice saying the default changed
+//   explicit anything -> binds what it says and is met with SILENCE
 //
-// An operator who wrote the wildcard made an informed choice; warning them
+// An operator who wrote an address made an informed choice; warning them
 // would be noise they cannot turn off. Anything that flattens the optional into
 // a string — a defaulted field, an encoder that always writes the effective
-// value — destroys that distinction and silences the warning for exactly the
+// value — destroys that distinction and silences the notice for exactly the
 // people it exists for.
 
 #include <gtest/gtest.h>
@@ -55,11 +56,11 @@ Config client_config_with(const ForwardRule& rule) {
 // Provenance: absent vs explicit
 // ---------------------------------------------------------------------------
 
-TEST(ForwardBindAddressTest, AbsentFallsBackToTheWildcardButIsNotExplicit) {
+TEST(ForwardBindAddressTest, AbsentFallsBackToLoopbackButIsNotExplicit) {
     const ForwardRule rule{2222, "10.0.0.5", 22, std::nullopt};
     EXPECT_FALSE(rule.has_explicit_local_address());
-    EXPECT_EQ(rule.effective_local_address(), "0.0.0.0")
-        << "the legacy fallback must not change: existing deployments rely on it";
+    EXPECT_EQ(rule.effective_local_address(), "127.0.0.1")
+        << "the v0.5.0 default is loopback (issue #27); LAN reach must be asked for";
 }
 
 TEST(ForwardBindAddressTest, ExplicitValueIsUsedAndReportedAsExplicit) {
@@ -68,27 +69,30 @@ TEST(ForwardBindAddressTest, ExplicitValueIsUsedAndReportedAsExplicit) {
     EXPECT_EQ(rule.effective_local_address(), "127.0.0.1");
 }
 
-TEST(ForwardBindAddressTest, AnExplicitWildcardIsDistinguishableFromAnAbsentOne) {
-    // The distinction the whole warning design rests on. Both bind the same
+TEST(ForwardBindAddressTest, AnExplicitLoopbackIsDistinguishableFromAnAbsentOne) {
+    // The distinction the whole notice design rests on. Both bind the same
     // address; only one of them asked for it.
     const ForwardRule absent{2222, "10.0.0.5", 22, std::nullopt};
-    const ForwardRule explicit_wildcard{2222, "10.0.0.5", 22, std::string("0.0.0.0")};
+    const ForwardRule explicit_loopback{2222, "10.0.0.5", 22, std::string("127.0.0.1")};
 
-    EXPECT_EQ(absent.effective_local_address(), explicit_wildcard.effective_local_address());
-    EXPECT_NE(absent.has_explicit_local_address(), explicit_wildcard.has_explicit_local_address());
+    EXPECT_EQ(absent.effective_local_address(), explicit_loopback.effective_local_address());
+    EXPECT_NE(absent.has_explicit_local_address(), explicit_loopback.has_explicit_local_address());
 }
 
 // ---------------------------------------------------------------------------
 // The advisory
 // ---------------------------------------------------------------------------
 
-TEST(ForwardBindAdvisoryTest, WarnsWhenTheKeyWasNeverSetAndTheBindIsExposed) {
+TEST(ForwardBindAdvisoryTest, NoticesWhenTheKeyWasNeverSet) {
     const ForwardRule rule{2222, "10.0.0.5", 22, std::nullopt};
     auto advisory = forward_bind_advisory(rule);
-    ASSERT_TRUE(advisory) << "an operator who never chose this must be told";
-    // The message has to carry the fix, not just the diagnosis.
+    ASSERT_TRUE(advisory) << "an operator who never chose this must be told what was chosen "
+                             "for them — especially across the v0.5.0 default flip";
+    // The message has to carry the fix, not just the diagnosis: both the way
+    // back to the old reach and the way to accept the new default.
     EXPECT_NE(advisory->find("local_address"), std::string::npos) << *advisory;
     EXPECT_NE(advisory->find("127.0.0.1"), std::string::npos) << *advisory;
+    EXPECT_NE(advisory->find("0.0.0.0"), std::string::npos) << *advisory;
     // ...and enough identity to act on when several forwards are configured.
     EXPECT_NE(advisory->find("2222"), std::string::npos) << *advisory;
 }
@@ -220,21 +224,21 @@ client:
 // Reload diffing
 // ---------------------------------------------------------------------------
 
-TEST(ForwardBindAddressReloadTest, AbsentAndExplicitWildcardCompareEqual) {
-    // Adding `local_address: 0.0.0.0` to a config that was already binding the
-    // wildcard changes nothing observable, so it must NOT stop and rebind a
-    // live listener.
+TEST(ForwardBindAddressReloadTest, AbsentAndExplicitLoopbackCompareEqual) {
+    // Adding `local_address: 127.0.0.1` to a config that was already binding
+    // loopback by default changes nothing observable, so it must NOT stop and
+    // rebind a live listener.
     const ForwardRule absent{2222, "h1", 22, std::nullopt};
-    const ForwardRule explicit_wildcard{2222, "h1", 22, std::string("0.0.0.0")};
-    EXPECT_TRUE(absent == explicit_wildcard);
+    const ForwardRule explicit_loopback{2222, "h1", 22, std::string("127.0.0.1")};
+    EXPECT_TRUE(absent == explicit_loopback);
 
-    const auto diff = util::diff_forwards({absent}, {explicit_wildcard});
+    const auto diff = util::diff_forwards({absent}, {explicit_loopback});
     EXPECT_TRUE(diff.added.empty()) << "a no-op edit rebound the listener";
     EXPECT_TRUE(diff.removed.empty()) << "a no-op edit dropped the listener";
 }
 
 TEST(ForwardBindAddressReloadTest, AChangedAddressIsADifferentRuleAndRebinds) {
-    const ForwardRule wildcard{2222, "h1", 22, std::nullopt};
+    const ForwardRule wildcard{2222, "h1", 22, std::string("0.0.0.0")};
     const ForwardRule loopback{2222, "h1", 22, std::string("127.0.0.1")};
     EXPECT_FALSE(wildcard == loopback);
 
@@ -243,6 +247,19 @@ TEST(ForwardBindAddressReloadTest, AChangedAddressIsADifferentRuleAndRebinds) {
     ASSERT_EQ(diff.removed.size(), 1u) << "the exposed listener was left running";
     EXPECT_EQ(diff.added[0].effective_local_address(), "127.0.0.1");
     EXPECT_EQ(diff.removed[0].effective_local_address(), "0.0.0.0");
+}
+
+TEST(ForwardBindAddressReloadTest, RestoringTheOldWildcardDefaultIsARebind) {
+    // The v0.5.0 migration edit itself: an operator whose absent-key forward
+    // used to serve the LAN writes `local_address: 0.0.0.0` to get that reach
+    // back. Absent now means loopback, so this MUST rebind.
+    const ForwardRule absent{2222, "h1", 22, std::nullopt};
+    const ForwardRule explicit_wildcard{2222, "h1", 22, std::string("0.0.0.0")};
+    EXPECT_FALSE(absent == explicit_wildcard);
+
+    const auto diff = util::diff_forwards({absent}, {explicit_wildcard});
+    ASSERT_EQ(diff.added.size(), 1u) << "the widened bind never took effect";
+    ASSERT_EQ(diff.removed.size(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -263,17 +280,16 @@ TEST(ForwardBindAddressListenerTest, AnExplicitLoopbackRuleBindsLoopback) {
         << "bound " << listener->local_endpoint().address().to_string();
 }
 
-TEST(ForwardBindAddressListenerTest, AnAbsentRuleStillBindsTheWildcard) {
-    // The compatibility guarantee, asserted rather than assumed: existing
-    // deployments that never set the key keep the reach they had.
+TEST(ForwardBindAddressListenerTest, AnAbsentRuleBindsLoopback) {
+    // The v0.5.0 guarantee, asserted rather than assumed: a forward that
+    // never asked for reach does not get any.
     asio::io_context io;
     const ForwardRule rule{0, "10.0.0.5", 22, std::nullopt};
     auto listener =
         std::make_shared<core::TcpListener>(io, rule.effective_local_address(), rule.local_port);
     ASSERT_TRUE(listener->is_bound()) << listener->bind_error().message();
-    EXPECT_TRUE(listener->local_endpoint().address().is_unspecified())
+    EXPECT_TRUE(listener->local_endpoint().address().is_loopback())
         << "bound " << listener->local_endpoint().address().to_string();
-    EXPECT_FALSE(listener->local_endpoint().address().is_loopback());
 }
 
 TEST(ForwardBindAddressListenerTest, AnIpv6RuleBinds) {

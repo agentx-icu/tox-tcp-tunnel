@@ -40,8 +40,8 @@ std::optional<bool> pid_is_toxtunnel(long pid);
 inline constexpr const char* kLockFileName = "toxtunnel.lock";
 
 /// Why a lock and not just a pid file: two daemons sharing one `data_dir` share
-/// one Tox identity (`tox_save.dat`), one inspect socket, one
-/// `known_servers.yaml` and one resume store. Nothing used to stop that, and
+/// one Tox identity (`tox_save.dat`), one inspect socket and one
+/// `known_servers.yaml`. Nothing used to stop that, and
 /// the symptoms — an identity that "randomly" loses friends, an inspect socket
 /// that answers for the wrong process — are miserable to diagnose. A kernel
 /// lock also releases automatically when a process dies, which is what makes a

@@ -16,25 +16,29 @@
 //                                 (effective local_address, local_port,
 //                                 remote_host, remote_port). "Effective" means
 //                                 an absent `local_address` and an explicit
-//                                 `0.0.0.0` are the SAME rule: adding the key
-//                                 to a forward that was already binding the
-//                                 wildcard must not drop a live listener.
-//                                 Changing it to a different address is a
-//                                 different rule, and does stop and rebind.
+//                                 `127.0.0.1` are the SAME rule (loopback is
+//                                 the absent-key default since v0.5.0):
+//                                 writing the default down must not drop a
+//                                 live listener. Changing it to a different
+//                                 address is a different rule, and does stop
+//                                 and rebind.
 //
 //                                 FAILURE MODE WORTH KNOWING: that rebind is
-//                                 stop-then-bind, not bind-then-stop. A new
-//                                 address that parses but is not available on
-//                                 this host (not assigned to an interface, or
-//                                 the port is taken there) leaves that forward
-//                                 DOWN — the old listener is already gone and
-//                                 the new bind fails. Reload is best-effort
-//                                 per forward, so the daemon and its other
-//                                 forwards keep running, the failure is
-//                                 reported, and a later reload retries it.
-//                                 Tunnels already established through the old
-//                                 listener are unaffected: they are accepted
-//                                 connections, not listeners.
+//                                 stop-then-bind, not bind-then-stop (the two
+//                                 addresses may share the port). If the new
+//                                 address parses but is not available on this
+//                                 host (not assigned to an interface, or the
+//                                 port is taken there), the new bind fails and
+//                                 the client re-binds the PREVIOUS rule so the
+//                                 forward keeps serving on its old address
+//                                 (issue #26); only if that restore also fails
+//                                 is the forward down. Reload stays
+//                                 best-effort per forward: the daemon and its
+//                                 other forwards keep running, the failure is
+//                                 reported, and a later reload retries the new
+//                                 address. Tunnels already established through
+//                                 the old listener are unaffected: they are
+//                                 accepted connections, not listeners.
 //   * logging.level            — forwarded straight to spdlog.
 //
 // `check_reloadable` is the gate. `diff_forwards` is the helper the client
@@ -61,10 +65,11 @@ namespace toxtunnel::util {
 ///
 /// Equality of two rules is "same EFFECTIVE local_address, same local_port,
 /// same remote_host, same remote_port" — i.e. the natural key of a listener.
-/// "Effective" means an absent `local_address` and an explicit `0.0.0.0` are
-/// the same rule, so adding the key to a forward that already bound the
-/// wildcard does not stop and rebind a live listener; a different address
-/// does. Reordering the same set of rules in YAML produces an empty diff.
+/// "Effective" means an absent `local_address` and an explicit `127.0.0.1`
+/// are the same rule (loopback is the absent-key default since v0.5.0), so
+/// writing the default down does not stop and rebind a live listener; a
+/// different address does. Reordering the same set of rules in YAML produces
+/// an empty diff.
 struct ForwardDiff {
     std::vector<ForwardRule> added;
     std::vector<ForwardRule> removed;

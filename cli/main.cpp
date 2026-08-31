@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "toxtunnel/app/known_servers.hpp"
+#include "toxtunnel/app/rules_engine.hpp"
 #include "toxtunnel/app/tunnel_client.hpp"
 #include "toxtunnel/app/tunnel_server.hpp"
 #include "toxtunnel/tox/tox_adapter.hpp"
@@ -591,11 +592,25 @@ int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subact
         return 1;
     }
 
-    // Forward-exposure advisories. These also come out of the daemon at
+    // Load the rules file exactly as the daemon does at startup. A missing or
+    // malformed rules.yaml fails `initialize()`, so a "valid" verdict that
+    // never opened it told the operator the config was deployable when it was
+    // not (issue #23). Loading — not just stat'ing — also catches syntax and
+    // schema errors with the same messages the daemon would print.
+    if (loaded.value().server.has_value() && loaded.value().server->rules_file.has_value()) {
+        auto rules = toxtunnel::RulesEngine::from_file(*loaded.value().server->rules_file);
+        if (!rules.has_value()) {
+            std::cerr << "config check: server.rules_file: " << rules.error() << "\n";
+            return 1;
+        }
+    }
+
+    // Forward bind-default advisories. These also come out of the daemon at
     // startup, but a host running `logging.level: error` would never see that
     // one — and this command is where an operator looks before deploying.
-    // Advisory only: it never changes the exit code, because the wildcard bind
-    // is still valid, supported configuration.
+    // Advisory only: it never changes the exit code, because an absent
+    // `local_address` is still valid, supported configuration — it just binds
+    // loopback since v0.5.0 where it used to bind the wildcard.
     if (loaded.value().client.has_value()) {
         for (const auto& fwd : loaded.value().client->forwards) {
             if (auto advisory = toxtunnel::forward_bind_advisory(fwd)) {
@@ -883,8 +898,8 @@ int run_server(const toxtunnel::Config& config, bool run_as_service,
                const std::string& config_path) {
     using Logger = toxtunnel::util::Logger;
 
-    // Claim the data dir BEFORE initialize(): that call opens tox_save.dat, the
-    // inspect socket and the resume store, none of which two daemons may share.
+    // Claim the data dir BEFORE initialize(): that call opens tox_save.dat and
+    // the inspect socket, neither of which two daemons may share.
     // The guard also publishes our pid for inspect/reload discovery.
     toxtunnel::util::PidFileGuard pid_file(config.data_dir);
     if (auto rc = handle_data_dir_conflict(pid_file, config.data_dir); rc.has_value()) {
