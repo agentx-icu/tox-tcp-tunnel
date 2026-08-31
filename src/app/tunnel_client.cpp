@@ -519,10 +519,9 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
                     return listener->bind_error().message();
                 }
                 const auto captured = rule;
-                listener->start_accept(
-                    [this, captured](std::shared_ptr<core::TcpConnection> conn) {
-                        on_tcp_connection_accepted(std::move(conn), captured);
-                    });
+                listener->start_accept([this, captured](std::shared_ptr<core::TcpConnection> conn) {
+                    on_tcp_connection_accepted(std::move(conn), captured);
+                });
                 listeners_.push_back(std::move(listener));
                 forward_rules_.push_back(rule);
                 return std::nullopt;

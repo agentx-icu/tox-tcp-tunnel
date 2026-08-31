@@ -6,6 +6,7 @@
 #include <functional>
 #include <numeric>
 #include <span>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -561,7 +562,7 @@ TEST_F(TunnelCoalesceTest, CohortsKeepTheirAdmissionCapAcrossBackpressure) {
 // ---------------------------------------------------------------------------
 
 TEST_F(TunnelCoalesceTest, ReentrantSendQueuesBehindTheInFlightWritesRemainder) {
-    std::vector<uint8_t> first(2000, 0xAA);   // emits as 1367 + 633
+    std::vector<uint8_t> first(2000, 0xAA);  // emits as 1367 + 633
     std::vector<uint8_t> reentrant(100, 0xBB);
 
     bool injected = false;
@@ -710,4 +711,289 @@ TEST_F(TunnelCoalesceTest, DeferredLocalAndRemoteCloseSettleExactlyOnce) {
         toxtunnel::util::MetricsRegistry::CloseReason::Remote);
     EXPECT_EQ(remote_closed_after - remote_closed_before, 1u)
         << "the remote close was finalized more than once";
+}
+
+// ===========================================================================
+// Terminal Abort ordering (slice 3, issue #24)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 15. send_error() seals admission and abandons retained DATA atomically, so
+//     no TUNNEL_DATA can reach the wire after the terminal TUNNEL_ERROR —
+//     previously the retained cohorts kept riding the retry timer and emitted
+//     against a tunnel the peer had already torn down. Also: one tunnel, one
+//     terminal ERROR; the second call is a suppressed duplicate.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, SendErrorAbandonsRetainedDataAndClaimsTheOneTerminalError) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        if (!allow_send) {
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    // Retained under backpressure.
+    std::vector<uint8_t> payload(400, 0xAB);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+
+    allow_send = true;
+    tunnel_->send_error(2, "target went away");
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
+
+    // Admission is sealed: nothing new gets in.
+    EXPECT_FALSE(tunnel_->send_data_to_tox(payload))
+        << "admission accepted bytes after the terminal Abort seal";
+
+    // A duplicate terminal error is suppressed entirely.
+    tunnel_->send_error(3, "duplicate");
+
+    // Give the (now pointless) retry timer every chance to misbehave.
+    pump_for(30ms);
+
+    const auto errors = std::count(captured_.all_frame_types.begin(),
+                                   captured_.all_frame_types.end(), FrameType::TUNNEL_ERROR);
+    const auto data_frames = std::count(captured_.all_frame_types.begin(),
+                                        captured_.all_frame_types.end(), FrameType::TUNNEL_DATA);
+    EXPECT_EQ(errors, 1) << "either the duplicate was not suppressed or the ERROR never went out";
+    EXPECT_EQ(data_frames, 0) << "abandoned DATA reached the wire after the terminal ERROR";
+}
+
+// ---------------------------------------------------------------------------
+// 15b. A CLOSE deferred behind backpressure records an Owed obligation that
+//      pins the tunnel id. send_error()'s abandonment removes the drain that
+//      would have discharged it, so it must give the obligation up itself —
+//      after the ERROR attempt and the terminal transition — or an owner
+//      whose on_id_releasable hook is already installed waits forever and
+//      the id is pinned for the life of the object.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, SendErrorReleasesAnOwedCloseObligation) {
+    tunnel_->set_on_send_to_tox(
+        [&](std::span<const uint8_t>) -> SendOutcome { return SendOutcome::SendqFull; });
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    std::vector<uint8_t> payload(200, 0x77);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+    tunnel_->close();  // defers behind the retained bytes; CLOSE now Owed
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Connected) << "close was not deferred";
+
+    bool releasable = false;
+    tunnel_->set_on_id_releasable([&] { releasable = true; });
+    EXPECT_FALSE(releasable) << "id released while a CLOSE was still owed";
+
+    tunnel_->send_error(2, "target died mid-close");
+    EXPECT_TRUE(releasable)
+        << "the owed CLOSE was abandoned silently and the id stayed pinned forever";
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
+}
+
+// ---------------------------------------------------------------------------
+// 16. send_error() from INSIDE the driver's send callback: the abandonment
+//     runs while a DATA frame is in flight. The commit step must tolerate the
+//     emptied FIFO (nothing to consume), the remainder must never follow the
+//     ERROR onto the wire, and nothing crashes.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, SendErrorFromInsideTheSendCallbackAbandonsTheRemainder) {
+    std::vector<uint8_t> payload(2000, 0xCD);  // would emit as 1367 + 633
+
+    bool errored = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        if (!errored) {
+            errored = true;
+            // Same thread, mid-frame: the driver is active and its first
+            // frame is being accepted right now.
+            tunnel_->send_error(2, "mid-flight failure");
+        }
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+    pump_for(30ms);
+
+    // Wire order: the first DATA frame (in flight when the error struck),
+    // then the ERROR, then silence — the 633-byte remainder was abandoned.
+    ASSERT_GE(captured_.all_frame_types.size(), 2u);
+    EXPECT_EQ(captured_.all_frame_types[0], FrameType::TUNNEL_DATA);
+    EXPECT_EQ(captured_.all_frame_types[1], FrameType::TUNNEL_ERROR);
+    EXPECT_EQ(captured_.all_frame_types.size(), 2u)
+        << "abandoned remainder (or a duplicate frame) reached the wire after the ERROR";
+    EXPECT_EQ(captured_.data_payloads.size(), 1u);
+    EXPECT_EQ(captured_.data_payloads[0].size(), 1367u);
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
+}
+
+// ---------------------------------------------------------------------------
+// 16b. close() re-entered from the terminal ERROR's own transport callback:
+//      the state still reads Connected there (the Error transition happens
+//      after the send), so only the Abort seal stands between the re-entrant
+//      close and a TUNNEL_CLOSE emitted AFTER the terminal ERROR —
+//      downgrading Abort to graceful on the wire. (Slice-3 review finding.)
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, ReentrantCloseDuringTheTerminalErrorEmitsNoClose) {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_ERROR) {
+            tunnel_->close();  // state still reads Connected here
+        }
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    tunnel_->send_error(2, "boom");
+    pump_for(20ms);
+
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_CLOSE),
+              0)
+        << "a graceful CLOSE followed the terminal ERROR onto the wire";
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_ERROR),
+              1);
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
+}
+
+// ---------------------------------------------------------------------------
+// 16b2. force_close() re-entered from the terminal ERROR's transport
+//       callback: it claims Connected -> Closed and asks to announce a CLOSE
+//       before send_error() has fenced the close machinery. Only the Abort
+//       seal consulted at the EMISSION boundary (emit_close_frame_once)
+//       stops that CLOSE from following the ERROR onto the wire; the
+//       terminal Closed claim must also survive (send_error's transition is
+//       conditional, not a blind Error store). (Slice-3 follow-up P1.)
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, ReentrantForceCloseDuringTheTerminalErrorEmitsNoClose) {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_ERROR) {
+            tunnel_->force_close();  // claims Connected -> Closed re-entrantly
+        }
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    tunnel_->send_error(2, "boom");
+    pump_for(20ms);
+
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_CLOSE),
+              0)
+        << "force_close's CLOSE announcement followed the terminal ERROR onto the wire";
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_ERROR),
+              1);
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Closed)
+        << "send_error's transition clobbered the terminal state force_close claimed";
+}
+
+// ---------------------------------------------------------------------------
+// 16c. send_error() from inside an in-flight CLOSE's transport callback,
+//      where the CLOSE comes back SendqFull: the terminal fence must stop
+//      the SendqFull verdict from restoring Owed and re-arming a CLOSE retry
+//      that would land after the ERROR. Also: the CLOSE emit path must not
+//      clobber the terminal Error state with its Disconnecting transition.
+//      (Slice-3 review finding.)
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, TerminalErrorFencesAnInFlightCloseRetry) {
+    int close_attempts = 0;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_CLOSE) {
+            ++close_attempts;
+            // Same thread, mid-CLOSE: the target died while the close was
+            // inside the transport.
+            tunnel_->send_error(2, "died during close");
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    tunnel_->close();  // empty FIFO: the CLOSE emits synchronously
+    pump_for(100ms);   // a wrongly re-armed retry would fire well within this
+
+    EXPECT_EQ(close_attempts, 1) << "the CLOSE retried after the terminal ERROR";
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_ERROR),
+              1);
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error)
+        << "the CLOSE path's Disconnecting transition clobbered the terminal state";
+}
+
+// ---------------------------------------------------------------------------
+// 16d. force_close() with retained outbound DATA and an accepting transport:
+//      the best-effort flush must reach the wire BEFORE the CLOSE
+//      announcement — the peer drops post-close frames as "unknown tunnel",
+//      so CLOSE-then-DATA is the recorded truncation mistake. (Slice-3
+//      review finding: the old order announced first.)
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, ForceCloseFlushesRetainedDataBeforeItsClose) {
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    std::vector<uint8_t> payload(300, 0x5A);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));  // held for the flush timer
+
+    tunnel_->force_close();
+
+    EXPECT_EQ(captured_.concatenated_data(), payload) << "force_close dropped deliverable bytes";
+    ASSERT_GE(captured_.all_frame_types.size(), 2u);
+    EXPECT_EQ(captured_.all_frame_types[0], FrameType::TUNNEL_DATA);
+    EXPECT_EQ(captured_.all_frame_types[1], FrameType::TUNNEL_CLOSE)
+        << "the CLOSE announcement overtook the flushed DATA";
+}
+
+// ---------------------------------------------------------------------------
+// 16e. A transport callback that THROWS during the terminal ERROR must not
+//      strand the tunnel: the claim is irrevocable (later send_error calls
+//      are suppressed duplicates), so the terminal transition and the close
+//      notification must still run. (Slice-3 review finding; mirrors the
+//      ClaimGuard in emit_close_frame_once.)
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, ThrowingTransportDoesNotStrandTheTerminalError) {
+    tunnel_->set_on_send_to_tox([](std::span<const uint8_t>) -> SendOutcome {
+        throw std::runtime_error("transport exploded");
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    bool close_notified = false;
+    tunnel_->set_on_close([&] { close_notified = true; });
+
+    tunnel_->send_error(2, "boom");
+
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error)
+        << "the throwing transport skipped the terminal transition";
+    EXPECT_TRUE(close_notified) << "the throwing transport skipped the close notification";
+}
+
+// ---------------------------------------------------------------------------
+// 17. close_outbound_gate() publishes the Abort seal in the same critical
+//     section that closes the gate: one authority. Afterwards ordinary
+//     admission is refused outright instead of feeding bytes to fake-success
+//     gated sends.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, GateCloseSealsAdmissionInTheSameStep) {
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    tunnel_->close_outbound_gate();
+    EXPECT_TRUE(tunnel_->outbound_gate_closed());
+
+    std::vector<uint8_t> payload(64, 0x11);
+    EXPECT_FALSE(tunnel_->send_data_to_tox(payload))
+        << "admission stayed open after the gate closed — gate and seal split authority";
+    EXPECT_TRUE(captured_.data_payloads.empty());
 }

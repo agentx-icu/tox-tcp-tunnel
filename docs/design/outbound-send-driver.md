@@ -4,9 +4,20 @@ Status: **approved, partially implemented.** Slice 1 (typed seam + handshake)
 shipped in v0.4.13. Slice 2 (cohort FIFO + the single emission driver for DATA)
 is implemented on master: no Tox send callback runs under `coalesce_mutex_` on
 any DATA path any more, and the deferred-close bookkeeping moved from the flush
-timer into the driver's drain-complete step. Slices 3-5 are specified here and
-not yet built — tracked as
-https://github.com/agentx-icu/tox-tcp-tunnel/issues/24.
+timer into the driver's drain-complete step. Slice 3 is **partially
+implemented** — the terminal Abort ordering landed (`send_error()` seals
+admission, abandons undelivered DATA and claims the single terminal ERROR in
+one critical section before any callback runs; `close_outbound_gate()`
+publishes the Abort seal in the same critical section that closes the gate;
+the graceful paths and the driver consult the seal so neither a CLOSE nor a
+pre-authorization DATA frame follows the terminal ERROR), but **CLOSE and
+ERROR frames still emit through their own latch/retry machinery rather than
+through `run_emission_driver` itself** — the "one driver owns every emission
+path" end-state remains open. Of the `LocalTerminalIntent` ladder only `Abort`
+is materialized (`outbound_abort_published_`); the graceful levels stay in
+their pre-ladder flags until slice 4's privileged backlog drain exists to
+enforce them on ordinary admission. That residue plus slices 4-5 are tracked
+as https://github.com/agentx-icu/tox-tcp-tunnel/issues/24.
 
 This document exists because the design took nine rounds of independent review
 to converge, and eight of those rounds were rejections that each found a real
@@ -225,8 +236,28 @@ state/error callback, because those callbacks can re-enter admission.
    no lock held), cohorts tagged with their admission cap, `EmitOutcome` with
    `DeferredToActiveEmitter` distinct from satisfied, and the deferred-close
    bookkeeping executed by whichever emitter completes the drain.
-3. CLOSE/ERROR driver ownership; `send_error()` reordering; `close_outbound_gate()`
-   publishing `Abort`.
+3. **Partially implemented: terminal Abort ordering.** Landed: `send_error()`
+   reordering (seal admission + abandon DATA + claim the one terminal ERROR
+   atomically, callbacks outside the mutex; the seal also fences the CLOSE
+   obligation via `cancel_close_retry`, covering Owed and InFlight),
+   `close_outbound_gate()` publishing `Abort` in the gate's own critical
+   section, `force_close()` flushing best-effort BEFORE its CLOSE
+   announcement and abandoning the rest, the graceful close/EOF/remote-close
+   paths and the driver's pre-callback check consulting the seal, and the
+   driver tolerating a mid-flight abandonment. CLOSE retention/retry on the
+   SENDQ cadence predates this slice (`CloseFrameState` + `sendq_retry`), and
+   DATA-before-CLOSE ordering is the slice-2 drain-complete bookkeeping.
+   **Still open:** routing the CLOSE/ERROR emissions themselves through
+   `run_emission_driver`, so that literally no second path invokes a send
+   callback. **Documented residual (closed by that same open work, not by
+   slice 5):** a CLOSE that claims InFlight and then stalls before its
+   transport call can still land after a concurrent terminal ERROR — the
+   pre-transport recheck in `emit_close_frame_once` narrows that window to
+   the same allowance granted an already-authorised DATA callback, and the
+   single serialized owner for CLOSE/ERROR eliminates it outright (an ERROR
+   queues behind an already-authorised CLOSE, or cancels one not yet
+   selected). A `terminal_error_in_flight_` fence keeps the id from being
+   recycled while the ERROR's own transport attempt is outstanding.
 4. Pending-backlog seal, handoff ownership, privileged capability, aggregate cap.
 5. Only then: revisit the strong `close_all_local()` fence and whether the
    `force_close()` local-abandon guard can be removed. Removing the mutex hold is

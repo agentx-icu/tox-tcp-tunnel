@@ -926,11 +926,14 @@ void TunnelManager::close_all_local() {
     // that had already acquired one is outside what either design covers.
     //
     // H-01 discipline: `close_outbound_gate()` is the only thing called under
-    // `mutex_`, and it is provably non-re-entrant — it takes just the tunnel's
-    // own mutex to raise a flag and null two std::functions, then returns. It
-    // never calls back into the manager and never blocks on a send. The lock
-    // order manager-mutex_ -> tunnel-mutex_ is the
-    // one snapshot() already uses, and no path takes them the other way round.
+    // `mutex_`, and it is provably non-re-entrant — it takes the tunnel's own
+    // `mutex_` and `coalesce_mutex_` together (one scoped_lock: the gate and
+    // the terminal Abort seal are a single authority since issue #24 slice 3)
+    // to raise two flags, clear the abandoned FIFO and null two
+    // std::functions, then returns. It never calls back into the manager and
+    // never blocks on a send. The lock order manager-mutex_ -> tunnel-mutexes
+    // is the one snapshot() already uses, and no path takes them the other
+    // way round.
     std::map<uint16_t, std::shared_ptr<Tunnel>> doomed;
     TunnelClosedCallback closed_cb;
     {

@@ -555,7 +555,15 @@ class TunnelImpl : public Tunnel {
     // Error handling
     // -----------------------------------------------------------------
 
-    /// Send an error frame and transition to Error state.
+    /// Send the single terminal TUNNEL_ERROR and transition to Error state.
+    ///
+    /// Slice-3 ordering (issue #24): atomically seals admission and abandons
+    /// undelivered DATA (`publish_abort_locked`), claims the one terminal
+    /// ERROR, and only then — with no lock held — sends the frame and fires
+    /// the state/close callbacks (which may re-enter admission; the seal is
+    /// already published, so they are refused instead of racing the
+    /// abandonment). A second call is a suppressed duplicate: one tunnel,
+    /// one terminal ERROR.
     void send_error(uint8_t error_code, const std::string& description);
 
     // -----------------------------------------------------------------
@@ -1032,6 +1040,24 @@ class TunnelImpl : public Tunnel {
     /// `coalesce_mutex_`. Never emits — emission belongs to the driver.
     void fifo_append_locked(std::span<const uint8_t> data, std::size_t cap);
 
+    /// Publish the terminal `Abort` intent (slice 3 of the outbound-send
+    /// driver design, issue #24): seal ordinary DATA admission and abandon
+    /// everything undelivered — the cohort FIFO and any deferred-close
+    /// bookkeeping riding on its drain. The caller must hold
+    /// `coalesce_mutex_`, which is what makes the seal atomic with the
+    /// abandonment: an admission racing this either lands before (and is
+    /// abandoned) or re-checks the seal after and is refused.
+    ///
+    /// In the design's `LocalTerminalIntent` ladder (None < LocalEof <
+    /// GracefulClose < Abort) only `Abort` is materialized so far — the two
+    /// graceful levels still live in the flags that predate the ladder
+    /// (`pending_tcp_eof_` / `close_pending_`), because enforcing them on
+    /// ordinary admission requires the slice-4 privileged capability that
+    /// drains the sealed pending-TCP backlog. No graceful operation may ever
+    /// route through here: Abort abandons bytes, and `close()` / TCP EOF owe
+    /// theirs to the peer.
+    void publish_abort_locked();
+
     /// THE single outbound emission driver for TUNNEL_DATA (slice 2 of the
     /// outbound-send-driver design, issue #24). At most one thread drains at a
     /// time; every send callback runs with NO lock held (frame selection and
@@ -1269,6 +1295,34 @@ class TunnelImpl : public Tunnel {
     // every iteration; cleared when the FIFO empties or the drain backpressures
     // (the retry timer flushes everything anyway).
     bool driver_flush_all_requested_{false};
+    // The terminal `Abort` seal (see publish_abort_locked). One-way. Always
+    // STORED under `coalesce_mutex_` so the seal and the FIFO abandonment are
+    // one atomic step; exposed as an atomic only so admission can fast-reject
+    // without the lock (the authoritative re-check happens under the lock
+    // before any append).
+    std::atomic<bool> outbound_abort_published_{false};
+    // The single terminal TUNNEL_ERROR has been claimed (send_error). Always
+    // STORED under `coalesce_mutex_`, in the same critical section as the
+    // Abort seal; whoever flips it owes the frame and the state / close
+    // notifications, and every later send_error() is a suppressed duplicate.
+    // Atomic because emit_close_frame_once() reads it under
+    // `close_frame_mutex_` as the ERROR->CLOSE fence: once the terminal ERROR
+    // is claimed, NO tunnel CLOSE may be newly authorized — not even an Owed
+    // one — or it would follow the ERROR onto the wire. Deliberately narrower
+    // than `outbound_abort_published_`: a force_close teardown (Abort without
+    // an ERROR) must still allow the handed-off CLOSE that an in-flight OPEN's
+    // sender owes the peer.
+    std::atomic<bool> terminal_error_claimed_{false};
+    // Releasability fence for the terminal ERROR's own transport attempt. Set
+    // by send_error() before it invokes the transport, cleared after the
+    // attempt and the terminal transition settle. While set,
+    // id_releasable_locked() answers no: the ERROR frame is (or may be)
+    // inside the transport naming this id, and the Abandoned verdict a
+    // concurrently-fenced CLOSE records must not release the id out from
+    // under it — a recycled id would make the in-flight ERROR name the
+    // replacement. The wakeup that matters fires from send_error() itself
+    // (cancel_close_retry -> maybe_notify) after the fence clears.
+    std::atomic<bool> terminal_error_in_flight_{false};
     asio::steady_timer coalesce_timer_;
     // Receiver-side ACK retry state. This is intentionally separate from the
     // DATA coalescing timer: an inbound TCP drain can need to retry only ACKs
