@@ -6,9 +6,11 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "toxtunnel/tox/types.hpp"
+#include "toxtunnel/util/endpoint_label.hpp"
 #include "toxtunnel/util/expected.hpp"
 #include "toxtunnel/util/logger.hpp"
 
@@ -18,17 +20,85 @@ namespace toxtunnel {
 // Configuration structures
 // ---------------------------------------------------------------------------
 
+/// The address a forward binds when the operator did not name one.
+///
+/// A LEGACY COMPATIBILITY FALLBACK, not a recommendation: it is the wildcard,
+/// so the forward is reachable from anything that can route to this host. It
+/// stays the default only because changing it would silently break existing
+/// deployments that rely on it. New configs should set `local_address`
+/// explicitly — `127.0.0.1` unless the forward is genuinely meant to serve
+/// other machines.
+inline constexpr std::string_view kLegacyForwardBindAddress = "0.0.0.0";
+
 /// Represents a port forwarding rule for client mode.
 struct ForwardRule {
     uint16_t local_port = 0;   ///< Local port to listen on
     std::string remote_host;   ///< Remote host to connect to (via tunnel)
     uint16_t remote_port = 0;  ///< Remote port to connect to
 
+    /// Local address to bind the listener to. NUMERIC IP LITERALS ONLY —
+    /// IPv4 or IPv6 (`127.0.0.1`, `::1`, `192.168.1.10`, `0.0.0.0`, `::`).
+    ///
+    /// Deliberately NOT named `local_host`, even though it sits beside
+    /// `remote_host`: `remote_host` accepts a hostname, which the *server*
+    /// resolves, whereas this goes to `asio::ip::make_address`, which parses
+    /// literals only. `localhost` is rejected here — use `127.0.0.1`.
+    ///
+    /// OPTIONAL ON PURPOSE, and absence is preserved rather than collapsed
+    /// into a default string: "the operator never set this" and "the operator
+    /// deliberately chose the wildcard" must stay distinguishable, because the
+    /// first earns a migration warning and the second must be met with
+    /// silence.
+    ///
+    /// Declared last, and DEFAULT-INITIALISED, so the three-field aggregate
+    /// form keeps compiling: this project builds `-Werror` with
+    /// `-Wmissing-field-initializers`, and without the initialiser here every
+    /// existing `{port, "host", port}` site becomes a hard error on both Clang
+    /// and GCC. The type stays an aggregate, so brace initialisation with
+    /// three or four fields both work.
+    std::optional<std::string> local_address = std::nullopt;
+
+    /// The address this rule actually binds: the explicit value, or the
+    /// legacy wildcard fallback.
+    [[nodiscard]] std::string effective_local_address() const {
+        return local_address.value_or(std::string(kLegacyForwardBindAddress));
+    }
+
+    /// "127.0.0.1:2222", or "[::1]:2222" for IPv6. The brackets are not
+    /// decoration: without them "::1:2222" is ambiguous — a reader cannot tell
+    /// where the address ends and the port begins.
+    [[nodiscard]] std::string local_endpoint_label() const {
+        return format_endpoint_label(effective_local_address(), local_port);
+    }
+
+    /// True when the operator named an address, whatever it was. The warning
+    /// path keys off this, not off the resulting address.
+    [[nodiscard]] bool has_explicit_local_address() const noexcept {
+        return local_address.has_value();
+    }
+
+    /// Compares the EFFECTIVE address, so an absent value and an explicit
+    /// `0.0.0.0` are equal. `diff_forwards()` turns inequality into a
+    /// stop-and-rebind, and adding the key to a config that was already
+    /// binding the wildcard changes nothing observable — it must not drop a
+    /// live listener. A genuinely different address still compares unequal
+    /// and does rebind.
     bool operator==(const ForwardRule& other) const {
         return local_port == other.local_port && remote_host == other.remote_host &&
-               remote_port == other.remote_port;
+               remote_port == other.remote_port &&
+               effective_local_address() == other.effective_local_address();
     }
 };
+
+/// Migration advisory for a forward that is about to bind, or is bound, to a
+/// non-loopback address WITHOUT the operator having asked for one.
+///
+/// Returns the message to show, or `std::nullopt` when there is nothing to say
+/// — which includes every rule that names an address explicitly, `0.0.0.0`
+/// included. An operator who wrote the wildcard made an informed choice and
+/// gets silence; the warning exists for the operator who does not know their
+/// forward is exposed.
+[[nodiscard]] std::optional<std::string> forward_bind_advisory(const ForwardRule& rule);
 
 /// Represents a pipe-mode target for client stdio forwarding.
 struct PipeTarget {

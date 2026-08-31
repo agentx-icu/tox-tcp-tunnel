@@ -152,7 +152,8 @@ class TunnelClient {
     /// is not recorded in `forward_rules_`, the next reload retries it.
     struct ReloadResult {
         /// Empty when every added forward bound. Otherwise a human-readable
-        /// list of "local port N: <reason>" entries.
+        /// list of "<address>:<port>: <reason>" entries (IPv6 bracketed), the
+        /// address being the forward's effective `local_address`.
         std::string warnings;
     };
 

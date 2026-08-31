@@ -47,6 +47,7 @@ add_executable(unit_tests
     unit/pid_file_test.cpp
     unit/tcp_listener_bind_test.cpp
     unit/config_diagnostics_test.cpp
+    unit/forward_bind_address_test.cpp
     unit/path_security_test.cpp
     unit/tunnel_id_allocator_test.cpp
     unit/open_handshake_test.cpp
@@ -97,6 +98,7 @@ gtest_discover_tests(unit_tests
 # Integration tests
 add_executable(integration_tests
     integration/test_config_pipeline.cpp
+    integration/test_forward_bind_wiring.cpp
     integration/test_http_scenarios.cpp
     integration/test_inspect_ipc.cpp
     integration/test_pipe_bridge.cpp

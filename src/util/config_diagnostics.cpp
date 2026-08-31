@@ -88,7 +88,7 @@ const KeySet& pipe_keys() {
     return k;
 }
 const KeySet& forward_keys() {
-    static const KeySet k{"local_port", "remote_host", "remote_port"};
+    static const KeySet k{"local_port", "remote_host", "remote_port", "local_address"};
     return k;
 }
 const KeySet& client_keys() {

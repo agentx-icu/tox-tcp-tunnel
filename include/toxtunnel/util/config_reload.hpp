@@ -13,7 +13,28 @@
 //   * server.rules_file        — the *content* of the file is re-read; the
 //                                 path itself may change too.
 //   * client.forwards          — listener set is diffed by
-//                                 (local_port, remote_host, remote_port).
+//                                 (effective local_address, local_port,
+//                                 remote_host, remote_port). "Effective" means
+//                                 an absent `local_address` and an explicit
+//                                 `0.0.0.0` are the SAME rule: adding the key
+//                                 to a forward that was already binding the
+//                                 wildcard must not drop a live listener.
+//                                 Changing it to a different address is a
+//                                 different rule, and does stop and rebind.
+//
+//                                 FAILURE MODE WORTH KNOWING: that rebind is
+//                                 stop-then-bind, not bind-then-stop. A new
+//                                 address that parses but is not available on
+//                                 this host (not assigned to an interface, or
+//                                 the port is taken there) leaves that forward
+//                                 DOWN — the old listener is already gone and
+//                                 the new bind fails. Reload is best-effort
+//                                 per forward, so the daemon and its other
+//                                 forwards keep running, the failure is
+//                                 reported, and a later reload retries it.
+//                                 Tunnels already established through the old
+//                                 listener are unaffected: they are accepted
+//                                 connections, not listeners.
 //   * logging.level            — forwarded straight to spdlog.
 //
 // `check_reloadable` is the gate. `diff_forwards` is the helper the client
@@ -38,9 +59,12 @@ namespace toxtunnel::util {
 
 /// Sets of ForwardRules added vs removed between a current and new config.
 ///
-/// Equality of two rules is "same local_port, same remote_host, same
-/// remote_port" — i.e. the natural key of a listener. Reordering the same set
-/// of rules in YAML produces an empty diff.
+/// Equality of two rules is "same EFFECTIVE local_address, same local_port,
+/// same remote_host, same remote_port" — i.e. the natural key of a listener.
+/// "Effective" means an absent `local_address` and an explicit `0.0.0.0` are
+/// the same rule, so adding the key to a forward that already bound the
+/// wildcard does not stop and rebind a live listener; a different address
+/// does. Reordering the same set of rules in YAML produces an empty diff.
 struct ForwardDiff {
     std::vector<ForwardRule> added;
     std::vector<ForwardRule> removed;

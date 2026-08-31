@@ -513,6 +513,52 @@ int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subact
     return 0;
 }
 
+/// Resolve known-servers aliases in a client config to 76-character Tox IDs.
+///
+/// The daemon does this BEFORE `validate()`, because validation only knows how
+/// to check a 76-hex id and would otherwise report a perfectly good alias as
+/// "must be 76 characters" (C-21 in the 2026-05-20 review). `config check` has
+/// to do the same or it contradicts the daemon: a config the daemon starts
+/// happily would fail the very command operators are told to run first.
+///
+/// Returns an error message for an unknown alias, or nullopt on success.
+[[nodiscard]] std::optional<std::string> resolve_client_aliases(toxtunnel::Config& config) {
+    if (!config.is_client() || !config.client.has_value()) {
+        return std::nullopt;
+    }
+    toxtunnel::app::KnownServersStore lookup(config.data_dir);
+    std::string resolve_err;
+    // Replaces an alias with its tox_id in place. Anything that is neither a
+    // 76-hex id nor a known alias is reported as an unknown alias rather than
+    // being left to surface later as a length complaint.
+    auto try_resolve = [&](std::string& id, const char* which) -> bool {
+        if (id.empty() || id.size() == 76) {
+            return true;
+        }
+        const auto original = id;
+        const auto resolved = lookup.resolve_tox_id(original);
+        if (resolved == original) {
+            resolve_err = std::string("Unknown server alias '") + original + "' in " + which +
+                          " (run `toxtunnel servers list` to see known aliases, or "
+                          "supply a 76-character Tox ID)";
+            return false;
+        }
+        std::cerr << "Resolved alias '" << original << "' to "
+                  << (resolved.size() == 76 ? resolved.substr(0, 12) + "..." : resolved) << "\n";
+        id = resolved;
+        return true;
+    };
+    if (!try_resolve(config.client->server_id, "--server-id / client.server_id")) {
+        return resolve_err;
+    }
+    for (auto& fb : config.client->fallback_server_ids) {
+        if (!try_resolve(fb, "--server-id-fallback / client.fallback_server_ids")) {
+            return resolve_err;
+        }
+    }
+    return std::nullopt;
+}
+
 /// Parse, validate and lint a config file without starting anything.
 ///
 /// Exit codes: 0 = usable, 1 = cannot be loaded or fails validation, and with
@@ -531,10 +577,31 @@ int cmd_inspect(const std::filesystem::path& data_dir, const std::string& subact
         std::cerr << "config check: unknown key '" << key.path << "' (ignored by this build)\n";
     }
 
+    // Resolve aliases before validating, exactly as the daemon does. Without
+    // this, a registered alias in `client.server_id` fails here with "Server ID
+    // must be 76 characters" on a config the daemon starts without complaint.
+    if (auto alias_err = resolve_client_aliases(loaded.value())) {
+        std::cerr << "config check: " << *alias_err << "\n";
+        return 1;
+    }
+
     auto validation = loaded.value().validate();
     if (!validation.has_value()) {
         std::cerr << "config check: " << validation.error() << "\n";
         return 1;
+    }
+
+    // Forward-exposure advisories. These also come out of the daemon at
+    // startup, but a host running `logging.level: error` would never see that
+    // one — and this command is where an operator looks before deploying.
+    // Advisory only: it never changes the exit code, because the wildcard bind
+    // is still valid, supported configuration.
+    if (loaded.value().client.has_value()) {
+        for (const auto& fwd : loaded.value().client->forwards) {
+            if (auto advisory = toxtunnel::forward_bind_advisory(fwd)) {
+                std::cerr << "config check: warning: " << *advisory << "\n";
+            }
+        }
     }
 
     std::cout << "config check: " << config_path << " is valid ("
@@ -1465,44 +1532,9 @@ int main(int argc, char* argv[]) {
     // data_dir. Single pass so the "Resolved alias …" message fires at most
     // once per id per run.
     // -----------------------------------------------------------------------
-    if (config.is_client() && config.client.has_value()) {
-        toxtunnel::app::KnownServersStore lookup(config.data_dir);
-        // try_resolve replaces an alias with its tox_id in-place. If the
-        // input is neither a 76-hex tox_id nor a known alias, set out_err
-        // and return false — this is C-21 in the 2026-05-20 review: an
-        // unresolved alias used to fall through to validate() which
-        // reported "must be 76 hex chars", leaving the operator
-        // wondering why their alias was treated as malformed instead of
-        // unknown.
-        std::string resolve_err;
-        auto try_resolve = [&](std::string& id, const char* which) -> bool {
-            if (id.empty() || id.size() == 76) {
-                return true;
-            }
-            const auto original = id;
-            const auto resolved = lookup.resolve_tox_id(original);
-            if (resolved == original) {
-                resolve_err = std::string("Unknown server alias '") + original + "' in " + which +
-                              " (run `toxtunnel servers list` to see known aliases, or "
-                              "supply a 76-character Tox ID)";
-                return false;
-            }
-            std::cerr << "Resolved alias '" << original << "' to "
-                      << (resolved.size() == 76 ? resolved.substr(0, 12) + "..." : resolved)
-                      << "\n";
-            id = resolved;
-            return true;
-        };
-        if (!try_resolve(config.client->server_id, "--server-id / client.server_id")) {
-            std::cerr << resolve_err << "\n";
-            return 1;
-        }
-        for (auto& fb : config.client->fallback_server_ids) {
-            if (!try_resolve(fb, "--server-id-fallback / client.fallback_server_ids")) {
-                std::cerr << resolve_err << "\n";
-                return 1;
-            }
-        }
+    if (auto alias_err = resolve_client_aliases(config)) {
+        std::cerr << *alias_err << "\n";
+        return 1;
     }
 
     // -----------------------------------------------------------------------

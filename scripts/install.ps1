@@ -167,6 +167,7 @@ client:
   server_id: REPLACE_WITH_SERVER_TOX_ID
   forwards:
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22
 "@
@@ -235,6 +236,8 @@ if ($Mode -eq 'server') {
     Write-Host "  - Edit $configPath :"
     Write-Host "      * client.server_id: <76-char Tox ID from your server>"
     Write-Host "      * client.forwards:  adjust local_port / remote_host / remote_port"
+    Write-Host "                          (local_address: 127.0.0.1 keeps a forward reachable"
+    Write-Host "                           only from this machine; omitting it binds all interfaces)"
     Write-Host "  - Then enable the daemon:"
     Write-Host "      * service.allow_client_daemon: true   (required to bind local ports)"
     Write-Host "      * service.auto_start: true            (optional, for auto-start on boot)"

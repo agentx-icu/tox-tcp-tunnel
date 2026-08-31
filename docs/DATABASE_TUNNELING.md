@@ -78,6 +78,7 @@ client:
   server_id: "${SERVER_ID}"
   forwards:
     - local_port: 5432
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5432
 EOF
@@ -196,6 +197,7 @@ client:
 
   forwards:
     - local_port: 5432      # Local port to listen on
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1  # Database server on remote machine
       remote_port: 5432      # PostgreSQL port
 ```
@@ -209,7 +211,7 @@ client:
 Wait for the connection message:
 ```
 Server friend 0 is now online
-Listening on local port 5432 -> 127.0.0.1:5432
+Listening on 127.0.0.1:5432 -> 127.0.0.1:5432
 ```
 
 3. **Connect to the remote database**
@@ -230,21 +232,25 @@ client:
   forwards:
     # PostgreSQL
     - local_port: 5432
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5432
 
     # MySQL
     - local_port: 3306
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 3306
 
     # Redis
     - local_port: 6379
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 6379
 
     # MongoDB
     - local_port: 27017
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 27017
 ```

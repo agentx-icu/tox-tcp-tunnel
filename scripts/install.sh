@@ -181,6 +181,7 @@ client:
   server_id: REPLACE_WITH_SERVER_TOX_ID
   forwards:
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22
 YAML
@@ -269,6 +270,8 @@ Next steps (client):
   - Edit ${CONFIG_PATH}:
       * client.server_id: <76-char Tox ID from your server>
       * client.forwards:  add or modify the local_port / remote_host / remote_port lines
+                          (local_address: 127.0.0.1 keeps a forward reachable only
+                           from this machine; omitting it binds all interfaces)
   - Then enable the daemon:
       * service.allow_client_daemon: true   (required to bind local ports)
       * service.auto_start: true            (optional, for auto-start on boot)

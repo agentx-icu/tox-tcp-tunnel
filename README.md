@@ -439,6 +439,7 @@ client:
 
   forwards:
     - local_port: 2222      # Local port to listen on
+      local_address: 127.0.0.1  # Bind loopback only - see note below
       remote_host: 127.0.0.1  # SSH server on remote machine
       remote_port: 22        # SSH port
 ```
@@ -449,9 +450,16 @@ Start the client:
 ./build/toxtunnel -c client.yaml
 ```
 
+`local_address` controls which interface the forward listens on. **Omit it and
+the forward binds `0.0.0.0`** — reachable by anything that can route to your
+machine — which is what every release before v0.4.13 did. Set it to `127.0.0.1`
+unless you intend other machines to use the forward; ToxTunnel warns at startup
+when it is missing. Numeric IP literals only (`127.0.0.1`, `::1`), not
+hostnames. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the details.
+
 Output:
 ```
-Listening on local port 2222 -> 127.0.0.1:22
+Listening on 127.0.0.1:2222 -> 127.0.0.1:22
 Client started
 ```
 
@@ -590,7 +598,7 @@ toxtunnel -m client --server-id homelab --pipe 127.0.0.1:22
 client:
   server_id: homelab     # resolved from known_servers.yaml at startup
   forwards:
-    - { local_port: 2222, remote_host: 127.0.0.1, remote_port: 22 }
+    - { local_port: 2222, local_address: 127.0.0.1, remote_host: 127.0.0.1, remote_port: 22 }
 ```
 
 `servers list/show/add/remove` accept `-d/--data-dir DIR` (defaults to the same
@@ -819,7 +827,7 @@ client:
     timeout_seconds: 60
     prefer_primary_grace_seconds: 30
   forwards:
-    - { local_port: 2222, remote_host: 127.0.0.1, remote_port: 22 }
+    - { local_port: 2222, local_address: 127.0.0.1, remote_host: 127.0.0.1, remote_port: 22 }
 ```
 
 CLI equivalent (repeatable `--server-id-fallback`):
@@ -882,22 +890,27 @@ client:
   server_id: "SERVER_TOX_ADDRESS"
   forwards:
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22        # SSH
 
     - local_port: 5432
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5432      # PostgreSQL
 
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 192.168.1.100
       remote_port: 80        # Web server on remote LAN
 
     - local_port: 3389
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 3389      # Windows RDP
 
     - local_port: 873
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 873        # Rsync
 ```

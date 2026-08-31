@@ -66,6 +66,7 @@ client:
   server_id: "${SERVER_ID}"
   forwards:
     - local_port: 8873
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 873
 EOF
@@ -127,6 +128,7 @@ client:
 
   forwards:
     - local_port: 8873
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 873      # rsync port
 ```
@@ -205,6 +207,7 @@ client:
   server_id: "${SERVER_ID}"
   forwards:
     - local_port: 5901
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5901
 EOF
@@ -238,6 +241,7 @@ client:
 
   forwards:
     - local_port: 3389
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 3389      # RDP port
 ```
@@ -282,6 +286,7 @@ client:
 
   forwards:
     - local_port: 5901
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5901      # VNC port for :1
 ```
@@ -304,6 +309,7 @@ client:
 
   forwards:
     - local_port: 4000
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 4000      # NoMachine default port
 ```
@@ -345,6 +351,7 @@ client:
   server_id: "${SERVER_ID}"
   forwards:
     - local_port: 8888
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 8080
 EOF
@@ -378,6 +385,7 @@ client:
   server_id: "${SERVER_ID}"
   forwards:
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22
 EOF
@@ -409,11 +417,13 @@ client:
   forwards:
     # Synology/TrueNAS web interface
     - local_port: 5000
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5000
 
     # SMB/CIFS file shares
     - local_port: 1445
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 445
 ```
@@ -442,6 +452,7 @@ client:
 
   forwards:
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22      # SSH port
 ```
@@ -467,15 +478,19 @@ client:
 
   forwards:
     - local_port: 5000
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5000      # DSM web interface
     - local_port: 5001
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5001      # DSM HTTPS
     - local_port: 1445
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 445       # SMB
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22        # SSH
 ```
@@ -501,6 +516,7 @@ client:
   forwards:
     # S3 proxy port
     - local_port: 9000
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 9000
 ```
@@ -531,9 +547,11 @@ client:
 
   forwards:
     - local_port: 25565
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 25565      # Minecraft default
     - local_port: 25575
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 25575      # RCON port
 ```
@@ -559,16 +577,19 @@ client:
   forwards:
     # Counter-Strike
     - local_port: 27015
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 27015
 
     # Garry's Mod
     - local_port: 27015
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 27015
 
     # SteamCMD Master Server Query Port
     - local_port: 27020
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 27020
 ```
@@ -585,6 +606,7 @@ client:
 
   forwards:
     - local_port: 2375
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 2375      # Docker HTTP API
 ```
@@ -609,6 +631,7 @@ client:
 
   forwards:
     - local_port: 6443
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 6443      # Kubernetes API server
 ```
@@ -920,6 +943,7 @@ client:
 
   forwards:
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22
 ```
@@ -1021,6 +1045,7 @@ client:
   forwards:
     # Forward to internal server
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 10.0.0.100
       remote_port: 80
 ```
@@ -1038,6 +1063,7 @@ client:
 
   forwards:
     - local_port: 9090
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 8080      # Port from gateway config
 ```
@@ -1069,6 +1095,7 @@ client:
   server_id: "${GATEWAY_ID}"
   forwards:
     - local_port: ${LOCAL_PORT}
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: ${SERVER_PORT}
 EOF
@@ -1130,6 +1157,7 @@ client:
   server_id: "${server_id}"
   forwards:
     - local_port: ${local_port}
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 80
 EOF
@@ -1343,6 +1371,7 @@ spec:
             server_id: "$(cat /etc/tox/id)"
             forwards:
               - local_port: 8080
+                local_address: 127.0.0.1
                 remote_host: 127.0.0.1
                 remote_port: 80
           EOF

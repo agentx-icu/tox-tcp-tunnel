@@ -64,13 +64,58 @@ client:
 
   forwards:
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22                     # local:2222 -> remote:22
 
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 192.168.1.100
       remote_port: 80                     # local:8080 -> remote:80
 ```
+
+#### Which interface a forward listens on — `local_address`
+
+`local_address` is the local interface the forward binds. **It takes numeric
+IP literals only** — `127.0.0.1`, `::1`, `192.168.1.10`, `0.0.0.0`, `::`. It is
+not `local_host`, and it does not accept `localhost` or any other hostname;
+that would be rejected at startup. (`remote_host` is different: it is resolved
+on the *server* side, so a hostname is fine there.)
+
+| Value | Who can reach the forward |
+|---|---|
+| `127.0.0.1` (recommended) | Only this machine |
+| `::1` | Only this machine, over IPv6 |
+| A specific interface address | Anything that can reach that interface |
+| `0.0.0.0` / `::` | Anything that can route to this host |
+
+**If you omit the key the forward binds `0.0.0.0`** — every interface — which
+is what every ToxTunnel before v0.4.13 did unconditionally. That default is
+kept only so existing deployments do not change behaviour on upgrade; it is a
+compatibility fallback, not a recommendation. A forward is a hole into the
+remote network, and on a laptop on a café network the wildcard means anyone on
+that network can use it.
+
+So from v0.4.13 a client that omits the key logs a warning at startup naming
+the forward, and `toxtunnel config check` reports the same thing:
+
+```
+forward 0.0.0.0:2222 -> 127.0.0.1:22 is listening on all interfaces because no
+'local_address' was set; anything that can reach this host can use it. Set
+'local_address: 127.0.0.1' on this forward to accept only local connections, or
+set it explicitly to silence this warning.
+```
+
+Writing `local_address: 0.0.0.0` explicitly is a supported choice and silences
+the warning — the warning is for operators who did not know, not for those who
+decided. Set it explicitly either way; a future release may change the default
+to loopback.
+
+Changing `local_address` on a running daemon takes effect on reload: the
+listener is stopped and rebound. Adding `local_address: 0.0.0.0` to a forward
+that was already binding the wildcard is a no-op and does *not* disturb the
+live listener. See [Hot Reload](#hot-reload) for the failure mode when the new
+address is not available on the host.
 
 ### Multi-Server Failover
 
@@ -821,7 +866,7 @@ writes to the pipe (Windows). `TOXTUNNEL_RELOAD_PID` overrides the pid file.
 | Field | Effect on reload |
 |---|---|
 | `logging.level` | Swapped atomically — next log line uses the new level. |
-| `client.forwards` | New listeners are bound, removed listeners are closed, unchanged listeners keep their open tunnels. |
+| `client.forwards` | New listeners are bound, removed listeners are closed, unchanged listeners keep their open tunnels. A rule is "unchanged" by its *effective* `local_address` plus `local_port`/`remote_host`/`remote_port`, so adding `local_address: 0.0.0.0` to a forward that already bound the wildcard disturbs nothing; changing it to a different address stops and rebinds that listener. |
 | `server.rules_file` | File is re-read, the parsed `RulesEngine` is swapped in, rate-limit buckets are synced and per-friend tunnel caps re-applied. **Already-open tunnels are not touched** — even ones the new rules would now deny; only the next `TUNNEL_OPEN` is evaluated against them. Drop the friend (or restart) to cut live traffic. |
 
 ### Non-reloadable fields (reload is rejected, running config untouched)
@@ -844,12 +889,34 @@ A successful reload is logged at INFO (`config reloaded (rules: N rules)` on the
 server, `config reloaded (forwards: +A -B)` on the client). There is no reload
 counter in the metrics endpoint — the log is the record.
 
+### A forward whose new bind address is unavailable stays down
+
+Reload rebinds a changed forward by **stopping the old listener first**, then
+binding the new one. If the new `local_address` parses but is not usable on
+this host — not assigned to any interface, or that port is already taken on it
+— the new bind fails and **that forward is left down**: the old listener is
+already gone.
+
+This is contained rather than fatal, and deliberately so. Reload is
+best-effort *per forward*: the daemon keeps running, every other forward keeps
+serving, and tunnels already established through the old listener are
+unaffected (they are accepted connections, not listeners). The failure is
+logged at ERROR and reported in the reload result, and because the rule is not
+recorded as active, a later reload retries it — so fixing the address and
+reloading again is enough, with no restart.
+
+```
+Reload: not forwarding 10.1.2.3:2222 -> 127.0.0.1:22 (Can't assign requested address)
+```
+
+Verify with `toxtunnel config check` before reloading a live daemon.
+
 One client-side caveat: a reload that *adds* a forward whose local port is
 already taken applies everything else and logs
-`reload applied with warnings: local port N: Address already in use`. That one
+`reload applied with warnings: 127.0.0.1:N: Address already in use`. That one
 forward is not served; the next reload retries it. At **startup** a busy forward
 port is fatal instead: the daemon logs `cannot listen on configured forward
-port(s): local port N: …` and exits 1, rather than coming up healthy-looking
+port(s): 127.0.0.1:N: …` and exits 1, rather than coming up healthy-looking
 while forwarding nothing. (On Windows the OS wording is "Only one usage of each
 socket address … is normally permitted"; listeners there take
 `SO_EXCLUSIVEADDRUSE`, so a second instance cannot quietly share the port the
@@ -886,16 +953,19 @@ client:
   forwards:
     # SSH
     - local_port: 2222
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 22
 
     # PostgreSQL
     - local_port: 5432
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 5432
 
     # Web server on server's LAN
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 192.168.1.100
       remote_port: 80
 ```

@@ -1,6 +1,7 @@
 #include "toxtunnel/util/config.hpp"
 
 #include <algorithm>
+#include <asio.hpp>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -343,6 +344,36 @@ ToxConfig Config::effective_tox_config() const {
 }
 
 // ---------------------------------------------------------------------------
+// Forward bind advisory
+// ---------------------------------------------------------------------------
+
+std::optional<std::string> forward_bind_advisory(const ForwardRule& rule) {
+    // An operator who named an address decided for themselves — including the
+    // ones who named the wildcard. Warning them would be noise they cannot
+    // silence, and noise that cannot be silenced gets filtered out along with
+    // the warnings that matter.
+    if (rule.has_explicit_local_address()) {
+        return std::nullopt;
+    }
+
+    // Only the exposed outcome is worth a warning. An unparseable address
+    // cannot be the default, so this only ever inspects the fallback; if that
+    // ever changes, an address we cannot parse is not something to speculate
+    // about in a warning.
+    asio::error_code ec;
+    const auto addr = asio::ip::make_address(rule.effective_local_address(), ec);
+    if (ec || addr.is_loopback()) {
+        return std::nullopt;
+    }
+
+    return "forward " + rule.local_endpoint_label() + " -> " + rule.remote_host + ":" +
+           std::to_string(rule.remote_port) +
+           " is listening on all interfaces because no 'local_address' was set; anything that can "
+           "reach this host can use it. Set 'local_address: 127.0.0.1' on this forward to accept "
+           "only local connections, or set it explicitly to silence this warning.";
+}
+
+// ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
 
@@ -525,6 +556,23 @@ util::Expected<void, std::string> Config::validate() const {
             }
             if (fwd.remote_port == 0) {
                 return util::make_unexpected(std::string("Forward rule remote_port cannot be 0"));
+            }
+            if (fwd.local_address.has_value()) {
+                // Numeric literals only — this string goes straight to
+                // asio::ip::make_address. Caught here rather than at bind time
+                // so a typo fails the config, not the listener.
+                //
+                // NOT restricted to loopback, unlike client.socks5.listen:
+                // binding a forward to a LAN address is a legitimate choice,
+                // whereas an unauthenticated SOCKS5 proxy on the LAN is not.
+                asio::error_code addr_ec;
+                (void)asio::ip::make_address(*fwd.local_address, addr_ec);
+                if (addr_ec) {
+                    return util::make_unexpected(
+                        "Forward rule local_address '" + *fwd.local_address +
+                        "' is not a valid IP address (numeric IPv4/IPv6 literals only; use "
+                        "127.0.0.1 rather than localhost)");
+                }
             }
         }
 
@@ -778,6 +826,14 @@ Node convert<ForwardRule>::encode(const ForwardRule& rhs) {
     node["local_port"] = rhs.local_port;
     node["remote_host"] = rhs.remote_host;
     node["remote_port"] = rhs.remote_port;
+    // Emit the key only when the operator set it. Writing the effective
+    // address unconditionally would round-trip "never set" into "explicitly
+    // chose the wildcard" and silence the migration warning for exactly the
+    // operators it is meant to reach. An explicit wildcard IS written, because
+    // that provenance has to survive too.
+    if (rhs.local_address.has_value()) {
+        node["local_address"] = *rhs.local_address;
+    }
     return node;
 }
 
@@ -800,6 +856,11 @@ bool convert<ForwardRule>::decode(const Node& node, ForwardRule& rhs) {
         return false;
     }
     rhs.remote_port = node["remote_port"].as<uint16_t>();
+
+    // Optional: left absent when the key is missing, so provenance survives.
+    if (node["local_address"]) {
+        rhs.local_address = node["local_address"].as<std::string>();
+    }
 
     return true;
 }

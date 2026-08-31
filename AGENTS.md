@@ -80,7 +80,7 @@ than expanding this section.
 
 | Layer | Components |
 |-------|------------|
-| Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter`, `TunnelResumeStore` |
+| Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter` |
 | TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
 | Tox | `ToxAdapter` (owns the only Tox event loop), `ToxConnection`, `ToxWatchdog` |
 | Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame`, `OwnedFrameBuffer`, `WriteCoalescer`, `BdpFlowControl`, `TunnelIdAllocator` |

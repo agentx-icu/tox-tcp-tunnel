@@ -61,6 +61,7 @@ client:
   server_id: "${SERVER_ID}"
   forwards:
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 8888
 EOF
@@ -140,6 +141,7 @@ client:
 
   forwards:
     - local_port: 8080      # Local port to listen on
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1  # Where the web server runs on remote machine
       remote_port: 8888      # Port the web server listens on
 ```
@@ -153,7 +155,7 @@ client:
 Wait for the connection message:
 ```
 Server friend 0 is now online
-Listening on local port 8080 -> 127.0.0.1:8888
+Listening on 127.0.0.1:8080 -> 127.0.0.1:8888
 ```
 
 3. **Access the remote web server**
@@ -176,14 +178,17 @@ client:
 
   forwards:
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 8080      # Main web app
 
     - local_port: 3000
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 3000      # Development server
 
     - local_port: 9000
+      local_address: 127.0.0.1
       remote_host: 192.168.1.100
       remote_port: 80       # Web server on remote LAN
 ```
@@ -216,6 +221,7 @@ client:
 
   forwards:
     - local_port: 8888
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 8888      # tinyproxy port
 ```
@@ -268,6 +274,7 @@ client:
   server_id: "PI_TOX_ADDRESS_HERE"
   forwards:
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 80      # Pi-hole HTTP port
 ```
@@ -381,7 +388,7 @@ margin under that ceiling.
 
 ### Port Already in Use
 
-**Symptom**: `Failed to bind to local port XXXX`
+**Symptom**: `cannot listen on configured forward port(s): 127.0.0.1:XXXX: Address already in use`
 
 **Solutions**:
 1. Choose a different local port
@@ -424,6 +431,7 @@ client:
 
   forwards:
     - local_port: 8080
+      local_address: 127.0.0.1
       remote_host: 127.0.0.1
       remote_port: 8080      # Local webhook receiver
 ```

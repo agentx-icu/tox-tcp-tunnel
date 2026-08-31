@@ -2,9 +2,29 @@
 
 #include <utility>
 
+#include "toxtunnel/util/endpoint_label.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::core {
+
+namespace {
+
+/// Label this listener by the endpoint it actually bound, not just its port.
+/// With `local_address` configurable, two forwards can share a port number on
+/// different interfaces, so a port-only message no longer identifies which one
+/// a line is about.
+[[nodiscard]] std::string listener_label(const asio::ip::tcp::acceptor& acceptor,
+                                         std::uint16_t port) {
+    asio::error_code ec;
+    const auto endpoint = acceptor.local_endpoint(ec);
+    if (ec) {
+        // Closed or never bound: the port is all we can honestly report.
+        return "port " + std::to_string(port);
+    }
+    return format_endpoint_label(endpoint.address().to_string(), endpoint.port());
+}
+
+}  // namespace
 
 // ===========================================================================
 // Construction
@@ -40,15 +60,16 @@ void TcpListener::start_accept(AcceptHandler handler) {
         return;
     }
     if (!is_bound()) {
-        util::Logger::warn("TcpListener: not accepting on port {} (bind failed: {})", port_,
-                           bind_error_.message());
+        util::Logger::warn("TcpListener: not accepting on {} (bind failed: {})",
+                           listener_label(acceptor_, port_), bind_error_.message());
         return;
     }
 
     accept_handler_ = std::move(handler);
     accepting_.store(true, std::memory_order_relaxed);
 
-    util::Logger::info("TcpListener: accepting connections on port {}", port_);
+    util::Logger::info("TcpListener: accepting connections on {}",
+                       listener_label(acceptor_, port_));
 
     do_accept();
 }
@@ -60,13 +81,17 @@ void TcpListener::stop() {
 
     accepting_.store(false, std::memory_order_relaxed);
 
+    // Resolve the label BEFORE closing: local_endpoint() stops working the
+    // moment the acceptor is closed, and a shutdown line that says "port N"
+    // would be exactly the ambiguity this change removes.
+    const std::string label = listener_label(acceptor_, port_);
+
     asio::error_code ec;
     acceptor_.close(ec);
     if (ec) {
-        util::Logger::warn("TcpListener: error closing acceptor on port {}: {}", port_,
-                           ec.message());
+        util::Logger::warn("TcpListener: error closing acceptor on {}: {}", label, ec.message());
     } else {
-        util::Logger::info("TcpListener: stopped listening on port {}", port_);
+        util::Logger::info("TcpListener: stopped listening on {}", label);
     }
 }
 

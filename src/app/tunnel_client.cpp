@@ -1,5 +1,6 @@
 #include "toxtunnel/app/tunnel_client.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <future>
 #include <span>
@@ -361,7 +362,7 @@ void TunnelClient::start() {
                 on_tcp_connection_accepted(std::move(conn), rule);
             });
 
-            util::Logger::info("Listening on local port {} -> {}:{}", rule.local_port,
+            util::Logger::info("Listening on {} -> {}:{}", rule.local_endpoint_label(),
                                rule.remote_host, rule.remote_port);
         }
     }
@@ -499,8 +500,8 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
                         listeners_.erase(listeners_.begin() + static_cast<std::ptrdiff_t>(i));
                         forward_rules_.erase(forward_rules_.begin() +
                                              static_cast<std::ptrdiff_t>(i));
-                        util::Logger::info("Stopped listener on local port {} -> {}:{}",
-                                           removed.local_port, removed.remote_host,
+                        util::Logger::info("Stopped listener on {} -> {}:{}",
+                                           removed.local_endpoint_label(), removed.remote_host,
                                            removed.remote_port);
                     } else {
                         ++i;
@@ -509,8 +510,8 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
             }
 
             for (const auto& added : diff.added) {
-                auto listener = std::make_shared<core::TcpListener>(io_ctx_->get_io_context(),
-                                                                    added.local_port);
+                auto listener = std::make_shared<core::TcpListener>(
+                    io_ctx_->get_io_context(), added.effective_local_address(), added.local_port);
                 if (!listener->is_bound()) {
                     // Reload is best-effort per forward: a busy port must not
                     // take down a daemon that is happily serving the others.
@@ -518,13 +519,19 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
                     if (!bind_failures->empty()) {
                         *bind_failures += "; ";
                     }
-                    *bind_failures += "local port " + std::to_string(added.local_port) + ": " +
-                                      listener->bind_error().message();
+                    *bind_failures +=
+                        added.local_endpoint_label() + ": " + listener->bind_error().message();
                     ++*failed_count;
-                    util::Logger::error("Reload: not forwarding local port {} -> {}:{} ({})",
-                                        added.local_port, added.remote_host, added.remote_port,
-                                        listener->bind_error().message());
+                    util::Logger::error("Reload: not forwarding {} -> {}:{} ({})",
+                                        added.local_endpoint_label(), added.remote_host,
+                                        added.remote_port, listener->bind_error().message());
                     continue;
+                }
+                if (auto advisory = forward_bind_advisory(added)) {
+                    // Same rule on the reload path: a forward added by reload
+                    // is just as exposed as one added at startup, and this is
+                    // the only moment its operator is told.
+                    util::Logger::warn("Reload: {}", *advisory);
                 }
                 const auto rule = added;
                 listener->start_accept([this, rule](std::shared_ptr<core::TcpConnection> conn) {
@@ -532,8 +539,50 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
                 });
                 listeners_.push_back(std::move(listener));
                 forward_rules_.push_back(added);
-                util::Logger::info("Started listener on local port {} -> {}:{}", added.local_port,
+                util::Logger::info("Started listener on {} -> {}:{}", added.local_endpoint_label(),
                                    added.remote_host, added.remote_port);
+            }
+        }
+
+        // Refresh provenance on the forwards that SURVIVED this reload.
+        //
+        // This deliberately runs OUTSIDE the `!diff.empty()` guard above.
+        // `operator==` compares the *effective* bind address, so adding or
+        // removing an explicit `0.0.0.0` yields an EMPTY diff — which is the
+        // behaviour we want for the listener, since rebinding an unchanged
+        // socket would drop live connections for nothing, but it also means the
+        // block above never runs for exactly this case.
+        //
+        // Left alone, the surviving rule in `forward_rules_` keeps the OLD
+        // explicit/absent flag while `config_` below takes the new one, and the
+        // two then disagree about the same forward. That is not cosmetic:
+        // whether the operator wrote the key by hand is precisely what decides
+        // if this forward is entitled to a bind advisory, so a stale flag
+        // either suppresses a warning they should see or repeats one they have
+        // already answered.
+        if (!is_pipe_mode() && new_config.client) {
+            const auto& fwds = new_config.client->forwards;
+            for (auto& live : forward_rules_) {
+                const auto match =
+                    // operator== already covers the remote host/port and the
+                    // effective bind address; that IS the forward's identity.
+                    std::find_if(fwds.begin(), fwds.end(), [&live](const ForwardRule& candidate) {
+                        return candidate == live;
+                    });
+                if (match == fwds.end() ||
+                    match->has_explicit_local_address() == live.has_explicit_local_address()) {
+                    continue;
+                }
+                const bool became_implicit = !match->has_explicit_local_address();
+                live.local_address = match->local_address;
+                if (became_implicit) {
+                    // explicit -> absent. The bind is unchanged, but the
+                    // operator just deleted the line recording their intent, so
+                    // this is the moment to tell them what it now means.
+                    if (auto advisory = forward_bind_advisory(live)) {
+                        util::Logger::warn("Reload: {}", *advisory);
+                    }
+                }
             }
         }
 
@@ -794,15 +843,24 @@ util::Expected<void, std::string> TunnelClient::create_listeners(
     listeners_.reserve(forwards.size());
 
     std::string failures;
+    std::vector<std::string> advisories;
     for (const auto& rule : forwards) {
-        auto listener =
-            std::make_shared<core::TcpListener>(io_ctx_->get_io_context(), rule.local_port);
+        auto listener = std::make_shared<core::TcpListener>(
+            io_ctx_->get_io_context(), rule.effective_local_address(), rule.local_port);
         if (!listener->is_bound()) {
             if (!failures.empty()) {
                 failures += "; ";
             }
-            failures += "local port " + std::to_string(rule.local_port) + ": " +
-                        listener->bind_error().message();
+            // address:port, not port alone: with local_address configurable,
+            // "port 2222 is busy" no longer identifies which forward failed.
+            failures += rule.local_endpoint_label() + ": " + listener->bind_error().message();
+        } else if (auto advisory = forward_bind_advisory(rule)) {
+            // COLLECTED, not emitted yet. Startup is all-or-nothing: if a later
+            // forward fails to bind, every listener is torn down and the daemon
+            // exits, so a warning already printed would claim a forward "is
+            // listening on all interfaces" when in fact nothing is listening at
+            // all. Held until every bind has succeeded.
+            advisories.push_back(std::move(*advisory));
         }
         listeners_.push_back(std::move(listener));
     }
@@ -813,6 +871,11 @@ util::Expected<void, std::string> TunnelClient::create_listeners(
         listeners_.clear();
         forward_rules_.clear();
         return util::make_unexpected("cannot listen on configured forward port(s): " + failures);
+    }
+    // Every forward is bound, so these listeners really are up and really are
+    // exposed. Only now is the warning true.
+    for (const auto& advisory : advisories) {
+        util::Logger::warn("{}", advisory);
     }
     return {};
 }

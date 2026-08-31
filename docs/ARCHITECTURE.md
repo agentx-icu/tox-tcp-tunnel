@@ -46,8 +46,8 @@
 | `RateLimiter`       | Per-friend token-bucket layer that runs before `RulesEngine` on TUNNEL_OPEN. Modes: `off \| report \| enforce`. Hot-reloadable via the rules file. Defaults to `off` (no v0.3.0 behaviour change). A per-friend `rate_limit:` block **overrides only the fields it names**, inheriting the rest from `rate_limit_defaults`. **The byte buckets (`bytes_per_sec` / `bytes_burst`) are NOT wired into the data path**: the structure exists and the keys parse, but nothing consumes byte tokens, so configuring them throttles nothing (the rules loader warns). |
 | `ToxWatchdog`       | Heartbeat-based detector for a stalled `tox_iterate`. The Tox thread bumps the counter on every return; a 1 Hz observer on the main IO context calls `std::abort()` if the deadline is exceeded. Persistent abort count lives at `<data_dir>/abort_count`. |
 | `TunnelIdAllocator` | Bitset-backed 1..65535 allocator with a roving cursor and an explicit `reserve(id)` API for the tunnel-resume path. |
-| `TunnelResumeStore` | Client-side `<data_dir>/tunnel_resume_state.yaml` persistence (schema-versioned, age-pruned). Wipes itself when the active server's Tox ID changes. Persisted via `util::atomic_write_file`. |
-| `atomic_write_file` | Shared helper: write to `<path>.tmp.<pid>`, fsync, rename, optional parent-dir fsync (`F_FULLFSYNC` on macOS). Used by `ToxSave::persist`, `KnownServersStore::save`, and `TunnelResumeStore::save`. |
+| `TunnelResumeStore` | **Not wired up.** Client-side `<data_dir>/tunnel_resume_state.yaml` persistence (schema-versioned, age-pruned), written against the day resume survives a process restart. Nothing constructs it today: resume is live-reconnect only, so there is no restart for it to survive, and `tunnel.resume.state_path` is parsed but never read. Kept deliberately — see `docs/CONFIGURATION.md`, which already calls the store reserved. |
+| `atomic_write_file` | Shared helper: write to `<path>.tmp.<pid>`, fsync, rename, optional parent-dir fsync (`F_FULLFSYNC` on macOS). Used by `ToxSave::persist` and `KnownServersStore::save` (and by `TunnelResumeStore::save`, which nothing calls). |
 
 ## Configuration Model
 
@@ -473,7 +473,9 @@ logged at ERROR as `reload rejected: config reload rejected: field '<name>'
 requires a restart (not in the reloadable subset)` and leaves the running config
 untouched. On the client, an added forward whose local port cannot bind is not
 a rejection: the rest of the reload is applied and the daemon logs
-`reload applied with warnings: local port N: <reason>`.
+`reload applied with warnings: <address>:<port>: <reason>` (the address is
+the forward's effective `local_address`, so the message identifies which
+forward failed when several share a port number across interfaces).
 
 ## Inbound Copy Path
 

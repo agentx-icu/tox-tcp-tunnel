@@ -95,7 +95,7 @@ than expanding this section.
 
 | Layer | Components |
 |-------|------------|
-| Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter`, `TunnelResumeStore` |
+| Application | `TunnelServer`, `TunnelClient`, `RulesEngine`, `InspectServer`, `Socks5Listener`, `RateLimiter` |
 | TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
 | Tox | `ToxAdapter` (owns the iterate thread), `ToxConnection`, `ToxWatchdog`. NOTE: `ToxAdapter` owns the **only** Tox event loop — wire all new tox-thread work into it. |
 | Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame`, `OwnedFrameBuffer`, `WriteCoalescer`, `BdpFlowControl`, `TunnelIdAllocator` |
