@@ -1,7 +1,11 @@
 # Outbound send driver — approved design
 
 Status: **approved, partially implemented.** Slice 1 (typed seam + handshake)
-shipped in v0.4.13. Slices 2-5 are specified here and not yet built — tracked as
+shipped in v0.4.13. Slice 2 (cohort FIFO + the single emission driver for DATA)
+is implemented on master: no Tox send callback runs under `coalesce_mutex_` on
+any DATA path any more, and the deferred-close bookkeeping moved from the flush
+timer into the driver's drain-complete step. Slices 3-5 are specified here and
+not yet built — tracked as
 https://github.com/agentx-icu/tox-tcp-tunnel/issues/24.
 
 This document exists because the design took nine rounds of independent review
@@ -11,11 +15,14 @@ mistakes recorded below.
 
 ## The problem
 
-Two paths invoke a Tox send callback **while holding `coalesce_mutex_`**: the
-buffered drain (`coalesce_emit_front_locked`) and the immediate/bypass branch in
-`send_data_to_tox`. That violates the rule the rest of the codebase follows
+(As it stood before slice 2; kept for the record.) Two paths invoked a Tox send
+callback **while holding `coalesce_mutex_`**: the buffered drain
+(`coalesce_emit_front_locked`) and the immediate/bypass branch in
+`send_data_to_tox`. That violated the rule the rest of the codebase follows
 (snapshot under the lock, call outside it), and `OutboundSnapshot`'s own
-documentation already promises callbacks run with no lock held.
+documentation already promised callbacks run with no lock held. Slice 2
+replaced both with `run_emission_driver` + the cohort FIFO; the CLOSE/ERROR
+paths (slice 3) and the pending-backlog seal (slice 4) remain.
 
 It is not a tidiness problem. The coupling has produced a series of real bugs —
 truncation, reordering, and teardown failures — because the mutex is invisible
@@ -212,7 +219,12 @@ state/error callback, because those callbacks can re-enter admission.
    OPEN retry off the coalesce cadence; the OPEN_ACK causal barrier (`Connected`,
    open metrics, `start_read()` and DATA admission all behind the same `Sent`);
    terminal ERROR when the target dies while OPEN_ACK is backpressured.
-2. Cohort FIFO and the single emission driver for DATA.
+2. **Cohort FIFO and the single emission driver for DATA — implemented.**
+   `run_emission_driver` (single-flight under `coalesce_mutex_`, frame
+   selection and consumption-commit under the lock, the send between them with
+   no lock held), cohorts tagged with their admission cap, `EmitOutcome` with
+   `DeferredToActiveEmitter` distinct from satisfied, and the deferred-close
+   bookkeeping executed by whichever emitter completes the drain.
 3. CLOSE/ERROR driver ownership; `send_error()` reordering; `close_outbound_gate()`
    publishing `Abort`.
 4. Pending-backlog seal, handoff ownership, privileged capability, aggregate cap.

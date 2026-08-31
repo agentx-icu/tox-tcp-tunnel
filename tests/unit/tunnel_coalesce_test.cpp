@@ -496,3 +496,218 @@ TEST_F(TunnelCoalesceTest, LocalHalfCloseStillAcceptsPeerDataUntilPeerCloses) {
     tunnel_->handle_frame(ProtocolFrame::make_tunnel_close(tunnel_->tunnel_id()));
     EXPECT_EQ(tunnel_->state(), Tunnel::State::Closed);
 }
+
+// ===========================================================================
+// Outbound emission driver (slice 2, issue #24)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 11. Cohort caps are never merged. Bytes buffered under the batch cap and a
+//     bypass write parked behind them each keep the cap they were admitted
+//     under, across backpressure and retry. A merged cap would either break
+//     the buffered framing contract (frame larger than coalesce_max_bytes)
+//     or slice the bypass write below the wire ceiling for no reason.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, CohortsKeepTheirAdmissionCapAcrossBackpressure) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        if (!allow_send) {
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    // Batch cap of 100 so the caps are visibly different from the 1367-byte
+    // bypass ceiling.
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/100);
+
+    // 250 bytes admitted under the batch cap, all retained by backpressure.
+    std::vector<uint8_t> batched(250, 0xAA);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(batched));
+    EXPECT_TRUE(captured_.data_payloads.empty());
+
+    // 150 bytes admitted as a bypass write. Must queue BEHIND the batched
+    // cohort (FIFO) but keep its own one-frame-per-write framing.
+    tunnel_->set_coalesce_mode(CoalesceMode::Bypass);
+    std::vector<uint8_t> bypass(150, 0xBB);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(bypass));
+    EXPECT_TRUE(captured_.data_payloads.empty());
+
+    allow_send = true;
+    std::vector<uint8_t> expected;
+    expected.insert(expected.end(), batched.begin(), batched.end());
+    expected.insert(expected.end(), bypass.begin(), bypass.end());
+    ASSERT_TRUE(wait_until([&] { return captured_.concatenated_data() == expected; }))
+        << "backpressured cohorts did not drain in order";
+
+    // Frame boundaries: the batched cohort drains under ITS cap (100, 100,
+    // 50), the bypass cohort under the wire ceiling (one 150-byte frame).
+    // Never a frame mixing bytes admitted under different caps.
+    ASSERT_EQ(captured_.data_payloads.size(), 4u);
+    EXPECT_EQ(captured_.data_payloads[0].size(), 100u);
+    EXPECT_EQ(captured_.data_payloads[1].size(), 100u);
+    EXPECT_EQ(captured_.data_payloads[2].size(), 50u);
+    EXPECT_EQ(captured_.data_payloads[3].size(), 150u);
+}
+
+// ---------------------------------------------------------------------------
+// 12. A send_data_to_tox() re-entered from INSIDE the send callback (the
+//     synchronous ACK round-trip shape) queues behind the in-flight write's
+//     remainder. The rejected-draft failure mode was A1, C, A2: the reentrant
+//     write jumping the not-yet-emitted second half of the write that
+//     triggered it. Under the old in-lock emission this call would have
+//     deadlocked on coalesce_mutex_ instead.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, ReentrantSendQueuesBehindTheInFlightWritesRemainder) {
+    std::vector<uint8_t> first(2000, 0xAA);   // emits as 1367 + 633
+    std::vector<uint8_t> reentrant(100, 0xBB);
+
+    bool injected = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        if (!injected) {
+            injected = true;
+            // Same thread, from inside the first frame's callback.
+            EXPECT_TRUE(tunnel_->send_data_to_tox(reentrant));
+        }
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    ASSERT_TRUE(tunnel_->send_data_to_tox(first));
+
+    // Byte order is the assertion that catches the A1, C, A2 reorder: a
+    // jumped queue concatenates to A1 + C + A2, which != A + C. Frame count is
+    // deliberately NOT pinned to one-frame-per-write: both writes were
+    // admitted under the same bypass cap, and "one frame per bypass write" is
+    // a property of the unobstructed path only — under a backlog the FIFO
+    // legitimately merges same-cap cohorts (633 + 100 emit as one frame).
+    std::vector<uint8_t> expected;
+    expected.insert(expected.end(), first.begin(), first.end());
+    expected.insert(expected.end(), reentrant.begin(), reentrant.end());
+    ASSERT_TRUE(wait_until([&] { return captured_.concatenated_data() == expected; }))
+        << "reentrant write was lost or reordered";
+
+    ASSERT_EQ(captured_.data_payloads.size(), 2u);
+    EXPECT_EQ(captured_.data_payloads[0].size(), 1367u);
+    EXPECT_EQ(captured_.data_payloads[1].size(), 733u);
+}
+
+// ---------------------------------------------------------------------------
+// 12b. flush_pending_writes() during backpressure must not cancel the retry
+//      timer — that timer is the ONLY wakeup for the retained bytes, and
+//      cancelling it on a drain that did NOT complete is the same
+//      "deferred/backpressured means drained" conflation the driver design
+//      exists to kill. (Slice-2 review finding.)
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, FlushDuringBackpressureLeavesTheRetryTimerArmed) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        if (!allow_send) {
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    std::vector<uint8_t> payload(500, 0xEE);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+
+    // The flush attempt backpressures; the bytes stay retained and the retry
+    // timer must survive the flush.
+    tunnel_->flush_pending_writes();
+    EXPECT_TRUE(captured_.data_payloads.empty());
+
+    allow_send = true;
+    ASSERT_TRUE(wait_until([&] { return captured_.concatenated_data() == payload; }))
+        << "flush_pending_writes() cancelled the only wakeup for the retained bytes";
+}
+
+// ---------------------------------------------------------------------------
+// 13. close() while an emitter is mid-drain treats "deferred" as deferred,
+//     never as drained: the TUNNEL_CLOSE is emitted by the driver AFTER the
+//     remaining DATA, not in between. This is the first rejected draft of the
+//     driver design (a boolean that conflated the two let CLOSE overtake
+//     in-flight DATA).
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, CloseFromInsideTheSendCallbackWaitsForTheDrain) {
+    std::vector<uint8_t> payload(2000, 0xCC);  // emits as 1367 + 633
+
+    bool closed = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        if (!closed) {
+            closed = true;
+            // The driver is active (this very callback): close() must defer.
+            tunnel_->close();
+        }
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+
+    ASSERT_TRUE(wait_until([&] {
+        return std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                          FrameType::TUNNEL_CLOSE) == 1;
+    })) << "deferred close never fired after the drain";
+
+    EXPECT_EQ(captured_.concatenated_data(), payload) << "close truncated in-flight data";
+    // CLOSE is the LAST frame — after both DATA frames, never between them.
+    ASSERT_FALSE(captured_.all_frame_types.empty());
+    EXPECT_EQ(captured_.all_frame_types.back(), FrameType::TUNNEL_CLOSE);
+    EXPECT_EQ(captured_.all_frame_types.size(), 3u);
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Disconnecting);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Local half-close AND remote close both deferred behind the same
+//     backpressured drain settle exactly once. The drain-complete bookkeeping
+//     must consume BOTH flags in one pass: leaving `remote_close_pending_`
+//     set let a later empty-FIFO driver run (the flush timer fires
+//     regardless) finalize the remote close a second time, double-counting
+//     the remote-close metric. (Slice-2 review finding.)
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, DeferredLocalAndRemoteCloseSettleExactlyOnce) {
+    const auto remote_closed_before = toxtunnel::util::MetricsRegistry::instance().tunnels_closed(
+        toxtunnel::util::MetricsRegistry::CloseReason::Remote);
+
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        if (!allow_send) {
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    std::vector<uint8_t> payload(300, 0xDD);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+
+    // Local EOF defers behind the retained bytes...
+    tunnel_->on_tcp_read_eof();
+    // ...and the peer's CLOSE arrives while they are still retained.
+    tunnel_->handle_frame(ProtocolFrame::make_tunnel_close(tunnel_->tunnel_id()));
+    EXPECT_TRUE(captured_.data_payloads.empty());
+
+    allow_send = true;
+    ASSERT_TRUE(wait_until([&] { return tunnel_->state() == Tunnel::State::Closed; }))
+        << "deferred local+remote close never settled after the drain";
+    EXPECT_EQ(captured_.concatenated_data(), payload);
+
+    // Force further empty-FIFO driver runs; they must find nothing to settle.
+    tunnel_->flush_pending_writes();
+    pump_for(20ms);
+
+    const auto remote_closed_after = toxtunnel::util::MetricsRegistry::instance().tunnels_closed(
+        toxtunnel::util::MetricsRegistry::CloseReason::Remote);
+    EXPECT_EQ(remote_closed_after - remote_closed_before, 1u)
+        << "the remote close was finalized more than once";
+}

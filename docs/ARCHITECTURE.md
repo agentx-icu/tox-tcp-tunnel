@@ -515,13 +515,22 @@ Key properties:
 
 ## Outbound Copy Path
 
-The v0.4.0 Wave B work makes the symmetric outbound path
-(local TCP → Tox) single-copy. The TCP read writes directly into an
+The v0.4.0 Wave B work made the symmetric outbound path
+(local TCP → Tox) single-copy: the TCP read wrote directly into an
 `OwnedFrameBuffer`'s payload region, which reserves 6 header bytes in
 front of the payload inside the same allocation. `serialize_in_place()`
 fills in the header before the buffer is handed to
 `ToxAdapter::send_lossless_packet`, so toxcore sees one contiguous wire
 view per frame.
+
+Since the slice-2 emission driver (issue #24), every write is first
+admitted into the outbound cohort FIFO and the frame buffer is filled
+from the cohort — one additional payload memcpy (and cohort append) on
+the bypass path relative to Wave B. That is the deliberate price of the
+driver's core guarantee (frame selection and consumption-commit under
+`coalesce_mutex_`, the send callback with no lock held, bytes never gone
+from the FIFO while their frame can still fail); the Wave B win that
+remains is the absence of any separate framing-buffer allocation.
 
 ```
 TcpConnection::async_read_some  (I/O pool worker thread)
@@ -529,8 +538,12 @@ TcpConnection::async_read_some  (I/O pool worker thread)
    │  (allocation = [0xA0][type:1][tunnel_id:2][length:2][payload:N])
    ▼
 TunnelImpl::send_data_to_tox
-   │  consults the adaptive coalescer; on bypass/drain → emit directly
-   │  on batch → buffer for up to coalesce_max_delay_us
+   │  consults the adaptive coalescer, then admits the bytes into the
+   │  outbound cohort FIFO (each cohort tagged with the frame cap it was
+   │  admitted under); the single emission driver (issue #24 slice 2)
+   │  emits frames with NO lock held across the send callback —
+   │  bypass/drain drain synchronously when the driver is idle,
+   │  batch holds a sub-cap remainder for up to coalesce_max_delay_us
    ▼
 ProtocolFrame::serialize_tunnel_data_in_place(OwnedFrameBuffer&, id)
    │  writes the 6 prefix bytes into the reserved header room

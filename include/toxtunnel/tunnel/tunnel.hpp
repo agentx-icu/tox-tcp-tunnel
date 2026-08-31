@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -61,6 +62,30 @@ enum class SendOutcome : std::uint8_t {
     Sent,           ///< Accepted by toxcore.
     SendqFull,      ///< Transient backpressure — the caller still owns the frame.
     PermanentFail,  ///< Will not succeed. Roll back; peer gone, frame malformed.
+};
+
+/// Outcome of a request to the outbound emission driver (slice 2 of
+/// docs/design/outbound-send-driver.md, tracked as issue #24).
+///
+/// `DeferredToActiveEmitter` must NEVER be read as satisfied: another thread
+/// owns the drain and this request's bytes (or its flush intent) have merely
+/// been queued behind it. A close path that treats "deferred" as "drained"
+/// emits its CLOSE while DATA is still in flight and the CLOSE overtakes the
+/// DATA — the exact bug the design doc records as its first rejected draft.
+///
+/// `RequestSatisfied` for a full-frames-only request is compatible with a
+/// sub-MTU remainder still buffered — it is named for what it means, not
+/// "Drained".
+enum class EmitOutcome : std::uint8_t {
+    RequestSatisfied,         ///< The drain this caller asked for was performed.
+    DeferredToActiveEmitter,  ///< Another thread is the emitter; it will pick this up.
+    Backpressured,            ///< toxcore SENDQ full; bytes retained, retry timer armed.
+};
+
+/// What a drain request asks of the emission driver.
+enum class DrainPolicy : std::uint8_t {
+    FullFramesOnly,  ///< Emit whole `cap`-sized frames; a sub-cap remainder stays.
+    FlushAll,        ///< Emit everything, including a sub-cap final frame.
 };
 
 // ---------------------------------------------------------------------------
@@ -989,24 +1014,48 @@ class TunnelImpl : public Tunnel {
     /// `send_frame_to_tox`.
     bool send_owned_data_to_tox(OwnedFrameBuffer buf);
 
-    /// Append `data` to the coalesce buffer, draining full-MTU frames as it
-    /// fills. The caller must hold `coalesce_mutex_`.
-    void coalesce_append_locked(std::span<const uint8_t> data);
+    /// One entry of the outbound cohort FIFO: bytes admitted under one frame
+    /// cap. Caps cannot be merged (a merged cap breaks either the buffered or
+    /// the bypass framing contract — see the design doc), so adjacent appends
+    /// coalesce only when their caps are equal, and a cohort keeps its cap
+    /// across backpressure and retry. Consumed via a front cursor with lazy
+    /// compaction so draining stays amortized O(n).
+    struct OutboundCohort {
+        std::size_t cap;
+        std::vector<std::uint8_t> bytes;
+        std::size_t consumed{0};
+        [[nodiscard]] std::size_t pending() const noexcept { return bytes.size() - consumed; }
+    };
 
-    /// Emit a single TUNNEL_DATA frame carrying the front of the coalesce
-    /// buffer (up to `coalesce_max_bytes_` bytes). The caller must hold
-    /// `coalesce_mutex_`. Returns true if the frame was handed to Tox (and the
-    /// bytes erased from the buffer); returns false if Tox backpressured
-    /// (toxcore lossless SENDQ full) — in that case the bytes are RETAINED for
-    /// a later retry and the send window is NOT refunded. Dropping them would
-    /// silently truncate the tunnel (a lossless stream must never lose bytes to
-    /// transient transport backpressure).
-    [[nodiscard]] bool coalesce_emit_front_locked(std::size_t bytes);
+    /// Append `data` to the outbound FIFO under frame cap `cap`, merging into
+    /// the back cohort only when its cap matches. The caller must hold
+    /// `coalesce_mutex_`. Never emits — emission belongs to the driver.
+    void fifo_append_locked(std::span<const uint8_t> data, std::size_t cap);
 
-    /// Drain the coalesce buffer in <= MTU frames (full frames then the
-    /// remainder). Stops at the first backpressured emit. Returns true iff the
-    /// buffer is now empty. The caller must hold `coalesce_mutex_`.
-    [[nodiscard]] bool coalesce_try_drain_locked();
+    /// THE single outbound emission driver for TUNNEL_DATA (slice 2 of the
+    /// outbound-send-driver design, issue #24). At most one thread drains at a
+    /// time; every send callback runs with NO lock held (frame selection and
+    /// consumption-commit each take `coalesce_mutex_` briefly, the send happens
+    /// between them). A caller that finds the driver busy has its request
+    /// queued behind the active emitter — a FlushAll intent is latched so the
+    /// active emitter honours it — and gets `DeferredToActiveEmitter`, which
+    /// must never be treated as drained.
+    ///
+    /// On toxcore backpressure the in-flight bytes are RETAINED at the front of
+    /// their cohort (the send window stays charged, so upstream TCP reads
+    /// pause) and the retry timer is armed. Dropping them would silently
+    /// truncate the stream.
+    ///
+    /// When the driver empties the FIFO it also performs the deferred-close
+    /// bookkeeping (`close_pending_` / `remote_close_pending_`) that used to
+    /// live in the flush-timer handler, so a deferred CLOSE is emitted by
+    /// whichever emitter actually finishes the drain.
+    ///
+    /// `arm_timer_on_remainder` is false only for the `Drain` coalesce policy,
+    /// whose sub-cap remainder waits for overflow or an explicit flush rather
+    /// than the timer.
+    [[nodiscard]] EmitOutcome run_emission_driver(DrainPolicy policy,
+                                                  bool arm_timer_on_remainder = true);
 
     /// Send TUNNEL_CLOSE and move to Disconnecting. Must be called WITHOUT
     /// `coalesce_mutex_` held (it sends through the Tox callback).
@@ -1032,10 +1081,10 @@ class TunnelImpl : public Tunnel {
     /// pending. The caller must hold `coalesce_mutex_`.
     void coalesce_arm_timer_locked();
 
-    /// Bytes still pending in the coalesce buffer (total minus the already-
-    /// emitted prefix). The caller must hold `coalesce_mutex_`.
+    /// Bytes still pending in the outbound cohort FIFO. The caller must hold
+    /// `coalesce_mutex_`.
     [[nodiscard]] std::size_t coalesce_pending_locked() const noexcept {
-        return coalesce_buf_.size() - coalesce_consumed_;
+        return outbound_fifo_pending_;
     }
 
     /// Live bytes still queued in `pending_tcp_input_` (total minus the
@@ -1177,10 +1226,12 @@ class TunnelImpl : public Tunnel {
     /// Total bytes sent (accepted from local TCP, charged to the send window).
     std::atomic<std::size_t> total_bytes_sent_{0};
 
-    /// Lossless flow accounting (lock-free; do NOT hold coalesce_mutex_ when
-    /// touching these — the ACK handler must stay lock-free because the coalesce
-    /// drain holds coalesce_mutex_ across send_frame_to_tox, and a synchronous
-    /// ACK round-trip would re-enter and self-deadlock).
+    /// Lossless flow accounting. Lock-free by design: the ACK handler must
+    /// never need coalesce_mutex_, so a synchronous ACK round-trip
+    /// re-entering from inside the emission driver's send callback works with
+    /// no lock (see handle_tunnel_ack_frame). The emitter itself MAY touch
+    /// these while holding coalesce_mutex_ (the driver's rollback does) —
+    /// the atomics carry the correctness, not the mutex.
     ///  - total_bytes_emitted_: payload bytes actually handed to toxcore.
     ///    Stored with release at the emit sites.
     ///  - total_bytes_acked_: cumulative peer-acked bytes, CLAMPED so it can
@@ -1201,13 +1252,23 @@ class TunnelImpl : public Tunnel {
     // Separate mutex from `mutex_` so a flush that crosses to the Tox thread
     // never races with state/callback edits (which also call into us).
     mutable std::mutex coalesce_mutex_;
-    std::vector<std::uint8_t> coalesce_buf_;
-    // Bytes already emitted from the front of coalesce_buf_ but not yet erased.
-    // Consuming via this offset (instead of erase-from-front on every frame)
-    // keeps draining a large backpressured buffer O(n) instead of O(n^2). The
-    // prefix is reclaimed lazily: reset to 0 when the buffer fully drains, and
-    // compacted in coalesce_append_locked once the consumed prefix dominates.
-    std::size_t coalesce_consumed_{0};
+    // Outbound cohort FIFO (slice 2, issue #24). Each cohort carries the frame
+    // cap it was admitted under; only the emission driver consumes, always from
+    // the front. `outbound_fifo_pending_` caches the summed pending bytes so
+    // coalesce_pending_locked() stays O(1).
+    std::deque<OutboundCohort> outbound_fifo_;
+    std::size_t outbound_fifo_pending_{0};
+    // True while one thread is the emission driver. Guarded by
+    // `coalesce_mutex_`; every exit decision (drain complete, sub-cap stop,
+    // backpressure) happens in the same critical section that clears it, and
+    // every append happens under the same mutex, so a wakeup can never be lost
+    // between "driver saw an empty FIFO" and "a producer appended".
+    bool driver_active_{false};
+    // A FlushAll request arrived (possibly from a deferred caller) and has not
+    // yet been honoured by a complete drain. Re-read by the active driver on
+    // every iteration; cleared when the FIFO empties or the drain backpressures
+    // (the retry timer flushes everything anyway).
+    bool driver_flush_all_requested_{false};
     asio::steady_timer coalesce_timer_;
     // Receiver-side ACK retry state. This is intentionally separate from the
     // DATA coalescing timer: an inbound TCP drain can need to retry only ACKs
