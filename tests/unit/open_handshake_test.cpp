@@ -457,18 +457,27 @@ TEST_F(SendqRoutingTest, HandshakeAndDataFramesAreReturnedToTheirDriver) {
     EXPECT_TRUE(drained.empty());
 }
 
-TEST_F(SendqRoutingTest, OtherControlFramesStillParkAndStillReportSent) {
-    // Deliberately unchanged by this slice: CLOSE / ERROR / PING and friends
-    // keep the park-and-report-Sent behaviour (and with it the known
-    // stale-frame-onto-a-recycled-id hazard) until they too move to driver
-    // ownership.
-    EXPECT_EQ(route(ProtocolFrame::make_tunnel_close(kTunnelId)), SendOutcome::Sent);
-    EXPECT_EQ(route(ProtocolFrame::make_tunnel_error(kTunnelId, 3, "x")), SendOutcome::Sent);
+TEST_F(SendqRoutingTest, CloseAndErrorAreReturnedToTheirDriver) {
+    // Issue #24 slice 3: CLOSE and ERROR are now driver-owned, so
+    // route_sendq_full() returns their backpressure verbatim (like OPEN / ACK
+    // / DATA) instead of parking raw bytes and faking Sent — the per-tunnel
+    // driver retains and retries them with their identity intact, which is
+    // what forbids ERROR,CLOSE wire ordering.
+    EXPECT_EQ(route(ProtocolFrame::make_tunnel_close(kTunnelId)), SendOutcome::SendqFull);
+    EXPECT_EQ(route(ProtocolFrame::make_tunnel_error(kTunnelId, 3, "x")), SendOutcome::SendqFull);
+
+    io_ctx.run();
+    EXPECT_TRUE(drained.empty()) << "CLOSE/ERROR must not be parked in the manager queue";
+}
+
+TEST_F(SendqRoutingTest, RemainingControlFramesStillParkAndStillReportSent) {
+    // PING (and PONG / INFO / RESUME) are still manager-owned: no per-tunnel
+    // identity hazard, so they keep the park-and-report-Sent behaviour until
+    // they too move to driver ownership.
     EXPECT_EQ(route(ProtocolFrame::make_ping()), SendOutcome::Sent);
 
     io_ctx.run();
-    EXPECT_EQ(drained, (std::vector<FrameType>{FrameType::TUNNEL_CLOSE, FrameType::TUNNEL_ERROR,
-                                               FrameType::PING}))
+    EXPECT_EQ(drained, (std::vector<FrameType>{FrameType::PING}))
         << "parked frames must still be delivered by the drain timer, in order";
 }
 
@@ -2808,14 +2817,11 @@ TEST_F(IdReservationTest, ABackpressuredCloseFrameIsRetriedAndKeepsTheIdReserved
     // version of this test kept its own reference alive and so could not see
     // that.
     //
-    // SCOPE: this injects SendqFull directly through the per-tunnel callback, so
-    // it covers the CALLBACK CONTRACT, not today's production CLOSE path.
-    // Production senders go through app::detail::make_tunnel_senders(), and
-    // route_sendq_full() excludes TUNNEL_CLOSE from driver-owned retry — a
-    // backpressured CLOSE is parked in TunnelManager's queue and reported Sent,
-    // so this retry never arms for it. The machinery is the contract for the
-    // slice that moves CLOSE off that queue; do not read this test as evidence
-    // that production CLOSEs are retried today.
+    // SCOPE: this injects SendqFull directly through the per-tunnel callback,
+    // covering the CALLBACK CONTRACT. Since issue #24 slice 3 this is also the
+    // production path: route_sendq_full() now includes TUNNEL_CLOSE in
+    // driver-owned retry, so a backpressured CLOSE is returned SendqFull (not
+    // parked in TunnelManager's queue) and this per-tunnel retry arms for it.
     std::atomic<int> close_attempts{0};
     std::atomic<bool> transport_blocked{true};
     std::weak_ptr<tunnel::TunnelImpl> weak_tunnel;
@@ -2988,7 +2994,9 @@ TEST(ClaimTerminalIsAtomicTest, AnObserverCannotSampleTheStateBetweenClaimAndObl
             // Wake the claimant as soon as the quota is met. Taking the
             // rendezvous mutex here is what gives the notification a
             // happens-before edge with the claimant's predicate check.
-            { std::lock_guard<std::mutex> rendezvous(rendezvous_mutex); }
+            {
+                std::lock_guard<std::mutex> rendezvous(rendezvous_mutex);
+            }
             rendezvous_cv.notify_all();
         }
     });

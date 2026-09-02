@@ -765,15 +765,28 @@ TEST_F(TunnelCoalesceTest, SendErrorAbandonsRetainedDataAndClaimsTheOneTerminalE
 // ---------------------------------------------------------------------------
 // 15b. A CLOSE deferred behind backpressure records an Owed obligation that
 //      pins the tunnel id. send_error()'s abandonment removes the drain that
-//      would have discharged it, so it must give the obligation up itself —
-//      after the ERROR attempt and the terminal transition — or an owner
-//      whose on_id_releasable hook is already installed waits forever and
-//      the id is pinned for the life of the object.
+//      would have discharged it, so once its own terminal ERROR settles the
+//      two-party finalizer (cancel_close_retry) must give the obligation up —
+//      or an owner whose on_id_releasable hook is already installed waits
+//      forever and the id is pinned for the life of the object.
+//
+//      Issue #24 slice 3: the ERROR is now driver-emitted. The DATA path is
+//      backpressured to force the close deferral, but the ERROR frame is
+//      accepted so it genuinely settles; the id then releases. (A permanently
+//      SendqFull-ing transport would instead keep the id pinned by the
+//      terminal_error_in_flight_ fence until the ERROR settles — the
+//      strengthened guarantee that a still-owed ERROR cannot land on a
+//      recycled id.)
 // ---------------------------------------------------------------------------
 
 TEST_F(TunnelCoalesceTest, SendErrorReleasesAnOwedCloseObligation) {
-    tunnel_->set_on_send_to_tox(
-        [&](std::span<const uint8_t>) -> SendOutcome { return SendOutcome::SendqFull; });
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_ERROR) {
+            return SendOutcome::Sent;  // the terminal ERROR reaches the peer
+        }
+        return SendOutcome::SendqFull;  // DATA is backpressured -> close defers
+    });
     tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
 
     std::vector<uint8_t> payload(200, 0x77);
@@ -786,8 +799,7 @@ TEST_F(TunnelCoalesceTest, SendErrorReleasesAnOwedCloseObligation) {
     EXPECT_FALSE(releasable) << "id released while a CLOSE was still owed";
 
     tunnel_->send_error(2, "target died mid-close");
-    EXPECT_TRUE(releasable)
-        << "the owed CLOSE was abandoned silently and the id stayed pinned forever";
+    EXPECT_TRUE(releasable) << "the owed CLOSE was not given up once the terminal ERROR settled";
     EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
 }
 
@@ -996,4 +1008,381 @@ TEST_F(TunnelCoalesceTest, GateCloseSealsAdmissionInTheSameStep) {
     EXPECT_FALSE(tunnel_->send_data_to_tox(payload))
         << "admission stayed open after the gate closed — gate and seal split authority";
     EXPECT_TRUE(captured_.data_payloads.empty());
+}
+
+// ===========================================================================
+// Slice-3 completion (issue #24): CLOSE and ERROR routed through the single
+// emission driver. The tests below exercise the driver-owned emission paths
+// directly.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 18. A terminal ERROR that the transport backpressures is RETAINED and
+//     retried on the SENDQ cadence until it is accepted — never dropped, and
+//     never parked in the manager queue. The id stays pinned (the
+//     terminal_error_in_flight_ fence) until it genuinely settles.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, TerminalErrorRetriesUntilSent) {
+    std::atomic<int> error_attempts{0};
+    std::atomic<bool> accept{false};
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_ERROR) {
+            error_attempts.fetch_add(1);
+            if (!accept.load()) {
+                return SendOutcome::SendqFull;
+            }
+            captured_.record(wire);
+            return SendOutcome::Sent;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    bool releasable = false;
+    tunnel_->set_on_id_releasable([&] { releasable = true; });
+
+    tunnel_->send_error(2, "boom");
+    // First attempt backpressured; the id must NOT be releasable yet.
+    EXPECT_GE(error_attempts.load(), 1);
+    EXPECT_FALSE(releasable) << "id released while the terminal ERROR was still owed";
+
+    accept.store(true);
+    ASSERT_TRUE(pump_until([&] { return releasable; }));
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_ERROR),
+              1)
+        << "exactly one terminal ERROR reaches the wire, however many attempts it took";
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
+}
+
+// ---------------------------------------------------------------------------
+// 19. A graceful CLOSE that the transport backpressures is retained and
+//     retried by the driver (its own SENDQ timer), then resolves once
+//     accepted — the id releases only then.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, CloseRetriesUntilSent) {
+    std::atomic<int> close_attempts{0};
+    std::atomic<bool> accept{false};
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_CLOSE) {
+            close_attempts.fetch_add(1);
+            if (!accept.load()) {
+                return SendOutcome::SendqFull;
+            }
+            captured_.record(wire);
+            return SendOutcome::Sent;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    bool releasable = false;
+    tunnel_->set_on_id_releasable([&] { releasable = true; });
+
+    tunnel_->close();
+    EXPECT_GE(close_attempts.load(), 1);
+    EXPECT_FALSE(releasable) << "id released while the CLOSE was still owed";
+
+    accept.store(true);
+    ASSERT_TRUE(pump_until([&] { return releasable; }));
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_CLOSE),
+              1)
+        << "exactly one CLOSE reaches the wire";
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Disconnecting);
+}
+
+// ---------------------------------------------------------------------------
+// 20. A second CLOSE request while the first is parked for the SENDQ backoff
+//     is refused (returns false) — it must neither double-book the metric nor
+//     bypass the backoff by relatching the request.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, SecondCloseRequestDuringBackoffDoesNotReemit) {
+    std::atomic<int> close_attempts{0};
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_CLOSE) {
+            close_attempts.fetch_add(1);
+            return SendOutcome::SendqFull;  // permanently parked for this test
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    tunnel_->close();  // first request: one attempt, then parks on SendqFull
+    const int after_first = close_attempts.load();
+    EXPECT_EQ(after_first, 1);
+
+    // A second close() while the CLOSE is parked/armed must NOT schedule a
+    // fresh emission (the request predicate refuses a relatch during backoff);
+    // only the retry timer relatches, on its own cadence.
+    tunnel_->close();
+    EXPECT_EQ(close_attempts.load(), after_first)
+        << "a second CLOSE request re-emitted synchronously during the SENDQ backoff";
+}
+
+// ---------------------------------------------------------------------------
+// 21. Under the single driver, an ERROR raised while a CLOSE is mid-flight
+//     never produces ERROR,CLOSE on the wire: the CLOSE either lands first
+//     (CLOSE,ERROR, allowed) or is abandoned by the ERROR claim.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, DriverNeverEmitsErrorBeforeAnInFlightClose) {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame.has_value() && frame.value().type() == FrameType::TUNNEL_CLOSE) {
+            // Target died while our CLOSE was inside the transport.
+            tunnel_->send_error(2, "died during close");
+        }
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    tunnel_->close();
+    pump_for(30ms);
+
+    // Whatever interleaving occurred, ERROR must never precede CLOSE.
+    const auto& types = captured_.all_frame_types;
+    auto err = std::find(types.begin(), types.end(), FrameType::TUNNEL_ERROR);
+    auto cls = std::find(types.begin(), types.end(), FrameType::TUNNEL_CLOSE);
+    if (err != types.end() && cls != types.end()) {
+        EXPECT_LT(std::distance(types.begin(), cls), std::distance(types.begin(), err))
+            << "ERROR reached the wire before the CLOSE";
+    }
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
+}
+
+// ---------------------------------------------------------------------------
+// 22. A throwing DATA send callback is treated as Abort, not retry (the
+//     callback cannot promise the transport did not accept the frame). The
+//     tunnel completes to terminal Error, the FIFO is abandoned, and the
+//     exception propagates to the synchronous caller (RAII state repair, not
+//     a swallow).
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, ThrowingDataCallbackAbortsToTerminal) {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t>) -> SendOutcome {
+        throw std::runtime_error("data callback exploded");
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    bool close_notified = false;
+    tunnel_->set_on_close([&] { close_notified = true; });
+
+    std::vector<uint8_t> payload(64, 0x33);
+    // send_data_to_tox runs the driver synchronously on this thread; the
+    // throw propagates (repaired, not swallowed). Wrapped in a lambda because
+    // the method is [[nodiscard]].
+    EXPECT_THROW({ (void)tunnel_->send_data_to_tox(payload); }, std::runtime_error);
+
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error)
+        << "a throwing DATA callback must drive the tunnel terminal (Abort)";
+    // The internal terminal ERROR was deposited and armed for retry; its own
+    // send also throws, which the timer boundary contains and settles as a
+    // permanent failure — that transport-party arrival completes the two-party
+    // finalizer and fires the close notification. Pump for it.
+    EXPECT_TRUE(pump_until([&] { return close_notified; }))
+        << "terminal completion must fire the close notification";
+    // A subsequent write is refused outright: admission is sealed.
+    EXPECT_FALSE(tunnel_->send_data_to_tox(payload));
+}
+
+// ---------------------------------------------------------------------------
+// 23. Post-drain exception isolation (issue #24 slice 3): a throwing state or
+//     close callback in a deferred close/finalize action must not strand the
+//     owner's teardown notification, and — when a graceful close deferred
+//     behind a drain completes — the close notification still fires.
+// ---------------------------------------------------------------------------
+
+// 23a. A throwing state-change callback during the deferred CLOSE's transition
+//      must not skip the close notification (armed-fallback repair).
+TEST_F(TunnelCoalesceTest, DeferredCloseStateCallbackThrowStillNotifiesClose) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        if (!allow_send) {
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    bool close_notified = false;
+    tunnel_->set_on_close([&] { close_notified = true; });
+
+    // Backpressure the DATA so the close defers behind it.
+    std::vector<uint8_t> payload(200, 0x21);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+    tunnel_->close();
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Connected) << "close was not deferred";
+
+    // A state-change callback that throws when the tunnel reaches Disconnecting.
+    tunnel_->set_on_state_change([](Tunnel::State s) {
+        if (s == Tunnel::State::Disconnecting) {
+            throw std::runtime_error("state callback exploded");
+        }
+    });
+
+    // Release: the retry timer drains the DATA, then the driver completes the
+    // deferred close; the throwing state callback must not swallow the close
+    // notification.
+    allow_send = true;
+    ASSERT_TRUE(pump_until([&] { return close_notified; }))
+        << "a throwing state callback stranded the deferred close notification";
+}
+
+// 23b. A throwing on_close during remote finalization propagates (it is not
+//      swallowed), and the tunnel still reaches a terminal state.
+TEST_F(TunnelCoalesceTest, RemoteFinalizeCloseCallbackThrowPropagates) {
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+    tunnel_->set_on_close([] { throw std::runtime_error("on_close exploded"); });
+
+    // Drive a remote-close finalization directly. finalize_remote_close() is
+    // reached through handle_tunnel_close_frame when nothing is buffered.
+    auto close_frame = ProtocolFrame::make_tunnel_close(1);
+    // The throwing on_close propagates out of the frame handler.
+    EXPECT_THROW({ tunnel_->handle_frame(close_frame); }, std::runtime_error);
+    // The terminal transition still happened before the notification threw.
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Closed);
+}
+
+// 23c. When a deferred FULL close and a deferred remote close both complete on
+//      the same drain, a throw in the first action (emit_close_and_transition)
+//      must NOT skip the second (finalize_remote_close): finish-all. The throw
+//      is contained at the timer boundary; we assert both post-conditions ran.
+TEST_F(TunnelCoalesceTest, FirstDeferredActionThrowStillRunsRemoteFinalize) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        if (!allow_send) {
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    bool close_notified = false;
+    tunnel_->set_on_close([&] { close_notified = true; });
+
+    // Backpressure so both the local close() and the peer CLOSE defer behind
+    // the drain (a full close deferred, plus a deferred remote close).
+    std::vector<uint8_t> payload(200, 0x2c);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+    tunnel_->close();                                            // deferred full close
+    tunnel_->handle_frame(ProtocolFrame::make_tunnel_close(1));  // remote close, deferred
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Connected) << "closes were not both deferred";
+
+    // The first deferred action (emit_close_and_transition) throws from its
+    // state callback; finalize_remote_close must still run.
+    tunnel_->set_on_state_change([](Tunnel::State s) {
+        if (s == Tunnel::State::Disconnecting) {
+            throw std::runtime_error("first deferred action exploded");
+        }
+    });
+
+    // Release: drain completes on the retry timer; the throw is logged+
+    // contained at the timer boundary. Assert finish-all — the remote finalize
+    // drove the tunnel terminal despite the first action throwing, and the
+    // deferred close notification still fired.
+    allow_send = true;
+    ASSERT_TRUE(pump_until([&] { return tunnel_->state() == Tunnel::State::Closed; }))
+        << "the first action's throw skipped the remote finalization";
+    EXPECT_TRUE(close_notified) << "the deferred close notification was stranded";
+}
+
+// 23d. A throwing on_id_releasable during a deferred close's completion must
+//      not skip notify_close_once() — the armed fallback runs the close
+//      notification even though the id-release callback threw.
+TEST_F(TunnelCoalesceTest, DeferredCloseIdReleaseThrowStillNotifiesClose) {
+    bool allow_send = false;
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        if (!allow_send) {
+            return SendOutcome::SendqFull;
+        }
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/kBatchingDelayUs, /*max_bytes=*/1362);
+
+    bool close_notified = false;
+    tunnel_->set_on_close([&] { close_notified = true; });
+    tunnel_->set_on_id_releasable([] { throw std::runtime_error("id-release exploded"); });
+
+    std::vector<uint8_t> payload(200, 0x2d);
+    ASSERT_TRUE(tunnel_->send_data_to_tox(payload));
+    tunnel_->close();  // deferred behind the backpressured DATA
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Connected) << "close was not deferred";
+
+    // Release: the retry timer drains the DATA and completes the deferred
+    // close; the throwing id-release callback must not strand the close
+    // notification.
+    allow_send = true;
+    ASSERT_TRUE(pump_until([&] { return close_notified; }))
+        << "a throwing on_id_releasable stranded the deferred close notification";
+}
+
+// ---------------------------------------------------------------------------
+// 24. outbound_aborted() is the primitive the resume paths gate on (issue #24
+//     slice 3): the client skips / force-settles an aborted tunnel instead of
+//     sending TUNNEL_RESUME_REQUEST, and the server declines + removes an
+//     aborted held tunnel. Both revalidate it after the ACK exchange. The
+//     end-to-end races need a client/server harness (integration scope); here
+//     we pin the accessor those checks read.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, OutboundAbortedReflectsTerminalSeal) {
+    EXPECT_FALSE(tunnel_->outbound_aborted()) << "a live tunnel is not aborted";
+
+    // force_close() is the Abort level of the terminal-intent ladder.
+    tunnel_->force_close();
+    EXPECT_TRUE(tunnel_->outbound_aborted())
+        << "force_close() must publish the Abort seal the resume paths gate on";
+}
+
+TEST_F(TunnelCoalesceTest, OutboundAbortedSetBySendError) {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        return SendOutcome::Sent;
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+
+    EXPECT_FALSE(tunnel_->outbound_aborted());
+    tunnel_->send_error(2, "boom");
+    EXPECT_TRUE(tunnel_->outbound_aborted())
+        << "send_error() seals the outbound side; resume must treat it as ineligible";
+}
+
+// ---------------------------------------------------------------------------
+// 25. Finalizer-exception disposition (issue #24 slice 3): a throwing on_close
+//     that fires when send_error's producer arrival completes the two-party
+//     settle PROPAGATES to send_error's synchronous caller (it is not
+//     swallowed), while the terminal transition still lands first.
+// ---------------------------------------------------------------------------
+
+TEST_F(TunnelCoalesceTest, SendErrorPropagatesThrowingOnCloseFromFinalizer) {
+    tunnel_->set_on_send_to_tox([&](std::span<const uint8_t> wire) -> SendOutcome {
+        captured_.record(wire);
+        return SendOutcome::Sent;  // ERROR reaches the wire; transport settles.
+    });
+    tunnel_->configure_coalesce(/*max_delay_us=*/0, /*max_bytes=*/1362);
+    tunnel_->set_on_close([] { throw std::runtime_error("on_close exploded"); });
+
+    // send_error: ERROR sent (transport arrives), then the normal-path producer
+    // arrival completes the settle and runs the finalizer -> notify_close_once
+    // -> throwing on_close propagates out of send_error.
+    EXPECT_THROW({ tunnel_->send_error(2, "boom"); }, std::runtime_error);
+    // The terminal transition ran before the propagating finalizer.
+    EXPECT_EQ(tunnel_->state(), Tunnel::State::Error);
+    EXPECT_EQ(std::count(captured_.all_frame_types.begin(), captured_.all_frame_types.end(),
+                         FrameType::TUNNEL_ERROR),
+              1);
 }

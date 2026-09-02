@@ -3,12 +3,14 @@
 #include <asio.hpp>
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 #include "toxtunnel/util/config.hpp"
+#include "toxtunnel/util/fatal_boundary.hpp"
 #include "toxtunnel/util/metrics.hpp"
 
 using namespace toxtunnel;
@@ -359,4 +361,45 @@ TEST_F(MetricsTest, HttpServerRejectsInvalidListenSpec) {
     MetricsServer server(io_ctx, MetricsRegistry::instance());
     const auto err = server.start("not-a-host:port", "/metrics");
     EXPECT_FALSE(err.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Fatal diagnostic worker boundary (issue #24 slice 3). An exception escaping
+// a completion handler must be named + counted + aborted, never silently
+// terminate. See util/fatal_boundary.hpp.
+// ---------------------------------------------------------------------------
+
+TEST(FatalBoundaryTest, AbortsAndDiagnosesOnEscapingStdException) {
+    // The diagnostic must name the context AND the exception's own message, so
+    // an operator reading the crash log sees what escaped, not just "aborting".
+    EXPECT_DEATH(
+        {
+            toxtunnel::util::run_with_fatal_boundary("unit-test-ctx",
+                                                     [] { throw std::runtime_error("boom-msg"); });
+        },
+        "unit-test-ctx.*boom-msg");
+}
+
+TEST(FatalBoundaryTest, AbortsOnEscapingNonStandardException) {
+    EXPECT_DEATH(
+        { toxtunnel::util::run_with_fatal_boundary("unit-test", [] { throw 42; }); }, "aborting");
+}
+
+TEST(FatalBoundaryTest, PassesThroughWhenNoException) {
+    bool ran = false;
+    toxtunnel::util::run_with_fatal_boundary("unit-test", [&] { ran = true; });
+    EXPECT_TRUE(ran);
+}
+
+// The fatal boundary bumps toxtunnel_worker_aborts_total just before aborting.
+// The abort is in a forked child (EXPECT_DEATH) so the counter itself is
+// verified directly here, including its /metrics exposition.
+TEST_F(MetricsTest, WorkerAbortsCounterIncrementsAndExports) {
+    EXPECT_EQ(MetricsRegistry::instance().worker_aborts(), 0u);
+    MetricsRegistry::instance().inc_worker_aborts();
+    MetricsRegistry::instance().inc_worker_aborts();
+    EXPECT_EQ(MetricsRegistry::instance().worker_aborts(), 2u);
+
+    const std::string exposition = MetricsRegistry::instance().render();
+    EXPECT_NE(exposition.find("toxtunnel_worker_aborts_total 2"), std::string::npos);
 }

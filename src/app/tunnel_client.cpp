@@ -1148,6 +1148,15 @@ void TunnelClient::send_resume_requests() {
         if (!impl || impl->state() != tunnel::Tunnel::State::Connected) {
             continue;
         }
+        // Issue #24 slice 3: a tunnel whose outbound side is Abort-sealed (e.g.
+        // driven terminal by a throwing DATA callback) can read Connected for
+        // a transient window but will refuse all further outbound admission —
+        // resuming it would hand the peer a tunnel that can never send. Skip
+        // it and force-settle it locally instead.
+        if (impl->outbound_aborted()) {
+            impl->force_close();
+            continue;
+        }
         tunnel::TunnelResumeRequestPayload req;
         req.prior_tunnel_id = id;
         req.last_local_recv_offset = impl->bytes_received();
@@ -1179,6 +1188,19 @@ void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack) 
         return;
     }
     if (ack.status == tunnel::TunnelResumeStatus::Ok) {
+        // Issue #24 slice 3: revalidate the seal AFTER the exchange. An Abort
+        // that raced the request/ACK (a throwing DATA callback drove the
+        // tunnel terminal while the ACK was in flight) means this "resumed"
+        // tunnel can never send again — force-settle it instead of reporting
+        // success.
+        if (impl->outbound_aborted()) {
+            util::MetricsRegistry::instance().inc_resume_failures();
+            util::Logger::warn(
+                "Tunnel {} RESUME_ACK Ok but the tunnel was aborted mid-exchange; closing",
+                ack.new_tunnel_id);
+            impl->force_close();
+            return;
+        }
         util::MetricsRegistry::instance().inc_resume_successes();
         util::Logger::info("Tunnel {} resumed (server recv={} send={})", ack.new_tunnel_id,
                            ack.server_recv_offset, ack.server_send_offset);

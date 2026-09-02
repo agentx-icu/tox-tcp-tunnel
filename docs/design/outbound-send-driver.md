@@ -1,23 +1,29 @@
 # Outbound send driver — approved design
 
-Status: **approved, partially implemented.** Slice 1 (typed seam + handshake)
+Status: **approved, slices 1-3 implemented.** Slice 1 (typed seam + handshake)
 shipped in v0.4.13. Slice 2 (cohort FIFO + the single emission driver for DATA)
 is implemented on master: no Tox send callback runs under `coalesce_mutex_` on
 any DATA path any more, and the deferred-close bookkeeping moved from the flush
-timer into the driver's drain-complete step. Slice 3 is **partially
-implemented** — the terminal Abort ordering landed (`send_error()` seals
-admission, abandons undelivered DATA and claims the single terminal ERROR in
-one critical section before any callback runs; `close_outbound_gate()`
-publishes the Abort seal in the same critical section that closes the gate;
-the graceful paths and the driver consult the seal so neither a CLOSE nor a
-pre-authorization DATA frame follows the terminal ERROR), but **CLOSE and
-ERROR frames still emit through their own latch/retry machinery rather than
-through `run_emission_driver` itself** — the "one driver owns every emission
-path" end-state remains open. Of the `LocalTerminalIntent` ladder only `Abort`
-is materialized (`outbound_abort_published_`); the graceful levels stay in
-their pre-ladder flags until slice 4's privileged backlog drain exists to
-enforce them on ordinary admission. That residue plus slices 4-5 are tracked
-as https://github.com/agentx-icu/tox-tcp-tunnel/issues/24.
+timer into the driver's drain-complete step. Slice 3 is now **complete**: CLOSE
+and ERROR are emitted only by `run_emission_driver` itself (CLOSE via a
+request-and-kick `close_emit_requested_` + `CloseFrameState`; ERROR via the
+terminal-ERROR slot `pending_terminal_error_` with its own SENDQ retry timer
+and a two-party settle latch), so literally no second path invokes a send
+callback for a per-tunnel terminal frame. `driver_owns_retry()` returns
+CLOSE/ERROR backpressure verbatim (they no longer park in the manager queue);
+the driver's selection order ERROR→DATA→CLOSE plus the commit-side
+`terminal_error_claimed_` supersession fence make ERROR-before-CLOSE wire
+ordering impossible; a throwing DATA callback completes to a terminal Abort;
+every asio handler boundary (timers, io_context workers, signal contexts)
+contains exceptions, with a diagnostic fatal worker boundary as the last
+line. The full R-numbered review history and the completion plan live in
+`slice3-close-error-routing-plan.md`. Companion / follow-up work is tracked
+separately: resume stale-ACK identity (#28), pre-existing exception-safety
+debt in stop/destructor/completion handlers (#29), manager pending-queue
+session provenance (#30), and the resume-abort integration regressions (#31).
+Slices 4-5 (pending-backlog seal, privileged capability, aggregate cap, the
+strong `close_all_local()` fence) remain open and are tracked as
+https://github.com/agentx-icu/tox-tcp-tunnel/issues/24.
 
 This document exists because the design took nine rounds of independent review
 to converge, and eight of those rounds were rejections that each found a real

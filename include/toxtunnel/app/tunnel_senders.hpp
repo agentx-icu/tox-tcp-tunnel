@@ -42,11 +42,14 @@ struct TunnelSenders {
 ///  * **The outbound FIFO barrier.** For TUNNEL_OPEN and TUNNEL_ACK, the
 ///    manager's retry queue is consulted BEFORE toxcore, not merely after a
 ///    refusal. Checking only afterwards leaves the design's central failure
-///    live: a CLOSE parked in that queue is reported as sent, the tunnel
+///    live: a frame parked in that queue is reported as sent, the tunnel
 ///    resolves, the id is released and recycled, and a new OPEN for the same id
-///    goes out directly — so the stale CLOSE drains afterwards and kills the new
-///    tunnel. See `TunnelManager::outbound_queue_busy()` for the exact ordering
-///    guarantee and its (concurrent, non-causal) residual.
+///    goes out directly — so the stale parked frame drains afterwards and kills
+///    the new tunnel. (TUNNEL_CLOSE and TUNNEL_ERROR no longer park at all
+///    since issue #24 slice 3 — they are driver-owned and retried in place —
+///    so this recycled-id hazard now only concerns the frame types still on
+///    the manager queue.) See `TunnelManager::outbound_queue_busy()` for the
+///    exact ordering guarantee and its (concurrent, non-causal) residual.
 ///
 /// @param send_lossless  Typed toxcore send. Must remain callable for the
 ///                       lifetime of the tunnel that owns these callbacks.

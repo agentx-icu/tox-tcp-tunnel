@@ -410,21 +410,27 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// What this deliberately does NOT do is wait for those sends. An earlier
     /// version blocked until every pre-gate snapshot was released, aiming for
     /// "nothing of this session is on the wire when we return". That was
-    /// unreachable from here and actively harmful: the data send path holds
-    /// `coalesce_mutex_` across its callback, and a send callback that tears
-    /// its own tunnel down would re-enter `force_close()` →
-    /// `flush_pending_writes()` → the same non-recursive mutex. Because this
+    /// unreachable from here: a send callback that tears its own tunnel down
+    /// re-enters `force_close()` → `flush_pending_writes()` → the emission
+    /// driver, which cannot *wait* for the in-flight send it was called from
+    /// (the driver no longer holds `coalesce_mutex_` across a send since slice
+    /// 2, so this is no longer a deadlock — but the wait is still meaningless).
+    /// Because this
     /// runs on the strand that also carries inbound frames, the cure was worse
     /// than the disease: an indefinite data stall traded for one stale frame on
     /// an opt-in code path. (That re-entrant route is separately defused —
     /// `force_close()` skips the flush once the gate is closed — but the wait
     /// remains the wrong tool.)
     ///
-    /// Closing the residual needs the send path restructured so no lock is held
-    /// across the Tox call — a design change, not a patch. Until then the
+    /// The send path no longer holds a lock across the Tox call (slice 2
+    /// removed that), so the old deadlock is gone; the residual that remains is
+    /// a *pre-gate snapshot* one — a sender that copied the callback
+    /// microseconds before the gate closed can still land its frame. The
     /// consequence is a stale frame from an abandoned session, which the peer
     /// may map onto a recycled tunnel id. This is reachable only on the
-    /// default-off resume path's loser-manager race.
+    /// default-off resume path's loser-manager race, and closing it needs the
+    /// session-generation machinery tracked separately (issue #30), not a
+    /// patch here.
     void close_all_local();
 
     /// True once `close_all_local()` has abandoned this manager. Frames handed
@@ -485,9 +491,12 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     [[nodiscard]] SendOutcome send_frame_typed(const ProtocolFrame& frame);
 
     /// Park an already-serialized frame in the outbound retry queue.
-    /// Use this when a per-tunnel send (TUNNEL_CLOSE, TUNNEL_OPEN, ...) hit
-    /// toxcore SENDQ-full and the caller wants the same drain timer that
-    /// `send_frame` uses to re-send it. The bytes are the *unprefixed*
+    /// Use this for a manager-owned control frame (PING/PONG, INFO_*,
+    /// RESUME_*, or a manager-originated ERROR) that hit toxcore SENDQ-full
+    /// and wants the same drain timer that `send_frame` uses to re-send it.
+    /// The identity-bearing per-tunnel frames (OPEN/ACK/DATA and, since issue
+    /// #24 slice 3, CLOSE/ERROR) are NOT parked here — they are retained and
+    /// retried by their own driver. The bytes are the *unprefixed*
     /// frame (matching `send_handler_`'s contract) — the handler prepends
     /// the 0xA0 lossless byte before handing to toxcore.
     ///
@@ -519,24 +528,27 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// `send_frame()`. The per-tunnel callbacks hand their frames to toxcore
     /// directly (they must: they carry manager byte/frame accounting and the
     /// zero-copy owned path), so `send_frame_impl()`'s internal check cannot see
-    /// them. Without consulting this first, the design's central failure is live
-    /// on the production path:
+    /// them. Without consulting this first, the design's central failure would
+    /// be live for any still-parked frame — historically CLOSE, before issue
+    /// #24 slice 3 moved CLOSE/ERROR to driver ownership:
     ///
-    ///     CLOSE(id=7) -> SendqFull -> parked, reported Sent
+    ///     parked-frame(id=7) -> SendqFull -> parked, reported Sent
     ///       -> tunnel resolves -> id 7 released -> id 7 recycled
     ///     OPEN(id=7) -> sent DIRECTLY, accepted
-    ///     drain timer -> stale CLOSE(id=7) -> kills the NEW tunnel 7
+    ///     drain timer -> stale parked-frame(id=7) -> disturbs the NEW tunnel 7
     ///
-    /// Consulting it turns that into CLOSE-then-OPEN, which is the order the
-    /// peer needs.
+    /// Consulting it orders the new OPEN after the parked frame, which is the
+    /// order the peer needs.
     ///
     /// Best-effort, and deliberately so: the caller releases this mutex before
     /// calling toxcore, so a frame parked by another thread in that gap is still
     /// overtaken. That residual is *concurrent*, while the hazard above is
-    /// *causal* — the CLOSE is parked before the id is released, so any later
-    /// OPEN for the recycled id is ordered after it and sees a non-empty queue.
-    /// Closing the concurrent residual as well needs a single outbound owner,
-    /// which is the driver from later slices.
+    /// *causal* — the parked frame is queued before the id is released, so any
+    /// later OPEN for the recycled id is ordered after it and sees a non-empty
+    /// queue. Closing the concurrent residual as well needs a single outbound
+    /// owner, which is the driver; CLOSE/ERROR already have it, and the frame
+    /// types still on this queue (PING/PONG/INFO/RESUME) are the remaining
+    /// scope.
     [[nodiscard]] bool outbound_queue_busy() const;
 
     // -----------------------------------------------------------------
@@ -916,19 +928,24 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
 ///    and the drain timer later delivers the stale frame against whatever
 ///    tunnel recycled that id.
 ///
-///  * TUNNEL_DATA — returned as `SendqFull`, NOT parked. The per-tunnel
-///    coalesce buffer already owns DATA retry; parking here would put the same
-///    bytes on the wire twice.
+///  * TUNNEL_DATA, TUNNEL_CLOSE, TUNNEL_ERROR — returned as `SendqFull`, NOT
+///    parked. Each is driver-owned (issue #24 slice 3): the per-tunnel
+///    emission driver retains and retries DATA (coalesce buffer), CLOSE
+///    (`CloseFrameState` + close-retry timer) and ERROR (terminal-ERROR slot +
+///    its own retry timer). Parking their raw bytes would strip the tunnel
+///    identity off them and let a parked CLOSE drain after a directly-accepted
+///    ERROR — wire order ERROR,CLOSE, the very hazard the single driver exists
+///    to prevent.
 ///
-///  * Everything else (CLOSE 0x03, ERROR 0x05, INFO 0x06/0x07, RESUME
-///    0x08/0x09, PING 0x10, PONG 0x11) — parked in the manager retry queue and
-///    reported as `Sent`. A queue at its cap reports `PermanentFail`, since
-///    nothing took ownership of the frame.
+///  * Everything else (INFO 0x06/0x07, RESUME 0x08/0x09, PING 0x10, PONG
+///    0x11) — parked in the manager retry queue and reported as `Sent`. A
+///    queue at its cap reports `PermanentFail`, since nothing took ownership of
+///    the frame.
 ///
-///    KNOWN AND DELIBERATE: those frame types still carry the
+///    KNOWN AND DELIBERATE: those remaining frame types still carry the
 ///    stale-frame-onto-a-recycled-id hazard described above. Fixing them means
-///    moving each to driver ownership the way OPEN and OPEN_ACK now are, which
-///    is a separate change.
+///    moving each to driver ownership the way OPEN, OPEN_ACK, CLOSE and ERROR
+///    now are, which is a separate change.
 ///
 ///    This is *policy* preservation, not behaviour preservation. Parked frames
 ///    now coexist with driver-retained ones, which is a new arrangement: the

@@ -118,6 +118,7 @@ void MetricsRegistry::reset() {
     rate_limit_bytes_throttled_.store(0, std::memory_order_relaxed);
     tox_iterate_lag_ms_.store(0, std::memory_order_relaxed);
     watchdog_aborts_.store(0, std::memory_order_relaxed);
+    worker_aborts_.store(0, std::memory_order_relaxed);
     resume_attempts_.store(0, std::memory_order_relaxed);
     resume_successes_.store(0, std::memory_order_relaxed);
     resume_failures_.store(0, std::memory_order_relaxed);
@@ -281,6 +282,14 @@ void MetricsRegistry::inc_watchdog_aborts() {
 
 std::uint64_t MetricsRegistry::watchdog_aborts() const {
     return watchdog_aborts_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_worker_aborts() {
+    worker_aborts_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::worker_aborts() const {
+    return worker_aborts_.load(std::memory_order_relaxed);
 }
 
 void MetricsRegistry::inc_resume_attempts() {
@@ -478,6 +487,11 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_tox_iterate_lag_ms gauge\n"
            "toxtunnel_tox_iterate_lag_ms "
         << tox_iterate_lag_ms() << "\n";
+    out << "# HELP toxtunnel_worker_aborts_total Cumulative fatal worker-boundary aborts since "
+           "process start.\n"
+           "# TYPE toxtunnel_worker_aborts_total counter\n"
+           "toxtunnel_worker_aborts_total "
+        << worker_aborts() << "\n";
     out << "# HELP toxtunnel_watchdog_aborts_total Cumulative tox-thread wedge aborts since "
            "process start.\n"
            "# TYPE toxtunnel_watchdog_aborts_total counter\n"

@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "toxtunnel/tunnel/protocol.hpp"
+#include "toxtunnel/util/asio_timer.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::tunnel {
@@ -51,7 +52,7 @@ TunnelManager::~TunnelManager() {
         pending_drain_armed_ = false;
         pending_outbound_.clear();
     }
-    pending_drain_timer_.cancel();
+    util::cancel_timer_noexcept(pending_drain_timer_);
     close_all();
 }
 
@@ -152,7 +153,7 @@ void TunnelManager::disable_reaper() {
     std::lock_guard<std::mutex> lock(timer_mutex_);
     reaper_epoch_.fetch_add(1, std::memory_order_acq_rel);
     if (reaper_active_.exchange(false, std::memory_order_acq_rel)) {
-        reaper_timer_.cancel();
+        util::cancel_timer_noexcept(reaper_timer_);
     }
 }
 
@@ -372,7 +373,7 @@ void TunnelManager::disable_keepalive() {
     std::lock_guard<std::mutex> lock(timer_mutex_);
     keepalive_epoch_.fetch_add(1, std::memory_order_acq_rel);
     if (keepalive_active_.exchange(false, std::memory_order_acq_rel)) {
-        keepalive_timer_.cancel();
+        util::cancel_timer_noexcept(keepalive_timer_);
     }
 }
 
@@ -707,13 +708,14 @@ bool TunnelManager::remove_tunnel_impl(uint16_t tunnel_id, const Tunnel* expecte
             });
         }
 
-        const auto state = doomed->state();
-        if (state == Tunnel::State::Disconnecting || state == Tunnel::State::None) {
-            if (impl != nullptr) {
-                impl->force_close();
-            } else {
-                doomed->close();
-            }
+        // Dispatch predicate (issue #24 slice 3): force_close() — not close()
+        // — whenever the tunnel is already terminal, never-opened, in
+        // half-close, OR Abort-sealed. A sealed-but-Connected tunnel (e.g. one
+        // a throwing DATA callback drove to Abort) no-ops on close(), which
+        // would detach it here with nothing fired or released; sampling the
+        // seal (abort_teardown_required) routes it to force_close instead.
+        if (impl != nullptr && impl->abort_teardown_required()) {
+            impl->force_close();
         } else {
             doomed->close();
         }
@@ -880,7 +882,7 @@ void TunnelManager::close_all_local() {
     }
     // Outside the mutex: cancel() completes inline on some backends and the
     // handler re-takes pending_mutex_.
-    pending_drain_timer_.cancel();
+    util::cancel_timer_noexcept(pending_drain_timer_);
 
     // Step 3 — close the manager's outbound gate.
     //
@@ -897,13 +899,15 @@ void TunnelManager::close_all_local() {
     // snapshotted the handler microseconds ago can be descheduled and start its
     // call after this returns.
     //
-    // We deliberately do NOT wait for those sends. That wait deadlocks: the
-    // data path holds coalesce_mutex_ across its callback, and this function
-    // goes on to force_close() every tunnel, whose flush_pending_writes()
-    // re-takes that same non-recursive mutex. force_close() now skips the flush
-    // once the gate is closed, which defuses the re-entrant route; the wait
-    // stays gone because it bought a guarantee this layer cannot honour anyway.
-    // See the contract on close_all_local() for the exact residual and why
+    // We deliberately do NOT wait for those sends. Historically that wait
+    // deadlocked (the data path used to hold coalesce_mutex_ across its
+    // callback, and this function goes on to force_close() every tunnel, whose
+    // flush_pending_writes() re-took that same non-recursive mutex). Since
+    // slice 2 the driver no longer holds coalesce_mutex_ across a send, so the
+    // re-entrant route merely defers to the active emitter rather than
+    // deadlocking; force_close() also skips the flush once the gate is closed.
+    // The wait stays gone because it bought a guarantee this layer cannot
+    // honour anyway. See the contract on close_all_local() for the residual and
     // closing it is a design change.
     {
         std::lock_guard<std::mutex> lock(handler_mutex_);
@@ -956,19 +960,33 @@ void TunnelManager::close_all_local() {
     //
     // Must be outside the lock: force_close() fires on_close_, which re-enters
     // the owning server (H-01). It also takes each tunnel's `coalesce_mutex_`
-    // — but only for the socket/state half: because we closed every outbound
-    // gate above, force_close() takes its local-abandon path and skips the
-    // coalesce flush entirely. That matters when this whole call is running
-    // inside a Tox send callback, which the data path invokes while holding
-    // that very mutex.
+    // — but only briefly, for the socket/state half: because we closed every
+    // outbound gate above, force_close() takes its local-abandon path and
+    // skips the coalesce flush entirely. That matters when this whole call is
+    // running inside a Tox send callback: the driver no longer holds
+    // `coalesce_mutex_` across a send (slice 2), but a re-entrant flush would
+    // still merely defer to the active emitter, and skipping it avoids even
+    // that.
     for (auto& [id, tunnel] : doomed) {
         if (!tunnel) {
             continue;
         }
-        if (auto* impl = dynamic_cast<TunnelImpl*>(tunnel.get())) {
-            impl->force_close();
-        } else {
-            tunnel->close();
+        // Per-tunnel isolation: a throwing force_close() (e.g. a DATA callback
+        // that threw during its best-effort flush) must not skip the rest of
+        // the batch — this call reaches here from stop() and from destructors,
+        // where a propagating exception would leave the session half torn down
+        // or terminate the process.
+        try {
+            if (auto* impl = dynamic_cast<TunnelImpl*>(tunnel.get())) {
+                impl->force_close();
+            } else {
+                tunnel->close();
+            }
+        } catch (const std::exception& e) {
+            util::Logger::warn("TunnelManager: tunnel {} threw during local abandon: {}", id,
+                               e.what());
+        } catch (...) {
+            util::Logger::warn("TunnelManager: tunnel {} threw during local abandon", id);
         }
         if (closed_cb) {
             asio::post(io_ctx_, [closed_cb, id = id]() { closed_cb(id); });
@@ -1005,7 +1023,6 @@ void TunnelManager::close_all() {
             // detach it here while leaving its socket open and its on_close_
             // unfired — and the id release is coupled to the tunnel discharging
             // its CLOSE obligation, not to close() returning.
-            const auto state = tunnel->state();
             auto* impl = dynamic_cast<TunnelImpl*>(tunnel.get());
             std::weak_ptr<TunnelManager> weak_self = weak_from_this();
             const bool defer_release = impl != nullptr && !weak_self.expired();
@@ -1019,11 +1036,24 @@ void TunnelManager::close_all() {
             } else {
                 release_tunnel_id(id);
             }
-            if (impl != nullptr &&
-                (state == Tunnel::State::None || state == Tunnel::State::Disconnecting)) {
-                impl->force_close();
-            } else {
-                tunnel->close();
+            // Same dispatch predicate as remove_tunnel_impl (issue #24 slice
+            // 3): force_close() when terminal / never-opened / half-close /
+            // Abort-sealed — a sealed tunnel's close() is a no-op, and with a
+            // stopped-but-alive io_context after close_all() (the production
+            // shutdown order) that would strand a parked terminal ERROR.
+            // Per-tunnel isolation (see close_all_local): one throwing tunnel
+            // must not skip the rest of the batch or the shutdown that follows.
+            try {
+                if (impl != nullptr && impl->abort_teardown_required()) {
+                    impl->force_close();
+                } else {
+                    tunnel->close();
+                }
+            } catch (const std::exception& e) {
+                util::Logger::warn("TunnelManager: tunnel {} threw during close_all: {}", id,
+                                   e.what());
+            } catch (...) {
+                util::Logger::warn("TunnelManager: tunnel {} threw during close_all", id);
             }
         } else {
             release_tunnel_id(id);
@@ -1331,6 +1361,15 @@ bool driver_owns_retry(FrameType type) noexcept {
         case FrameType::TUNNEL_OPEN:
         case FrameType::TUNNEL_ACK:
         case FrameType::TUNNEL_DATA:
+        // TUNNEL_CLOSE and TUNNEL_ERROR since issue #24 slice 3: both are now
+        // emitted only by the per-tunnel emission driver, which retains and
+        // retries them on the SENDQ cadence (CloseFrameState / the terminal-
+        // ERROR slot). Parking their raw bytes in this manager queue would
+        // strip the tunnel identity off them and let a parked CLOSE drain
+        // after a directly-accepted ERROR — wire order ERROR,CLOSE, the exact
+        // hazard the driver serialization exists to prevent.
+        case FrameType::TUNNEL_CLOSE:
+        case FrameType::TUNNEL_ERROR:
             return true;
         default:
             return false;
@@ -1361,8 +1400,11 @@ SendOutcome route_sendq_full(TunnelManager& manager, std::span<const std::uint8_
 bool frame_must_respect_outbound_barrier(FrameType type) noexcept {
     // OPEN and OPEN_ACK only. These are the identity-carrying handshake frames
     // this slice moved to driver ownership, and they are what the recycled-id
-    // hazard turns on: holding an OPEN behind a parked CLOSE for the same id
-    // restores close-then-open ordering at the peer.
+    // hazard turns on: holding an OPEN behind an older frame still parked in
+    // the manager queue for the same id restores the ordering the peer needs.
+    // (CLOSE/ERROR no longer park at all since issue #24 slice 3, so the parked
+    // frame that OPEN must wait behind is now one of the manager-owned control
+    // types.)
     //
     // TUNNEL_DATA is deliberately NOT here, and does not need to be. DATA only
     // flows once the tunnel is Connected, which on the client requires its OPEN
@@ -1371,11 +1413,15 @@ bool frame_must_respect_outbound_barrier(FrameType type) noexcept {
     // behind them transitively. Adding DATA would instead stall a live stream
     // behind an unrelated parked PING for up to a drain interval.
     //
-    // CLOSE / ERROR / PING / PONG / INFO / RESUME are not here either: they are
-    // still owned by TunnelManager's retry queue, and a direct send of one that
-    // toxcore happens to accept can still overtake a parked frame. That is the
-    // documented residual of leaving them parked, and it goes away when they
-    // move to driver ownership (see route_sendq_full's contract).
+    // CLOSE and ERROR are no longer here OR in the manager's retry queue:
+    // since issue #24 slice 3 they are driver-owned (driver_owns_retry), so
+    // route_sendq_full returns their backpressure verbatim and the per-tunnel
+    // driver retains/retries them with their identity intact — there is no
+    // parked raw-byte copy left to overtake. PING / PONG / INFO / RESUME are
+    // still owned by TunnelManager's retry queue, and a direct send of one
+    // that toxcore happens to accept can still overtake a parked frame. That
+    // is the documented residual of leaving THOSE parked; it goes away when
+    // they too move to driver ownership.
     return type == FrameType::TUNNEL_OPEN || type == FrameType::TUNNEL_ACK;
 }
 
@@ -1555,7 +1601,7 @@ void TunnelManager::clear_pending_outbound() {
     // Cancel any outstanding timer so its handler bails on the next firing
     // (the handler also re-checks `pending_drain_armed_` and the queue, so
     // a race here just turns into a cheap no-op).
-    pending_drain_timer_.cancel();
+    util::cancel_timer_noexcept(pending_drain_timer_);
     if (dropped > 0) {
         pending_dropped_total_.fetch_add(dropped, std::memory_order_relaxed);
         util::Logger::info("TunnelManager: cleared {} pending outbound frame(s)", dropped);

@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include "toxtunnel/app/known_servers.hpp"
 #include "toxtunnel/app/rules_engine.hpp"
@@ -21,6 +22,7 @@
 #include "toxtunnel/tox/tox_adapter.hpp"
 #include "toxtunnel/util/config.hpp"
 #include "toxtunnel/util/config_diagnostics.hpp"
+#include "toxtunnel/util/fatal_boundary.hpp"
 #include "toxtunnel/util/logger.hpp"
 #include "toxtunnel/util/pid_file.hpp"
 #include "toxtunnel/util/qr_code.hpp"
@@ -47,6 +49,15 @@ namespace {
 #endif
 
 constexpr const char* kVersion = TOXTUNNEL_VERSION;
+
+// Fatal diagnostic boundary for the signal-context pumps (issue #24 slice 3):
+// the same shared helper IoContext's worker threads use. An exception escaping
+// a handler on this context (a SIGHUP reload, say) is named, counted, and
+// aborted rather than reaching std::terminate silently.
+template <typename Fn>
+void run_signal_ctx_fatal(Fn&& pump) {
+    toxtunnel::util::run_with_fatal_boundary("signal context", std::forward<Fn>(pump));
+}
 
 /// Map from CLI string to LogLevel.
 const std::map<std::string, toxtunnel::util::LogLevel> kLogLevelMap = {
@@ -991,17 +1002,17 @@ int run_server(const toxtunnel::Config& config, bool run_as_service,
     // For Windows service, poll for stop requests
     if (run_as_service) {
         while (!toxtunnel::util::is_windows_service_stopping()) {
-            signal_ctx.poll_one();
+            run_signal_ctx_fatal([&] { signal_ctx.poll_one(); });
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         server.stop();
     } else {
-        signal_ctx.run();
+        run_signal_ctx_fatal([&] { signal_ctx.run(); });
     }
     reload_pipe.stop();
 #else
     // Block on signal wait
-    signal_ctx.run();
+    run_signal_ctx_fatal([&] { signal_ctx.run(); });
 #endif
 
     if (run_as_service) {
@@ -1086,7 +1097,7 @@ int run_client(const toxtunnel::Config& config, bool run_as_service,
         toxtunnel::util::notify_service_ready();
     }
 
-    std::thread signal_thread([&signal_ctx] { signal_ctx.run(); });
+    std::thread signal_thread([&signal_ctx] { run_signal_ctx_fatal([&] { signal_ctx.run(); }); });
 
 #if defined(_WIN32)
     // For Windows service, poll for stop requests

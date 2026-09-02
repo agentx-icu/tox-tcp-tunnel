@@ -1279,13 +1279,15 @@ TEST_F(TunnelManagerTest, CloseAllLocal_FencesAnInFlightTunnelSend) {
 
 // Regression: a send callback that abandons its own session must not deadlock.
 //
-// The coalesced data path invokes the Tox send callback while holding the
-// tunnel's `coalesce_mutex_`. If that callback tears the session down —
-// close_all_local() -> force_close() -> flush_pending_writes() — the flush
-// re-takes that same non-recursive mutex on the same thread and the process
-// wedges. force_close() takes its local-abandon path (no flush) once the
-// outbound gate is closed, which is exactly the state close_all_local()
-// establishes before it force-closes anything.
+// Historically the coalesced data path invoked the Tox send callback while
+// holding the tunnel's `coalesce_mutex_`, so a callback that tore the session
+// down — close_all_local() -> force_close() -> flush_pending_writes() —
+// re-took that same non-recursive mutex on the same thread and wedged. Slice 2
+// removed the lock-across-send, so a re-entrant flush now merely defers to the
+// active emitter; force_close() additionally takes its local-abandon path (no
+// flush) once the outbound gate is closed, which is exactly the state
+// close_all_local() establishes before it force-closes anything. This test
+// pins both guarantees.
 //
 // This test hangs forever on a regression, so it runs the teardown on its own
 // thread and fails on a deadline rather than taking the suite down with it.

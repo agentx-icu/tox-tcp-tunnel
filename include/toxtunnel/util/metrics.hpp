@@ -162,6 +162,13 @@ class MetricsRegistry {
     void inc_watchdog_aborts();
     [[nodiscard]] std::uint64_t watchdog_aborts() const;
 
+    /// Increment just before a fatal diagnostic worker-boundary abort (an
+    /// exception escaped an asio completion handler; see
+    /// `util::run_with_fatal_boundary`). Best-effort — the process aborts
+    /// immediately after — so it is the in-process view only.
+    void inc_worker_aborts();
+    [[nodiscard]] std::uint64_t worker_aborts() const;
+
     // -----------------------------------------------------------------
     // Tunnel resume protocol
     // -----------------------------------------------------------------
@@ -240,6 +247,7 @@ class MetricsRegistry {
     // Tox-thread watchdog.
     std::atomic<std::int64_t> tox_iterate_lag_ms_{0};
     std::atomic<std::uint64_t> watchdog_aborts_{0};
+    std::atomic<std::uint64_t> worker_aborts_{0};
 
     // Tunnel resume protocol.
     std::atomic<std::uint64_t> resume_attempts_{0};

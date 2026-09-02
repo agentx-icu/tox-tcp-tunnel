@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "toxtunnel/util/fatal_boundary.hpp"
 #include "toxtunnel/util/logger.hpp"
 
 namespace toxtunnel::core {
@@ -34,7 +35,9 @@ void IoContext::run() {
     for (std::size_t i = 0; i < num_threads_; ++i) {
         threads_.emplace_back([this, i]() {
             util::Logger::debug("IoContext worker thread {} started", i);
-            io_context_.run();
+            // Fatal diagnostic boundary — one shared helper for every asio
+            // pump (issue #24 slice 3). See util/fatal_boundary.hpp.
+            util::run_with_fatal_boundary("IoContext worker thread", [this] { io_context_.run(); });
             util::Logger::debug("IoContext worker thread {} exiting", i);
         });
     }

@@ -2158,13 +2158,20 @@ void TunnelServer::handle_resume_request(uint32_t friend_number,
     // Disconnecting is a half-close that still carries data in the peer->server
     // direction (handle_tunnel_data accepts DATA while Disconnecting), so it must
     // NOT be declined. Decline only the genuinely dead/incomplete states.
+    // Issue #24 slice 3: a held tunnel whose outbound side is Abort-sealed can
+    // read Connected/Disconnecting for a transient window but will refuse all
+    // further outbound admission — accepting it for resume would revive a
+    // tunnel that can never send back. Decline it exactly like a dead one, and
+    // remove the sealed held tunnel.
     if (const auto st = impl->state();
-        st != tunnel::Tunnel::State::Connected && st != tunnel::Tunnel::State::Disconnecting) {
+        (st != tunnel::Tunnel::State::Connected && st != tunnel::Tunnel::State::Disconnecting) ||
+        impl->outbound_aborted()) {
         send_resume_ack(friend_number, req->prior_tunnel_id, 0, 0,
                         tunnel::TunnelResumeStatus::TooOld);
         util::Logger::info(
-            "RESUME_REQUEST friend {} tunnel {}: tunnel not resumable (state={}); declined",
-            friend_number, req->prior_tunnel_id, tunnel::to_string(st));
+            "RESUME_REQUEST friend {} tunnel {}: tunnel not resumable (state={}, aborted={}); "
+            "declined",
+            friend_number, req->prior_tunnel_id, tunnel::to_string(st), impl->outbound_aborted());
         // We are holding the very tunnel we looked up, so name it: an id-only
         // removal here would take out whatever recycled the id instead.
         (void)mgr->remove_tunnel_if(req->prior_tunnel_id, impl);
@@ -2205,6 +2212,22 @@ void TunnelServer::handle_resume_request(uint32_t friend_number,
             "(stream will have a {}+{} byte hole)",
             friend_number, req->prior_tunnel_id, c_sent > s_recv ? c_sent - s_recv : 0,
             s_sent > c_recv ? s_sent - c_recv : 0);
+    }
+
+    // Issue #24 slice 3: revalidate the seal immediately before committing to
+    // the Ok. An Abort that raced the reconciliation above (a throwing
+    // outbound callback drove the held tunnel terminal) means it can never
+    // send back — decline and remove it instead of reattaching a dead tunnel.
+    if (impl->outbound_aborted()) {
+        send_resume_ack(friend_number, req->prior_tunnel_id, s_recv, s_sent,
+                        tunnel::TunnelResumeStatus::TooOld);
+        util::Logger::info(
+            "RESUME_REQUEST friend {} tunnel {}: tunnel aborted during reconciliation; declined",
+            friend_number, req->prior_tunnel_id);
+        if (mgr) {
+            (void)mgr->remove_tunnel_if(req->prior_tunnel_id, impl);
+        }
+        return;
     }
 
     // Reattach: the held tunnel keeps its state + target TCP and resumes.

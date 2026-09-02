@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -967,19 +968,20 @@ class TunnelImpl : public Tunnel {
     ///         path (they all book before knowing the transport's answer).
     bool emit_close_frame_once();
 
-    /// Re-attempt a TUNNEL_CLOSE that toxcore refused with SENDQ-full.
+    /// Physically arm a TUNNEL_CLOSE SENDQ retry whose OWNERSHIP
+    /// (`close_retry_armed_` + epoch + attempt) was already published inside
+    /// the SendqFull verdict commit — publish-then-arm, so no producer
+    /// request can relatch between the commit and the arm and bypass the
+    /// backoff. Epoch-validated; on an arm exception or a not-shared-owned
+    /// tunnel the published ownership is cleared and the obligation resolved
+    /// (the R4-2 fallback), so the request predicate can never be wedged by
+    /// a phantom timer.
     ///
-    /// Same cadence as the OPEN retry (sendq_retry.hpp) and for the same reason:
-    /// the coalesce delay is legally 0 and would spin.
-    ///
-    /// NOT ON THE PRODUCTION CLOSE PATH YET. `route_sendq_full()` excludes
-    /// TUNNEL_CLOSE from driver-owned retry: production senders park a
-    /// backpressured CLOSE in `TunnelManager`'s queue and report `Sent`, so this
-    /// timer never arms for them today. What is being put in place here is the
-    /// CONTRACT — retain and retry, never drop — for the later slice that moves
-    /// CLOSE off the manager queue. It is live now only for a callback that
-    /// returns `SendqFull` for a CLOSE, which is legal and which the seam must
-    /// therefore handle.
+    /// Same cadence as the OPEN retry (sendq_retry.hpp) and for the same
+    /// reason: the coalesce delay is legally 0 and would spin. LIVE ON THE
+    /// PRODUCTION CLOSE PATH since `driver_owns_retry()` returns CLOSE (and
+    /// ERROR) backpressure verbatim instead of parking raw bytes in
+    /// `TunnelManager`'s queue.
     ///
     /// OWNERSHIP: the handler holds a STRONG self-reference, so the retry owner
     /// keeps itself alive until the frame is sent, permanently fails, or is
@@ -989,7 +991,7 @@ class TunnelImpl : public Tunnel {
     /// backpressured CLOSE was silently dropped instead of retried — the very
     /// thing retention+retry replaced manager-parking to avoid. The self-
     /// reference is released as soon as the state leaves `Owed`.
-    void arm_close_retry_timer(unsigned attempt);
+    void arm_close_retry_timer(std::uint64_t epoch, unsigned attempt);
 
    public:
     /// Stop retrying a backpressured TUNNEL_CLOSE and give the obligation up.
@@ -1008,6 +1010,103 @@ class TunnelImpl : public Tunnel {
     /// force_close() that has claimed the state and is about to announce.
     void note_close_owed();
 
+    // ---- Slice-3 completion helpers (issue #24): CLOSE/ERROR routed
+    // ---- through the single emission driver. --------------------------
+
+    /// Which half of the two-party terminal-ERROR settlement is arriving.
+    enum class ErrorSettleParty : std::uint8_t { Producer, Transport };
+
+    /// Arrive one settlement party (exactly-once per party). When the pair
+    /// completes, runs the finalizer OUTSIDE the lock — unless
+    /// `defer_finalizer` (a caller holding foreign locks, e.g. the gate under
+    /// TunnelManager::mutex_), which latches `error_finalize_pending_` for
+    /// run_pending_terminal_finalizer() instead.
+    ///
+    /// Finalizer-exception disposition: when `propagate` is true (a
+    /// synchronous settlement site that can carry it — e.g. send_error's
+    /// normal-path producer arrival) the finalizer's first exception is
+    /// RETURNED for the caller to rethrow/accumulate; when false (async or
+    /// destructor boundaries) it is logged and null is returned. Returns null
+    /// whenever the finalizer did not run (this party was not the second) or
+    /// did not throw.
+    std::exception_ptr arrive_terminal_error_party(ErrorSettleParty party,
+                                                   bool defer_finalizer = false,
+                                                   bool propagate = false);
+
+    /// The settle actions themselves: lower `terminal_error_in_flight_`,
+    /// cancel_close_retry(), notify_close_once() — each individually
+    /// isolated; returns the first captured exception (or null). noexcept.
+    std::exception_ptr run_terminal_error_finalizer() noexcept;
+
+    /// Drain a gate-deferred finalizer latch. Must be called with NO locks
+    /// held. Safe to call when nothing is pending.
+    void run_pending_terminal_finalizer();
+
+    /// Claim the single terminal ERROR and deposit its pre-serialized wire
+    /// bytes for the driver (ONE critical section under `coalesce_mutex_`:
+    /// Abort seal + fences + claim + deposit + settle-latch reset). Returns
+    /// false when a previous claim exists (duplicate suppressed). When the
+    /// shutdown fence already stands or `wire` is empty (serialization
+    /// failed), the claim still succeeds but deposits nothing and the caller
+    /// must treat the transport as settled — signalled via
+    /// `*transport_settled_immediately`.
+    bool claim_terminal_error(std::vector<std::uint8_t> wire, bool* transport_settled_immediately);
+
+    /// Publish-then-arm for the ERROR SENDQ retry timer. Ownership
+    /// (`error_retry_armed_` + epoch + attempt) must already be published in
+    /// the verdict commit; this performs the physical arm, epoch-validated,
+    /// with the arm-exception guard (a throw or a not-shared-owned tunnel
+    /// settles the slot permanently).
+    void arm_error_retry_timer(std::uint64_t epoch, unsigned attempt);
+
+    /// Shutdown settlement of the ERROR machinery (gate / force_close /
+    /// destructor): sets `error_retry_cancelled_`, bumps the epoch, cancels
+    /// the timer, and — only for an UNSELECTED parked slot — clears it.
+    /// Caller must hold `coalesce_mutex_`. Returns true when the transport
+    /// party must be arrived by the caller once its locks drop.
+    bool settle_error_for_shutdown_locked();
+
+    /// Send pre-serialized (unprefixed) wire bytes through the outbound
+    /// snapshot — the driver's transport call for the terminal ERROR, whose
+    /// bytes were serialized at claim time. Same gate semantics as
+    /// send_frame_to_tox_typed (gate-closed short-circuits to Sent).
+    SendOutcome send_wire_to_tox_typed(std::span<const std::uint8_t> wire);
+
+    /// The driver's unwind recovery (timer-paced, no asio::post): clears
+    /// `driver_active_` (+ the flush latch) idempotently, then converts any
+    /// unselected eligible control request into retry-timer ownership —
+    /// ERROR onto its SENDQ timer, a CLOSE request onto the close-retry
+    /// timer. Each recovery action is individually exception-isolated.
+    void recover_after_driver_unwind() noexcept;
+
+    /// Exit-protocol re-check: is a control obligation (a parked-but-now-
+    /// unarmed terminal ERROR, or a requested CLOSE) eligible for the driver
+    /// to select right now? The caller must hold `coalesce_mutex_`; this takes
+    /// `close_frame_mutex_` internally (documented lock order). Used at every
+    /// driver break point so a control request deposited mid-pass is not
+    /// stranded when its kick found the driver active.
+    [[nodiscard]] bool control_obligation_eligible_locked();
+
+    /// Like run_pending_terminal_finalizer() but returns the first captured
+    /// finalizer exception instead of logging it — for a synchronous caller
+    /// (force_close) that accumulates it into its own rethrow.
+    [[nodiscard]] std::exception_ptr take_pending_terminal_finalizer() noexcept;
+
+   public:
+    /// Manager teardown dispatch predicate: force_close() (not close())
+    /// must be used when the tunnel is already terminal, never-opened, in
+    /// half-close, OR Abort-sealed — a sealed tunnel's close() is a no-op,
+    /// so routing it there would detach it with nothing fired or released.
+    [[nodiscard]] bool abort_teardown_required() const noexcept;
+
+    /// Lock-free view of the terminal Abort seal, for resume eligibility /
+    /// revalidation (a sealed tunnel must not be offered or accepted for
+    /// resume).
+    [[nodiscard]] bool outbound_aborted() const noexcept {
+        return outbound_abort_published_.load(std::memory_order_acquire);
+    }
+
+   private:
     /// Give up an owed TUNNEL_CLOSE because it turned out not to be owed (the
     /// OPEN it would have retracted never reached the peer).
     void abandon_close_obligation();
@@ -1015,6 +1114,15 @@ class TunnelImpl : public Tunnel {
     /// Fire `on_id_releasable_` if this tunnel can no longer put any frame on
     /// the wire naming its id. Idempotent; the callback runs at most once.
     void maybe_notify_id_releasable();
+
+    /// The teardown-notification obligations owed by a post-drain action
+    /// (`emit_close_and_transition` / `finalize_remote_close`) if it unwinds
+    /// through a throwing state callback before reaching its explicit
+    /// notify: run `maybe_notify_id_releasable()` then `notify_close_once()`,
+    /// each isolated. noexcept — it runs from a destructor fallback. Both
+    /// callees are idempotent, so the normal-path explicit call is not
+    /// double-fired.
+    void notify_teardown_fallback() noexcept;
 
     /// Send a fully-framed TUNNEL_DATA OwnedFrameBuffer to the Tox peer via
     /// the zero-copy callback if it is set; otherwise fall back to the
@@ -1314,15 +1422,53 @@ class TunnelImpl : public Tunnel {
     // sender owes the peer.
     std::atomic<bool> terminal_error_claimed_{false};
     // Releasability fence for the terminal ERROR's own transport attempt. Set
-    // by send_error() before it invokes the transport, cleared after the
-    // attempt and the terminal transition settle. While set,
+    // inside the claim's critical section, cleared by the two-party settle
+    // finalizer once BOTH the transport attempt has genuinely settled (Sent /
+    // PermanentFail / shutdown — not a per-attempt SendqFull) AND the
+    // producer's terminal transition + callbacks have completed. While set,
     // id_releasable_locked() answers no: the ERROR frame is (or may be)
-    // inside the transport naming this id, and the Abandoned verdict a
-    // concurrently-fenced CLOSE records must not release the id out from
-    // under it — a recycled id would make the in-flight ERROR name the
-    // replacement. The wakeup that matters fires from send_error() itself
-    // (cancel_close_retry -> maybe_notify) after the fence clears.
+    // inside the transport — or retained for a SENDQ retry — naming this id,
+    // and the Abandoned verdict a concurrently-fenced CLOSE records must not
+    // release the id out from under it — a recycled id would make the
+    // in-flight ERROR name the replacement.
     std::atomic<bool> terminal_error_in_flight_{false};
+
+    // ---- Terminal-ERROR emission slot (issue #24 slice 3 completion). ----
+    // All guarded by `coalesce_mutex_`. The single serialized emission owner
+    // (`run_emission_driver`) is the only thing that ever hands these wire
+    // bytes to the transport; producers (send_error / close_for_timeout's
+    // linger branch) only claim + deposit + kick.
+    struct PendingTerminalError {
+        std::vector<std::uint8_t> wire;  ///< Fully serialized BEFORE the claim.
+        unsigned attempt{0};             ///< SENDQ backoff progression.
+    };
+    std::optional<PendingTerminalError> pending_terminal_error_;
+    /// THE single readiness/backoff bit: set while the slot is parked for the
+    /// SENDQ retry timer; only that timer's handler clears it and kicks.
+    bool error_retry_armed_{false};
+    /// Selected by the driver; a transport attempt is outstanding. Shutdown
+    /// settlement must NOT settle a selected slot — its own commit/exception
+    /// guard owns the transport-party arrival (a pre-gate OutboundSnapshot
+    /// can still land the frame).
+    bool error_attempt_in_flight_{false};
+    /// Persistent shutdown fence, mirroring `close_retry_cancelled_`: set by
+    /// every shutdown-settlement site (gate / force_close / destructor)
+    /// whether or not a slot exists at that moment. A SendqFull commit that
+    /// observes it settles permanently instead of re-arming; a claim that
+    /// observes it deposits nothing (claim-without-deposit).
+    bool error_retry_cancelled_{false};
+    std::uint64_t error_retry_epoch_{0};
+    asio::steady_timer error_retry_timer_;
+    // Two-party settle latch: the finalizer (lower the fence, then
+    // cancel_close_retry, then notify_close_once — noexcept, per-action
+    // isolation) runs exactly once, when BOTH one-shot bools are set.
+    bool error_producer_arrived_{false};
+    bool error_transport_arrived_{false};
+    /// The pair completed in a context that may not run callbacks (the gate
+    /// under TunnelManager::mutex_): the finalizer is latched here and
+    /// drained by run_pending_terminal_finalizer() at the next out-of-lock
+    /// point (force_close, a later arrival, the destructor).
+    bool error_finalize_pending_{false};
     asio::steady_timer coalesce_timer_;
     // Receiver-side ACK retry state. This is intentionally separate from the
     // DATA coalescing timer: an inbound TCP drain can need to retry only ACKs
@@ -1450,11 +1596,13 @@ class TunnelImpl : public Tunnel {
         /// the question this state answers, which is whether THIS OBJECT will
         /// put another CLOSE on the wire. It will not, in all three cases.
         ///
-        /// Deliberately NOT "no frame naming this id can appear on the wire":
-        /// that would be false. `route_sendq_full()` parks CLOSE in
-        /// `TunnelManager`'s retry queue and reports `Sent`, so a manager-owned
-        /// copy can still surface after this tunnel is done with it. That is the
-        /// documented residual of leaving CLOSE on the manager queue.
+        /// Since issue #24 slice 3 the CLOSE is driver-owned: `Resolved` means
+        /// this object has handed its one CLOSE to the transport (or given it
+        /// up), and — unlike the old manager-parked path — no separate
+        /// manager-owned copy exists to surface later. The `Resolved` verdict
+        /// itself is therefore a complete answer for the CLOSE. (A concurrently
+        /// in-flight terminal ERROR is a distinct frame, fenced by
+        /// `terminal_error_in_flight_` in `id_releasable_locked()`.)
         ///
         /// It is NOT bounded by `remove_tunnel_if()`'s id-release rule — reaching
         /// this state immediately permits that rule to release the id, so it
@@ -1466,6 +1614,13 @@ class TunnelImpl : public Tunnel {
     };
     mutable std::mutex close_frame_mutex_;
     CloseFrameState close_frame_state_{CloseFrameState::NotOwed};
+    /// A producer has scheduled the one CLOSE for emission by the driver.
+    /// Bare `Owed` without this flag never auto-emits (the close()-drain
+    /// deferral and the DeferredToSender handshake ordering depend on that).
+    /// Cleared at selection; on a SendqFull verdict it stays cleared and only
+    /// the close-retry timer handler relatches it, so no producer can bypass
+    /// the SENDQ backoff. Guarded by `close_frame_mutex_`.
+    bool close_emit_requested_{false};
     /// SENDQ retry for a backpressured TUNNEL_CLOSE. Guarded by
     /// `close_frame_mutex_`, like every other close-frame decision.
     asio::steady_timer close_retry_timer_;

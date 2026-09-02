@@ -6,6 +6,7 @@
 #include <limits>
 #include <utility>
 
+#include "toxtunnel/util/asio_timer.hpp"
 #include "toxtunnel/util/metrics.hpp"
 
 namespace toxtunnel::tunnel {
@@ -106,6 +107,7 @@ TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t fr
       friend_number_(friend_number),
       send_window_size_(send_window),
       last_activity_ns_(std::chrono::steady_clock::now().time_since_epoch().count()),
+      error_retry_timer_(io_ctx),
       coalesce_timer_(io_ctx),
       ack_retry_timer_(io_ctx),
       close_retry_timer_(io_ctx) {
@@ -116,10 +118,32 @@ TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t fr
 TunnelImpl::~TunnelImpl() {
     // Cancel pending timer waits; already-dispatched handlers capture weak_ptr
     // and bail out if destruction won the race.
-    coalesce_timer_.cancel();
-    ack_retry_timer_.cancel();
-    open_retry_timer_.cancel();
-    close_retry_timer_.cancel();
+    util::cancel_timer_noexcept(coalesce_timer_);
+    util::cancel_timer_noexcept(ack_retry_timer_);
+    util::cancel_timer_noexcept(open_retry_timer_);
+    util::cancel_timer_noexcept(close_retry_timer_);
+    util::cancel_timer_noexcept(error_retry_timer_);
+    // Backstop: a destroyed tunnel emits nothing, so a surviving parked
+    // terminal ERROR settles here — the settle latch must not leak
+    // cancel_close_retry/notify unrun (both are idempotent; the finalizer is
+    // noexcept with per-action isolation).
+    {
+        bool arrive_transport = false;
+        {
+            std::lock_guard<std::mutex> lock(coalesce_mutex_);
+            arrive_transport = settle_error_for_shutdown_locked();
+            if (error_attempt_in_flight_) {
+                // No transport attempt can be outstanding during destruction
+                // (that would be UB regardless); count it settled.
+                error_attempt_in_flight_ = false;
+                arrive_transport = true;
+            }
+        }
+        if (arrive_transport) {
+            arrive_terminal_error_party(ErrorSettleParty::Transport);
+        }
+        run_pending_terminal_finalizer();
+    }
     // Backstop: a destroyed tunnel can no longer emit anything, whatever it may
     // still have owed. Without this an owner waiting on set_on_id_releasable()
     // would hold the id reserved forever.
@@ -672,7 +696,10 @@ TunnelImpl::CloseObligation TunnelImpl::cancel_open_retry_locked() {
     open_abandon_requested_ = true;
     ++open_retry_epoch_;  // Invalidate any handler already dispatched.
     open_retry_armed_ = false;
-    open_retry_timer_.cancel();
+    // Non-throwing (R9-3): claim_terminal() runs through here and must not
+    // publish a terminal state and then lose its notification ownership to a
+    // throwing cancel.
+    util::cancel_timer_noexcept(open_retry_timer_);
 
     switch (open_phase_) {
         case OpenPhase::Pending:
@@ -727,7 +754,12 @@ TunnelImpl::TerminalClaim TunnelImpl::claim_terminal() {
     // id_releasable() observer blocks rather than sampling. See
     // set_terminal_claim_test_hook(). Null in production.
     if (terminal_claim_test_hook_) {
-        terminal_claim_test_hook_();
+        // The hook is unrestricted; the claim contract is non-throwing end to
+        // end (R10-2), so contain it like the timer cancels below.
+        try {
+            terminal_claim_test_hook_();
+        } catch (...) {
+        }
     }
 
     // Stop any TUNNEL_OPEN retry and learn who owes the peer a CLOSE — still
@@ -760,7 +792,8 @@ void TunnelImpl::cancel_close_retry() {
         std::lock_guard<std::mutex> lock(close_frame_mutex_);
         ++close_retry_epoch_;  // Invalidate any handler already dispatched.
         close_retry_armed_ = false;
-        close_retry_timer_.cancel();
+        close_emit_requested_ = false;
+        util::cancel_timer_noexcept(close_retry_timer_);
         // Fences an attempt that is already inside the transport: its verdict is
         // recorded under this same lock, and will see this.
         close_retry_cancelled_ = true;
@@ -793,25 +826,23 @@ TunnelImpl::IdReleasableProbe TunnelImpl::probe_id_releasable() const {
 }
 
 bool TunnelImpl::emit_close_frame_once() {
+    // Request-and-kick (issue #24, slice 3 completion): the transport call
+    // itself belongs to the single emission driver. This function only
+    // SCHEDULES the one CLOSE; a true return means "this call owns the
+    // emission" exactly as before (the close is booked on a true return, not
+    // on delivery), so the metric keying at every call site is unchanged.
     {
         std::lock_guard<std::mutex> lock(close_frame_mutex_);
         if (close_retry_cancelled_) {
             // Shut down. With the outbound gate closed every send is a no-op
-            // anyway, so there is nothing to gain by starting one.
+            // anyway, so there is nothing to gain by scheduling one.
             return false;
         }
         if (terminal_error_claimed_.load(std::memory_order_acquire)) {
-            // The terminal ERROR replaces any CLOSE. Refusing HERE — at the
-            // emission boundary, not only at the close()/EOF entry points —
-            // is what closes the window where a thread passes an entry check,
-            // stalls, and authorizes a fresh CLOSE between send_error()'s
-            // seal and its close-retry fence (slice-3 follow-up P1: wire
-            // order ERROR, CLOSE). An Owed obligation left behind is
-            // abandoned by that same fence (cancel_close_retry) moments
-            // later. Keyed on the ERROR claim, NOT the broader Abort seal: a
-            // force_close teardown also publishes Abort, but the CLOSE an
-            // in-flight OPEN's sender owes the peer after the handoff must
-            // still go out behind that OPEN.
+            // The terminal ERROR replaces any CLOSE. Keyed on the ERROR
+            // claim, NOT the broader Abort seal: a force_close teardown also
+            // publishes Abort, but the CLOSE an in-flight OPEN's sender owes
+            // the peer after the handoff must still go out behind that OPEN.
             return false;
         }
         if (close_frame_state_ != CloseFrameState::NotOwed &&
@@ -819,109 +850,43 @@ bool TunnelImpl::emit_close_frame_once() {
             // Already claimed, resolved or abandoned — there is only ever one.
             return false;
         }
-        // InFlight pins the id for the whole transport call. It also discharges
-        // any owed-ness in the same step, so no owner has to balance anything.
-        close_frame_state_ = CloseFrameState::InFlight;
-    }
-
-    // Fallback for an exit that records no verdict — a throwing serializer or
-    // callback. Retaining the frame there would pin the id forever, because the
-    // same serialization would throw again on every retry, so this resolves.
-    struct ClaimGuard {
-        TunnelImpl* self;
-        bool recorded{false};
-        ~ClaimGuard() {
-            if (recorded) {
-                return;
-            }
-            try {
-                {
-                    std::lock_guard<std::mutex> lock(self->close_frame_mutex_);
-                    if (self->close_frame_state_ == CloseFrameState::InFlight) {
-                        self->close_frame_state_ = CloseFrameState::Resolved;
-                    }
-                }
-                self->maybe_notify_id_releasable();
-            } catch (...) {
-                // A destructor must not propagate.
-            }
+        if (close_emit_requested_ || close_retry_armed_) {
+            // Already scheduled, or parked for the SENDQ backoff — a second
+            // producer must neither double-book the metric nor bypass the
+            // backoff by relatching the request.
+            return false;
         }
-    } claim_guard{this};
-
-    // Pre-transport recheck of the ERROR->CLOSE fence, mirroring the DATA
-    // driver's pre-callback authorization: a terminal ERROR that won the race
-    // between our InFlight claim above and this point must not be followed by
-    // this CLOSE. The verdict is Abandoned — the ERROR replaced the CLOSE.
-    // (The id is NOT recycled out from under the in-flight ERROR: see the
-    // terminal_error_in_flight_ fence in id_releasable_locked.)
-    //
-    // RESIDUAL (interim): a thread that passes this check and stalls before
-    // the transport call can still land its CLOSE after a concurrent ERROR.
-    // The mechanism that eliminates this is the still-open CLOSE/ERROR
-    // driver-ownership work (issue #24): with both frames serialized through
-    // the single emission owner, an ERROR either queues behind an
-    // already-authorised CLOSE or cancels one not yet selected, and no
-    // check-then-send window exists at all. Until that lands, this recheck
-    // narrows the window to the same allowance the design grants an
-    // already-authorised DATA callback.
-    if (terminal_error_claimed_.load(std::memory_order_acquire)) {
-        {
-            std::lock_guard<std::mutex> lock(close_frame_mutex_);
-            close_frame_state_ = CloseFrameState::Abandoned;
-        }
-        claim_guard.recorded = true;
-        maybe_notify_id_releasable();
-        return false;
+        close_frame_state_ = CloseFrameState::Owed;
+        close_emit_requested_ = true;
     }
-
-    auto frame = ProtocolFrame::make_tunnel_close(tunnel_id_);
-    // TYPED, not the bool wrapper. Collapsing the outcome here threw away the
-    // one distinction eleven rounds of this slice exist to preserve: SendqFull
-    // means the transport did NOT take the frame and this tunnel still owns it.
-    // Resolving on it dropped the CLOSE and released the id, with no retry.
-    const SendOutcome outcome = send_frame_to_tox_typed(frame);
-
-    bool rearm = false;
-    {
-        std::lock_guard<std::mutex> lock(close_frame_mutex_);
-        if (close_retry_cancelled_) {
-            // Teardown fenced this attempt while it was inside the transport.
-            // Whatever the transport said, no further attempt may be armed — a
-            // late SendqFull restoring Owed here would arm a fresh strong-self
-            // timer after cancellation and keep this object alive past shutdown.
-            close_frame_state_ = outcome == SendOutcome::Sent ? CloseFrameState::Resolved
-                                                              : CloseFrameState::Abandoned;
-        } else if (outcome == SendOutcome::SendqFull) {
-            // Transient backpressure. Back to Owed, which keeps the id pinned,
-            // and this tunnel is the retry owner — the same arrangement the
-            // TUNNEL_OPEN driver uses, for the same reason (the manager's queue
-            // carries no tunnel identity).
-            close_frame_state_ = CloseFrameState::Owed;
-            rearm = true;
-        } else {
-            // Sent, or PermanentFail: either way this object is done trying.
-            close_frame_state_ = CloseFrameState::Resolved;
-        }
-    }
-    claim_guard.recorded = true;
-
-    if (rearm) {
-        // Attempt counter advances across retries so the backoff actually grows;
-        // re-arming from the handler with a fresh 0 would pin it at the base
-        // delay forever.
-        unsigned attempt = 0;
-        {
-            std::lock_guard<std::mutex> lock(close_frame_mutex_);
-            attempt = close_retry_attempt_++;
-        }
-        arm_close_retry_timer(attempt);
-    } else {
-        maybe_notify_id_releasable();
-    }
+    // Kick OUTSIDE close_frame_mutex_ (the driver takes coalesce_mutex_ ->
+    // close_frame_mutex_; kicking under the latter would invert the order).
+    // FlushAll, so a Drain-mode sub-cap remainder drains ahead of the CLOSE
+    // without depending on a timer that mode deliberately never arms.
+    (void)run_emission_driver(DrainPolicy::FlushAll);
     return true;
 }
 
-void TunnelImpl::arm_close_retry_timer(unsigned attempt) {
+void TunnelImpl::arm_close_retry_timer(std::uint64_t epoch, unsigned attempt) {
+    // Ownership (`close_retry_armed_` + epoch + attempt) was PUBLISHED inside
+    // the SendqFull verdict commit; this is only the physical arm, and every
+    // failure mode below clears that published ownership exactly once
+    // (epoch-validated) so the request predicate is never wedged by a
+    // phantom timer.
+    const auto resolve_fallback = [this, epoch] {
+        {
+            std::lock_guard<std::mutex> lock(close_frame_mutex_);
+            if (epoch != close_retry_epoch_ || !close_retry_armed_) {
+                return;  // A newer owner exists; nothing of ours to clear.
+            }
+            close_retry_armed_ = false;
+            if (close_frame_state_ == CloseFrameState::Owed) {
+                close_frame_state_ = CloseFrameState::Resolved;
+            }
+        }
+        maybe_notify_id_releasable();
+    };
+
     std::shared_ptr<Tunnel> self_ref;
     try {
         self_ref = shared_from_this();
@@ -930,52 +895,66 @@ void TunnelImpl::arm_close_retry_timer(unsigned attempt) {
     }
     if (!self_ref) {
         // Not shared-owned (stack / unique_ptr fixtures): the handler could
-        // never resolve its weak_ptr, and an outstanding async_wait would force
-        // the io_context destructor to service a pending op — the hazard
-        // TunnelManager::arm_pending_drain_timer_locked() documents. Resolve
-        // instead of pinning the id on a retry that can never run.
+        // never resolve its reference, and an outstanding async_wait would
+        // force the io_context destructor to service a pending op — the
+        // hazard TunnelManager::arm_pending_drain_timer_locked() documents.
+        // Resolve instead of pinning the id on a retry that can never run.
         util::Logger::warn(
             "Tunnel {} cannot retry a backpressured TUNNEL_CLOSE: tunnel is not shared-owned",
             tunnel_id_);
-        {
-            std::lock_guard<std::mutex> lock(close_frame_mutex_);
-            if (close_frame_state_ == CloseFrameState::Owed) {
-                close_frame_state_ = CloseFrameState::Resolved;
-            }
-        }
-        maybe_notify_id_releasable();
+        resolve_fallback();
         return;
     }
 
-    std::lock_guard<std::mutex> lock(close_frame_mutex_);
-    if (close_retry_cancelled_ || close_frame_state_ != CloseFrameState::Owed ||
-        close_retry_armed_) {
-        return;
-    }
-    close_retry_armed_ = true;
-    const auto epoch = ++close_retry_epoch_;
-    // Dedicated cadence, never coalesce_max_delay_us_ — see sendq_retry.hpp.
-    close_retry_timer_.expires_after(sendq_retry_delay(attempt));
-    // STRONG capture: the retry owner keeps itself alive until the obligation
-    // resolves. A weak one let removal destroy the tunnel and silently drop the
-    // frame. Released when the handler returns without re-arming.
-    close_retry_timer_.async_wait([self_ref, epoch, attempt](const std::error_code& ec) {
-        if (ec) {
-            return;  // Cancelled — see cancel_close_retry().
+    try {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        if (epoch != close_retry_epoch_ || !close_retry_armed_ || close_retry_cancelled_ ||
+            close_frame_state_ != CloseFrameState::Owed) {
+            return;  // Superseded or fenced between commit and arm.
         }
-        auto self = std::static_pointer_cast<TunnelImpl>(self_ref);
-        {
-            std::lock_guard<std::mutex> lock(self->close_frame_mutex_);
-            if (epoch != self->close_retry_epoch_) {
-                return;  // Stale firing.
+        // Dedicated cadence, never coalesce_max_delay_us_ — see sendq_retry.hpp.
+        close_retry_timer_.expires_after(sendq_retry_delay(attempt));
+        // STRONG capture: the retry owner keeps itself alive until the
+        // obligation resolves. A weak one let removal destroy the tunnel and
+        // silently drop the frame. Released when the handler returns without
+        // re-arming.
+        close_retry_timer_.async_wait([self_ref, epoch](const std::error_code& ec) {
+            if (ec) {
+                return;  // Cancelled — see cancel_close_retry().
             }
-            self->close_retry_armed_ = false;
-        }
-        // Re-claims from Owed and re-attempts. A further SendqFull re-arms
-        // from inside emit_close_frame_once(), with the next backoff step.
-        (void)attempt;
-        (void)self->emit_close_frame_once();
-    });
+            auto self = std::static_pointer_cast<TunnelImpl>(self_ref);
+            {
+                std::lock_guard<std::mutex> lock(self->close_frame_mutex_);
+                if (epoch != self->close_retry_epoch_) {
+                    return;  // Stale firing.
+                }
+                self->close_retry_armed_ = false;
+                if (self->close_retry_cancelled_ ||
+                    self->terminal_error_claimed_.load(std::memory_order_acquire) ||
+                    self->close_frame_state_ != CloseFrameState::Owed) {
+                    return;  // Fenced or resolved while parked; nothing to relatch.
+                }
+                // The timer handler is the ONLY relatcher — see
+                // close_emit_requested_.
+                self->close_emit_requested_ = true;
+            }
+            try {
+                (void)self->run_emission_driver(DrainPolicy::FlushAll);
+            } catch (const std::exception& e) {
+                // Asio handler boundary: contain (io_context::run has no
+                // catch of its own short of the fatal worker boundary).
+                util::Logger::warn("Tunnel {} CLOSE retry kick threw: {}", self->tunnel_id_,
+                                   e.what());
+            } catch (...) {
+                util::Logger::warn("Tunnel {} CLOSE retry kick threw", self->tunnel_id_);
+            }
+        });
+    } catch (...) {
+        // The physical arm threw (expires_after / async_wait). Clear the
+        // published ownership and resolve — the R4-2 fallback.
+        util::Logger::warn("Tunnel {} failed to arm the TUNNEL_CLOSE retry timer", tunnel_id_);
+        resolve_fallback();
+    }
 }
 
 bool TunnelImpl::id_releasable_locked() const {
@@ -995,8 +974,9 @@ bool TunnelImpl::id_releasable_locked() const {
             return false;
         case CloseFrameState::Resolved:
             // This object owes no further emission, whether or not the peer
-            // got the frame. Scoped to this tunnel — a manager-parked copy is
-            // not covered; see CloseFrameState::Resolved.
+            // got the frame. Since issue #24 slice 3 the CLOSE is driver-owned
+            // and retained in place, so there is no separate manager-parked
+            // copy to outlive this verdict; see CloseFrameState::Resolved.
             return true;
         case CloseFrameState::NotOwed:
         case CloseFrameState::Abandoned:
@@ -1043,6 +1023,267 @@ void TunnelImpl::abandon_close_obligation() {
         close_frame_state_ = CloseFrameState::Abandoned;
     }
     maybe_notify_id_releasable();
+}
+
+// ===========================================================================
+// Terminal-ERROR slot machinery (issue #24, slice 3 completion)
+// ===========================================================================
+
+bool TunnelImpl::abort_teardown_required() const noexcept {
+    const State current = state_.load(std::memory_order_acquire);
+    return current == State::None || current == State::Disconnecting || current == State::Closed ||
+           current == State::Error || outbound_abort_published_.load(std::memory_order_acquire);
+}
+
+std::exception_ptr TunnelImpl::run_terminal_error_finalizer() noexcept {
+    // Order is load-bearing: the fence comes down FIRST, so the wakeups the
+    // fence deferred (cancel_close_retry -> maybe_notify, and any observer of
+    // id_releasable) fire with it already lowered. Each action is isolated;
+    // the FIRST captured exception is returned, later ones are logged.
+    std::exception_ptr first;
+    terminal_error_in_flight_.store(false, std::memory_order_release);
+    try {
+        cancel_close_retry();
+    } catch (...) {
+        first = std::current_exception();
+    }
+    try {
+        notify_close_once();
+    } catch (...) {
+        if (!first) {
+            first = std::current_exception();
+        } else {
+            try {
+                util::Logger::warn(
+                    "Tunnel {} terminal-error finalizer: close notification also threw",
+                    tunnel_id_);
+            } catch (...) {
+            }
+        }
+    }
+    return first;
+}
+
+std::exception_ptr TunnelImpl::arrive_terminal_error_party(ErrorSettleParty party,
+                                                           bool defer_finalizer, bool propagate) {
+    bool run_now = false;
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        bool& mine = party == ErrorSettleParty::Producer ? error_producer_arrived_
+                                                         : error_transport_arrived_;
+        if (mine) {
+            return nullptr;  // Exactly-once per party, whatever combination races.
+        }
+        mine = true;
+        if (error_producer_arrived_ && error_transport_arrived_) {
+            if (defer_finalizer) {
+                // The caller holds foreign locks (the gate under
+                // TunnelManager::mutex_): no callback may run here. Latched
+                // for run_pending_terminal_finalizer() at the next
+                // out-of-lock drain point.
+                error_finalize_pending_ = true;
+            } else {
+                run_now = true;
+            }
+        }
+    }
+    if (!run_now) {
+        return nullptr;
+    }
+    auto ep = run_terminal_error_finalizer();
+    if (ep && propagate) {
+        // Synchronous settlement site: hand the exception back for the caller
+        // to rethrow/accumulate.
+        return ep;
+    }
+    if (ep) {
+        // Async / destructor boundary: log and suppress.
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            util::Logger::warn("Tunnel {} terminal-error finalizer threw: {}", tunnel_id_,
+                               e.what());
+        } catch (...) {
+            util::Logger::warn("Tunnel {} terminal-error finalizer threw", tunnel_id_);
+        }
+    }
+    return nullptr;
+}
+
+std::exception_ptr TunnelImpl::take_pending_terminal_finalizer() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        if (!error_finalize_pending_) {
+            return nullptr;
+        }
+        error_finalize_pending_ = false;
+    }
+    return run_terminal_error_finalizer();
+}
+
+void TunnelImpl::run_pending_terminal_finalizer() {
+    if (auto ep = take_pending_terminal_finalizer()) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            util::Logger::warn("Tunnel {} deferred terminal-error finalizer threw: {}", tunnel_id_,
+                               e.what());
+        } catch (...) {
+            util::Logger::warn("Tunnel {} deferred terminal-error finalizer threw", tunnel_id_);
+        }
+    }
+}
+
+bool TunnelImpl::control_obligation_eligible_locked() {
+    // Caller holds coalesce_mutex_. A terminal ERROR parked-but-now-unarmed
+    // (its retry timer fired and cleared the arm while this run was active) is
+    // eligible for reselection; so is a requested CLOSE. Excludes anything
+    // fenced or already in flight.
+    if (pending_terminal_error_.has_value() && !error_retry_armed_ && !error_attempt_in_flight_ &&
+        !error_retry_cancelled_) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(close_frame_mutex_);
+    return close_emit_requested_ && close_frame_state_ == CloseFrameState::Owed &&
+           !close_retry_cancelled_ && !terminal_error_claimed_.load(std::memory_order_acquire);
+}
+
+bool TunnelImpl::claim_terminal_error(std::vector<std::uint8_t> wire,
+                                      bool* transport_settled_immediately) {
+    *transport_settled_immediately = false;
+    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+    publish_abort_locked();
+    if (terminal_error_claimed_.load(std::memory_order_relaxed)) {
+        return false;  // Duplicate suppressed; the first claim owns everything.
+    }
+    // The releasability fence goes up INSIDE the winning claim's critical
+    // section, BEFORE the claim becomes visible: a CLOSE selection that
+    // observes the claim (and abandons) must already find the id
+    // unreleasable, or a force_close() publishing a terminal state in the
+    // gap would let the id recycle under the ERROR this claim deposits.
+    terminal_error_in_flight_.store(true, std::memory_order_release);
+    terminal_error_claimed_.store(true, std::memory_order_release);
+    error_producer_arrived_ = false;
+    error_transport_arrived_ = false;
+    error_finalize_pending_ = false;
+    if (error_retry_cancelled_ || wire.empty()) {
+        // Shutdown won before the claim, or serialization failed: claim
+        // WITHOUT deposit. Nothing will ever be sent, so the caller arrives
+        // the transport party immediately (outside this lock).
+        *transport_settled_immediately = true;
+        return true;
+    }
+    PendingTerminalError slot;
+    slot.wire = std::move(wire);
+    pending_terminal_error_.emplace(std::move(slot));
+    return true;
+}
+
+SendOutcome TunnelImpl::send_wire_to_tox_typed(std::span<const std::uint8_t> wire) {
+    // The terminal ERROR's bytes were serialized at claim time; the snapshot
+    // fuses "is the gate open?" with copying the callback into one critical
+    // section (close_outbound_gate can never slip between them).
+    OutboundSnapshot snapshot(*this);
+    if (snapshot.gate_closed()) {
+        // Gate-closed short-circuits to Sent: a SendqFull here would park the
+        // frame for a retry that keeps a torn-down tunnel alive. See
+        // close_outbound_gate().
+        return SendOutcome::Sent;
+    }
+    const auto& cb = snapshot.span_callback();
+    if (!cb) {
+        return SendOutcome::PermanentFail;
+    }
+    // No lock held; the callback re-enters ToxAdapter and the manager.
+    return cb(wire);
+}
+
+void TunnelImpl::arm_error_retry_timer(std::uint64_t epoch, unsigned attempt) {
+    // Ownership (`error_retry_armed_` + epoch) was PUBLISHED in the verdict
+    // commit; this is only the physical arm. Every failure mode settles the
+    // slot permanently exactly once (epoch-validated), so the driver's ERROR
+    // selection predicate is never wedged by a phantom timer.
+    const auto settle_fallback = [this, epoch] {
+        bool arrive = false;
+        {
+            std::lock_guard<std::mutex> lock(coalesce_mutex_);
+            if (epoch != error_retry_epoch_ || !error_retry_armed_) {
+                return;  // A newer owner exists; nothing of ours to settle.
+            }
+            error_retry_armed_ = false;
+            pending_terminal_error_.reset();
+            arrive = true;
+        }
+        if (arrive) {
+            arrive_terminal_error_party(ErrorSettleParty::Transport);
+        }
+    };
+
+    std::shared_ptr<Tunnel> self_ref;
+    try {
+        self_ref = shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+    }
+    if (!self_ref) {
+        util::Logger::warn(
+            "Tunnel {} cannot retry a backpressured TUNNEL_ERROR: tunnel is not shared-owned",
+            tunnel_id_);
+        settle_fallback();
+        return;
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        if (epoch != error_retry_epoch_ || !error_retry_armed_ || error_retry_cancelled_ ||
+            !pending_terminal_error_.has_value()) {
+            return;  // Superseded or fenced between commit and arm.
+        }
+        error_retry_timer_.expires_after(sendq_retry_delay(attempt));
+        error_retry_timer_.async_wait([self_ref, epoch](const std::error_code& ec) {
+            if (ec) {
+                return;  // Cancelled.
+            }
+            auto self = std::static_pointer_cast<TunnelImpl>(self_ref);
+            {
+                std::lock_guard<std::mutex> lock(self->coalesce_mutex_);
+                if (epoch != self->error_retry_epoch_) {
+                    return;  // Stale firing.
+                }
+                self->error_retry_armed_ = false;
+                if (self->error_retry_cancelled_ || !self->pending_terminal_error_.has_value()) {
+                    return;  // Fenced or already settled while parked.
+                }
+            }
+            try {
+                (void)self->run_emission_driver(DrainPolicy::FlushAll);
+            } catch (const std::exception& e) {
+                util::Logger::warn("Tunnel {} ERROR retry kick threw: {}", self->tunnel_id_,
+                                   e.what());
+            } catch (...) {
+                util::Logger::warn("Tunnel {} ERROR retry kick threw", self->tunnel_id_);
+            }
+        });
+    } catch (...) {
+        util::Logger::warn("Tunnel {} failed to arm the TUNNEL_ERROR retry timer", tunnel_id_);
+        settle_fallback();
+    }
+}
+
+bool TunnelImpl::settle_error_for_shutdown_locked() {
+    error_retry_cancelled_ = true;
+    ++error_retry_epoch_;
+    error_retry_armed_ = false;
+    util::cancel_timer_noexcept(error_retry_timer_);
+    if (pending_terminal_error_.has_value() && !error_attempt_in_flight_) {
+        // Unselected parked slot: nothing will send it now. A SELECTED slot
+        // is deliberately left alone — its transport attempt may already be
+        // past the gate (pre-gate OutboundSnapshot), so its own
+        // commit/exception guard owns the transport-party arrival; the
+        // cancelled fence above stops its SendqFull verdict from re-arming.
+        pending_terminal_error_.reset();
+        return true;
+    }
+    return false;
 }
 
 void TunnelImpl::set_on_id_releasable(std::function<void()> cb) {
@@ -1187,7 +1428,34 @@ void TunnelImpl::close() {
     emit_close_and_transition();
 }
 
+void TunnelImpl::notify_teardown_fallback() noexcept {
+    try {
+        maybe_notify_id_releasable();
+    } catch (...) {
+    }
+    try {
+        notify_close_once();
+    } catch (...) {
+    }
+}
+
 void TunnelImpl::emit_close_and_transition() {
+    // Armed fallback: runs the shared notify_teardown_fallback() only if this
+    // unwinds before disarming (a throwing state callback). On the normal path
+    // it disarms first, then the explicit notify_close_once() below propagates
+    // a throwing on_close to the caller (the driver's run_deferred
+    // remember-first channel) instead of swallowing it. A local class has the
+    // same private access as this member.
+    struct Fallback {
+        TunnelImpl* self;
+        bool armed{true};
+        ~Fallback() {
+            if (armed) {
+                self->notify_teardown_fallback();
+            }
+        }
+    } fallback{this};
+
     bool should_send_close = false;
     {
         std::lock_guard<std::mutex> lock(coalesce_mutex_);
@@ -1217,12 +1485,14 @@ void TunnelImpl::emit_close_and_transition() {
 
     util::Logger::info("Tunnel {} closing", tunnel_id_);
 
-    // The buffer is fully drained and CLOSE has been emitted — it is now safe
-    // for the owner to tear the tunnel down. Firing this only here (rather than
-    // when close() is first requested) is what lets a backpressured tunnel
-    // finish flushing its data before removal, instead of dropping it. The
-    // callback is responsible for deferring the actual teardown (asio::post)
-    // so it never destroys this tunnel mid-call.
+    // Normal-path notification. maybe_notify_id_releasable() runs while the
+    // fallback is still ARMED: if its id-release callback throws, the fallback
+    // still runs notify_close_once() (both callees idempotent), so the close
+    // notification is never skipped, and the id-release exception propagates.
+    // Then disarm and call notify_close_once() explicitly so a throwing
+    // on_close propagates to the caller instead of being swallowed.
+    maybe_notify_id_releasable();
+    fallback.armed = false;
     notify_close_once();
 }
 
@@ -1247,14 +1517,61 @@ void TunnelImpl::close_for_timeout() {
         // it, but code 3 now means "the target refused the connection" and this
         // is a local linger timeout — leaving it at 3 would contradict the wire
         // contract even though nothing observable would break today.
-        auto frame = ProtocolFrame::make_tunnel_error(tunnel_id_, 2, "half-close linger timeout");
-        send_frame_to_tox(frame);
-        util::MetricsRegistry::instance().inc_tunnels_closed(
-            util::MetricsRegistry::CloseReason::Timeout);
-        transition_state(State::Closed);
-        util::Logger::info("Tunnel {} force-closed after half-close linger timeout; peer notified",
-                           tunnel_id_);
-        notify_close_once();
+        //
+        // Slice-3 completion (issue #24): this ERROR competes for the SAME
+        // one-shot terminal claim as send_error() and is emitted only by the
+        // driver — one slot cannot linearize two payload owners. A losing
+        // producer emits nothing: the winner's retained ERROR reaches the
+        // peer (or permanently fails), and one terminal frame suffices. All
+        // timeout-specific bookkeeping (Timeout metric, Closed state) stays
+        // producer-local, exactly as before.
+        std::vector<std::uint8_t> wire;
+        try {
+            wire = ProtocolFrame::make_tunnel_error(tunnel_id_, 2, "half-close linger timeout")
+                       .serialize();
+        } catch (...) {
+            util::Logger::warn(
+                "Tunnel {} linger-timeout error frame failed to serialize; closing locally",
+                tunnel_id_);
+        }
+        bool transport_settled = false;
+        if (claim_terminal_error(std::move(wire), &transport_settled)) {
+            struct ProducerSettleGuard {
+                TunnelImpl* self;
+                ~ProducerSettleGuard() {
+                    try {
+                        self->arrive_terminal_error_party(ErrorSettleParty::Producer);
+                    } catch (...) {
+                    }
+                }
+            } producer_guard{this};
+            if (transport_settled) {
+                arrive_terminal_error_party(ErrorSettleParty::Transport);
+            } else {
+                try {
+                    (void)run_emission_driver(DrainPolicy::FlushAll);
+                } catch (const std::exception& e) {
+                    util::Logger::warn("Tunnel {} linger-timeout error kick threw: {}", tunnel_id_,
+                                       e.what());
+                } catch (...) {
+                    util::Logger::warn("Tunnel {} linger-timeout error kick threw", tunnel_id_);
+                }
+            }
+            util::MetricsRegistry::instance().inc_tunnels_closed(
+                util::MetricsRegistry::CloseReason::Timeout);
+            transition_state(State::Closed);
+            util::Logger::info(
+                "Tunnel {} force-closed after half-close linger timeout; peer notified",
+                tunnel_id_);
+            notify_close_once();
+        } else {
+            // A real send_error() beat us to the claim: the tunnel is already
+            // being torn down with a terminal ERROR on the way, which
+            // supersedes the linger notification. Emit nothing; the winner
+            // owns the state and the close notification.
+            util::Logger::debug(
+                "Tunnel {} linger timeout superseded by an in-flight terminal error", tunnel_id_);
+        }
         return;
     }
 
@@ -1347,9 +1664,29 @@ void TunnelImpl::maybe_finish_pending_tcp_eof() {
 }
 
 void TunnelImpl::finalize_remote_close() {
+    // Same armed-fallback shape as emit_close_and_transition(): the teardown
+    // wakeup is owed if a throwing state-change callback in transition_state()
+    // unwinds before the explicit normal-path call, but on the normal path a
+    // throwing on_close propagates to the caller. Both callees are idempotent.
+    struct Fallback {
+        TunnelImpl* self;
+        bool armed{true};
+        ~Fallback() {
+            if (armed) {
+                self->notify_teardown_fallback();
+            }
+        }
+    } fallback{this};
+
     util::MetricsRegistry::instance().inc_tunnels_closed(
         util::MetricsRegistry::CloseReason::Remote);
     transition_state(State::Closed);
+
+    // maybe_notify_id_releasable() runs while ARMED (see
+    // emit_close_and_transition): a throwing id-release callback must not skip
+    // notify_close_once(), which the fallback then runs.
+    maybe_notify_id_releasable();
+    fallback.armed = false;
     notify_close_once();
 }
 
@@ -1399,14 +1736,41 @@ void TunnelImpl::force_close() {
     // meaningful, and skipping it costs nothing in that state: with the gate
     // closed every emit is rejected, and the buffered bytes are being
     // discarded either way.
+    // Remember-first/finish-all/rethrow-FIRST-last (R8-2/R9-2): a throwing
+    // step (the DATA-throw policy makes the flush below genuinely able to
+    // throw) must not skip the socket release or the notifications with the
+    // resources_released_ latch already consumed — a later force_close would
+    // then see a "duplicate" and leak the fd. Every obligation below runs;
+    // the first exception wins and is rethrown at the end.
+    std::exception_ptr first_ex;
+    const auto note_ex = [&first_ex, this]() noexcept {
+        if (!first_ex) {
+            first_ex = std::current_exception();
+        } else {
+            try {
+                util::Logger::warn("Tunnel {} force_close: additional step threw", tunnel_id_);
+            } catch (...) {
+            }
+        }
+    };
+
     if (owns_resources && !outbound_gate_closed()) {
-        flush_pending_writes();
+        try {
+            flush_pending_writes();
+        } catch (...) {
+            note_ex();
+        }
     }
 
-    if (announce && emit_close_frame_once()) {
-        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
+    try {
+        if (announce && emit_close_frame_once()) {
+            util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
+        }
+    } catch (...) {
+        note_ex();
     }
 
+    bool arrive_transport = false;
     if (owns_resources) {
         {
             // Whatever the best-effort flush could not deliver is abandoned
@@ -1415,33 +1779,88 @@ void TunnelImpl::force_close() {
             // graceful operation). Published AFTER the flush, so the flush
             // still delivers what it can; sealing admission here also stops
             // the retry timer from resurrecting the remainder against a
-            // tunnel being destroyed.
+            // tunnel being destroyed. The terminal-ERROR machinery settles in
+            // the same critical section (unselected parked slot only; a
+            // selected attempt's commit guard owns its arrival, and the
+            // cancelled fence stops its SendqFull from re-arming) — this is
+            // the settlement point that makes close_all()'s Error dispatch
+            // safe with a stopped-but-alive io_context.
             std::lock_guard<std::mutex> lock(coalesce_mutex_);
             publish_abort_locked();
+            arrive_transport = settle_error_for_shutdown_locked();
+        }
+        if (arrive_transport) {
+            // Defer the finalizer: if this transport arrival completes the
+            // two-party latch, its exception must land in first_ex (finish-
+            // all/rethrow-first), not be logged-and-suppressed inside the
+            // immediate finalizer path.
+            try {
+                arrive_terminal_error_party(ErrorSettleParty::Transport, /*defer_finalizer=*/true);
+            } catch (...) {
+                note_ex();
+            }
+        }
+        // Drain the finalizer — deferred here or by an earlier gate close
+        // (close_all_local closes the gate under the manager lock and defers
+        // exactly to here). Accumulate its exception into the first-wins
+        // channel rather than logging it.
+        if (auto ep = take_pending_terminal_finalizer()) {
+            if (!first_ex) {
+                first_ex = ep;
+            }
         }
 
         // Close TCP connection if any. Runs even when another thread claimed the
         // state first: a tunnel driven to Error by send_error() never closed its
         // socket, so skipping the cleanup on terminality would leak the fd.
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (tcp_conn_) {
-            tcp_conn_->force_close();
-            tcp_conn_.reset();
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (tcp_conn_) {
+                tcp_conn_->force_close();
+                tcp_conn_.reset();
+            }
+        } catch (...) {
+            note_ex();
         }
+    }
+
+    // Kick the driver once after the abort (plan: the announce may have
+    // latched a CLOSE behind then-retained DATA the abort just abandoned;
+    // without this only the coalesce timer would pick it up). Harmlessly
+    // deferred or empty in every other case.
+    try {
+        (void)run_emission_driver(DrainPolicy::FlushAll);
+    } catch (...) {
+        note_ex();
     }
 
     // The state itself was published by the claim at the top; this is the
     // observer half of that transition, and only the claimant owes it.
     if (claimed_terminal) {
-        notify_state_change(State::Closed);
+        try {
+            notify_state_change(State::Closed);
+        } catch (...) {
+            note_ex();
+        }
     }
-    maybe_notify_id_releasable();
+    try {
+        maybe_notify_id_releasable();
+    } catch (...) {
+        note_ex();
+    }
     // M-07: force_close() drives a terminal state just like the remote-close /
     // error paths, so it must fire the close callback too. Otherwise a caller
     // that uses force_close() directly would bypass manager cleanup and the
     // active-tunnel gauge decrement. notify_close_once() is idempotent.
-    notify_close_once();
+    try {
+        notify_close_once();
+    } catch (...) {
+        note_ex();
+    }
     util::Logger::info("Tunnel {} force closed", tunnel_id_);
+    if (first_ex) {
+        std::rethrow_exception(first_ex);
+    }
 }
 
 // ===========================================================================
@@ -2100,86 +2519,73 @@ bool TunnelImpl::send_data_to_tox(const std::vector<uint8_t>& data) {
 // ===========================================================================
 
 void TunnelImpl::send_error(uint8_t error_code, const std::string& description) {
-    // Slice-3 ordering (issue #24): ONE critical section seals admission,
-    // abandons undelivered DATA, and claims the single terminal ERROR. The
-    // abandonment matters beyond tidiness — without it the retained cohorts
-    // kept riding the retry timer and could put TUNNEL_DATA on the wire
-    // AFTER the TUNNEL_ERROR, which the peer then processes against a tunnel
-    // it has already torn down.
-    bool claimed = false;
-    {
-        std::lock_guard<std::mutex> lock(coalesce_mutex_);
-        publish_abort_locked();
-        if (!terminal_error_claimed_.load(std::memory_order_relaxed)) {
-            // The releasability fence goes up INSIDE the winning claim's
-            // critical section, BEFORE the claim becomes visible: a CLOSE
-            // whose pre-transport recheck observes the claim (and records
-            // Abandoned) must already find the id unreleasable, or a
-            // force_close() publishing a terminal state in the gap would let
-            // the id recycle under the ERROR this claim is about to send.
-            terminal_error_in_flight_.store(true, std::memory_order_release);
-            terminal_error_claimed_.store(true, std::memory_order_release);
-            claimed = true;
-        }
+    // Slice-3 completion (issue #24): the producer no longer touches the
+    // transport. It serializes FIRST (outside any lock, so an allocation
+    // throw settles as a claim-without-deposit rather than unwinding before
+    // the claim), then in ONE critical section seals admission, abandons
+    // undelivered DATA, claims the single terminal ERROR and deposits the
+    // wire bytes for the emission driver — which is the only thing that ever
+    // sends them. The abandonment matters beyond tidiness: retained cohorts
+    // used to ride the retry timer and could put TUNNEL_DATA on the wire
+    // AFTER the TUNNEL_ERROR.
+    std::vector<std::uint8_t> wire;
+    try {
+        wire = ProtocolFrame::make_tunnel_error(tunnel_id_, error_code, description).serialize();
+    } catch (...) {
+        util::Logger::warn(
+            "Tunnel {} terminal error frame failed to serialize; proceeding with terminal "
+            "transition",
+            tunnel_id_);
+        // wire stays empty: claim-without-deposit below.
     }
-    if (!claimed) {
+
+    bool transport_settled = false;
+    if (!claim_terminal_error(std::move(wire), &transport_settled)) {
         util::Logger::debug("Tunnel {} suppressed duplicate terminal error (code={}, desc='{}')",
                             tunnel_id_, error_code, description);
         return;
     }
 
-    // Everything after the claim settles through an RAII guard, because any
-    // of it can throw (the serializer, the transport callback, a state-change
-    // callback) and the claim above is irrevocable — leaving the tunnel
-    // un-transitioned, the fence up, or the CLOSE machinery unfenced would
-    // strand the tunnel and pin its id for the life of the object. The guard
-    // runs on every exit path:
-    //  * lowers the releasability fence FIRST, then
-    //  * cancel_close_retry() — abandons an Owed CLOSE and fences an
-    //    InFlight attempt's verdict, so a late SendqFull cannot restore Owed
-    //    and put a CLOSE retry on the wire after this ERROR; its
-    //    maybe_notify runs with the fence already down, delivering any
-    //    wakeup the fence deferred; then
-    //  * notify_close_once().
-    // Ordering rationale: the CLOSE fence and the id release both happen
-    // only AFTER the ERROR's transport attempt (an id released earlier could
-    // be recycled before the frame goes out, and the ERROR would then name
-    // the replacement) and after the terminal transition
-    // (id_releasable_locked() requires a terminal state, so an owner whose
-    // on_id_releasable hook is already installed would otherwise miss its
-    // only wakeup). Mirrors the ClaimGuard in emit_close_frame_once().
-    struct TerminalSettleGuard {
+    // The producer party arrives on EVERY exit. An ARMED fallback covers the
+    // exceptional path (a throwing state callback in the transition loop),
+    // where it must log — a destructor cannot propagate. On the normal path
+    // it is disarmed and the producer party is arrived explicitly BELOW with
+    // propagation, so a finalizer exception (e.g. a throwing on_close when
+    // this producer arrival completes the pair) reaches send_error's caller.
+    bool producer_arrived = false;
+    struct ProducerFallback {
         TunnelImpl* self;
-        ~TerminalSettleGuard() {
-            // Each step in its own try: a throwing timer cancellation inside
-            // cancel_close_retry() must not skip the close notification, and
-            // none of them may propagate out of a destructor.
-            self->terminal_error_in_flight_.store(false, std::memory_order_release);
-            try {
-                self->cancel_close_retry();
-            } catch (...) {
+        bool* done;
+        ~ProducerFallback() {
+            if (*done) {
+                return;
             }
             try {
-                self->notify_close_once();
+                self->arrive_terminal_error_party(ErrorSettleParty::Producer);
             } catch (...) {
             }
         }
-    } settle_guard{this};
+    } producer_guard{this, &producer_arrived};
 
-    // Transport and state/error callbacks run OUTSIDE the mutex — they
-    // re-enter the manager, and the state callbacks can re-enter admission,
-    // which the seal published above refuses instead of racing the
-    // abandonment.
-    try {
-        auto frame = ProtocolFrame::make_tunnel_error(tunnel_id_, error_code, description);
-        send_frame_to_tox(frame);
-    } catch (...) {
-        util::Logger::warn(
-            "Tunnel {} terminal error frame failed to serialize or send; proceeding with "
-            "terminal transition",
-            tunnel_id_);
+    if (transport_settled) {
+        // Shutdown won before the claim, or serialization failed: nothing
+        // will ever be sent. Settle the transport half immediately.
+        arrive_terminal_error_party(ErrorSettleParty::Transport);
+    } else {
+        // Hand the deposit to the single emission owner. A deferral is fine
+        // (the active emitter's exit protocol picks the slot up); a throw is
+        // contained so it cannot unwind past the terminal transition the
+        // producer still owes (R2-2c).
+        try {
+            (void)run_emission_driver(DrainPolicy::FlushAll);
+        } catch (const std::exception& e) {
+            util::Logger::warn("Tunnel {} terminal error kick threw: {}", tunnel_id_, e.what());
+        } catch (...) {
+            util::Logger::warn("Tunnel {} terminal error kick threw", tunnel_id_);
+        }
     }
-    // Conditional, not blind: the ERROR transport callback can re-enter
+
+    // Conditional, not blind: a transport callback can re-enter
     // force_close(), which legitimately claims Connected -> Closed before we
     // get here — a blind Error store would overwrite that claimed terminal
     // state. A LOOP rather than a fixed set of attempts: a concurrent
@@ -2187,7 +2593,8 @@ void TunnelImpl::send_error(uint8_t error_code, const std::string& description) 
     // not leave the claimed error stranded in a non-terminal state with the
     // id pinned — the claim owes a terminal state, so retry from the freshly
     // observed state until an Error edge lands or a racing terminal claim
-    // absorbs it.
+    // absorbs it. Abort was published before any of this, so the state/error
+    // callbacks that fire here find admission already sealed.
     for (;;) {
         const State current = state_.load(std::memory_order_acquire);
         if (current == State::Closed || current == State::Error) {
@@ -2203,6 +2610,15 @@ void TunnelImpl::send_error(uint8_t error_code, const std::string& description) 
 
     util::Logger::error("Tunnel {} sent error: code={}, desc='{}'", tunnel_id_, error_code,
                         description);
+
+    // Normal-path producer arrival, with propagation: if this completes the
+    // two-party settle and the finalizer (notably a throwing on_close) throws,
+    // it surfaces to send_error's caller rather than being swallowed.
+    producer_arrived = true;
+    if (auto ep = arrive_terminal_error_party(ErrorSettleParty::Producer,
+                                              /*defer_finalizer=*/false, /*propagate=*/true)) {
+        std::rethrow_exception(ep);
+    }
 }
 
 // ===========================================================================
@@ -2410,14 +2826,30 @@ void TunnelImpl::close_outbound_gate() {
     // acquires both mutexes deadlock-free; nothing else in this file holds
     // one while taking the other (the slice-2 driver removed the last
     // nesting).
-    std::scoped_lock lock(mutex_, coalesce_mutex_);
-    publish_abort_locked();
-    outbound_gate_closed_.store(true, std::memory_order_release);
-    // Belt and braces: drop the callbacks too, so any future code path that
-    // forgets to take an OutboundSnapshot still finds nothing to call. The gate
-    // — not this swap — is the authoritative check.
-    on_send_to_tox_ = nullptr;
-    on_send_to_tox_owned_ = nullptr;
+    bool arrive_transport = false;
+    {
+        std::scoped_lock lock(mutex_, coalesce_mutex_);
+        publish_abort_locked();
+        // Shutdown-settle the terminal-ERROR machinery in the same critical
+        // section. An UNSELECTED parked slot settles here; a selected
+        // attempt's own commit guard settles it (the cancelled fence below
+        // stops its SendqFull from re-arming). NOTE the caller contract:
+        // close_all_local() invokes this under TunnelManager::mutex_ with a
+        // documented never-calls-back guarantee, so the arrival below runs
+        // with the finalizer DEFERRED — no callback runs here; force_close()
+        // (which close_all_local always calls next, outside the manager
+        // lock) drains it via run_pending_terminal_finalizer().
+        arrive_transport = settle_error_for_shutdown_locked();
+        outbound_gate_closed_.store(true, std::memory_order_release);
+        // Belt and braces: drop the callbacks too, so any future code path that
+        // forgets to take an OutboundSnapshot still finds nothing to call. The gate
+        // — not this swap — is the authoritative check.
+        on_send_to_tox_ = nullptr;
+        on_send_to_tox_owned_ = nullptr;
+    }
+    if (arrive_transport) {
+        arrive_terminal_error_party(ErrorSettleParty::Transport, /*defer_finalizer=*/true);
+    }
 }
 
 // ===========================================================================
@@ -2594,7 +3026,9 @@ void TunnelImpl::flush_pending_writes() {
     // cancel too.
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
     if (coalesce_pending_locked() == 0 && !driver_active_) {
-        coalesce_timer_.cancel();
+        // Non-throwing (R12-1): on the force_close path a throwing cancel
+        // would become the synchronous force_close exception.
+        util::cancel_timer_noexcept(coalesce_timer_);
         coalesce_timer_armed_ = false;
     }
 }
@@ -2661,183 +3095,476 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
     bool emit_close = false;
     bool finalize_after_drain = false;
 
-    for (;;) {
-        // Which outbound path is active. Snapshotted OUTSIDE coalesce_mutex_
-        // (the old drain nested mutex_ inside coalesce_mutex_; the driver
-        // never holds both).
-        bool zero_copy = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            zero_copy = static_cast<bool>(on_send_to_tox_owned_);
-        }
+    // A parked terminal ERROR arms its retry timer AFTER the loop, so the arm
+    // never happens while this run is still the active driver (lost-wakeup).
+    bool arm_error_after = false;
+    std::uint64_t err_arm_epoch = 0;
+    unsigned err_arm_attempt = 0;
 
-        // ---- Select one frame under the lock. Nothing is consumed yet:
-        // cohort bytes must never be gone from the FIFO while the frame that
-        // carries them can still fail and need a retry. ----
-        OwnedFrameBuffer owned_frame;
-        std::optional<ProtocolFrame> span_frame;
-        std::size_t frame_bytes = 0;
-        {
-            std::lock_guard<std::mutex> lock(coalesce_mutex_);
-            while (!outbound_fifo_.empty() && outbound_fifo_.front().pending() == 0) {
-                outbound_fifo_.pop_front();
-            }
-            if (outbound_fifo_.empty()) {
-                // Drain complete. Perform the deferred-close bookkeeping that
-                // used to live in the flush-timer handler — whichever emitter
-                // finishes the drain owes it, or a close deferred behind a
-                // backlog another thread happened to drain would never fire.
-                if (close_pending_) {
-                    close_pending_ = false;
-                    // A remote CLOSE deferred behind this same drain is
-                    // discharged by this same completion. Leaving the flag set
-                    // let a later empty-FIFO driver run (the Batch timer armed
-                    // at admission fires regardless) take the remote branch
-                    // and finalize a SECOND time — double-counting the
-                    // remote-close metric even though notify_close_once()
-                    // protects the callback.
-                    const bool remote_deferred = remote_close_pending_;
-                    remote_close_pending_ = false;
-                    if (close_pending_full_) {
-                        close_pending_full_ = false;
-                        emit_full_close = true;
-                        // Peer already closed its side while we drained: our
-                        // CLOSE completes the handshake in both directions, so
-                        // finalize right after emitting it instead of leaving
-                        // the tunnel parked in Disconnecting for the
-                        // half-close cap to reap.
-                        finalize_after_drain = remote_deferred;
-                    } else if (!local_close_sent_) {
-                        local_close_sent_ = true;
-                        local_stream_done_ = true;
-                        emit_close = true;
-                        finalize_after_drain = remote_close_received_;
-                    } else if (remote_deferred) {
-                        // Our CLOSE was already emitted earlier; only the
-                        // deferred remote side is left to settle.
-                        finalize_after_drain = local_stream_done_;
-                    }
-                } else if (remote_close_pending_) {
-                    remote_close_pending_ = false;
-                    finalize_after_drain = local_stream_done_;
-                }
-                driver_flush_all_requested_ = false;
-                driver_active_ = false;
-                break;
-            }
-            auto& front = outbound_fifo_.front();
-            if (front.pending() >= front.cap) {
-                frame_bytes = front.cap;
-            } else if (driver_flush_all_requested_) {
-                frame_bytes = front.pending();
-            } else {
-                // FullFramesOnly with a sub-cap remainder: satisfied by
-                // contract (`RequestSatisfied` is deliberately not "Drained").
-                // The remainder flushes on the timer — except for the Drain
-                // coalesce policy, which holds it for overflow or an explicit
-                // flush.
-                if (arm_timer_on_remainder) {
-                    coalesce_arm_timer_locked();
-                }
-                driver_active_ = false;
-                break;
-            }
-            const std::span<const std::uint8_t> payload(front.bytes.data() + front.consumed,
-                                                        frame_bytes);
-            // One payload memcpy out of the cohort into the frame buffer: the
-            // bytes were buffered before the final emission boundary was
-            // known. The Wave B win — skipping the secondary lossless-prefix
-            // allocation in the send callback — is preserved.
-            if (zero_copy) {
-                owned_frame = OwnedFrameBuffer::with_payload(payload);
-                util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
-                ProtocolFrame::serialize_tunnel_data_in_place(owned_frame, tunnel_id_);
-            } else {
-                span_frame.emplace(ProtocolFrame::make_tunnel_data(tunnel_id_, payload));
-            }
-        }
+    // Which frame kind the current iteration selected, tracked outside the try
+    // so an exceptional unwind can apply the kind-specific repair.
+    enum class Sel { None, Data, Error, Close };
+    Sel current_sel = Sel::None;
 
-        // ---- Pre-callback authorization. A terminal Abort published after
-        // frame selection (the lock is released) abandoned the FIFO; letting
-        // this frame START its send would put DATA on the wire after the
-        // terminal ERROR. The design's "a DATA callback already authorised is
-        // allowed to return" covers only a callback past this check — the
-        // narrow residual between this load and the callback entry is that
-        // allowance. ----
-        if (outbound_abort_published_.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lock(coalesce_mutex_);
-            driver_flush_all_requested_ = false;
-            driver_active_ = false;
-            break;  // Abandoned: nothing left that this driver may emit.
-        }
+    try {
+        for (;;) {
+            current_sel = Sel::None;
 
-        // ---- Emit with NO lock held. Count as emitted BEFORE the (inline,
-        // synchronous) send callback: a same-thread ACK round-trip can
-        // re-enter handle_tunnel_ack_frame before the send returns, and its
-        // acquire-load of total_bytes_emitted_ must already include these
-        // bytes or a legitimate ACK is under-credited. Undone on failure. ----
-        total_bytes_emitted_.fetch_add(frame_bytes, std::memory_order_release);
-        const bool sent = zero_copy ? send_owned_data_to_tox(std::move(owned_frame))
-                                    : send_frame_to_tox(*span_frame);
+            // Which DATA outbound path is active. Snapshotted OUTSIDE
+            // coalesce_mutex_ (the old drain nested mutex_ inside
+            // coalesce_mutex_; the driver never holds both).
+            bool zero_copy = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                zero_copy = static_cast<bool>(on_send_to_tox_owned_);
+            }
 
-        // ---- Commit or roll back under the lock. The front cohort is stable
-        // across the unlocked send: only the driver consumes or pops from the
-        // front, and fifo_append_locked never compacts while the driver is
-        // active. ----
-        {
-            std::lock_guard<std::mutex> lock(coalesce_mutex_);
-            if (sent) {
-                // A terminal Abort (publish_abort_locked) may have abandoned
-                // the FIFO while this frame was in flight — the frame reached
-                // the transport first and there is nothing left to consume.
-                if (!outbound_fifo_.empty()) {
-                    auto& front = outbound_fifo_.front();
-                    front.consumed += frame_bytes;
-                    outbound_fifo_pending_ -= frame_bytes;
-                    if (front.consumed == front.bytes.size()) {
+            // ---- Select one frame under the lock. Nothing is consumed yet:
+            // cohort bytes must never be gone from the FIFO while the frame
+            // that carries them can still fail and need a retry. Priority:
+            // (1) a claimed terminal ERROR, (2) DATA, (3) a requested CLOSE
+            // once the FIFO is empty. ----
+            OwnedFrameBuffer owned_frame;
+            std::optional<ProtocolFrame> span_frame;
+            std::vector<std::uint8_t> error_wire;
+            std::size_t frame_bytes = 0;
+            {
+                std::lock_guard<std::mutex> lock(coalesce_mutex_);
+
+                // (1) Terminal ERROR: the Abort seal already emptied the FIFO
+                // under this same mutex, so nothing DATA can precede it here.
+                if (pending_terminal_error_.has_value() && !error_retry_armed_ &&
+                    !error_attempt_in_flight_) {
+                    // Set current_sel BEFORE the (allocating, throwable) wire
+                    // copy: if the copy throws, the catch must classify this as
+                    // Sel::Error so the in-flight slot is settled rather than
+                    // stranded (a Sel::None classification would exclude it
+                    // from recovery, pinning the id and the close notification).
+                    current_sel = Sel::Error;
+                    error_attempt_in_flight_ = true;
+                    error_wire = pending_terminal_error_->wire;  // copy; slot retained
+                } else {
+                    while (!outbound_fifo_.empty() && outbound_fifo_.front().pending() == 0) {
                         outbound_fifo_.pop_front();
                     }
+                    if (!outbound_fifo_.empty()) {
+                        auto& front = outbound_fifo_.front();
+                        if (front.pending() >= front.cap) {
+                            frame_bytes = front.cap;
+                        } else if (driver_flush_all_requested_) {
+                            frame_bytes = front.pending();
+                        } else {
+                            // FullFramesOnly with a sub-cap remainder: satisfied
+                            // by contract (`RequestSatisfied` is deliberately not
+                            // "Drained"). The remainder flushes on the timer —
+                            // except for the Drain coalesce policy.
+                            if (arm_timer_on_remainder) {
+                                coalesce_arm_timer_locked();
+                            }
+                            // Exit-protocol re-check: a control obligation
+                            // deposited mid-pass must not be stranded.
+                            if (control_obligation_eligible_locked()) {
+                                continue;
+                            }
+                            driver_active_ = false;
+                            break;
+                        }
+                        const std::span<const std::uint8_t> payload(
+                            front.bytes.data() + front.consumed, frame_bytes);
+                        // One payload memcpy out of the cohort into the frame
+                        // buffer: the bytes were buffered before the final
+                        // emission boundary was known. The Wave B win —
+                        // skipping the secondary lossless-prefix allocation in
+                        // the send callback — is preserved.
+                        if (zero_copy) {
+                            owned_frame = OwnedFrameBuffer::with_payload(payload);
+                            util::MetricsRegistry::instance().inc_outbound_buffer_allocs();
+                            ProtocolFrame::serialize_tunnel_data_in_place(owned_frame, tunnel_id_);
+                        } else {
+                            span_frame.emplace(
+                                ProtocolFrame::make_tunnel_data(tunnel_id_, payload));
+                        }
+                        current_sel = Sel::Data;
+                    } else {
+                        // FIFO empty. (3) A requested CLOSE, selection-is-
+                        // authorization (the old pre-transport recheck is
+                        // gone). The ERROR->CLOSE fence is
+                        // `terminal_error_claimed_`: a CLOSE selected before a
+                        // racing claim lands as CLOSE,ERROR (allowed); one not
+                        // yet selected is refused here.
+                        bool close_selected = false;
+                        {
+                            std::lock_guard<std::mutex> close_lock(close_frame_mutex_);
+                            if (close_emit_requested_ &&
+                                close_frame_state_ == CloseFrameState::Owed &&
+                                !close_retry_cancelled_ &&
+                                !terminal_error_claimed_.load(std::memory_order_acquire)) {
+                                close_frame_state_ = CloseFrameState::InFlight;
+                                close_emit_requested_ = false;
+                                close_selected = true;
+                            }
+                        }
+                        if (close_selected) {
+                            span_frame.emplace(ProtocolFrame::make_tunnel_close(tunnel_id_));
+                            current_sel = Sel::Close;
+                        } else if (control_obligation_eligible_locked()) {
+                            // Exit-protocol re-check: a terminal ERROR or CLOSE
+                            // request deposited mid-pass (its kick found the
+                            // driver active and deferred) is eligible now —
+                            // loop so it is selected rather than stranded.
+                            continue;
+                        } else {
+                            // Drain complete. Perform the deferred-close
+                            // bookkeeping (a graceful close deferred behind a
+                            // DATA drain), then break.
+                            if (close_pending_) {
+                                close_pending_ = false;
+                                const bool remote_deferred = remote_close_pending_;
+                                remote_close_pending_ = false;
+                                if (close_pending_full_) {
+                                    close_pending_full_ = false;
+                                    emit_full_close = true;
+                                    finalize_after_drain = remote_deferred;
+                                } else if (!local_close_sent_) {
+                                    local_close_sent_ = true;
+                                    local_stream_done_ = true;
+                                    emit_close = true;
+                                    finalize_after_drain = remote_close_received_;
+                                } else if (remote_deferred) {
+                                    finalize_after_drain = local_stream_done_;
+                                }
+                            } else if (remote_close_pending_) {
+                                remote_close_pending_ = false;
+                                finalize_after_drain = local_stream_done_;
+                            }
+                            driver_flush_all_requested_ = false;
+                            driver_active_ = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // ---- ERROR emission. Its own claim published the Abort seal, so
+            // the DATA pre-callback abort check below deliberately does not
+            // apply to it. ----
+            if (current_sel == Sel::Error) {
+                const SendOutcome eo = send_wire_to_tox_typed(error_wire);
+                bool arrive_transport = false;
+                bool parked = false;
+                {
+                    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+                    error_attempt_in_flight_ = false;
+                    if (eo == SendOutcome::SendqFull && !error_retry_cancelled_) {
+                        // Transient backpressure: retain the slot, park it for
+                        // the dedicated SENDQ-cadence timer. Ownership AND the
+                        // driver-active clear happen in ONE critical section
+                        // so the timer (armed only after the loop, when the
+                        // driver is already inactive) can never fire while this
+                        // run is still the active driver and lose its wakeup.
+                        error_retry_armed_ = true;
+                        if (pending_terminal_error_.has_value()) {
+                            err_arm_attempt = pending_terminal_error_->attempt++;
+                        }
+                        err_arm_epoch = ++error_retry_epoch_;
+                        arm_error_after = true;
+                        driver_flush_all_requested_ = false;
+                        driver_active_ = false;
+                        parked = true;
+                    } else {
+                        // Sent / PermanentFail / gate-closed-Sent, or a
+                        // SendqFull that a shutdown fenced: the transport has
+                        // genuinely settled and nothing more will be sent.
+                        pending_terminal_error_.reset();
+                        arrive_transport = true;
+                    }
+                }
+                if (arrive_transport) {
+                    arrive_terminal_error_party(ErrorSettleParty::Transport);
+                }
+                if (parked) {
+                    // The physical arm runs after the loop (driver inactive).
+                    outcome = EmitOutcome::Backpressured;
+                    break;
                 }
                 continue;
             }
-            // Tox lossless SENDQ is full (transient transport backpressure).
-            // NOT a drop point: a lossless tunnel must never lose bytes to a
-            // momentarily-full send queue. RETAIN the bytes at the front of
-            // their cohort and keep the send window charged so upstream TCP
-            // reads pause; the retry timer re-runs the driver. (Earlier
-            // revisions erased + refunded here, silently truncating any
-            // transfer large/fast enough to outrun the Tox congestion window
-            // — observed as a hard ~85-90 KiB cap with the remainder lost.)
-            //
-            // NOTE: deliberately no "backpressure cleared" line on the success
-            // path. A half-full Tox SENDQ makes sends alternate fail/succeed
-            // at the retry cadence, so a recovery line would itself flood at
-            // kHz rates; the once-per-second throttled line below already
-            // reports the burst size via its `[+N suppressed]` suffix.
-            total_bytes_emitted_.fetch_sub(frame_bytes, std::memory_order_release);
-            util::Logger::debug_throttled(
-                backpressure_log_throttle(friend_number_, BackpressureSite::CoalesceDrain),
-                "Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_, frame_bytes);
-            coalesce_arm_timer_locked();
-            driver_flush_all_requested_ = false;
-            driver_active_ = false;
-            outcome = EmitOutcome::Backpressured;
-            break;
+
+            // ---- CLOSE emission. ----
+            if (current_sel == Sel::Close) {
+                const SendOutcome co = send_frame_to_tox_typed(*span_frame);
+                bool rearm = false;
+                std::uint64_t epoch = 0;
+                unsigned attempt = 0;
+                {
+                    std::lock_guard<std::mutex> lock(close_frame_mutex_);
+                    if (close_retry_cancelled_ ||
+                        terminal_error_claimed_.load(std::memory_order_acquire)) {
+                        // Fenced or superseded by a terminal ERROR while inside
+                        // the transport. A late SendqFull must NOT re-arm.
+                        close_frame_state_ = co == SendOutcome::Sent ? CloseFrameState::Resolved
+                                                                     : CloseFrameState::Abandoned;
+                    } else if (co == SendOutcome::SendqFull) {
+                        close_frame_state_ = CloseFrameState::Owed;
+                        close_retry_armed_ = true;
+                        epoch = ++close_retry_epoch_;
+                        attempt = close_retry_attempt_++;
+                        rearm = true;
+                    } else {
+                        close_frame_state_ = CloseFrameState::Resolved;
+                    }
+                }
+                if (rearm) {
+                    arm_close_retry_timer(epoch, attempt);
+                } else {
+                    maybe_notify_id_releasable();
+                }
+                continue;
+            }
+
+            // ---- DATA path. Pre-callback authorization: a terminal Abort
+            // published after frame selection abandoned the FIFO; letting this
+            // frame START its send would put DATA on the wire after the
+            // terminal ERROR. ----
+            if (outbound_abort_published_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(coalesce_mutex_);
+                // Exit-protocol re-check: a terminal ERROR deposited by the
+                // very send_error() that published this Abort (possibly
+                // re-entrantly) must be selected, not stranded. There is no
+                // coalesce-timer fallback here — the Abort emptied the FIFO.
+                if (control_obligation_eligible_locked()) {
+                    continue;
+                }
+                driver_flush_all_requested_ = false;
+                driver_active_ = false;
+                break;  // Abandoned: nothing left that this driver may emit.
+            }
+
+            // ---- Emit with NO lock held. Count as emitted BEFORE the
+            // (inline, synchronous) send callback: a same-thread ACK
+            // round-trip can re-enter handle_tunnel_ack_frame before the send
+            // returns, and its acquire-load of total_bytes_emitted_ must
+            // already include these bytes or a legitimate ACK is
+            // under-credited. Undone on failure. ----
+            total_bytes_emitted_.fetch_add(frame_bytes, std::memory_order_release);
+            const bool sent = zero_copy ? send_owned_data_to_tox(std::move(owned_frame))
+                                        : send_frame_to_tox(*span_frame);
+
+            // ---- Commit or roll back under the lock. ----
+            {
+                std::lock_guard<std::mutex> lock(coalesce_mutex_);
+                if (sent) {
+                    if (!outbound_fifo_.empty()) {
+                        auto& front = outbound_fifo_.front();
+                        front.consumed += frame_bytes;
+                        outbound_fifo_pending_ -= frame_bytes;
+                        if (front.consumed == front.bytes.size()) {
+                            outbound_fifo_.pop_front();
+                        }
+                    }
+                    continue;
+                }
+                // Tox lossless SENDQ full (transient backpressure). RETAIN the
+                // bytes at the front of their cohort; the retry timer re-runs
+                // the driver.
+                total_bytes_emitted_.fetch_sub(frame_bytes, std::memory_order_release);
+                util::Logger::debug_throttled(
+                    backpressure_log_throttle(friend_number_, BackpressureSite::CoalesceDrain),
+                    "Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_,
+                    frame_bytes);
+                coalesce_arm_timer_locked();
+                // Exit-protocol re-check, ERROR only: a terminal ERROR
+                // deposited while this DATA send was in flight seals + empties
+                // the FIFO, so it makes progress (top priority). A CLOSE
+                // request must NOT loop here — it requires an empty FIFO and
+                // the retained DATA still occupies it, so re-looping would
+                // spin; the coalesce timer above re-runs the driver, drains
+                // the DATA, and the drain-complete branch then selects the
+                // CLOSE.
+                if (pending_terminal_error_.has_value() && !error_retry_armed_ &&
+                    !error_attempt_in_flight_ && !error_retry_cancelled_) {
+                    continue;
+                }
+                driver_flush_all_requested_ = false;
+                driver_active_ = false;
+                outcome = EmitOutcome::Backpressured;
+                break;
+            }
         }
+    } catch (...) {
+        // Capture the ORIGINAL exception first; all repair below is contained
+        // so a secondary throw (a state callback during the DATA-abort
+        // terminalization, say) cannot replace it or skip recovery. This is
+        // RAII-style state repair, never a swallow — the original propagates.
+        std::exception_ptr original = std::current_exception();
+        try {
+            if (current_sel == Sel::Error) {
+                // A throwing ERROR send settles as permanent failure — no
+                // retry (a throw gave no SendqFull cadence to ride).
+                {
+                    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+                    error_attempt_in_flight_ = false;
+                    pending_terminal_error_.reset();
+                }
+                arrive_terminal_error_party(ErrorSettleParty::Transport);
+            } else if (current_sel == Sel::Close) {
+                // A throwing CLOSE send resolves the obligation (the frame
+                // will not be retried; the same serialization would throw).
+                {
+                    std::lock_guard<std::mutex> lock(close_frame_mutex_);
+                    if (close_frame_state_ == CloseFrameState::InFlight) {
+                        close_frame_state_ = CloseFrameState::Resolved;
+                    }
+                }
+                maybe_notify_id_releasable();
+            } else if (current_sel == Sel::Data) {
+                // A throwing DATA send = Abort (the callback contract cannot
+                // promise the transport did not accept the frame, so a retry
+                // could duplicate bytes). Seal + abandon the FIFO, then
+                // complete to terminal via the internal ERROR path so no
+                // dispatch site can sample a resting sealed-but-Connected
+                // state.
+                {
+                    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+                    publish_abort_locked();
+                }
+                std::vector<std::uint8_t> wire;
+                try {
+                    wire = ProtocolFrame::make_tunnel_error(tunnel_id_, 2,
+                                                            "outbound transport failure")
+                               .serialize();
+                } catch (...) {
+                }
+                bool transport_settled = false;
+                if (claim_terminal_error(std::move(wire), &transport_settled)) {
+                    // Producer arrival is guaranteed on EVERY exit — including
+                    // a throwing state callback inside the transition loop
+                    // below — or terminal_error_in_flight_ would never lower
+                    // and the id would pin forever.
+                    struct ProducerSettleGuard {
+                        TunnelImpl* self;
+                        ~ProducerSettleGuard() {
+                            try {
+                                self->arrive_terminal_error_party(ErrorSettleParty::Producer);
+                            } catch (...) {
+                            }
+                        }
+                    } producer_guard{this};
+                    if (transport_settled) {
+                        arrive_terminal_error_party(ErrorSettleParty::Transport);
+                    }
+                    // The deposited (or immediately-settled) ERROR is picked
+                    // up by recover_after_driver_unwind() below (it arms the
+                    // retry timer); no synchronous kick from an unwind path.
+                    for (;;) {
+                        const State cur = state_.load(std::memory_order_acquire);
+                        if (cur == State::Closed || cur == State::Error) {
+                            break;
+                        }
+                        if (transition_state_if(cur, State::Error)) {
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+            // A secondary exception during repair (e.g. a user state callback)
+            // must not preempt the original or skip recovery below.
+            try {
+                util::Logger::warn("Tunnel {} driver-unwind repair threw a secondary exception",
+                                   tunnel_id_);
+            } catch (...) {
+            }
+        }
+        recover_after_driver_unwind();
+        std::rethrow_exception(original);
+    }
+
+    // A parked ERROR arms its retry timer now — after the loop, with the
+    // driver already inactive, so a firing timer kicks a fresh driver rather
+    // than deferring into this run and losing its wakeup.
+    if (arm_error_after) {
+        arm_error_retry_timer(err_arm_epoch, err_arm_attempt);
     }
 
     // Deferred-close actions run with no lock held — each of these sends
-    // through the Tox callback and/or re-enters the manager.
+    // through the Tox callback (now the driver, re-entrantly) and/or re-enters
+    // the manager. Per-action isolation: a throwing close/state callback in
+    // one must not skip the others; the first exception is remembered and
+    // rethrown after all three are attempted (synchronous callers see it;
+    // timer boundaries contain it).
+    std::exception_ptr deferred_ex;
+    const auto run_deferred = [&deferred_ex](const auto& fn) {
+        try {
+            fn();
+        } catch (...) {
+            if (!deferred_ex) {
+                deferred_ex = std::current_exception();
+            }
+        }
+    };
     if (emit_full_close) {
-        emit_close_and_transition();
+        run_deferred([this] { emit_close_and_transition(); });
     }
     if (emit_close) {
-        emit_local_close_only();
+        run_deferred([this] { emit_local_close_only(); });
     }
     if (finalize_after_drain) {
-        finalize_remote_close();
+        run_deferred([this] { finalize_remote_close(); });
+    }
+    if (deferred_ex) {
+        std::rethrow_exception(deferred_ex);
     }
     return outcome;
+}
+
+void TunnelImpl::recover_after_driver_unwind() noexcept {
+    // Timer-paced recovery (no asio::post): clear the driver-active latch
+    // idempotently, then convert any unselected eligible control obligation
+    // into retry-timer ownership. Each action is exception-isolated.
+    bool arm_error = false;
+    std::uint64_t err_epoch = 0;
+    unsigned err_attempt = 0;
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        driver_flush_all_requested_ = false;
+        driver_active_ = false;
+        if (pending_terminal_error_.has_value() && !error_retry_armed_ &&
+            !error_attempt_in_flight_ && !error_retry_cancelled_) {
+            error_retry_armed_ = true;
+            err_epoch = ++error_retry_epoch_;
+            err_attempt = pending_terminal_error_->attempt;
+            arm_error = true;
+        }
+    }
+    if (arm_error) {
+        try {
+            arm_error_retry_timer(err_epoch, err_attempt);
+        } catch (...) {
+        }
+    }
+
+    bool arm_close = false;
+    std::uint64_t cl_epoch = 0;
+    unsigned cl_attempt = 0;
+    {
+        std::lock_guard<std::mutex> lock(close_frame_mutex_);
+        if (close_emit_requested_ && close_frame_state_ == CloseFrameState::Owed &&
+            !close_retry_cancelled_ && !close_retry_armed_ &&
+            !terminal_error_claimed_.load(std::memory_order_acquire)) {
+            close_emit_requested_ = false;
+            close_retry_armed_ = true;
+            cl_epoch = ++close_retry_epoch_;
+            cl_attempt = close_retry_attempt_++;
+            arm_close = true;
+        }
+    }
+    if (arm_close) {
+        try {
+            arm_close_retry_timer(cl_epoch, cl_attempt);
+        } catch (...) {
+        }
+    }
 }
 
 void TunnelImpl::coalesce_arm_timer_locked() {
@@ -2873,8 +3600,19 @@ void TunnelImpl::coalesce_arm_timer_locked() {
         // no lock held across any send, re-arms itself on backpressure, and —
         // when the FIFO empties — runs the deferred-close bookkeeping that
         // used to live here. A `DeferredToActiveEmitter` result is fine: the
-        // FlushAll intent is latched for the active emitter.
-        (void)self->run_emission_driver(DrainPolicy::FlushAll);
+        // FlushAll intent is latched for the active emitter. Contained at this
+        // asio handler boundary: a throwing deferred-close/state callback the
+        // driver rethrows must not escape into io_context::run (the fatal
+        // worker boundary would then abort). Handler-local repair already ran
+        // inside the driver.
+        try {
+            (void)self->run_emission_driver(DrainPolicy::FlushAll);
+        } catch (const std::exception& e) {
+            util::Logger::warn("Tunnel {} coalesce-timer drain threw: {}", self->tunnel_id_,
+                               e.what());
+        } catch (...) {
+            util::Logger::warn("Tunnel {} coalesce-timer drain threw", self->tunnel_id_);
+        }
     });
 }
 

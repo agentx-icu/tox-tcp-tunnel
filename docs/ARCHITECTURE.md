@@ -195,26 +195,37 @@ Two owners exist for a backpressured frame, and exactly one owns any given one:
 | Frame | Retry owner |
 |---|---|
 | `TUNNEL_OPEN`, `TUNNEL_ACK` | the tunnel / the server's `OpenAckGate` (retained, re-sent on the SENDQ backoff in `tunnel/sendq_retry.hpp`) |
-| `TUNNEL_DATA` | the per-tunnel coalesce buffer |
-| everything else | `TunnelManager::pending_outbound_` (raw wire bytes, drained on a timer) |
+| `TUNNEL_DATA` | the per-tunnel coalesce buffer, retried on the coalesce timer |
+| `TUNNEL_CLOSE`, `TUNNEL_ERROR` (per-tunnel) | the per-tunnel emission driver (`run_emission_driver`): CLOSE via `CloseFrameState`, ERROR via the terminal-ERROR slot, each retained and retried on the dedicated SENDQ backoff (issue #24 slice 3) |
+| everything else — `PING`, `PONG`, `INFO_*`, `RESUME_*`, and a *manager-originated* `TUNNEL_ERROR` (an unknown-tunnel reply with no local `TunnelImpl`) | `TunnelManager::pending_outbound_` (raw wire bytes, drained on a timer) |
 
 The manager queue carries no tunnel identity or generation, which is why the
-handshake frames were moved off it. All four production tunnel paths (the
-client's forward, SOCKS5 and pipe tunnels, and the server's target tunnel) are
-wired from one place, `app::detail::make_tunnel_senders()`.
+handshake frames — and, since issue #24 slice 3, the identity-bearing terminal
+frames CLOSE and ERROR — were moved off it: parking their raw bytes let a
+parked CLOSE drain after a directly-accepted ERROR (wire order ERROR,CLOSE),
+the ordering hazard the single emission driver exists to prevent. Only
+`TunnelImpl`-originated terminal frames are driver-owned; a manager-originated
+ERROR carries an id with no local tunnel object, so it stays on the queue. All
+four production tunnel paths (the client's forward, SOCKS5 and pipe tunnels,
+and the server's target tunnel) are wired from one place,
+`app::detail::make_tunnel_senders()`.
 
 **Outbound FIFO barrier.** A per-tunnel send goes straight to toxcore, bypassing
 `TunnelManager::send_frame()`, so it must consult
 `TunnelManager::outbound_queue_busy()` *before* sending — otherwise a new
-`TUNNEL_OPEN` for a recycled id can be accepted ahead of the old, still-parked
-`TUNNEL_CLOSE` for that same id, and the CLOSE then kills the new tunnel. The
-barrier covers frames already parked *and* one popped by the drain and still
-inside the transport call. It is applied to `TUNNEL_OPEN` and `TUNNEL_ACK` only;
-`TUNNEL_DATA` is ordered behind them transitively (it cannot flow before the
-tunnel is `Connected`), and the still-parked control frames keep their existing
-best-effort ordering until they too move to driver ownership. The guarantee is
-causal, not total: the check releases `pending_mutex_` before calling toxcore, so
-a frame parked by an unrelated thread in that gap can still be overtaken.
+`TUNNEL_OPEN` for a recycled id can be accepted ahead of an older frame still
+parked (or mid-drain) in the manager queue for that same id, and the stale
+frame then disturbs the new tunnel. (CLOSE/ERROR no longer park at all since
+issue #24 slice 3 — they are driver-owned and retained in place — so this
+recycled-id hazard now only concerns the frame types still on the manager
+queue.) The barrier covers frames already parked *and* one popped by the drain
+and still inside the transport call. It is applied to `TUNNEL_OPEN` and
+`TUNNEL_ACK` only; `TUNNEL_DATA` is ordered behind them transitively (it cannot
+flow before the tunnel is `Connected`), and the still-parked control frames
+keep their existing best-effort ordering until they too move to driver
+ownership. The guarantee is causal, not total: the check releases
+`pending_mutex_` before calling toxcore, so a frame parked by an unrelated
+thread in that gap can still be overtaken.
 
 Design rationale and the remaining slices: `docs/design/outbound-send-driver.md`.
 
@@ -577,25 +588,28 @@ Key properties:
   the unacked byte count is restored and a short ACK retry timer is armed.
   This matters when the receiver's TCP queue has already drained: without the
   timer there may be no later writable callback to reopen the sender's window.
-- Control frames routed through `TunnelManager::send_frame` (notably
-  `TUNNEL_OPEN_ACK` on the server side, plus `PING`/`PONG`) get the same
-  treatment via `TunnelManager::pending_outbound_`: on toxcore SENDQ-full,
-  the serialized frame is parked FIFO and a 20 ms drain timer retries until
-  it lands. Without this, a burst of concurrent `TUNNEL_OPEN`s could silently
-  lose `TUNNEL_OPEN_ACK`s and wedge the client peer in `Connecting` forever
-  (the v0.4.5 SENDQ-loss bug). The queue is capped at 4096 frames per
-  manager; exceeding the cap is the only path that surfaces `send_frame` →
-  `false` to the caller.
-- The per-tunnel `on_send_to_tox` callback path (`TUNNEL_OPEN` from a client
-  opening a tunnel, `TUNNEL_CLOSE` emitted by either side after the local
-  TCP socket FIN's) routes through `tox_adapter_->send_lossless_packet`
-  directly — but on SENDQ-full failure it forwards the (non-DATA) frame to
-  `TunnelManager::queue_outbound_for_retry`, the same drain queue described
-  above. `TUNNEL_DATA` frames keep using the per-tunnel coalesce buffer's
-  retry-on-timer mechanism rather than double-queueing into the manager;
-  the frame-type byte at offset 0 is used to discriminate. Without this,
-  a `TUNNEL_CLOSE` lost to SENDQ-full would leave the peer's tunnel hung
-  in `Disconnecting` (the bidirectional-bulk-transfer close-handshake hang).
+- Manager-owned control frames (`PING`/`PONG`, `INFO_*`, `RESUME_*`, and a
+  manager-originated `TUNNEL_ERROR`) get parked via
+  `TunnelManager::pending_outbound_`: on toxcore SENDQ-full the serialized
+  frame is parked FIFO and a 20 ms drain timer retries until it lands. The
+  queue is capped at 4096 frames per manager; exceeding the cap is the only
+  path that surfaces `send_frame` → `false` to the caller. The server's
+  `TUNNEL_OPEN_ACK` is NOT on this queue — it is retained and re-sent by the
+  `OpenAckGate` on the SENDQ backoff, the fix for the v0.4.5 bug where a burst
+  of concurrent `TUNNEL_OPEN`s could silently lose `TUNNEL_OPEN_ACK`s and wedge
+  the client peer in `Connecting` forever.
+- The per-tunnel `on_send_to_tox` callback path routes through
+  `tox_adapter_->send_lossless_packet` directly. On SENDQ-full failure
+  `route_sendq_full()` (frame-type byte at offset 0) decides ownership:
+  `TUNNEL_OPEN`, `TUNNEL_ACK`, `TUNNEL_DATA`, `TUNNEL_CLOSE` and `TUNNEL_ERROR`
+  are driver-owned — their backpressure is returned to the caller verbatim and
+  the per-tunnel driver retains/retries them with their identity intact (issue
+  #24 slice 3) — while the remaining control frames are forwarded to
+  `TunnelManager::queue_outbound_for_retry`. Keeping CLOSE/ERROR driver-owned
+  is what forbids a parked CLOSE draining after a directly-accepted ERROR (wire
+  order ERROR,CLOSE); a `TUNNEL_CLOSE` lost to SENDQ-full would otherwise also
+  leave the peer's tunnel hung in `Disconnecting` (the bidirectional-bulk-
+  transfer close-handshake hang).
 - TCP close is directional. Local EOF does **not** emit `TUNNEL_CLOSE`
   until both `pending_tcp_input_` and the coalesce buffer have drained
   into ordered Tox DATA frames; peer `TUNNEL_CLOSE` maps to
