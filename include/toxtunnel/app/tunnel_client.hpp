@@ -98,8 +98,16 @@ using LosslessPacketSendFn = std::function<bool(uint32_t, const uint8_t*, std::s
 ///   // ... run until shutdown ...
 ///   client.stop();
 /// @endcode
+// Grants tests access to the private resume machinery (issue #31) without a
+// live toxcore link: install a capture sender, seed tunnels/tokens/generation
+// against real TunnelManager/TunnelImpl objects, and drive the resume handlers
+// directly. Defined only in the test binary.
+class TunnelResumeTestAccess;
+
 class TunnelClient {
    public:
+    friend class TunnelResumeTestAccess;
+
     TunnelClient();
     ~TunnelClient();
 
@@ -326,6 +334,12 @@ class TunnelClient {
     };
     std::unordered_map<std::uint16_t, ResumeToken> resume_tokens_;
     mutable std::mutex resume_tokens_mutex_;
+
+    /// Seam for sending a serialized RESUME_REQUEST (issue #31 testability).
+    /// initialize() wires this to the toxcore lossless send; a test installs a
+    /// capture via TunnelResumeTestAccess to drive send_resume_requests()
+    /// without toxcore. Args: friend number, prefixed packet bytes.
+    std::function<void(std::uint32_t, const std::vector<std::uint8_t>&)> resume_request_sender_;
 
     /// The friend the inbound routing path is currently pinned to (issue #30).
     /// Touched ONLY on `inbound_strand_`: the switch repins it together with

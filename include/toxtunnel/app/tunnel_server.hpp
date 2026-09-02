@@ -595,8 +595,14 @@ struct OpenFailureReason {
 ///   // ... server runs until stop() is called ...
 ///   server.stop();
 /// @endcode
+// Grants tests access to the private resume machinery (issue #31) without a
+// live toxcore link. Defined only in the test binary.
+class TunnelServerResumeTestAccess;
+
 class TunnelServer {
    public:
+    friend class TunnelServerResumeTestAccess;
+
     TunnelServer();
     ~TunnelServer();
 
@@ -885,6 +891,12 @@ class TunnelServer {
     };
     /// friend_number -> held manager (resume hold). Guarded by managers_mutex_.
     std::unordered_map<uint32_t, HeldManager> held_managers_;
+
+    /// Seam for sending a serialized RESUME_ACK (issue #31 testability). Null in
+    /// production (send_resume_ack falls back to the toxcore lossless send); a
+    /// test installs a capture to drive handle_resume_request() without
+    /// toxcore. Args: friend number, prefixed packet bytes.
+    std::function<void(std::uint32_t, const std::vector<std::uint8_t>&)> resume_ack_sender_;
 
     /// Protects managers_ map AND held_managers_. Recursive to avoid
     /// self-deadlock when callbacks (e.g., on_disconnect) re-enter while the

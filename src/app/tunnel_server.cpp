@@ -2150,7 +2150,14 @@ void TunnelServer::send_resume_ack(uint32_t friend_number, uint16_t tunnel_id,
     packet.reserve(1 + wire.size());
     packet.push_back(kLosslessPacketByte);
     packet.insert(packet.end(), wire.begin(), wire.end());
-    (void)tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size());
+    // Seam (issue #31 testability): production sends through toxcore; a test
+    // installs a capture via TunnelResumeTestAccess to drive
+    // handle_resume_request() without toxcore.
+    if (resume_ack_sender_) {
+        resume_ack_sender_(friend_number, packet);
+    } else {
+        (void)tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size());
+    }
 }
 
 void TunnelServer::handle_resume_request(uint32_t friend_number,

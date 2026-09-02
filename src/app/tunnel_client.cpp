@@ -945,6 +945,13 @@ void TunnelClient::setup_tunnel_manager() {
     strand_route_friend_ = server_friend_number_.load(std::memory_order_acquire);
     install_manager_send_handler(strand_route_friend_);
 
+    // Resume-request send seam (issue #31 testability): production sends the
+    // serialized RESUME_REQUEST through toxcore; a test installs a capture via
+    // TunnelResumeTestAccess to drive send_resume_requests() without toxcore.
+    resume_request_sender_ = [this](std::uint32_t fn, const std::vector<std::uint8_t>& packet) {
+        (void)tox_adapter_->send_lossless_packet(fn, packet.data(), packet.size());
+    };
+
     // Tunnel closed callback
     tunnel_mgr_->set_on_tunnel_closed(
         [](uint16_t tunnel_id) { util::Logger::debug("Tunnel {} closed", tunnel_id); });
@@ -1312,7 +1319,9 @@ void TunnelClient::send_resume_requests() {
         packet.reserve(1 + wire.size());
         packet.push_back(tunnel::kLosslessPacketByte);
         packet.insert(packet.end(), wire.begin(), wire.end());
-        (void)tox_adapter_->send_lossless_packet(fn, packet.data(), packet.size());
+        if (resume_request_sender_) {
+            resume_request_sender_(fn, packet);
+        }
         util::MetricsRegistry::instance().inc_resume_attempts();
         util::Logger::info("Sent RESUME_REQUEST for tunnel {} (recv={} send={})", id,
                            req.last_local_recv_offset, req.last_local_send_offset);
