@@ -3056,10 +3056,10 @@ TEST(ClaimTerminalIsAtomicTest, AnObserverCannotSampleTheStateBetweenClaimAndObl
                 saw_premature_release.store(true, std::memory_order_release);
             }
             probes.fetch_add(1, std::memory_order_acq_rel);
-            // Wake the claimant as soon as the quota is met. Taking the
-            // rendezvous mutex here is what gives the notification a
-            // happens-before edge with the claimant's predicate check.
             {
+                // Wake the claimant as soon as the quota is met. Taking the
+                // rendezvous mutex here is what gives the notification a
+                // happens-before edge with the claimant's predicate check.
                 std::lock_guard<std::mutex> rendezvous(rendezvous_mutex);
             }
             rendezvous_cv.notify_all();
