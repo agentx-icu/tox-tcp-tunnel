@@ -203,6 +203,13 @@ class TunnelClient {
     /// Stop the client from a callback without blocking the current thread.
     void request_stop();
 
+    /// (Re)install the TunnelManager send handler pinned to @p friend_number
+    /// (issue #30). Called once at initialize and again on every failover
+    /// switch (after the pending queue is cleared), so a pending-queue drain
+    /// that snapshotted the previous handler cannot stream an old-session frame
+    /// to the newly-active server.
+    void install_manager_send_handler(std::uint32_t friend_number);
+
     /// H-07 resume: after the active server reconnects, send a
     /// TUNNEL_RESUME_REQUEST for every still-Connected tunnel so the server can
     /// reattach the held tunnel and reconcile byte offsets. A no-op on the
@@ -312,9 +319,35 @@ class TunnelClient {
     struct ResumeToken {
         std::uint64_t generation{0};
         std::weak_ptr<tunnel::TunnelImpl> tunnel;
+        /// When an unanswered RESUME_REQUEST is force-settled (issue #28): a
+        /// lost ACK would otherwise leave the tunnel awaiting a reattach that
+        /// never comes until the next request round.
+        std::chrono::steady_clock::time_point deadline{};
     };
     std::unordered_map<std::uint16_t, ResumeToken> resume_tokens_;
     mutable std::mutex resume_tokens_mutex_;
+
+    /// The friend the inbound routing path is currently pinned to (issue #30).
+    /// Touched ONLY on `inbound_strand_`: the switch repins it together with
+    /// the manager send handler in one strand task, and the inbound routing
+    /// gate reads it in another. Because both run on the strand they are
+    /// serialized, so a frame that passes the gate is guaranteed to reply
+    /// through the handler pinned to the same friend — no lock is held across
+    /// the (Tox-thread-blocking) reply send. Not guarded by a mutex; the strand
+    /// is the synchronization. Initialised in initialize() before the strand
+    /// runs.
+    std::uint32_t strand_route_friend_{0};
+    /// Single earliest-deadline timer driving RESUME_ACK response deadlines
+    /// (issue #28). Armed/rearmed under `resume_tokens_mutex_`.
+    std::unique_ptr<asio::steady_timer> resume_deadline_timer_;
+
+    /// Arm `resume_deadline_timer_` for the earliest outstanding token deadline
+    /// (or cancel it when none remain). Caller must hold `resume_tokens_mutex_`.
+    void arm_resume_deadline_timer_locked();
+
+    /// Timer handler: force-settle every tunnel whose RESUME_ACK deadline has
+    /// passed and consume its token, then rearm for the next.
+    void on_resume_deadline();
 
     /// Background timer driving the failover state machine.
     std::unique_ptr<asio::steady_timer> failover_timer_;
@@ -323,6 +356,11 @@ class TunnelClient {
     /// don't burn CPU but fine enough that the configured timeouts are
     /// honoured within a couple of seconds.
     static constexpr std::chrono::seconds kFailoverTickInterval{1};
+
+    /// How long the client waits for a TUNNEL_RESUME_ACK before force-settling
+    /// the tunnel (issue #28). Comfortably above a Tox round-trip; a lost ACK
+    /// should not strand a tunnel awaiting reattach beyond this.
+    static constexpr std::chrono::seconds kResumeResponseDeadline{10};
 
     /// Re-arm the periodic failover state machine tick. No-op if the
     /// io_context is gone or the client is shutting down.

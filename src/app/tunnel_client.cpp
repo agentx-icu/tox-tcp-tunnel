@@ -439,6 +439,13 @@ void TunnelClient::stop() {
     if (connectivity_log_timer_) {
         util::cancel_timer_noexcept(*connectivity_log_timer_);
     }
+    {
+        std::lock_guard<std::mutex> lock(resume_tokens_mutex_);
+        resume_tokens_.clear();
+        if (resume_deadline_timer_) {
+            util::cancel_timer_noexcept(*resume_deadline_timer_);
+        }
+    }
     if (socks5_listener_) {
         step("socks5_listener stop", [this] { socks5_listener_->stop(); });
     }
@@ -474,6 +481,7 @@ void TunnelClient::stop() {
     info_refresh_timer_.reset();
     failover_timer_.reset();
     connectivity_log_timer_.reset();
+    resume_deadline_timer_.reset();
     socks5_listener_.reset();
     {
         std::lock_guard<std::mutex> lock(pipe_mutex_);
@@ -825,42 +833,42 @@ void TunnelClient::setup_tox_callbacks() {
     // waiting on our frame handlers (whose tail eventually calls
     // TcpConnection::write — itself another post). Costs one extra vector
     // copy of the inbound packet.
-    tox_adapter_->set_on_lossless_packet([this](uint32_t friend_number, const uint8_t* data,
-                                                std::size_t length) {
-        // S15 / 2026-05-20 follow-up: filter + capture sender identity
-        // atomically under endpoints_mutex_. A simple "is this the
-        // current active friend_number" check, followed by a later
-        // server_tox_id_snapshot(), would race with switch_active_endpoint
-        // and misattribute the inbound INFO_REPLY to the freshly-promoted
-        // server's record.
-        std::string sender_tox_id;
-        std::uint64_t captured_generation = 0;
-        {
-            std::lock_guard<std::mutex> lock(endpoints_mutex_);
-            if (active_index_ >= endpoints_.size() ||
-                endpoints_[active_index_].friend_number != friend_number) {
-                // Stale packet from a freshly-demoted fallback, or an
-                // unexpected friend. Either way, ignore.
-                util::Logger::debug(
-                    "Received lossless packet from non-active friend {} (active idx {})",
-                    friend_number, active_index_);
+    tox_adapter_->set_on_lossless_packet(
+        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) {
+            // S15 / 2026-05-20 follow-up: filter + capture sender identity
+            // atomically under endpoints_mutex_. A simple "is this the
+            // current active friend_number" check, followed by a later
+            // server_tox_id_snapshot(), would race with switch_active_endpoint
+            // and misattribute the inbound INFO_REPLY to the freshly-promoted
+            // server's record.
+            std::string sender_tox_id;
+            std::uint64_t captured_generation = 0;
+            {
+                std::lock_guard<std::mutex> lock(endpoints_mutex_);
+                if (active_index_ >= endpoints_.size() ||
+                    endpoints_[active_index_].friend_number != friend_number) {
+                    // Stale packet from a freshly-demoted fallback, or an
+                    // unexpected friend. Either way, ignore.
+                    util::Logger::debug(
+                        "Received lossless packet from non-active friend {} (active idx {})",
+                        friend_number, active_index_);
+                    return;
+                }
+                sender_tox_id = endpoints_[active_index_].tox_id_hex;
+                // Capture the resume-session generation atomically with the
+                // active-friend check (issue #28): a RESUME_ACK dispatched from
+                // the strand after a later switch/reconnect bump is stale.
+                captured_generation = resume_session_generation_;
+            }
+            if (length < 2) {
+                util::Logger::warn("Lossless packet too short ({} bytes)", length);
                 return;
             }
-            sender_tox_id = endpoints_[active_index_].tox_id_hex;
-            // Capture the resume-session generation atomically with the
-            // active-friend check (issue #28): a RESUME_ACK dispatched from
-            // the strand after a later switch/reconnect bump is stale.
-            captured_generation = resume_session_generation_;
-        }
-        if (length < 2) {
-            util::Logger::warn("Lossless packet too short ({} bytes)", length);
-            return;
-        }
 
-        std::vector<uint8_t> packet(data, data + length);
-        asio::post(
-            *inbound_strand_, [this, packet = std::move(packet),
-                               sender_tox_id = std::move(sender_tox_id), captured_generation]() {
+            std::vector<uint8_t> packet(data, data + length);
+            asio::post(*inbound_strand_, [this, packet = std::move(packet),
+                                          sender_tox_id = std::move(sender_tox_id),
+                                          captured_generation, friend_number]() {
                 // Skip byte 0 (lossless packet prefix byte), deserialize from byte 1.
                 auto frame_data = std::span<const uint8_t>(packet.data() + 1, packet.size() - 1);
                 auto frame_result = tunnel::ProtocolFrame::deserialize(frame_data);
@@ -886,9 +894,31 @@ void TunnelClient::setup_tox_callbacks() {
                     return;
                 }
 
+                // Active-friend gate for the generic routing path (issue #30),
+                // evaluated on the inbound strand against strand_route_friend_.
+                // A packet admitted from the OLD active friend before a failover
+                // switch could otherwise reach here after the manager handler
+                // was repinned to the new friend, and route_frame() would reply
+                // (PONG for a PING, an unknown-tunnel TUNNEL_ERROR) via the new
+                // handler — hitting the NEW server. The switch repins the
+                // handler AND strand_route_friend_ in one strand task, so this
+                // gate and that repin are serialized by the strand: a frame
+                // that passes replies through the handler for the SAME friend.
+                //
+                // No lock is held across route_frame() (which can block on the
+                // Tox thread for the reply send), so there is no Tox-thread /
+                // app-lock inversion. Keyed on the FRIEND, not the resume
+                // generation (which also bumps on a same-friend reconnect), so
+                // a connection blip does not drop legitimately-resumed traffic.
+                if (friend_number != strand_route_friend_) {
+                    util::Logger::debug(
+                        "Dropping inbound frame from friend {}: not the strand route friend {}",
+                        friend_number, strand_route_friend_);
+                    return;
+                }
                 tunnel_mgr_->route_frame(frame_result.value());
             });
-    });
+        });
 
     // Self connection status (DHT connectivity)
     tox_adapter_->set_on_self_connection([](bool connected) {
@@ -902,28 +932,18 @@ void TunnelClient::setup_tox_callbacks() {
 
 void TunnelClient::setup_tunnel_manager() {
     // Send handler: serialize frame, prepend the lossless prefix, send via ToxAdapter.
-    // Returns the typed outcome so the manager can distinguish transient
-    // backpressure (queue + retry) from a permanent failure (drop, surface).
-    tunnel_mgr_->set_send_handler(
-        [this](const std::vector<uint8_t>& frame_data) -> tunnel::SendOutcome {
-            std::vector<uint8_t> packet;
-            packet.reserve(1 + frame_data.size());
-            packet.push_back(tunnel::kLosslessPacketByte);
-            packet.insert(packet.end(), frame_data.begin(), frame_data.end());
-
-            const auto outcome = tox_adapter_->send_lossless_packet_typed(
-                server_friend_number_.load(std::memory_order_acquire), packet.data(),
-                packet.size());
-            switch (outcome) {
-                case tox::ToxAdapter::LosslessSendOutcome::Sent:
-                    return tunnel::SendOutcome::Sent;
-                case tox::ToxAdapter::LosslessSendOutcome::SendqFull:
-                    return tunnel::SendOutcome::SendqFull;
-                case tox::ToxAdapter::LosslessSendOutcome::PermanentFail:
-                    return tunnel::SendOutcome::PermanentFail;
-            }
-            return tunnel::SendOutcome::PermanentFail;
-        });
+    // Route-pinned to the active friend (issue #30). Capturing the friend
+    // number by value — rather than reading server_friend_number_ per send —
+    // means a pending-queue drain that snapshotted this handler keeps sending
+    // to the friend it was queued for even if a failover switch reinstalls the
+    // handler for the new friend mid-drain. switch_active_endpoint reinstalls
+    // it (after clearing the queue) so new-session frames target the new
+    // server. Returns the typed outcome so the manager can distinguish
+    // transient backpressure (queue + retry) from a permanent failure.
+    // Safe to set directly here: the io_context / inbound strand is not
+    // running yet, so there is no concurrent strand access (issue #30).
+    strand_route_friend_ = server_friend_number_.load(std::memory_order_acquire);
+    install_manager_send_handler(strand_route_friend_);
 
     // Tunnel closed callback
     tunnel_mgr_->set_on_tunnel_closed(
@@ -1199,6 +1219,34 @@ void TunnelClient::request_stop() {
     stop_cv_.notify_all();
 }
 
+void TunnelClient::install_manager_send_handler(std::uint32_t friend_number) {
+    if (!tunnel_mgr_) {
+        return;
+    }
+    tunnel_mgr_->set_send_handler(
+        [this, friend_number](const std::vector<uint8_t>& frame_data) -> tunnel::SendOutcome {
+            std::vector<uint8_t> packet;
+            packet.reserve(1 + frame_data.size());
+            packet.push_back(tunnel::kLosslessPacketByte);
+            packet.insert(packet.end(), frame_data.begin(), frame_data.end());
+
+            // friend_number is captured by value (issue #30): a drain that
+            // snapshotted this handler sends to the friend it was queued for,
+            // not whatever endpoint is now active.
+            const auto outcome = tox_adapter_->send_lossless_packet_typed(
+                friend_number, packet.data(), packet.size());
+            switch (outcome) {
+                case tox::ToxAdapter::LosslessSendOutcome::Sent:
+                    return tunnel::SendOutcome::Sent;
+                case tox::ToxAdapter::LosslessSendOutcome::SendqFull:
+                    return tunnel::SendOutcome::SendqFull;
+                case tox::ToxAdapter::LosslessSendOutcome::PermanentFail:
+                    return tunnel::SendOutcome::PermanentFail;
+            }
+            return tunnel::SendOutcome::PermanentFail;
+        });
+}
+
 void TunnelClient::send_resume_requests() {
     if (!tunnel_mgr_ || !config_.tunnel.resume.enabled) {
         return;
@@ -1250,10 +1298,12 @@ void TunnelClient::send_resume_requests() {
 
         // Record the outstanding-resume token BEFORE sending, so a fast ACK
         // cannot arrive before the token exists (issue #28). One token per
-        // tunnel object per session.
+        // tunnel object per session, stamped with a response deadline so a
+        // lost ACK force-settles the tunnel rather than lingering.
         {
             std::lock_guard<std::mutex> lock(resume_tokens_mutex_);
-            resume_tokens_[id] = ResumeToken{generation, impl};
+            resume_tokens_[id] = ResumeToken{
+                generation, impl, std::chrono::steady_clock::now() + kResumeResponseDeadline};
         }
 
         auto frame = tunnel::ProtocolFrame::make_tunnel_resume_request(req);
@@ -1266,6 +1316,81 @@ void TunnelClient::send_resume_requests() {
         util::MetricsRegistry::instance().inc_resume_attempts();
         util::Logger::info("Sent RESUME_REQUEST for tunnel {} (recv={} send={})", id,
                            req.last_local_recv_offset, req.last_local_send_offset);
+    }
+
+    // Arm the response-deadline timer for the earliest outstanding token.
+    {
+        std::lock_guard<std::mutex> lock(resume_tokens_mutex_);
+        arm_resume_deadline_timer_locked();
+    }
+}
+
+void TunnelClient::arm_resume_deadline_timer_locked() {
+    // Caller holds resume_tokens_mutex_.
+    if (!io_ctx_) {
+        return;
+    }
+    if (resume_tokens_.empty()) {
+        if (resume_deadline_timer_) {
+            util::cancel_timer_noexcept(*resume_deadline_timer_);
+        }
+        return;
+    }
+    auto earliest = std::chrono::steady_clock::time_point::max();
+    for (const auto& [id, tok] : resume_tokens_) {
+        earliest = std::min(earliest, tok.deadline);
+    }
+    if (!resume_deadline_timer_) {
+        resume_deadline_timer_ = std::make_unique<asio::steady_timer>(io_ctx_->get_io_context());
+    }
+    resume_deadline_timer_->expires_at(earliest);
+    resume_deadline_timer_->async_wait([this](const asio::error_code& ec) {
+        if (ec) {
+            return;  // Cancelled / rearmed.
+        }
+        on_resume_deadline();
+    });
+}
+
+void TunnelClient::on_resume_deadline() {
+    const auto now = std::chrono::steady_clock::now();
+    // Collect expired tokens under the lock; act on them (force-settle) with
+    // the lock released, since close() re-enters the manager. The generation is
+    // checked per tunnel afterwards, never nesting endpoints_mutex_ inside
+    // resume_tokens_mutex_.
+    std::vector<std::pair<std::weak_ptr<tunnel::TunnelImpl>, std::uint64_t>> expired;
+    {
+        std::lock_guard<std::mutex> lock(resume_tokens_mutex_);
+        for (auto it = resume_tokens_.begin(); it != resume_tokens_.end();) {
+            if (it->second.deadline <= now) {
+                expired.emplace_back(it->second.tunnel, it->second.generation);
+                it = resume_tokens_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        arm_resume_deadline_timer_locked();
+    }
+
+    const std::uint64_t current_generation = [this] {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        return resume_session_generation_;
+    }();
+
+    for (auto& [weak, gen] : expired) {
+        if (gen != current_generation) {
+            // A switch/reconnect already invalidated this session; its own
+            // teardown owns the tunnel. Nothing to force-settle here.
+            continue;
+        }
+        auto impl = weak.lock();
+        if (!impl) {
+            continue;  // Already gone.
+        }
+        util::MetricsRegistry::instance().inc_resume_failures();
+        util::Logger::warn("Tunnel {} RESUME_ACK not received before deadline; closing",
+                           impl->tunnel_id());
+        impl->close();
     }
 }
 
@@ -1307,6 +1432,8 @@ void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack,
         const bool matches =
             it->second.generation == captured_generation && it->second.tunnel.lock() == impl;
         resume_tokens_.erase(it);  // Consume regardless: one ACK per request.
+        // The consumed token may have been the earliest deadline; rearm.
+        arm_resume_deadline_timer_locked();
         if (!matches) {
             util::Logger::debug(
                 "RESUME_ACK for tunnel {} dropped: token/object mismatch (stale or recycled id)",
@@ -1852,6 +1979,10 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
     std::string new_tox_id;
     uint32_t new_friend_number = 0;
     {
+        // ONE critical section decides the switch, publishes the new active
+        // endpoint, and dispatches the manager route repin (issue #30). Keeping
+        // it atomic avoids a racing-second-switch desync between active_index_
+        // and the strand route pin.
         std::lock_guard<std::mutex> lock(endpoints_mutex_);
         if (new_index >= endpoints_.size() || new_index == active_index_) {
             return;
@@ -1866,8 +1997,39 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
         new_tox_id = endpoints_[new_index].tox_id_hex;
         server_tox_id_hex_ = new_tox_id;
         server_online_.store(endpoints_[new_index].online, std::memory_order_release);
+        server_friend_number_.store(new_friend_number, std::memory_order_release);
+
+        // Repin the manager route ON the inbound strand — POSTED while STILL
+        // holding endpoints_mutex_. asio::post always ENQUEUES (never runs the
+        // handler inline, unlike dispatch which can when the strand is idle),
+        // so nothing runs here and it is safe under the lock. Queuing it now —
+        // before releasing the lock — orders the repin task ahead of any
+        // inbound task for a new-friend packet, because that packet's ingress
+        // must take THIS lock (to read active) before it can post, and cannot
+        // do so until we release. So new-session frames are never dropped by
+        // the gate, and the whole decision stays a single atomic critical
+        // section.
+        //
+        // Running on the strand serializes the repin with the inbound routing
+        // gate — a frame that passes the gate replies through the handler
+        // pinned to the same friend, with NO client lock held across the
+        // (Tox-thread-blocking) reply send, so there is no Tox-thread/app-lock
+        // inversion.
+        //  * clear_pending_outbound() empties the old queue (and bumps the
+        //    drain epoch), so no old-session frame streams to the new server.
+        //  * strand_route_friend_ is set together with the handler in one
+        //    strand task, keeping the gate and the reply route consistent.
+        //  * An in-flight drain is unaffected: it holds a value copy of the old
+        //    handler in its SendSnapshot and sends its one popped frame to the
+        //    old friend.
+        if (tunnel_mgr_ && inbound_strand_) {
+            asio::post(*inbound_strand_, [this, new_friend_number]() {
+                strand_route_friend_ = new_friend_number;
+                tunnel_mgr_->clear_pending_outbound();
+                install_manager_send_handler(new_friend_number);
+            });
+        }
     }
-    server_friend_number_.store(new_friend_number, std::memory_order_release);
 
     util::Logger::info("Failover: switching active server {}... -> {}... (friend {})",
                        old_id_prefix, new_id_prefix, new_friend_number);
@@ -1876,16 +2038,11 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
     // listeners will re-open new tunnels through the new server on the next
     // accepted TCP connection. (For already-established TCP connections, the
     // close propagates back to the local TCP side, which matches the
-    // "rebuild on switchover" semantics described in the spec.)
+    // "rebuild on switchover" semantics described in the spec.) close_all()
+    // runs OUTSIDE endpoints_mutex_ because it fires on_close callbacks that
+    // re-enter the client.
     info_request_sent_.store(false);
     if (tunnel_mgr_) {
-        // Drop any control frames the manager parked for the *previous*
-        // server before switching the send handler's friend_number to the
-        // new one. Without this, queued OPEN/CLOSE/ACK bytes would be
-        // replayed against the new peer, creating ghost tunnels there or
-        // tearing down the wrong remote ID (P1 finding from the 2026-05-28
-        // codex review).
-        tunnel_mgr_->clear_pending_outbound();
         tunnel_mgr_->close_all();
     }
 
