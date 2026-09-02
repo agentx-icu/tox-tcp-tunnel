@@ -719,7 +719,14 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// (OPEN, OPEN_ACK, CLOSE, ACK, PING) survive a burst-induced toxcore
     /// queue-full instead of being silently dropped. Public surface stays
     /// just `send_frame` — this is the recovery path it kicks off.
-    void drain_pending_outbound();
+    ///
+    /// @param armed_epoch  The `pending_drain_epoch_` captured when this drain
+    ///   was armed (issue #30). If the queue was invalidated in the meantime
+    ///   (`clear_pending_outbound()` bumps the epoch on a client
+    ///   disconnect/endpoint switch), the captured epoch no longer matches and
+    ///   the drain drops its work instead of sending old-session frames to a
+    ///   switched endpoint.
+    void drain_pending_outbound(std::uint64_t armed_epoch);
 
     /// Shared body of `remove_tunnel()` and `remove_tunnel_if()`.
     ///
@@ -879,6 +886,15 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// in-flight entry is therefore part of the queue for barrier purposes even
     /// though it is not in the deque. Guarded by `pending_mutex_`.
     bool pending_drain_in_flight_{false};
+    /// Session-provenance generation for the pending queue (issue #30).
+    /// Bumped under `pending_mutex_` whenever the queue is invalidated —
+    /// `clear_pending_outbound()` (client disconnect / endpoint switch) and the
+    /// destructor. A drain timer captures the epoch when it is armed and
+    /// re-validates it at entry, on every dequeue, and before requeuing a
+    /// SENDQ-full frame; a mismatch means the session that queued these frames
+    /// is gone, so the drain drops them instead of streaming old-session frames
+    /// at a switched endpoint. Guarded by `pending_mutex_`.
+    std::uint64_t pending_drain_epoch_{0};
     /// Counter for diagnostics / metrics: total frames that hit the retry path.
     std::atomic<std::uint64_t> pending_enqueued_total_{0};
     /// Counter for diagnostics / metrics: frames dropped because the queue

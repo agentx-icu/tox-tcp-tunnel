@@ -51,6 +51,7 @@ TunnelManager::~TunnelManager() {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_drain_armed_ = false;
         pending_outbound_.clear();
+        ++pending_drain_epoch_;  // Invalidate any in-flight drain (issue #30).
     }
     util::cancel_timer_noexcept(pending_drain_timer_);
     close_all();
@@ -1475,8 +1476,12 @@ void TunnelManager::arm_pending_drain_timer_locked() {
         return;
     }
     pending_drain_armed_ = true;
+    // Capture the session-provenance epoch (issue #30): the drain validates it
+    // so a queue invalidated (cleared) between arm and fire is dropped, not
+    // streamed at whatever endpoint is now current.
+    const std::uint64_t armed_epoch = pending_drain_epoch_;
     pending_drain_timer_.expires_after(kPendingDrainDelay);
-    pending_drain_timer_.async_wait([weak](const std::error_code& ec) {
+    pending_drain_timer_.async_wait([weak, armed_epoch](const std::error_code& ec) {
         if (ec) {
             return;
         }
@@ -1484,11 +1489,11 @@ void TunnelManager::arm_pending_drain_timer_locked() {
         if (!self) {
             return;
         }
-        self->drain_pending_outbound();
+        self->drain_pending_outbound(armed_epoch);
     });
 }
 
-void TunnelManager::drain_pending_outbound() {
+void TunnelManager::drain_pending_outbound(std::uint64_t armed_epoch) {
     // One snapshot for the whole drain. close_all_local() does NOT wait for this
     // loop; the per-iteration mute re-check below is what stops it, so a drain
     // that was already running when the session was abandoned emits at most the
@@ -1513,6 +1518,17 @@ void TunnelManager::drain_pending_outbound() {
         std::vector<uint8_t> wire;
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
+            // Session-provenance re-check (issue #30): the queue was invalidated
+            // (cleared on a disconnect / endpoint switch) after this drain was
+            // armed. Whatever it holds now belongs to a session that this drain
+            // has no business streaming at the current endpoint — a stale
+            // clear_pending_outbound() already emptied the deque and bumped the
+            // epoch, so this is normally a no-op, but a frame re-queued by an
+            // in-flight pop below must not resurrect it either. Drop and stop.
+            if (armed_epoch != pending_drain_epoch_) {
+                pending_drain_armed_ = false;
+                return;
+            }
             // Re-check the mute on EVERY iteration, under the same mutex
             // close_all_local() latches it with. `handler` above is a copy
             // taken before the latch, so this is the only thing that stops a
@@ -1579,9 +1595,17 @@ void TunnelManager::drain_pending_outbound() {
 
         // SENDQ still full — push the frame back to the front of the queue
         // (preserving FIFO order with respect to any frames a concurrent
-        // send_frame() pushed to the back), and re-arm the timer.
+        // send_frame() pushed to the back), and re-arm the timer — UNLESS the
+        // session was invalidated while this frame was inside the transport
+        // (issue #30): a late requeue must not resurrect an old-session frame
+        // for a switched endpoint. Drop it and stop.
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
+            if (armed_epoch != pending_drain_epoch_) {
+                pending_dropped_total_.fetch_add(1, std::memory_order_relaxed);
+                pending_drain_armed_ = false;
+                return;
+            }
             pending_outbound_.push_front(std::move(wire));
             pending_drain_armed_ = false;
             arm_pending_drain_timer_locked();
@@ -1597,6 +1621,10 @@ void TunnelManager::clear_pending_outbound() {
         dropped = pending_outbound_.size();
         pending_outbound_.clear();
         pending_drain_armed_ = false;
+        // Session-provenance fence (issue #30): invalidate any in-flight drain
+        // armed for the queue we just emptied, so a SENDQ-full frame it is
+        // mid-transport with cannot be requeued for a switched endpoint.
+        ++pending_drain_epoch_;
     }
     // Cancel any outstanding timer so its handler bails on the next firing
     // (the handler also re-checks `pending_drain_armed_` and the queue, so

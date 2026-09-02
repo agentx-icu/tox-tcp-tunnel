@@ -283,7 +283,27 @@ void TcpListener::do_accept() {
         });
 
         if (accept_handler_) {
-            accept_handler_(std::move(conn));
+            // Contain a throwing accept handler to THIS connection (issue #29):
+            // letting it escape would reach the process-fatal asio worker
+            // boundary and stop the listener entirely. Closing the connection
+            // fires its on_closed, which decrements the active count set above,
+            // so capacity accounting stays correct; the accept loop continues.
+            try {
+                // Copy, not move: retain `conn` so it is still valid to close
+                // if the handler throws (a moved-from shared_ptr would be null).
+                accept_handler_(conn);
+            } catch (const std::exception& e) {
+                util::Logger::error("TcpListener: accept handler threw ({}); dropping connection",
+                                    e.what());
+                if (conn) {
+                    conn->force_close();
+                }
+            } catch (...) {
+                util::Logger::error("TcpListener: accept handler threw; dropping connection");
+                if (conn) {
+                    conn->force_close();
+                }
+            }
         }
 
         // Continue the accept loop.

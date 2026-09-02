@@ -229,7 +229,12 @@ void TcpConnection::deliver_peer_close_holdback() {
     util::Logger::debug("TcpConnection: replaying {} bytes read ahead of the read loop",
                         holdback.size());
     if (on_data_) {
-        on_data_(holdback.data(), holdback.size());
+        // Contain a throwing consumer as in the read loop (issue #29).
+        try {
+            on_data_(holdback.data(), holdback.size());
+        } catch (...) {
+            close_on_callback_fault("on_data (holdback replay)");
+        }
     }
 }
 
@@ -525,7 +530,18 @@ void TcpConnection::do_read() {
             }
 
             if (on_data_ && bytes_transferred > 0) {
-                on_data_(read_buffer_.data(), bytes_transferred);
+                // Contain a throwing consumer callback to THIS connection
+                // (issue #29): letting it escape would reach the process-fatal
+                // asio worker boundary and take the whole daemon down for one
+                // bad connection. Close this connection and stop reading;
+                // rearming after a throw would also leave the callback's own
+                // half-processed state inconsistent.
+                try {
+                    on_data_(read_buffer_.data(), bytes_transferred);
+                } catch (...) {
+                    close_on_callback_fault("on_data");
+                    return;
+                }
             }
 
             do_read();
@@ -713,7 +729,17 @@ void TcpConnection::do_write() {
                 // itself backpressured), keep the watermark set so the next
                 // drained frame calls again — otherwise a one-shot clear could
                 // strand the deferred ACK and stall the peer's window forever.
-                const bool flushed = on_writable_ ? on_writable_() : true;
+                bool flushed = true;
+                if (on_writable_) {
+                    // Contain a throwing writable callback to THIS connection
+                    // (issue #29), as in do_read().
+                    try {
+                        flushed = on_writable_();
+                    } catch (...) {
+                        close_on_callback_fault("on_writable");
+                        return;
+                    }
+                }
                 if (flushed) {
                     write_hit_watermark_ = false;
                 }
@@ -741,6 +767,21 @@ void TcpConnection::maybe_shutdown_send_locked() {
     } else {
         util::Logger::debug("TcpConnection: send half shutdown failed: {}", shutdown_ec.message());
         notify_error(shutdown_ec);
+    }
+}
+
+void TcpConnection::close_on_callback_fault(const char* what) noexcept {
+    try {
+        util::Logger::error("TcpConnection: {} callback threw; closing connection", what);
+    } catch (...) {
+    }
+    // Close from any live state, not only Connected: a write completion can run
+    // after close() already moved us to Disconnecting, and leaving that path
+    // un-closed would strand write_in_progress_ and the graceful close.
+    // do_close() is idempotent once Disconnected.
+    if (state_.load(std::memory_order_acquire) != ConnectionState::Disconnected) {
+        set_state(ConnectionState::Disconnecting);
+        do_close(std::make_error_code(std::errc::io_error));
     }
 }
 

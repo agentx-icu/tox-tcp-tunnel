@@ -13,6 +13,7 @@
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
+#include "toxtunnel/util/asio_timer.hpp"
 #include "toxtunnel/util/config_reload.hpp"
 #include "toxtunnel/util/logger.hpp"
 #include "toxtunnel/util/metrics.hpp"
@@ -219,7 +220,17 @@ TunnelServer::TunnelServer() = default;
 
 TunnelServer::~TunnelServer() {
     if (running_.load(std::memory_order_acquire)) {
-        stop();
+        // stop() rethrows the first shutdown-step exception to explicit
+        // callers; a destructor must not propagate (issue #29).
+        try {
+            stop();
+        } catch (const std::exception& e) {
+            try {
+                util::Logger::warn("~TunnelServer: stop() threw during teardown: {}", e.what());
+            } catch (...) {
+            }
+        } catch (...) {
+        }
     }
 }
 
@@ -462,16 +473,39 @@ void TunnelServer::stop() {
 
     util::Logger::info("TunnelServer stopping...");
 
+    // Phase isolation (issue #29): stop() is reached from ~TunnelServer, where
+    // an exception would std::terminate. Every step runs even if an earlier one
+    // throws; the first exception is remembered and rethrown at the end for an
+    // explicit caller, while the destructor swallows it.
+    std::exception_ptr first_ex;
+    const auto step = [&first_ex](const char* what, auto&& fn) noexcept {
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            try {
+                util::Logger::warn("TunnelServer::stop: {} threw: {}", what, e.what());
+            } catch (...) {
+            }
+            if (!first_ex) {
+                first_ex = std::current_exception();
+            }
+        } catch (...) {
+            if (!first_ex) {
+                first_ex = std::current_exception();
+            }
+        }
+    };
+
     // Phase 1: cancel pending async work but keep the owners alive — the
     // InspectServer/MetricsServer acceptor callbacks captured `this`, so
     // freeing them now (before io_context drains) would UAF on a
     // dispatched-but-not-yet-executed handler (S20 in the 2026-05-20
     // follow-up).
     if (inspect_server_) {
-        inspect_server_->stop();
+        step("inspect_server stop", [this] { inspect_server_->stop(); });
     }
     if (metrics_server_) {
-        metrics_server_->stop();
+        step("metrics_server stop", [this] { metrics_server_->stop(); });
     }
 
     // Close all tunnel managers (live + held-for-resume).
@@ -479,17 +513,17 @@ void TunnelServer::stop() {
         std::lock_guard lock(managers_mutex_);
         for (auto& [friend_number, manager] : managers_) {
             util::Logger::debug("Closing tunnels for friend {}", friend_number);
-            manager->close_all();
+            step("manager close_all", [&manager] { manager->close_all(); });
         }
         managers_.clear();
         // H-07: drop any managers held pending resume — cancel their prune
-        // timers and close their tunnels.
+        // timers (non-throwing) and close their tunnels.
         for (auto& [friend_number, held] : held_managers_) {
             if (held.prune_timer) {
-                held.prune_timer->cancel();
+                util::cancel_timer_noexcept(*held.prune_timer);
             }
             if (held.manager) {
-                held.manager->close_all();
+                step("held manager close_all", [&held] { held.manager->close_all(); });
             }
         }
         held_managers_.clear();
@@ -500,15 +534,17 @@ void TunnelServer::stop() {
     // still call heartbeat(), so retain the owner until stop() joins that
     // thread.
     if (watchdog_) {
-        tox_adapter_->set_watchdog(nullptr);
-        watchdog_->stop();
+        step("watchdog detach", [this] {
+            tox_adapter_->set_watchdog(nullptr);
+            watchdog_->stop();
+        });
     }
-    tox_adapter_->stop();
+    step("tox_adapter stop", [this] { tox_adapter_->stop(); });
     watchdog_.reset();
 
     // Phase 2: stop the io_context and join its workers. After this
     // returns, no async callback can run any more.
-    io_context_->stop();
+    step("io_context stop", [this] { io_context_->stop(); });
 
     // Phase 3: NOW it's safe to free the sub-servers; their callbacks
     // have all been drained.
@@ -520,6 +556,12 @@ void TunnelServer::stop() {
 
     running_.store(false, std::memory_order_release);
     util::Logger::info("TunnelServer stopped");
+
+    // Surface the first shutdown failure to an explicit stop() caller;
+    // ~TunnelServer swallows it (issue #29).
+    if (first_ex) {
+        std::rethrow_exception(first_ex);
+    }
 }
 
 bool TunnelServer::is_running() const noexcept {

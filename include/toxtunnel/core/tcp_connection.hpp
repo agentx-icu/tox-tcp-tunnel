@@ -329,6 +329,13 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// Perform the final socket close and invoke the disconnect callback.
     void do_close(const std::error_code& ec);
 
+    /// Close this connection because a consumer callback (on_data_ /
+    /// on_writable_) threw (issue #29). Contains the fault to this connection
+    /// so it cannot escape the asio completion handler and reach the
+    /// process-fatal worker boundary. Must be called ON the strand; closes from
+    /// any non-Disconnected state (do_close is idempotent once Disconnected).
+    void close_on_callback_fault(const char* what) noexcept;
+
     /// Shutdown the TCP send half if requested and all queued writes drained.
     void maybe_shutdown_send_locked();
 

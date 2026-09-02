@@ -9,6 +9,7 @@
 #include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
+#include "toxtunnel/util/asio_timer.hpp"
 #include "toxtunnel/util/config_reload.hpp"
 #include "toxtunnel/util/logger.hpp"
 #include "toxtunnel/util/metrics.hpp"
@@ -70,7 +71,17 @@ TunnelClient::TunnelClient() = default;
 
 TunnelClient::~TunnelClient() {
     if (running_) {
-        stop();
+        // stop() now rethrows the first shutdown-step exception to explicit
+        // callers; a destructor must not propagate (issue #29).
+        try {
+            stop();
+        } catch (const std::exception& e) {
+            try {
+                util::Logger::warn("~TunnelClient: stop() threw during teardown: {}", e.what());
+            } catch (...) {
+            }
+        } catch (...) {
+        }
     }
 }
 
@@ -381,6 +392,32 @@ void TunnelClient::stop() {
 
     util::Logger::info("Stopping TunnelClient...");
 
+    // Phase isolation (issue #29): stop() is reached from ~TunnelClient, where
+    // an exception would std::terminate, and stop_started_ is already latched
+    // so a throw partway leaves the client half torn down with no retry. Every
+    // shutdown step runs even if an earlier one throws; the first exception is
+    // remembered and rethrown at the very end (after io_ctx_->stop() and the
+    // running_ clear), so an explicit stop() caller still learns of it while a
+    // destructor caller — see ~TunnelClient — swallows it.
+    std::exception_ptr first_ex;
+    const auto step = [&first_ex](const char* what, auto&& fn) noexcept {
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            try {
+                util::Logger::warn("TunnelClient::stop: {} threw: {}", what, e.what());
+            } catch (...) {
+            }
+            if (!first_ex) {
+                first_ex = std::current_exception();
+            }
+        } catch (...) {
+            if (!first_ex) {
+                first_ex = std::current_exception();
+            }
+        }
+    };
+
     // Phase 1: signal everything to wind down. We only *cancel* pending
     // async work here; we do NOT yet free the owners. Several of our
     // sub-servers (InspectServer / MetricsServer / Socks5Listener)
@@ -389,22 +426,24 @@ void TunnelClient::stop() {
     // hadn't run yet, freeing the server out from under it would UAF.
     // (S20 in the 2026-05-20 follow-up.)
     if (inspect_server_) {
-        inspect_server_->stop();
+        step("inspect_server stop", [this] { inspect_server_->stop(); });
     }
+    // Timer cancels are non-throwing (util::cancel_timer_noexcept); a throwing
+    // cancel here would otherwise skip every later phase.
     if (info_refresh_timer_) {
-        info_refresh_timer_->cancel();
+        util::cancel_timer_noexcept(*info_refresh_timer_);
     }
     if (failover_timer_) {
-        failover_timer_->cancel();
+        util::cancel_timer_noexcept(*failover_timer_);
     }
     if (connectivity_log_timer_) {
-        connectivity_log_timer_->cancel();
+        util::cancel_timer_noexcept(*connectivity_log_timer_);
     }
     if (socks5_listener_) {
-        socks5_listener_->stop();
+        step("socks5_listener stop", [this] { socks5_listener_->stop(); });
     }
     for (auto& listener : listeners_) {
-        listener->stop();
+        step("listener stop", [&listener] { listener->stop(); });
     }
     {
         std::shared_ptr<StdioPipeBridge> pb;
@@ -413,21 +452,21 @@ void TunnelClient::stop() {
             pb = pipe_bridge_;
         }
         if (pb) {
-            pb->stop();
+            step("pipe_bridge stop", [&pb] { pb->stop(); });
         }
     }
     if (metrics_server_) {
-        metrics_server_->stop();
+        step("metrics_server stop", [this] { metrics_server_->stop(); });
     }
 
     // Phase 2: close all tunnels and stop the Tox thread. Both of these
     // post final work onto the io_context; we want it drained too.
-    tunnel_mgr_->close_all();
-    tox_adapter_->stop();
+    step("close_all", [this] { tunnel_mgr_->close_all(); });
+    step("tox_adapter stop", [this] { tox_adapter_->stop(); });
 
     // Phase 3: stop the io_context and join all workers. After this
     // returns, no callback can possibly run any more.
-    io_ctx_->stop();
+    step("io_ctx stop", [this] { io_ctx_->stop(); });
 
     // Phase 4: NOW it's safe to free the sub-servers. Any pending
     // async_accept callback was drained in phase 3.
@@ -446,6 +485,13 @@ void TunnelClient::stop() {
     stop_cv_.notify_all();
 
     util::Logger::info("TunnelClient stopped");
+
+    // All phases ran; surface the first failure to an explicit stop() caller.
+    // ~TunnelClient calls stop() inside a try/catch so a destructor never
+    // propagates (issue #29).
+    if (first_ex) {
+        std::rethrow_exception(first_ex);
+    }
 }
 
 bool TunnelClient::is_running() const noexcept {
@@ -651,10 +697,17 @@ util::Expected<TunnelClient::ReloadResult, std::string> TunnelClient::reload(
         std::promise<void> done;
         auto fut = done.get_future();
         asio::post(io_ctx_->get_io_context(), [&apply, &done]() {
-            apply();
-            done.set_value();
+            // A throwing apply() must fulfil the promise (issue #29): otherwise
+            // fut.get()/wait() below blocks the reload caller forever. Forward
+            // the exception so it surfaces to that caller instead.
+            try {
+                apply();
+                done.set_value();
+            } catch (...) {
+                done.set_exception(std::current_exception());
+            }
         });
-        fut.wait();
+        fut.get();  // Propagates any exception the posted apply() forwarded.
     } else {
         // Not running yet (no io threads to serialize against): apply inline.
         apply();
@@ -715,6 +768,10 @@ void TunnelClient::setup_tox_callbacks() {
             if (is_active) {
                 server_online_.store(connected, std::memory_order_release);
                 util::MetricsRegistry::instance().set_friends_online(connected ? 1 : 0);
+                // The active session ended (disconnect) or a new one began
+                // (reconnect); either way ids may be reused, so invalidate any
+                // outstanding RESUME_ACK from the prior session (issue #28).
+                ++resume_session_generation_;
             }
         }
 
@@ -768,36 +825,42 @@ void TunnelClient::setup_tox_callbacks() {
     // waiting on our frame handlers (whose tail eventually calls
     // TcpConnection::write — itself another post). Costs one extra vector
     // copy of the inbound packet.
-    tox_adapter_->set_on_lossless_packet(
-        [this](uint32_t friend_number, const uint8_t* data, std::size_t length) {
-            // S15 / 2026-05-20 follow-up: filter + capture sender identity
-            // atomically under endpoints_mutex_. A simple "is this the
-            // current active friend_number" check, followed by a later
-            // server_tox_id_snapshot(), would race with switch_active_endpoint
-            // and misattribute the inbound INFO_REPLY to the freshly-promoted
-            // server's record.
-            std::string sender_tox_id;
-            {
-                std::lock_guard<std::mutex> lock(endpoints_mutex_);
-                if (active_index_ >= endpoints_.size() ||
-                    endpoints_[active_index_].friend_number != friend_number) {
-                    // Stale packet from a freshly-demoted fallback, or an
-                    // unexpected friend. Either way, ignore.
-                    util::Logger::debug(
-                        "Received lossless packet from non-active friend {} (active idx {})",
-                        friend_number, active_index_);
-                    return;
-                }
-                sender_tox_id = endpoints_[active_index_].tox_id_hex;
-            }
-            if (length < 2) {
-                util::Logger::warn("Lossless packet too short ({} bytes)", length);
+    tox_adapter_->set_on_lossless_packet([this](uint32_t friend_number, const uint8_t* data,
+                                                std::size_t length) {
+        // S15 / 2026-05-20 follow-up: filter + capture sender identity
+        // atomically under endpoints_mutex_. A simple "is this the
+        // current active friend_number" check, followed by a later
+        // server_tox_id_snapshot(), would race with switch_active_endpoint
+        // and misattribute the inbound INFO_REPLY to the freshly-promoted
+        // server's record.
+        std::string sender_tox_id;
+        std::uint64_t captured_generation = 0;
+        {
+            std::lock_guard<std::mutex> lock(endpoints_mutex_);
+            if (active_index_ >= endpoints_.size() ||
+                endpoints_[active_index_].friend_number != friend_number) {
+                // Stale packet from a freshly-demoted fallback, or an
+                // unexpected friend. Either way, ignore.
+                util::Logger::debug(
+                    "Received lossless packet from non-active friend {} (active idx {})",
+                    friend_number, active_index_);
                 return;
             }
+            sender_tox_id = endpoints_[active_index_].tox_id_hex;
+            // Capture the resume-session generation atomically with the
+            // active-friend check (issue #28): a RESUME_ACK dispatched from
+            // the strand after a later switch/reconnect bump is stale.
+            captured_generation = resume_session_generation_;
+        }
+        if (length < 2) {
+            util::Logger::warn("Lossless packet too short ({} bytes)", length);
+            return;
+        }
 
-            std::vector<uint8_t> packet(data, data + length);
-            asio::post(*inbound_strand_, [this, packet = std::move(packet),
-                                          sender_tox_id = std::move(sender_tox_id)]() {
+        std::vector<uint8_t> packet(data, data + length);
+        asio::post(
+            *inbound_strand_, [this, packet = std::move(packet),
+                               sender_tox_id = std::move(sender_tox_id), captured_generation]() {
                 // Skip byte 0 (lossless packet prefix byte), deserialize from byte 1.
                 auto frame_data = std::span<const uint8_t>(packet.data() + 1, packet.size() - 1);
                 auto frame_result = tunnel::ProtocolFrame::deserialize(frame_data);
@@ -818,14 +881,14 @@ void TunnelClient::setup_tox_callbacks() {
                 // routed to a tunnel by the manager). Intercept it here.
                 if (frame_result.value().type() == tunnel::FrameType::TUNNEL_RESUME_ACK) {
                     if (auto ack = frame_result.value().as_tunnel_resume_ack()) {
-                        handle_resume_ack(*ack);
+                        handle_resume_ack(*ack, captured_generation);
                     }
                     return;
                 }
 
                 tunnel_mgr_->route_frame(frame_result.value());
             });
-        });
+    });
 
     // Self connection status (DHT connectivity)
     tox_adapter_->set_on_self_connection([](bool connected) {
@@ -1140,7 +1203,25 @@ void TunnelClient::send_resume_requests() {
     if (!tunnel_mgr_ || !config_.tunnel.resume.enabled) {
         return;
     }
-    const uint32_t fn = server_friend_number_.load(std::memory_order_acquire);
+    // Snapshot the session identity (issue #28): the friend to send to AND the
+    // generation the outstanding tokens are stamped with, atomically, so a
+    // switch cannot interleave between reading the friend and stamping tokens.
+    uint32_t fn = 0;
+    std::uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        if (active_index_ >= endpoints_.size()) {
+            return;
+        }
+        fn = endpoints_[active_index_].friend_number;
+        generation = resume_session_generation_;
+    }
+    // Fresh session: drop stale tokens from a prior generation before recording
+    // this round's.
+    {
+        std::lock_guard<std::mutex> lock(resume_tokens_mutex_);
+        resume_tokens_.clear();
+    }
     // Snapshot ids, then look up each tunnel without holding the manager lock
     // across the (cross-thread) send.
     for (uint16_t id : tunnel_mgr_->get_tunnel_ids()) {
@@ -1167,6 +1248,14 @@ void TunnelClient::send_resume_requests() {
         req.host = impl->target_host();
         req.target_port = impl->target_port();
 
+        // Record the outstanding-resume token BEFORE sending, so a fast ACK
+        // cannot arrive before the token exists (issue #28). One token per
+        // tunnel object per session.
+        {
+            std::lock_guard<std::mutex> lock(resume_tokens_mutex_);
+            resume_tokens_[id] = ResumeToken{generation, impl};
+        }
+
         auto frame = tunnel::ProtocolFrame::make_tunnel_resume_request(req);
         auto wire = frame.serialize();
         std::vector<uint8_t> packet;
@@ -1180,13 +1269,52 @@ void TunnelClient::send_resume_requests() {
     }
 }
 
-void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack) {
+void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack,
+                                     std::uint64_t captured_generation) {
+    // Session-generation gate (issue #28): a switch/reconnect that bumped the
+    // generation while this ACK sat in the strand makes it stale — the id it
+    // names may have been reused by a newer session. Drop it.
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        if (captured_generation != resume_session_generation_) {
+            util::Logger::debug(
+                "RESUME_ACK for tunnel {} dropped: session generation changed ({} != {})",
+                ack.new_tunnel_id, captured_generation, resume_session_generation_);
+            return;
+        }
+    }
+
     auto impl = std::dynamic_pointer_cast<tunnel::TunnelImpl>(
         tunnel_mgr_ ? tunnel_mgr_->get_tunnel(ack.new_tunnel_id) : nullptr);
     if (!impl) {
         util::Logger::debug("RESUME_ACK for unknown/closed tunnel {}", ack.new_tunnel_id);
         return;
     }
+
+    // Object-identity gate (issue #28): consume the outstanding token for this
+    // id and require it to belong to this generation AND resolve to the very
+    // tunnel object we are about to act on. This catches a same-generation id
+    // reuse the generation check alone would miss, and an ACK for which we sent
+    // no request.
+    {
+        std::lock_guard<std::mutex> lock(resume_tokens_mutex_);
+        auto it = resume_tokens_.find(ack.new_tunnel_id);
+        if (it == resume_tokens_.end()) {
+            util::Logger::debug("RESUME_ACK for tunnel {} dropped: no outstanding request",
+                                ack.new_tunnel_id);
+            return;
+        }
+        const bool matches =
+            it->second.generation == captured_generation && it->second.tunnel.lock() == impl;
+        resume_tokens_.erase(it);  // Consume regardless: one ACK per request.
+        if (!matches) {
+            util::Logger::debug(
+                "RESUME_ACK for tunnel {} dropped: token/object mismatch (stale or recycled id)",
+                ack.new_tunnel_id);
+            return;
+        }
+    }
+
     if (ack.status == tunnel::TunnelResumeStatus::Ok) {
         // Issue #24 slice 3: revalidate the seal AFTER the exchange. An Abort
         // that raced the request/ACK (a throwing DATA callback drove the
@@ -1730,6 +1858,9 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
         }
         old_id_prefix = endpoints_[active_index_].tox_id_hex.substr(0, 12);
         active_index_ = new_index;
+        // A switch reuses tunnel ids under a new session; invalidate any
+        // outstanding RESUME_ACK captured before this point (issue #28).
+        ++resume_session_generation_;
         new_friend_number = endpoints_[new_index].friend_number;
         new_id_prefix = endpoints_[new_index].tox_id_hex.substr(0, 12);
         new_tox_id = endpoints_[new_index].tox_id_hex;

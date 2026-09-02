@@ -515,6 +515,41 @@ TEST_F(SendqRoutingTest, TypedSendCannotOvertakeAFrameThatIsMidDrain) {
         << "the ACK must not have reached the transport at all";
 }
 
+// Issue #30: a pending-drain whose session is invalidated (clear_pending_
+// outbound bumps pending_drain_epoch_) while a frame is mid-transport must DROP
+// that frame, never requeue it — otherwise an old-session frame is resurrected
+// for whatever endpoint is now current.
+TEST_F(SendqRoutingTest, DrainDropsRequeueAfterSessionInvalidation) {
+    unsigned ping_sends = 0;
+    manager->set_send_handler([&](const std::vector<std::uint8_t>& wire) -> SendOutcome {
+        const FrameType type = type_of(wire);
+        if (type == FrameType::PING) {
+            ++ping_sends;
+            if (ping_sends == 1) {
+                return SendOutcome::SendqFull;  // Park it, arm the drain.
+            }
+            // Second sighting: the drain popped the frame and is mid-transport.
+            // A concurrent endpoint switch invalidates the queue right here.
+            manager->clear_pending_outbound();
+            return SendOutcome::SendqFull;  // Would normally requeue.
+        }
+        drained.push_back(type);
+        return SendOutcome::Sent;
+    });
+
+    ASSERT_TRUE(manager->send_frame(ProtocolFrame::make_ping()));
+    io_ctx.run();
+
+    EXPECT_EQ(ping_sends, 2u) << "the drain must have re-attempted exactly once";
+    // The invalidated frame was dropped, not requeued: the queue is idle and no
+    // further drain fires.
+    EXPECT_FALSE(manager->outbound_queue_busy())
+        << "an invalidated frame was requeued instead of dropped";
+    io_ctx.restart();
+    io_ctx.run();
+    EXPECT_EQ(ping_sends, 2u) << "a dropped frame must not be retried again";
+}
+
 // ===========================================================================
 // 4. The OPEN_ACK causal barrier
 // ===========================================================================
@@ -1202,6 +1237,36 @@ class PeerCloseHoldbackTest : public ::testing::Test {
 
     asio::io_context io_ctx;
 };
+
+// Issue #29: a throwing on_data_ consumer callback is contained to THIS
+// connection (closed), never escaping the strand read handler to the
+// process-fatal asio worker boundary. The io_context keeps running.
+TEST_F(PeerCloseHoldbackTest, ThrowingOnDataClosesConnectionAndSurvives) {
+    auto pair = Connect();
+
+    std::atomic<unsigned> disconnects{0};
+    pair->conn->set_on_data(
+        [](const std::uint8_t*, std::size_t) { throw std::runtime_error("consumer exploded"); });
+    pair->conn->set_on_disconnect(
+        [&disconnects](const std::error_code&) { disconnects.fetch_add(1); });
+    pair->conn->start_read();
+
+    std::error_code ignored;
+    asio::write(pair->target, asio::buffer(std::string("boom")), ignored);
+    ASSERT_FALSE(ignored);
+
+    // The throw closes this connection; pumping the io_context must NOT
+    // propagate the exception (it is contained at the strand handler).
+    pump_until([&] { return disconnects.load() > 0; });
+    EXPECT_GT(disconnects.load(), 0u) << "a throwing on_data must close the connection";
+    EXPECT_FALSE(pair->conn->is_connected());
+
+    // The io_context is still usable — the fault did not take the pool down.
+    bool tick = false;
+    asio::post(io_ctx, [&tick] { tick = true; });
+    pump_until([&] { return tick; });
+    EXPECT_TRUE(tick);
+}
 
 TEST_F(PeerCloseHoldbackTest, DataThenCloseDuringABackpressuredAckStillYieldsError) {
     // The case a bare "readable with zero bytes == FIN" probe misses entirely: a

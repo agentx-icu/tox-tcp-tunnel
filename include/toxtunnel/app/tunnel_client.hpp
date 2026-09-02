@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "toxtunnel/app/inspect_server.hpp"
@@ -206,11 +207,21 @@ class TunnelClient {
     /// TUNNEL_RESUME_REQUEST for every still-Connected tunnel so the server can
     /// reattach the held tunnel and reconcile byte offsets. A no-op on the
     /// first connect (no tunnels exist yet) and when resume is disabled.
+    ///
+    /// Records an outstanding-resume token per tunnel (issue #28): the session
+    /// generation snapshotted under `endpoints_mutex_` plus a weak reference to
+    /// the exact TunnelImpl, so the matching RESUME_ACK can prove it belongs to
+    /// this session and this tunnel object before acting.
     void send_resume_requests();
 
-    /// Handle an inbound TUNNEL_RESUME_ACK: on Ok the tunnel continues; on any
-    /// decline status the local tunnel is closed so its TCP peer is reset.
-    void handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack);
+    /// Handle an inbound TUNNEL_RESUME_ACK. @p captured_generation is the
+    /// `resume_session_generation_` sampled at ingress (issue #28): a switch or
+    /// reconnect that bumped the generation while this ACK sat in the strand
+    /// makes it stale, and it is dropped rather than acting on a tunnel object
+    /// that reused the id in a newer session. On Ok the tunnel continues; on
+    /// any decline status the local tunnel is closed so its TCP peer is reset.
+    void handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack,
+                           std::uint64_t captured_generation);
 
     // -----------------------------------------------------------------
     // Data members
@@ -283,6 +294,27 @@ class TunnelClient {
 
     /// Guards `endpoints_`, `active_index_` and the failover bookkeeping.
     mutable std::mutex endpoints_mutex_;
+
+    /// Monotonic resume-session generation (issue #28). Bumped under
+    /// `endpoints_mutex_` whenever the active session changes — an
+    /// active-endpoint switch (`switch_active_endpoint`) or the active
+    /// endpoint's connection status flipping (`set_on_friend_connection`) —
+    /// i.e. every point after which a tunnel id may be reused by a new session.
+    /// A RESUME_ACK captured at one generation and dispatched after a bump is
+    /// stale and must not act on the (possibly recycled) id.
+    std::uint64_t resume_session_generation_{0};
+
+    /// One outstanding-resume token per tunnel id (issue #28). Recorded by
+    /// `send_resume_requests()` and consumed by `handle_resume_ack()`, which
+    /// requires the generation to still match and the weak reference to resolve
+    /// to the exact tunnel object the request was sent for. Guarded by
+    /// `resume_tokens_mutex_`.
+    struct ResumeToken {
+        std::uint64_t generation{0};
+        std::weak_ptr<tunnel::TunnelImpl> tunnel;
+    };
+    std::unordered_map<std::uint16_t, ResumeToken> resume_tokens_;
+    mutable std::mutex resume_tokens_mutex_;
 
     /// Background timer driving the failover state machine.
     std::unique_ptr<asio::steady_timer> failover_timer_;
