@@ -456,9 +456,21 @@ class KeepaliveTest : public ::testing::Test {
     }
     void TearDown() override {
         if (manager) {
+            // Close and drain EXPLICITLY, while the manager, its tunnels and the
+            // io_context are all still alive. ~TunnelManager() also calls
+            // close_all(), but leaving it to the destructor meant tunnels were
+            // torn down as the object was going away, with their timer handlers
+            // still queued — which aborted on macOS x86_64 and raised an access
+            // violation on Windows once these tests began holding a real tunnel.
+            // Draining between each step keeps every handler running against
+            // live state.
             manager->disable_keepalive();
+            io_ctx.poll();
+            manager->close_all();
+            io_ctx.poll();
         }
         manager.reset();
+        io_ctx.poll();
     }
 };
 
@@ -466,9 +478,10 @@ TEST_F(KeepaliveTest, DeclaresPeerDeadWhenNoPong) {
     // The manager must hold a tunnel for the verdict to mean anything: the
     // point of declaring a peer dead is to tear its tunnels down. See
     // DoesNotDeclarePeerDeadWithNoTunnels for the empty case.
-    std::atomic<int> close_frames{0};
-    auto tunnel = MakeConnectedTunnel(io_ctx, /*tunnel_id=*/900, &close_frames);
-    manager->add_tunnel(900, std::move(tunnel));
+    // No close-frame counter: it would be a test-body local, and these tunnels
+    // are closed in TearDown(), after that local has died (issue: the send
+    // handler captured a dangling pointer and crashed the teardown).
+    manager->add_tunnel(900, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/900));
 
     std::atomic<bool> dead{false};
     manager->set_on_peer_dead([&dead]() { dead.store(true); });
@@ -514,9 +527,7 @@ TEST_F(KeepaliveTest, ExemptionDoesNotLatchAndDoesNotAccrueAgainstThePeer) {
     // Sit empty for well over the timeout with no PONG ever fed.
     EXPECT_FALSE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 5000ms));
 
-    std::atomic<int> close_frames{0};
-    auto tunnel = MakeConnectedTunnel(io_ctx, /*tunnel_id=*/901, &close_frames);
-    manager->add_tunnel(901, std::move(tunnel));
+    manager->add_tunnel(901, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/901));
 
     // (b) The accrued silence must not be charged to the peer: no verdict yet.
     EXPECT_FALSE(RunUntil(
@@ -544,9 +555,7 @@ TEST_F(KeepaliveTest, ExemptTimeDoesNotAccrueEvenWhenTimeoutEqualsInterval) {
 
     // Land the tunnel just before a tick is due, the worst case for accrual.
     std::this_thread::sleep_for(900ms);
-    std::atomic<int> close_frames{0};
-    auto tunnel = MakeConnectedTunnel(io_ctx, /*tunnel_id=*/902, &close_frames);
-    manager->add_tunnel(902, std::move(tunnel));
+    manager->add_tunnel(902, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/902));
 
     // The peer must get a full fresh timeout, not inherit the idle silence.
     EXPECT_FALSE(RunUntil(
