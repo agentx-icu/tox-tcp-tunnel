@@ -704,5 +704,99 @@ TEST_F(TcpLoopbackTest, PauseResumeAfterStartReadDoesNotCorruptData) {
     listener->stop();
 }
 
+// ===========================================================================
+// WriteThenCloseDeliversEveryByte  (regression: issue #33)
+// ===========================================================================
+
+TEST_F(TcpLoopbackTest, WriteThenCloseDeliversEveryByte) {
+    // Pins the deliver-then-handle invariant in the read completion: a
+    // completion that reports bytes AND a terminal error must hand the bytes to
+    // on_data_ before acting on the error. The handler used to return on `ec`
+    // first, which would drop that payload.
+    //
+    // HONEST SCOPE: this does NOT reproduce the field truncation of issue #33.
+    // Verified by reverting the fix — this test still passes on macOS, because
+    // asio on a TCP socket normally reports buffered data on one completion and
+    // the EOF on the next, so the data+error completion this guards is not what
+    // a plain write-then-close produces here. Treat it as a guard against
+    // reintroducing an error-before-delivery ordering, not as proof that #33 is
+    // fixed. The real reproducer for #33 remains the cross-machine rig (a 2 KiB
+    // echo through a live tunnel, which lost frame-aligned tails at 1.07% and
+    // 4.60% on two of three links).
+    constexpr int kRounds = 25;
+    constexpr std::size_t kPayload = 4096;
+
+    std::vector<std::uint8_t> payload(kPayload);
+    for (std::size_t i = 0; i < kPayload; ++i) {
+        payload[i] = static_cast<std::uint8_t>(i & 0xFF);
+    }
+
+    for (int round = 0; round < kRounds; ++round) {
+        auto listener = make_listener();
+        const auto port = listener->port();
+        ASSERT_NE(port, 0) << "round " << round;
+
+        std::promise<std::shared_ptr<core::TcpConnection>> accepted_promise;
+        auto accepted_future = accepted_promise.get_future();
+        listener->start_accept([&accepted_promise](std::shared_ptr<core::TcpConnection> conn) {
+            accepted_promise.set_value(std::move(conn));
+        });
+
+        // Raw asio socket as the writer, so the close is a plain socket close
+        // with no TcpConnection drain logic of its own in the way.
+        asio::ip::tcp::socket writer(io());
+        std::error_code connect_ec;
+        writer.connect(loopback(port), connect_ec);
+        ASSERT_FALSE(connect_ec) << "round " << round << ": " << connect_ec.message();
+
+        ASSERT_EQ(accepted_future.wait_for(kTimeout), std::future_status::ready)
+            << "round " << round;
+        auto reader = accepted_future.get();
+        ASSERT_NE(reader, nullptr) << "round " << round;
+
+        auto received = std::make_shared<std::vector<std::uint8_t>>();
+        auto received_mutex = std::make_shared<std::mutex>();
+        reader->set_on_data([received, received_mutex](const std::uint8_t* data, std::size_t len) {
+            std::lock_guard<std::mutex> lock(*received_mutex);
+            received->insert(received->end(), data, data + len);
+        });
+
+        // Write everything and close BEFORE the reader starts, so the payload
+        // and the FIN are already queued together when the first read runs.
+        std::error_code write_ec;
+        asio::write(writer, asio::buffer(payload), write_ec);
+        ASSERT_FALSE(write_ec) << "round " << round << ": " << write_ec.message();
+        writer.shutdown(asio::ip::tcp::socket::shutdown_send, write_ec);
+        writer.close(write_ec);
+
+        reader->start_read();
+
+        const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(*received_mutex);
+                if (received->size() >= kPayload) {
+                    break;
+                }
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+            std::this_thread::sleep_for(5ms);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(*received_mutex);
+            ASSERT_EQ(received->size(), kPayload)
+                << "round " << round << ": tail dropped when the peer closed ("
+                << (kPayload - received->size()) << " bytes lost)";
+            EXPECT_EQ(*received, payload) << "round " << round << ": payload corrupted";
+        }
+
+        reader->close();
+        listener->stop();
+    }
+}
+
 }  // namespace
 }  // namespace toxtunnel::integration
