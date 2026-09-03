@@ -418,10 +418,39 @@ void TunnelManager::schedule_keepalive_tick_locked(std::uint64_t epoch) {
             return;
         }
 
-        // Liveness check: if no PONG within the timeout, declare the peer dead.
         const int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-        const int64_t last_ns = self->last_pong_ns_.load(std::memory_order_relaxed);
         const int64_t timeout_ns = self->keepalive_timeout_ns_.load(std::memory_order_relaxed);
+
+        // A manager with no tunnels has nothing at stake, and silence from such
+        // a peer is not evidence of a wedge. Declaring it dead anyway is
+        // actively harmful under multi-server failover: a client keeps a friend
+        // link to every configured server but only exchanges keepalive with the
+        // ACTIVE one, so every fallback server would reap a perfectly healthy
+        // standby client after one timeout — and the teardown then made that
+        // server refuse the client's tunnels for good, precisely when failover
+        // promoted it (issue #36). Keepalive exists to tear down tunnels
+        // belonging to a wedged peer; with no tunnels there is nothing to tear
+        // down. A peer that is genuinely gone is removed by the friend-offline
+        // path instead.
+        //
+        // The clock is reset here, BEFORE the liveness comparison, rather than
+        // merely skipping the verdict once the timeout has already elapsed.
+        // Skipping alone is not enough: silence keeps accruing across the exempt
+        // period, so the first tick within one timeout of a tunnel finally
+        // opening would still declare the peer dead — destroying the very tunnel
+        // a failover promotion had just created. Time spent with nothing at
+        // stake must not count against the peer at all, so the timeout only
+        // starts running once there is something to lose.
+        // Resetting the clock (rather than returning early) is what keeps the
+        // PING cadence and the re-arm below on their single code path: with the
+        // baseline moved up, the comparison simply cannot trip while the manager
+        // is empty, and an idle peer still gets pinged.
+        if (self->tunnel_count() == 0) {
+            self->last_pong_ns_.store(now_ns, std::memory_order_relaxed);
+        }
+
+        // Liveness check: if no PONG within the timeout, declare the peer dead.
+        const int64_t last_ns = self->last_pong_ns_.load(std::memory_order_relaxed);
         if (last_ns > 0 && now_ns - last_ns > timeout_ns) {
             if (!self->peer_dead_latched_.exchange(true, std::memory_order_acq_rel)) {
                 util::Logger::warn(
@@ -543,9 +572,12 @@ bool TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
 
     TunnelCreatedCallback created_cb;
     std::shared_ptr<Tunnel> replaced;
+    bool first_tunnel = false;
 
     {
         std::unique_lock lock(mutex_);
+        // Whether this add takes the manager from idle to holding something.
+        first_tunnel = tunnels_.empty();
 
         // Check if we're at the limit
         if (tunnels_.size() >= max_tunnels_ && tunnels_.find(tunnel_id) == tunnels_.end()) {
@@ -572,6 +604,23 @@ bool TunnelManager::add_tunnel(uint16_t tunnel_id, std::shared_ptr<Tunnel> tunne
             used_ids_[tunnel_id] = true;
             tunnels_[tunnel_id] = std::move(tunnel);
             created_cb = on_tunnel_created_;
+            if (first_tunnel) {
+                // Start the keepalive clock here, not merely at the next tick,
+                // and do it UNDER `mutex_` together with the insert. While the
+                // manager was empty the liveness verdict was exempt (see the
+                // keepalive tick), but the tick only rebases when it runs, so up
+                // to one full interval of silence can already have accrued by
+                // the time a tunnel appears. With `timeout == interval` that is
+                // enough to declare a brand-new tunnel's peer dead at once —
+                // exactly the failover tunnel this guard protects (issue #36).
+                //
+                // Resetting after the unlock would leave a window in which a
+                // concurrent tick sees tunnel_count() == 1 while the timestamp
+                // is still stale, i.e. the very verdict this prevents. Publishing
+                // both under the same lock closes it.
+                last_pong_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                    std::memory_order_relaxed);
+            }
         }
     }
 

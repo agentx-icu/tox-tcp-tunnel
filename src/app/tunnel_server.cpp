@@ -1585,11 +1585,42 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     {
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
-        if (it == managers_.end()) {
-            util::Logger::warn("No TunnelManager for friend {} during TUNNEL_OPEN", friend_number);
+        if (it != managers_.end()) {
+            manager_ptr = it->second;
+        }
+    }
+    if (!manager_ptr) {
+        // Self-heal instead of refusing. The friend link is plainly up (its
+        // OPEN just arrived) and the rules already allowed this target, so a
+        // missing manager is our own bookkeeping gap, not the peer's fault.
+        // Refusing here was permanent: nothing else rebuilds the manager while
+        // the friend stays connected, so every later OPEN from that friend was
+        // refused too — which is how a keepalive teardown of an idle standby
+        // client silently disabled failover to this server (issue #36).
+        //
+        // setup_tunnel_manager() is the right rebuild: it consults
+        // held_managers_ first, so a manager parked by a resume hold is
+        // RESURRECTED rather than shadowed by a fresh empty one, and it
+        // try_emplaces so a concurrent installer wins. Called with
+        // managers_mutex_ released (it takes the lock itself) and from
+        // inbound_strand_, the same strand on_friend_connection() uses.
+        util::Logger::warn("No TunnelManager for friend {} during TUNNEL_OPEN; rebuilding",
+                           friend_number);
+        setup_tunnel_manager(friend_number, pk_hex);
+        {
+            std::lock_guard lock(managers_mutex_);
+            auto it = managers_.find(friend_number);
+            if (it != managers_.end()) {
+                manager_ptr = it->second;
+            }
+        }
+        if (!manager_ptr) {
+            util::Logger::warn("Could not rebuild a TunnelManager for friend {}; refusing OPEN",
+                               friend_number);
+            util::MetricsRegistry::instance().inc_tunnels_opened(
+                util::MetricsRegistry::OpenResult::Failed);
             return;
         }
-        manager_ptr = it->second;
     }
 
     // Let TunnelManager handle the incoming open (reserves the tunnel_id
