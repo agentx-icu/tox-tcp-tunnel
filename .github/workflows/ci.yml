@@ -414,11 +414,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install clang-format
+        # Pin the exact clang-format version. `apt-get install clang-format`
+        # floats with the runner image (currently 18) and disagrees with the
+        # 20.1.6 developers run locally, so a tree that formats clean locally
+        # can fail CI (and vice versa). The pip wheel ships the identical
+        # binary on CI and dev machines; a venv sidesteps PEP 668 on the
+        # runner's system Python.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format
+          python3 -m venv "$RUNNER_TEMP/clang-format-venv"
+          "$RUNNER_TEMP/clang-format-venv/bin/pip" install --quiet clang-format==20.1.6
+          echo "$RUNNER_TEMP/clang-format-venv/bin" >> "$GITHUB_PATH"
       - name: Check code formatting
         run: |
+          clang-format --version
           find include src tests -type f \( -name "*.cpp" -o -name "*.hpp" \) -print0 | \
             xargs -0 clang-format --dry-run --Werror -style=file
 

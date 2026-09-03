@@ -58,7 +58,13 @@ prefer linking there rather than duplicating here.
 ## Code Style
 
 - Google style, 4-space indentation, 100-column limit
-- Run `clang-format` before committing
+- Run `clang-format` before committing. CI pins **clang-format 20.1.6**
+  (`.github/workflows/ci.yml` installs `clang-format==20.1.6` from PyPI); match
+  it locally so `clang-format --version` reports exactly `20.1.6`
+  (`pip install clang-format==20.1.6` is the reliable pin; a Homebrew `llvm`
+  may float within LLVM 20) — other versions disagree on edge cases (e.g.
+  `struct flock fl{}` spacing, empty-body block collapsing) and will fail the
+  `code-style-check` job
 - Warnings are errors (`-Werror`)
 - C++20
 

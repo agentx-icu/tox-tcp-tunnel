@@ -223,7 +223,7 @@ TEST(InspectServerSocket, StaleSocketFileIsUnlinkedOnStart) {
         << "start must clear a stale path and rebind";
 
     // After start, the path exists and is a socket (not the old regular file).
-    struct stat st {};
+    struct stat st{};
     ASSERT_EQ(::stat(sock_path.c_str(), &st), 0);
     EXPECT_TRUE(S_ISSOCK(st.st_mode)) << "path should be a socket after rebind";
 

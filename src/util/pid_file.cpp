@@ -222,7 +222,7 @@ PidFileGuard::PidFileGuard(std::filesystem::path data_dir) : data_dir_(std::move
     // defined semantics on the network filesystems people occasionally point a
     // data_dir at, and because it is released automatically when the process
     // dies however it dies.
-    struct flock fl {};
+    struct flock fl{};
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
     fl.l_start = 0;
