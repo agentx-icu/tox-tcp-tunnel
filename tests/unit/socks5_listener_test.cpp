@@ -313,26 +313,28 @@ TEST_F(Socks5ListenerLifecycleTest, ParsesSocks5HandshakeAndInvokesOpenTunnel) {
 // is actually wired together, which is what was missing when a rate-limited
 // open was reaching callers as 0x04 "host unreachable".
 TEST_F(Socks5ListenerLifecycleTest, WireErrorReachesTheCallerAsTheRightSocks5Reply) {
+    // Pointers first, then the two bytes: interleaving them cost 14 bytes of
+    // padding per row and tripped optin.performance.Padding.
     struct Case {
         const char* label;
-        std::uint8_t error_code;
         const char* description;
+        std::uint8_t error_code;
         std::uint8_t expected_reply;
     };
     // Each row names which server version produces it.
     const Case cases[] = {
-        {"new server, rate limited", 1, "Rate limit exceeded", socks5::kReplyConnNotAllowed},
-        {"new server, rules denial", 1, "Access denied", socks5::kReplyConnNotAllowed},
-        {"new server, connect timeout", 2, "TCP connect failed: Operation timed out",
+        {"new server, rate limited", "Rate limit exceeded", 1, socks5::kReplyConnNotAllowed},
+        {"new server, rules denial", "Access denied", 1, socks5::kReplyConnNotAllowed},
+        {"new server, connect timeout", "TCP connect failed: Operation timed out", 2,
          socks5::kReplyHostUnreachable},
-        {"new server, refused", 3, "TCP connection refused: Connection refused",
+        {"new server, refused", "TCP connection refused: Connection refused", 3,
          socks5::kReplyConnRefused},
-        {"v0.4.11 server, rate limited", 3, "Rate limit exceeded", socks5::kReplyConnNotAllowed},
-        {"v0.4.11 server, refused", 3, "TCP connect failed: Connection refused",
+        {"v0.4.11 server, rate limited", "Rate limit exceeded", 3, socks5::kReplyConnNotAllowed},
+        {"v0.4.11 server, refused", "TCP connect failed: Connection refused", 3,
          socks5::kReplyConnRefused},
-        {"v0.4.11 server, timeout", 3, "TCP connect failed: Operation timed out",
+        {"v0.4.11 server, timeout", "TCP connect failed: Operation timed out", 3,
          socks5::kReplyHostUnreachable},
-        {"no TUNNEL_ERROR at all", 0, "", socks5::kReplyGeneralFailure},
+        {"no TUNNEL_ERROR at all", "", 0, socks5::kReplyGeneralFailure},
     };
 
     for (const auto& c : cases) {

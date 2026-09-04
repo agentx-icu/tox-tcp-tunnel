@@ -512,8 +512,17 @@ void TunnelServer::stop() {
     {
         std::lock_guard lock(managers_mutex_);
         for (auto& [friend_number, manager] : managers_) {
+            if (!manager) {
+                continue;  // defensive: a null entry would fault the shutdown path
+            }
             util::Logger::debug("Closing tunnels for friend {}", friend_number);
-            step("manager close_all", [&manager] { manager->close_all(); });
+            // Dereference OUTSIDE the lambda. The lambda body is analysed
+            // independently of the null check guarding it — clang-tidy's
+            // core.CallAndMessage flagged both of these loops as calling through
+            // a possibly-uninitialised pointer even where an `if` guard existed —
+            // so hand the lambda a reference and let it make a plain member call.
+            auto& mgr = *manager;
+            step("manager close_all", [&mgr] { mgr.close_all(); });
         }
         managers_.clear();
         // H-07: drop any managers held pending resume — cancel their prune
@@ -523,7 +532,8 @@ void TunnelServer::stop() {
                 util::cancel_timer_noexcept(*held.prune_timer);
             }
             if (held.manager) {
-                step("held manager close_all", [&held] { held.manager->close_all(); });
+                auto& mgr = *held.manager;  // see the loop above
+                step("held manager close_all", [&mgr] { mgr.close_all(); });
             }
         }
         held_managers_.clear();
