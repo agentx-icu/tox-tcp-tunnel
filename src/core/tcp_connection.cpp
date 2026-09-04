@@ -501,6 +501,33 @@ void TcpConnection::do_read() {
         asio::bind_executor(strand_, [this, self](const std::error_code& ec,
                                                   std::size_t bytes_transferred) {
             read_in_flight_ = false;
+
+            // Deliver payload BEFORE acting on a REMOTE error. A completion may
+            // carry both bytes and a terminal error, and returning on `ec`
+            // first would drop that payload — a truncated stream ending in a
+            // clean EOF, with nothing logged (issue #33).
+            //
+            // `operation_aborted` is excluded deliberately: that is OUR OWN
+            // cancellation, raised by force_close()/do_close(), which has
+            // already run the disconnect notification. Consumers tear their
+            // state down on that notification — Socks5Session clears its
+            // connection pointer — so handing them bytes afterwards would call
+            // into a half-destroyed consumer. A locally-cancelled read has no
+            // payload worth saving anyway; the stream is being abandoned, not
+            // ended.
+            if (on_data_ && bytes_transferred > 0 && ec != asio::error::operation_aborted) {
+                // Contain a throwing consumer callback to THIS connection
+                // (issue #29): letting it escape would reach the process-fatal
+                // asio worker boundary and take the whole daemon down for one
+                // bad connection.
+                try {
+                    on_data_(read_buffer_.data(), bytes_transferred);
+                } catch (...) {
+                    close_on_callback_fault("on_data");
+                    return;
+                }
+            }
+
             if (ec) {
                 if (ec == asio::error::eof) {
                     util::Logger::debug("TcpConnection: read ended: {}", ec.message());
@@ -527,21 +554,6 @@ void TcpConnection::do_read() {
                     do_close(ec);
                 }
                 return;
-            }
-
-            if (on_data_ && bytes_transferred > 0) {
-                // Contain a throwing consumer callback to THIS connection
-                // (issue #29): letting it escape would reach the process-fatal
-                // asio worker boundary and take the whole daemon down for one
-                // bad connection. Close this connection and stop reading;
-                // rearming after a throw would also leave the callback's own
-                // half-processed state inconsistent.
-                try {
-                    on_data_(read_buffer_.data(), bytes_transferred);
-                } catch (...) {
-                    close_on_callback_fault("on_data");
-                    return;
-                }
             }
 
             do_read();

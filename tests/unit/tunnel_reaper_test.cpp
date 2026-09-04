@@ -456,18 +456,111 @@ class KeepaliveTest : public ::testing::Test {
     }
     void TearDown() override {
         if (manager) {
+            // Close and drain EXPLICITLY, while the manager, its tunnels and the
+            // io_context are all still alive. ~TunnelManager() also calls
+            // close_all(), but leaving it to the destructor meant tunnels were
+            // torn down as the object was going away, with their timer handlers
+            // still queued — which aborted on macOS x86_64 and raised an access
+            // violation on Windows once these tests began holding a real tunnel.
+            // Draining between each step keeps every handler running against
+            // live state.
             manager->disable_keepalive();
+            io_ctx.poll();
+            manager->close_all();
+            io_ctx.poll();
         }
         manager.reset();
+        io_ctx.poll();
     }
 };
 
 TEST_F(KeepaliveTest, DeclaresPeerDeadWhenNoPong) {
+    // The manager must hold a tunnel for the verdict to mean anything: the
+    // point of declaring a peer dead is to tear its tunnels down. See
+    // DoesNotDeclarePeerDeadWithNoTunnels for the empty case.
+    // No close-frame counter: it would be a test-body local, and these tunnels
+    // are closed in TearDown(), after that local has died (issue: the send
+    // handler captured a dangling pointer and crashed the teardown).
+    manager->add_tunnel(900, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/900));
+
     std::atomic<bool> dead{false};
     manager->set_on_peer_dead([&dead]() { dead.store(true); });
     // Ping every 1s, declare dead after 1s of silence. No PONGs are ever fed.
     manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/1);
     EXPECT_TRUE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 5000ms));
+}
+
+TEST_F(KeepaliveTest, DoesNotDeclarePeerDeadWithNoTunnels) {
+    // Regression for issue #36. A client using multi-server failover friends
+    // every configured server but exchanges keepalive only with the ACTIVE one,
+    // so every fallback server sees a silent — yet perfectly healthy — peer.
+    // Declaring it dead tore down its manager, and the server then refused that
+    // client's tunnels for good, disabling failover exactly when it was needed.
+    // With no tunnels there is nothing at stake and nothing to tear down, so
+    // silence must NOT produce a verdict.
+    std::atomic<bool> dead{false};
+    manager->set_on_peer_dead([&dead]() { dead.store(true); });
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/1);
+
+    // Well past the timeout, with no PONG ever fed.
+    EXPECT_FALSE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 3000ms));
+    EXPECT_FALSE(dead.load());
+}
+
+TEST_F(KeepaliveTest, ExemptionDoesNotLatchAndDoesNotAccrueAgainstThePeer) {
+    // Two properties, and the second is the subtle one.
+    //
+    // (a) The empty-manager exemption must not latch: once a tunnel exists the
+    //     peer is back in scope for the liveness verdict.
+    // (b) Time spent exempt must NOT count against the peer. If the exemption
+    //     only skipped the verdict and left the last-PONG timestamp stale, the
+    //     first tick after a tunnel opened would measure all the silence that
+    //     accumulated while the manager was empty and declare the peer dead on
+    //     the spot — destroying the very tunnel a failover promotion had just
+    //     created, which is the failure this whole guard exists to prevent.
+    std::atomic<bool> dead{false};
+    manager->set_on_peer_dead([&dead]() { dead.store(true); });
+    // 3s of timeout, so "immediately after add_tunnel" is clearly separable
+    // from "one full timeout after add_tunnel".
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/3);
+
+    // Sit empty for well over the timeout with no PONG ever fed.
+    EXPECT_FALSE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 5000ms));
+
+    manager->add_tunnel(901, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/901));
+
+    // (b) The accrued silence must not be charged to the peer: no verdict yet.
+    EXPECT_FALSE(RunUntil(
+        io_ctx, [&dead] { return dead.load(); }, 1500ms))
+        << "peer declared dead immediately after a tunnel appeared — the exemption "
+           "left a stale liveness baseline";
+
+    // (a) But the clock does run from here, so a verdict still arrives.
+    EXPECT_TRUE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 8000ms));
+}
+
+TEST_F(KeepaliveTest, ExemptTimeDoesNotAccrueEvenWhenTimeoutEqualsInterval) {
+    // The tightest configuration, and the one the tick alone cannot cover:
+    // timeout == interval. Resetting the baseline only inside the tick still
+    // lets up to one whole interval of silence accrue between the last tick and
+    // add_tunnel(), which at this ratio is a full timeout — enough to kill a
+    // freshly promoted failover tunnel on the very next tick. add_tunnel() must
+    // therefore start the clock itself on the 0 -> 1 transition.
+    std::atomic<bool> dead{false};
+    manager->set_on_peer_dead([&dead]() { dead.store(true); });
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/1);
+
+    // Idle well past several timeouts with no PONG.
+    EXPECT_FALSE(RunUntil(io_ctx, [&dead] { return dead.load(); }, 3000ms));
+
+    // Land the tunnel just before a tick is due, the worst case for accrual.
+    std::this_thread::sleep_for(900ms);
+    manager->add_tunnel(902, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/902));
+
+    // The peer must get a full fresh timeout, not inherit the idle silence.
+    EXPECT_FALSE(RunUntil(
+        io_ctx, [&dead] { return dead.load(); }, 700ms))
+        << "peer declared dead inside one timeout of the tunnel appearing";
 }
 
 TEST_F(KeepaliveTest, StaysAliveWhilePongsArrive) {

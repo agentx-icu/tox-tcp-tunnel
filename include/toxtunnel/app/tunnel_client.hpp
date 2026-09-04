@@ -299,6 +299,13 @@ class TunnelClient {
     /// `endpoints_mutex_`.
     std::atomic<bool> server_online_{false};
 
+    /// Whether this daemon itself has DHT connectivity, mirrored from
+    /// ToxAdapter's self-connection callback. Read only for diagnostics: when
+    /// we are not on the DHT, "still trying to reach server X" is about US, not
+    /// the peer, and saying so is the difference between a 30-second diagnosis
+    /// and a long one (issue #34).
+    std::atomic<bool> self_connected_{false};
+
     /// All configured server endpoints (primary at index 0, then fallbacks in
     /// the order given). Mutated only under `endpoints_mutex_`.
     std::vector<ClientServerEndpoint> endpoints_;

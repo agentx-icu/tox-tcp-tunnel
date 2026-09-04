@@ -405,8 +405,22 @@ std::size_t ToxAdapter::bootstrap() {
         return count;
     });
 
-    util::Logger::info("Bootstrap complete: {}/{} nodes contacted", success_count,
-                       bootstrap_nodes.size());
+    if (success_count == 0) {
+        // "Bootstrap complete: 0/0 nodes contacted" at info level reads as
+        // success; it is total failure. With no node contacted the daemon
+        // cannot reach the DHT at all, yet everything else about it — metrics,
+        // inspect, "Server started" — looks perfectly healthy, so the operator
+        // is left debugging the peer instead of this process (issue #34).
+        // Say plainly what happened and what to do about it.
+        util::Logger::error(
+            "Bootstrap contacted 0 of {} node(s): this daemon has NO DHT connectivity and "
+            "cannot reach any peer. Set tox.bootstrap_nodes explicitly (IP literals) if "
+            "{} is unreachable from this host.",
+            bootstrap_nodes.size(), std::string(BootstrapSource::kDefaultNodesUrl));
+    } else {
+        util::Logger::info("Bootstrap complete: {}/{} nodes contacted", success_count,
+                           bootstrap_nodes.size());
+    }
     return success_count;
 }
 

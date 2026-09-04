@@ -921,7 +921,8 @@ void TunnelClient::setup_tox_callbacks() {
         });
 
     // Self connection status (DHT connectivity)
-    tox_adapter_->set_on_self_connection([](bool connected) {
+    tox_adapter_->set_on_self_connection([this](bool connected) {
+        self_connected_.store(connected, std::memory_order_relaxed);
         if (connected) {
             util::Logger::info("Connected to Tox DHT");
         } else {
@@ -2132,11 +2133,19 @@ void TunnelClient::run_connectivity_log_tick() {
         }
     }
 
+    // Attribute the failure correctly. Without this the message points the
+    // reader at the peer — "is the server up? is its Tox ID right?" — when the
+    // real answer is that WE never reached the DHT, which this process already
+    // knows (issue #34).
+    const char* cause = self_connected_.load(std::memory_order_relaxed)
+                            ? ""
+                            : "; this daemon is not connected to the Tox DHT, so it cannot reach "
+                              "any peer — check bootstrap";
     if (offline_secs >= 0) {
-        util::Logger::warn("Still trying to reach server {}...; offline for {}s (retrying)",
-                           id_prefix, offline_secs);
+        util::Logger::warn("Still trying to reach server {}...; offline for {}s (retrying){}",
+                           id_prefix, offline_secs, cause);
     } else {
-        util::Logger::warn("Still trying to reach server {}... (retrying)", id_prefix);
+        util::Logger::warn("Still trying to reach server {}... (retrying){}", id_prefix, cause);
     }
 }
 
