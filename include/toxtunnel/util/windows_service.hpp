@@ -3,6 +3,8 @@
 #include <functional>
 #include <string>
 
+#include "toxtunnel/util/expected.hpp"
+
 namespace toxtunnel::util {
 
 /// Human-readable reason the last install/uninstall failed, including the Win32
@@ -10,14 +12,33 @@ namespace toxtunnel::util {
 /// non-Windows or when nothing has failed yet.
 [[nodiscard]] std::string last_windows_service_error();
 
-/// Install a Windows service via the Service Control Manager.
+/// Install a Windows service via the Service Control Manager, or — when a
+/// service of that name is already registered — update it in place (binary
+/// path, auto-start, and the restart-on-failure recovery policy). Idempotent:
+/// re-running it after an upgrade brings an old registration up to date.
 /// @param extra_arguments Optional arguments appended after the quoted executable path
 ///                        (e.g. `-c "C:\\ProgramData\\ToxTunnel\\config.yaml" --service`).
-/// Returns true on success, false on failure.
+/// Returns true on success, false on failure (see last_windows_service_error()).
 /// On non-Windows platforms, always returns false.
 bool install_windows_service(const std::string& service_name, const std::string& display_name,
                              const std::string& binary_path,
                              const std::string& extra_arguments = {});
+
+/// True when the last successful install_windows_service() found the service
+/// already registered and updated it rather than creating it.
+[[nodiscard]] bool last_windows_service_install_updated_existing();
+
+/// Make sure @p service_name carries the ToxTunnel recovery policy (restart on
+/// failure, including non-crash error exits). Meant to be called by the daemon
+/// itself at service start, so a registration made by an older build — or by
+/// hand — repairs itself without anyone re-running the installer (issue #38).
+/// Returns true if the policy was applied now, false if it was already
+/// present, or an error string if the SCM could not be queried / updated
+/// (the running account lacks SERVICE_CHANGE_CONFIG, say). Best-effort by
+/// design: the caller logs the outcome and carries on either way.
+/// On non-Windows platforms, always returns false.
+[[nodiscard]] util::Expected<bool, std::string> ensure_windows_service_recovery_policy(
+    const std::string& service_name);
 
 /// Uninstall a Windows service.
 /// Returns true on success, false on failure.

@@ -34,6 +34,11 @@ struct InspectProviders {
     /// Returns how many friends are currently online (>= 0).
     std::function<std::size_t()> friends_online;
 
+    /// Whether this daemon is currently connected to the Tox DHT. A daemon
+    /// with no DHT connectivity cannot reach any peer, and until this field
+    /// existed `inspect status` reported it as healthy (issue #34).
+    std::function<bool()> dht_connected;
+
     /// Optional (client mode): seconds the active server has been continuously
     /// online, or 0 when offline. Lets `inspect status` answer "is the tunnel
     /// up, and since when" directly instead of inferring it from lifecycle log

@@ -272,6 +272,15 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// Immediately close the socket, discarding pending writes.
     void force_close();
 
+    /// Abortively close the socket: discard pending writes and send the peer
+    /// a TCP RST instead of a FIN (SO_LINGER with a zero timeout, then close).
+    /// The local application then sees ECONNRESET rather than a clean end of
+    /// stream — the right ending for a tunnel that terminated abnormally
+    /// (the remote target reset, a TUNNEL_ERROR), which a FIN would disguise
+    /// as a complete transfer (issue #35). Falls back to force_close()
+    /// semantics if the linger option cannot be set.
+    void abort();
+
     // -----------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------
@@ -328,6 +337,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 
     /// Perform the final socket close and invoke the disconnect callback.
     void do_close(const std::error_code& ec);
+
+    /// Shared body of force_close() / abort(): discard queued writes and close.
+    /// Runs on the strand. @p reset requests an RST (SO_LINGER 0) first.
+    void do_force_close(bool reset);
 
     /// Close this connection because a consumer callback (on_data_ /
     /// on_writable_) threw (issue #29). Contains the fault to this connection
@@ -388,6 +401,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// strand. Updated only from inside the strand.
     std::atomic<std::size_t> write_buffer_bytes_{0};
     bool write_in_progress_ = false;
+    /// Diagnostic: payload bytes the kernel has accepted so far. Strand-only.
+    std::size_t bytes_written_total_{0};
 
     /// Read-loop pause flag. When true, `do_read()` returns early without
     /// posting another async_read_some. Flipped by `pause_read` /
@@ -428,6 +443,12 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     /// Bytes the watch read ahead of the read loop, replayed to `on_data_` by
     /// `start_read()`. Strand-only. Capped at `kPeerCloseHoldbackCap`.
     std::vector<std::uint8_t> peer_close_holdback_;
+
+    /// The watch saw the peer's FIN *behind* banked bytes. Those bytes are
+    /// owed to the stream, so the watch does not tear down; it records the
+    /// close here and `start_read()` reports it — as the read loop would have
+    /// (`on_read_eof_`) — right after replaying the holdback. Strand-only.
+    bool peer_close_pending_{false};
 
     /// True once a write enqueue pushed the queue at/above the backpressure
     /// limit; reset (and on_writable_ fired) when the queue drains back below

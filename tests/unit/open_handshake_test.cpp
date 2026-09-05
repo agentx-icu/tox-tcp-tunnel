@@ -1268,24 +1268,36 @@ TEST_F(PeerCloseHoldbackTest, ThrowingOnDataClosesConnectionAndSurvives) {
     EXPECT_TRUE(tick);
 }
 
-TEST_F(PeerCloseHoldbackTest, DataThenCloseDuringABackpressuredAckStillYieldsError) {
-    // The case a bare "readable with zero bytes == FIN" probe misses entirely: a
-    // target that writes a banner and *then* closes hides its FIN behind those
-    // unread bytes, so the watch would stand down and the tunnel would sit in
-    // Connecting for an ACK whose target is already dead.
+TEST_F(PeerCloseHoldbackTest, DataThenCloseDuringABackpressuredAckIsDeliveredThenHalfClosed) {
+    // A target that writes a banner and *then* closes while the OPEN_ACK is
+    // still backpressured. The banner is owed to the stream (the kernel has
+    // already acknowledged it), so the watch must NOT tear the handshake down
+    // and drop it -- that was the 0-byte truncation of issue #33. Instead the
+    // FIN is remembered, the ACK keeps retrying, and once it lands the read
+    // loop replays the banner and then reports the close as a half-close.
     auto pair = Connect();
 
     std::vector<std::string> wire;
+    std::atomic<bool> ack_accepted{false};
     auto gate = std::make_shared<app::detail::OpenAckGate>(
-        io_ctx, []() -> tunnel::SendOutcome { return tunnel::SendOutcome::SendqFull; },
-        [&wire]() {
-            wire.emplace_back("START_READ");
-            wire.emplace_back("DATA");
+        io_ctx,
+        [&ack_accepted]() -> tunnel::SendOutcome {
+            return ack_accepted.load() ? tunnel::SendOutcome::Sent : tunnel::SendOutcome::SendqFull;
+        },
+        [&wire, &pair]() {
+            wire.emplace_back("COMMIT");
+            pair->conn->start_read();
             return true;
         },
         [&wire]() { wire.emplace_back("ERROR"); },
         [&wire]() { wire.emplace_back("POST_COMMIT_CLOSE"); });
 
+    std::string received;
+    pair->conn->set_on_data([&received, &wire](const std::uint8_t* data, std::size_t length) {
+        received.append(reinterpret_cast<const char*>(data), length);
+        wire.emplace_back("DATA");
+    });
+    pair->conn->set_on_read_eof([&wire]() { wire.emplace_back("EOF"); });
     pair->conn->set_on_disconnect([&wire, gate](const std::error_code&) {
         if (gate->target_gone()) {
             return;
@@ -1297,7 +1309,7 @@ TEST_F(PeerCloseHoldbackTest, DataThenCloseDuringABackpressuredAckStillYieldsErr
     gate->start();
     ASSERT_TRUE(wire.empty());
 
-    // Banner first, close second — no hook is invoked by hand.
+    // Banner first, close second -- no hook is invoked by hand.
     const std::string banner = "220 ready\r\n";
     std::error_code ignored;
     asio::write(pair->target, asio::buffer(banner), ignored);
@@ -1305,17 +1317,122 @@ TEST_F(PeerCloseHoldbackTest, DataThenCloseDuringABackpressuredAckStillYieldsErr
     pair->target.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
     pair->target.close(ignored);
 
+    // With the ACK still backpressured nothing may resolve: no ERROR (the
+    // target is not "dead", it has bytes owed), no delivery (the OPEN_ACK
+    // barrier), and the connection stays open.
+    {
+        io_ctx.restart();
+        io_ctx.run_for(kTimerGranularity * 4);
+    }
+    EXPECT_TRUE(wire.empty()) << "a FIN behind owed bytes must not resolve the handshake early";
+    EXPECT_TRUE(pair->conn->is_connected());
+    EXPECT_FALSE(gate->committed());
+
+    // The transport recovers; the gate's retry lands the ACK, commits, and the
+    // read loop replays the banner before reporting the close.
+    ack_accepted.store(true);
+    pump_until([&] { return !wire.empty() && wire.back() == "EOF"; });
+
+    const std::vector<std::string> observed = wire;
+    EXPECT_EQ(observed, (std::vector<std::string>{"COMMIT", "DATA", "EOF"}))
+        << "the banner must be delivered after the ACK and before the close";
+    EXPECT_EQ(received, banner);
+    EXPECT_TRUE(gate->committed());
+
+    pair->conn->force_close();
+    io_ctx.restart();
+    io_ctx.run();
+}
+
+TEST_F(PeerCloseHoldbackTest, DataThenResetDuringABackpressuredAckStillYieldsError) {
+    // The same shape with an abortive close: a reset discards what the target
+    // had sent (as the kernel does), and the handshake fails at once with a
+    // TUNNEL_ERROR rather than being parked behind bytes that are gone.
+    auto pair = Connect();
+
+    std::vector<std::string> wire;
+    auto gate = std::make_shared<app::detail::OpenAckGate>(
+        io_ctx, []() -> tunnel::SendOutcome { return tunnel::SendOutcome::SendqFull; },
+        [&wire]() {
+            wire.emplace_back("COMMIT");
+            return true;
+        },
+        [&wire]() { wire.emplace_back("ERROR"); },
+        [&wire]() { wire.emplace_back("POST_COMMIT_CLOSE"); });
+
+    pair->conn->set_on_data(
+        [&wire](const std::uint8_t*, std::size_t) { wire.emplace_back("DATA"); });
+    pair->conn->set_on_disconnect([&wire, gate](const std::error_code&) {
+        if (gate->target_gone()) {
+            return;
+        }
+        wire.emplace_back("ORDINARY_CLOSE");
+    });
+
+    pair->conn->watch_peer_close();
+    gate->start();
+    ASSERT_TRUE(wire.empty());
+
+    std::error_code ignored;
+    asio::write(pair->target, asio::buffer(std::string("220 ready\r\n")), ignored);
+    ASSERT_FALSE(ignored);
+    // Let the watch bank the banner before the RST lands, so this exercises
+    // the "reset behind read-ahead" branch rather than a bare reset.
+    {
+        io_ctx.restart();
+        io_ctx.run_for(kTimerGranularity * 4);
+    }
+    pair->target.set_option(asio::socket_base::linger(true, 0), ignored);
+    pair->target.close(ignored);
+
     pump_until([&] { return !wire.empty(); });
 
     const std::vector<std::string> observed = wire;
     EXPECT_EQ(observed, (std::vector<std::string>{"ERROR"}))
-        << "a FIN behind unread data must still reach the gate's abandon path";
+        << "a reset behind read-ahead must still fail the handshake";
     EXPECT_FALSE(gate->committed());
+    EXPECT_EQ(std::count(observed.begin(), observed.end(), "DATA"), 0)
+        << "nothing may be delivered before the OPEN_ACK is on the wire";
 
     gate->target_gone();
     pair->conn->force_close();
     io_ctx.restart();
     io_ctx.run();
+}
+
+TEST_F(PeerCloseHoldbackTest, AbandonedHandshakeDropsAPendingHoldbackClose) {
+    // The gate gives up (the ACK permanently fails) while a FIN is parked
+    // behind read-ahead bytes: the abandon path force-closes the socket. The
+    // disconnect must fire exactly once, and nothing may be delivered.
+    auto pair = Connect();
+
+    std::vector<std::string> wire;
+    pair->conn->set_on_data(
+        [&wire](const std::uint8_t*, std::size_t) { wire.emplace_back("DATA"); });
+    pair->conn->set_on_read_eof([&wire]() { wire.emplace_back("EOF"); });
+    pair->conn->set_on_disconnect(
+        [&wire](const std::error_code&) { wire.emplace_back("DISCONNECT"); });
+
+    pair->conn->watch_peer_close();
+    std::error_code ignored;
+    asio::write(pair->target, asio::buffer(std::string("banner")), ignored);
+    ASSERT_FALSE(ignored);
+    pair->target.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
+    pair->target.close(ignored);
+    {
+        io_ctx.restart();
+        io_ctx.run_for(kTimerGranularity * 4);
+    }
+    EXPECT_TRUE(wire.empty());
+    EXPECT_TRUE(pair->conn->is_connected()) << "the close is parked, the socket stays open";
+
+    // What abandon_open_ack() does with the connection.
+    pair->conn->force_close();
+    pump_until([&] { return !wire.empty(); });
+    io_ctx.restart();
+    io_ctx.run();
+    EXPECT_EQ(wire, (std::vector<std::string>{"DISCONNECT"}));
+    EXPECT_FALSE(pair->conn->is_connected());
 }
 
 TEST_F(PeerCloseHoldbackTest, ReadAheadIsReplayedInOrderWhenTheReadLoopStarts) {

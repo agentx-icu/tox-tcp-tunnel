@@ -21,6 +21,60 @@
 
 namespace toxtunnel::app {
 
+namespace {
+
+/// Per-tunnel open/active bookkeeping for the client's state-change callback.
+///
+/// One mutex, not three atomics: the `Connected` and the terminal callbacks
+/// run on different threads and are not ordered by the state word alone, so
+/// separate latches let a terminal callback book `opened{failed}` and
+/// decrement the active gauge in the gap where `Connected` had claimed its
+/// latch but not yet counted -- a double-booked open and a leaked gauge. Every
+/// decision below is taken under `mutex` with the whole record in view.
+struct ClientOpenBook {
+    std::mutex mutex;
+    bool connected{false};  ///< `Connected` was observed and booked (opened{ok}, active++).
+    bool resolved{false};   ///< Terminal outcome booked; a later Connected is ignored.
+    bool active{false};     ///< The active gauge currently counts this tunnel.
+};
+
+/// Book `Connected`. Returns false when the tunnel already ended (a terminal
+/// callback got there first): nothing is counted and the caller must not
+/// start reading a socket that is being closed.
+bool book_connected(ClientOpenBook& book) {
+    std::lock_guard<std::mutex> lock(book.mutex);
+    if (book.resolved || book.connected) {
+        return false;
+    }
+    book.connected = true;
+    book.resolved = true;
+    book.active = true;
+    util::MetricsRegistry::instance().inc_tunnels_opened(util::MetricsRegistry::OpenResult::Ok);
+    util::MetricsRegistry::instance().inc_tunnels_active(util::MetricsRegistry::Role::Client);
+    return true;
+}
+
+/// Book a terminal state. Returns whether the tunnel had reached `Connected`
+/// (the caller picks RST vs FIN on that). An open that never connected is
+/// counted under `opened{failed}` exactly once (issue #36); the active gauge is
+/// decremented exactly once, and only if it was ever incremented.
+bool book_terminal(ClientOpenBook& book) {
+    std::lock_guard<std::mutex> lock(book.mutex);
+    const bool was_connected = book.connected;
+    if (!book.resolved) {
+        book.resolved = true;
+        util::MetricsRegistry::instance().inc_tunnels_opened(
+            util::MetricsRegistry::OpenResult::Failed);
+    }
+    if (book.active) {
+        book.active = false;
+        util::MetricsRegistry::instance().dec_tunnels_active(util::MetricsRegistry::Role::Client);
+    }
+    return was_connected;
+}
+
+}  // namespace
+
 namespace detail {
 
 // `LosslessPacketSendFn` returns a plain bool, which cannot express SendqFull —
@@ -120,6 +174,7 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     tox_config.data_dir = config.data_dir;
     tox_config.udp_enabled = tox_cfg.udp_enabled;
     tox_config.ipv6_enabled = tox_cfg.ipv6_enabled;
+    tox_config.udp_port = tox_cfg.udp_port;
     tox_config.bootstrap_mode = tox_cfg.bootstrap_mode;
     tox_config.local_discovery_enabled = tox_cfg.bootstrap_mode == BootstrapMode::Lan;
     tox_config.name = "toxtunnel-client";
@@ -285,6 +340,7 @@ void TunnelClient::start() {
         providers.friends_online = [this]() -> std::size_t {
             return server_online_.load(std::memory_order_acquire) ? 1u : 0u;
         };
+        providers.dht_connected = [this]() -> bool { return tox_adapter_->is_connected(); };
         providers.peer_online_seconds = [this]() -> std::size_t {
             // Seconds the active server has been continuously online, or 0 when
             // offline. Snapshot under endpoints_mutex_ to avoid racing with
@@ -1043,6 +1099,10 @@ void TunnelClient::apply_coalesce_and_flow_control(tunnel::TunnelImpl& tunnel) {
     fc.safety_factor_x100 = static_cast<std::int64_t>(config_.flow_control.safety_factor_x100);
     fc.fixed_window_bytes = static_cast<std::int64_t>(config_.flow_control.fixed_window_bytes);
     tunnel.configure_flow_control(fc);
+
+    // Client-only: the client is the side that waits in Connecting for an
+    // OPEN_ACK (issue #36). Server tunnels never go through open().
+    tunnel.set_open_timeout(std::chrono::seconds(config_.tunnel.open_timeout_seconds));
 }
 
 void TunnelClient::start_pipe_mode() {
@@ -1475,7 +1535,13 @@ void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack,
         util::MetricsRegistry::instance().inc_resume_failures();
         util::Logger::warn("Tunnel {} resume declined (status {}); closing", ack.new_tunnel_id,
                            static_cast<int>(ack.status));
-        impl->close();
+        // Terminal ERROR, not a graceful close: bytes were lost in the
+        // reconnect gap (or the server no longer holds the tunnel), so the
+        // stream did not complete — the application must not be handed a
+        // clean EOF for it (issue #35). Nothing goes on the wire: the server
+        // has already dropped its side. Code 2 = general non-policy failure.
+        impl->fail_locally(2, "resume declined by server (status " +
+                                  std::to_string(static_cast<int>(ack.status)) + ")");
     }
 }
 
@@ -1545,32 +1611,33 @@ void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnectio
     });
 
     // Wire state change: when Connected (ACK received), start TCP read loop.
-    // Latch the open + active-gauge bookkeeping so the same tunnel can't
-    // be double-counted across the Connecting -> Connected -> Closed flow.
-    auto open_counted = std::make_shared<std::atomic<bool>>(false);
-    auto active_dec_latch = std::make_shared<std::atomic<bool>>(false);
-    tunnel->set_on_state_change(
-        [conn, tunnel_id, open_counted, active_dec_latch](tunnel::Tunnel::State new_state) {
-            if (new_state == tunnel::Tunnel::State::Connected) {
-                util::Logger::debug("Tunnel {} connected, starting TCP read", tunnel_id);
-                conn->start_read();
-                if (!open_counted->exchange(true)) {
-                    util::MetricsRegistry::instance().inc_tunnels_opened(
-                        util::MetricsRegistry::OpenResult::Ok);
-                    util::MetricsRegistry::instance().inc_tunnels_active(
-                        util::MetricsRegistry::Role::Client);
-                }
-            } else if (new_state == tunnel::Tunnel::State::Closed ||
-                       new_state == tunnel::Tunnel::State::Error) {
-                util::Logger::debug("Tunnel {} state: {}", tunnel_id, to_string(new_state));
-                conn->close();
-                if (open_counted->load(std::memory_order_acquire) &&
-                    !active_dec_latch->exchange(true)) {
-                    util::MetricsRegistry::instance().dec_tunnels_active(
-                        util::MetricsRegistry::Role::Client);
-                }
+    // All open/active bookkeeping goes through one mutex-guarded record so
+    // the Connected and terminal callbacks cannot interleave into a
+    // double-booked open or a leaked gauge (see ClientOpenBook).
+    auto book = std::make_shared<ClientOpenBook>();
+    tunnel->set_on_state_change([conn, tunnel_id, book](tunnel::Tunnel::State new_state) {
+        if (new_state == tunnel::Tunnel::State::Connected) {
+            if (!book_connected(*book)) {
+                return;  // Already ended; the socket is being closed.
             }
-        });
+            util::Logger::debug("Tunnel {} connected, starting TCP read", tunnel_id);
+            conn->start_read();
+        } else if (new_state == tunnel::Tunnel::State::Closed ||
+                   new_state == tunnel::Tunnel::State::Error) {
+            util::Logger::debug("Tunnel {} state: {}", tunnel_id, to_string(new_state));
+            const bool was_connected = book_terminal(*book);
+            // An established stream that ends in Error ended abnormally
+            // (the target reset, a peer TUNNEL_ERROR): reset the local socket
+            // so the application sees ECONNRESET, not a clean EOF that looks
+            // like a complete transfer (issue #35). Anything that never
+            // connected, and every graceful Closed, still ends with a FIN.
+            if (new_state == tunnel::Tunnel::State::Error && was_connected) {
+                conn->abort();
+            } else {
+                conn->close();
+            }
+        }
+    });
 
     // Wire tunnel close callback. H-S-4 (2026-05-20 fix-storm review):
     // capture shared_ptr — see the matching note on the pipe-mode
@@ -1686,8 +1753,7 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     // The reply gate latch ensures the listener's reply callback is invoked
     // exactly once across all possible state transitions of this tunnel.
     auto reply_sent = std::make_shared<std::atomic<bool>>(false);
-    auto open_counted = std::make_shared<std::atomic<bool>>(false);
-    auto active_dec_latch = std::make_shared<std::atomic<bool>>(false);
+    auto book = std::make_shared<ClientOpenBook>();
     auto reply_cb =
         std::make_shared<std::function<void(TunnelOpenOutcome)>>(std::move(on_tunnel_state));
     // Wrap initial_payload in a shared_ptr so the state-change lambda can drain
@@ -1696,13 +1762,15 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     auto initial_payload_holder =
         std::make_shared<std::vector<uint8_t>>(std::move(initial_payload));
     const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel;
-    tunnel->set_on_state_change([conn, tunnel_id, weak_tunnel, reply_sent, open_counted,
-                                 active_dec_latch, reply_cb,
+    tunnel->set_on_state_change([conn, tunnel_id, weak_tunnel, reply_sent, book, reply_cb,
                                  initial_payload_holder](tunnel::Tunnel::State new_state) {
         if (new_state == tunnel::Tunnel::State::Connected) {
             auto locked_tunnel = weak_tunnel.lock();
             if (!locked_tunnel) {
                 return;
+            }
+            if (!book_connected(*book)) {
+                return;  // Already ended; the terminal branch answered the reply.
             }
             if (!reply_sent->exchange(true)) {
                 (*reply_cb)(TunnelOpenOutcome::Connected);
@@ -1714,14 +1782,9 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
             }
             util::Logger::debug("SOCKS5 tunnel {} connected, starting TCP read", tunnel_id);
             conn->start_read();
-            if (!open_counted->exchange(true)) {
-                util::MetricsRegistry::instance().inc_tunnels_opened(
-                    util::MetricsRegistry::OpenResult::Ok);
-                util::MetricsRegistry::instance().inc_tunnels_active(
-                    util::MetricsRegistry::Role::Client);
-            }
         } else if (new_state == tunnel::Tunnel::State::Closed ||
                    new_state == tunnel::Tunnel::State::Error) {
+            const bool was_connected = book_terminal(*book);
             if (!reply_sent->exchange(true)) {
                 // Translate the peer's TUNNEL_ERROR reason so the listener can
                 // answer 0x02 ("not allowed by ruleset") for a policy denial
@@ -1737,11 +1800,12 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
                 (*reply_cb)(outcome);
             }
             util::Logger::debug("SOCKS5 tunnel {} state: {}", tunnel_id, to_string(new_state));
-            conn->close();
-            if (open_counted->load(std::memory_order_acquire) &&
-                !active_dec_latch->exchange(true)) {
-                util::MetricsRegistry::instance().dec_tunnels_active(
-                    util::MetricsRegistry::Role::Client);
+            // Abnormal end of an established stream -> RST (issue #35); see
+            // on_tcp_connection_accepted.
+            if (new_state == tunnel::Tunnel::State::Error && was_connected) {
+                conn->abort();
+            } else {
+                conn->close();
             }
         }
     });

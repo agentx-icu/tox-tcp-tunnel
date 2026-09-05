@@ -201,6 +201,26 @@ void TcpConnection::start_read() {
         // Anything the watch read ahead while the tunnel was still un-published
         // must reach on_data_ before the socket's next bytes do.
         deliver_peer_close_holdback();
+
+        // A FIN the watch saw behind those bytes is reported here, explicitly:
+        // do_read() returns at once when read_closed_ is set, so nothing else
+        // would ever surface it. Same shape as the read loop's own EOF branch.
+        // The replay may itself have closed the connection (a throwing
+        // consumer), in which case there is nothing left to report.
+        if (peer_close_pending_) {
+            peer_close_pending_ = false;
+            if (state_.load(std::memory_order_acquire) != ConnectionState::Connected) {
+                return;
+            }
+            util::Logger::debug("TcpConnection: reporting the peer close seen behind read-ahead");
+            if (on_read_eof_) {
+                on_read_eof_();
+            } else {
+                set_state(ConnectionState::Disconnecting);
+                do_close(std::error_code{});
+            }
+            return;
+        }
         do_read();
     });
 }
@@ -269,6 +289,16 @@ bool TcpConnection::write(const uint8_t* data, std::size_t length) {
         if (inner_s != ConnectionState::Connected && inner_s != ConnectionState::Disconnecting) {
             return;
         }
+        if (send_shutdown_requested_.load(std::memory_order_acquire)) {
+            // Posted after the shutdown request took effect on this strand:
+            // the stream has ended for the peer, so these bytes have no home.
+            // Correct peers never produce this (a CLOSE follows the last
+            // DATA), so it is worth a line.
+            util::Logger::warn(
+                "TcpConnection: dropping {} bytes written after the send half was shut down",
+                buf.size());
+            return;
+        }
         enqueue_write_locked(WriteBuffer{std::move(buf), {}});
     });
     return !over;
@@ -297,6 +327,16 @@ bool TcpConnection::write(std::vector<uint8_t> data) {
         if (inner_s != ConnectionState::Connected && inner_s != ConnectionState::Disconnecting) {
             return;
         }
+        if (send_shutdown_requested_.load(std::memory_order_acquire)) {
+            // Posted after the shutdown request took effect on this strand:
+            // the stream has ended for the peer, so these bytes have no home.
+            // Correct peers never produce this (a CLOSE follows the last
+            // DATA), so it is worth a line.
+            util::Logger::warn(
+                "TcpConnection: dropping {} bytes written after the send half was shut down",
+                data.size());
+            return;
+        }
         enqueue_write_locked(WriteBuffer{std::move(data), {}});
     });
     return !over;
@@ -323,6 +363,16 @@ bool TcpConnection::write(OwnedBufferView buf) {
     asio::post(strand_, [this, self, buf = std::move(buf)]() mutable {
         ConnectionState inner_s = state_.load(std::memory_order_acquire);
         if (inner_s != ConnectionState::Connected && inner_s != ConnectionState::Disconnecting) {
+            return;
+        }
+        if (send_shutdown_requested_.load(std::memory_order_acquire)) {
+            // Posted after the shutdown request took effect on this strand:
+            // the stream has ended for the peer, so these bytes have no home.
+            // Correct peers never produce this (a CLOSE follows the last
+            // DATA), so it is worth a line.
+            util::Logger::warn(
+                "TcpConnection: dropping {} bytes written after the send half was shut down",
+                buf.size());
             return;
         }
         enqueue_write_locked(WriteBuffer{{}, std::move(buf)});
@@ -367,46 +417,73 @@ void TcpConnection::close() {
 }
 
 void TcpConnection::shutdown_send() {
-    send_shutdown_requested_.store(true, std::memory_order_release);
+    // The request takes effect ON THE STRAND, in queue order with the writes
+    // that precede it -- not at call time. Setting the flag here, before the
+    // post, let a write-completion handler that happened to run in between
+    // see "shutdown requested" with an empty queue and shut the send half
+    // down while earlier write() calls were still posted-but-not-enqueued
+    // behind it: the FIN overtook those bytes and the peer saw a clean but
+    // truncated stream (issue #33 -- the tail lost was exactly the frames
+    // still in flight through the strand when the peer's CLOSE arrived).
     auto self = shared_from_this();
     asio::post(strand_, [this, self]() {
         if (state_.load(std::memory_order_acquire) == ConnectionState::Disconnected) {
             return;
         }
+        send_shutdown_requested_.store(true, std::memory_order_release);
         maybe_shutdown_send_locked();
     });
 }
 
 void TcpConnection::force_close() {
     auto self = shared_from_this();
-    asio::post(strand_, [this, self]() {
-        if (state_.load(std::memory_order_acquire) == ConnectionState::Disconnected) {
-            return;
-        }
-        util::Logger::debug("TcpConnection: force close");
+    asio::post(strand_, [this, self]() { do_force_close(/*reset=*/false); });
+}
 
-        // Discard pending writes. Subtract their bytes from the
-        // accounting; do NOT touch the in-flight write — its completion
-        // handler (which holds the buffer in a `shared_ptr<WriteBuffer>`)
-        // will fire with `operation_aborted` and refund its own bytes.
-        // The previous `store(0)` + `write_in_progress_ = false` racey
-        // pair caused an underflow because the in-flight completion still
-        // ran fetch_sub after store(0). (C-10 / H-13 in the 2026-05-20
-        // review.)
-        std::size_t pending = 0;
-        for (auto& wb : write_queue_) {
-            pending += wb.size();
-        }
-        if (pending > 0) {
-            write_buffer_bytes_.fetch_sub(pending, std::memory_order_relaxed);
-        }
-        write_queue_.clear();
-        // write_in_progress_ is intentionally left alone: the in-flight
-        // completion lambda flips it back to false (or do_close handles
-        // re-entry, since state_ is already Disconnected after do_close).
+void TcpConnection::abort() {
+    auto self = shared_from_this();
+    asio::post(strand_, [this, self]() { do_force_close(/*reset=*/true); });
+}
 
-        do_close(asio::error::operation_aborted);
-    });
+void TcpConnection::do_force_close(bool reset) {
+    if (state_.load(std::memory_order_acquire) == ConnectionState::Disconnected) {
+        return;
+    }
+    util::Logger::debug("TcpConnection: {}", reset ? "abort (RST)" : "force close");
+
+    if (reset && socket_.is_open()) {
+        // A zero linger turns the close below into an abortive one: the kernel
+        // drops the send queue and answers with RST, so the peer's next read
+        // fails with ECONNRESET instead of returning end-of-stream.
+        std::error_code linger_ec;
+        socket_.set_option(asio::socket_base::linger(true, 0), linger_ec);
+        if (linger_ec) {
+            util::Logger::debug("TcpConnection: SO_LINGER for abortive close failed: {}",
+                                linger_ec.message());
+        }
+    }
+
+    // Discard pending writes. Subtract their bytes from the
+    // accounting; do NOT touch the in-flight write — its completion
+    // handler (which holds the buffer in a `shared_ptr<WriteBuffer>`)
+    // will fire with `operation_aborted` and refund its own bytes.
+    // The previous `store(0)` + `write_in_progress_ = false` racey
+    // pair caused an underflow because the in-flight completion still
+    // ran fetch_sub after store(0). (C-10 / H-13 in the 2026-05-20
+    // review.)
+    std::size_t pending = 0;
+    for (auto& wb : write_queue_) {
+        pending += wb.size();
+    }
+    if (pending > 0) {
+        write_buffer_bytes_.fetch_sub(pending, std::memory_order_relaxed);
+    }
+    write_queue_.clear();
+    // write_in_progress_ is intentionally left alone: the in-flight
+    // completion lambda flips it back to false (or do_close handles
+    // re-entry, since state_ is already Disconnected after do_close).
+
+    do_close(asio::error::operation_aborted);
 }
 
 // ===========================================================================
@@ -593,6 +670,10 @@ void TcpConnection::do_watch_peer_close() {
                 return;
             }
 
+            // The error that actually ended the stream. The wait's own `ec` is
+            // clean for a FIN; a drain-time read_some() can add a reset.
+            std::error_code close_ec = ec;
+
             if (!ec) {
                 // Readable. That is either the peer closing (FIN: readable with
                 // nothing to read) or real data — and a target that sends a
@@ -654,21 +735,100 @@ void TcpConnection::do_watch_peer_close() {
                         do_watch_peer_close();
                         return;
                     }
-                    // eof / reset while draining: fall through to teardown.
+                    // eof / reset while draining: fall through to teardown,
+                    // carrying the real verdict (a reset here used to be
+                    // reported as a clean close because only the wait's ec
+                    // was consulted).
+                    if (read_ec != asio::error::eof) {
+                        close_ec = read_ec;
+                    }
+                } else if (!avail_ec) {
+                    // Readable with nothing to read is either FIN or RST, and
+                    // available() cannot tell them apart -- on every stack a
+                    // reset that lands behind banked bytes looks exactly like
+                    // a graceful close here. A non-blocking probe read can:
+                    // eof for FIN, a reset error for RST, would_block for a
+                    // spurious wakeup. User non-blocking mode for the probe
+                    // only, so a spurious wakeup cannot park this strand in
+                    // asio's synchronous poll.
+                    const bool was_non_blocking = socket_.non_blocking();
+                    std::error_code mode_ec;
+                    socket_.non_blocking(true, mode_ec);
+                    if (mode_ec) {
+                        // Cannot probe without risking a blocking read on the
+                        // strand: keep the pre-probe verdict (FIN).
+                        util::Logger::debug(
+                            "TcpConnection: could not enter non-blocking mode for the FIN/RST "
+                            "probe ({}); assuming FIN",
+                            mode_ec.message());
+                    }
+                    std::uint8_t probe = 0;
+                    std::error_code probe_ec = asio::error::eof;
+                    std::size_t got = 0;
+                    if (!mode_ec) {
+                        got = socket_.read_some(asio::buffer(&probe, 1), probe_ec);
+                        std::error_code restore_ec;
+                        socket_.non_blocking(was_non_blocking, restore_ec);
+                        if (restore_ec) {
+                            util::Logger::debug(
+                                "TcpConnection: could not restore the socket's blocking mode "
+                                "after the FIN/RST probe: {}",
+                                restore_ec.message());
+                        }
+                    }
+                    if (!probe_ec && got > 0) {
+                        // A byte raced in between available() and the probe: it
+                        // belongs to the stream, so bank it and keep watching
+                        // (one byte past the cap is harmless; the next pass
+                        // applies the cap).
+                        peer_close_holdback_.push_back(probe);
+                        do_watch_peer_close();
+                        return;
+                    }
+                    if (probe_ec == asio::error::would_block ||
+                        probe_ec == asio::error::try_again) {
+                        do_watch_peer_close();
+                        return;
+                    }
+                    if (probe_ec && probe_ec != asio::error::eof) {
+                        close_ec = probe_ec;
+                    }
+                    // eof: a graceful FIN, close_ec stays clean.
                 }
+            }
+
+            peer_close_watch_active_ = false;
+
+            // A graceful FIN behind bytes the target already handed us: those
+            // bytes were acknowledged at the TCP layer and belong to the
+            // stream, so they are NOT discarded. The close is recorded and the
+            // watch stands down; start_read() replays the holdback and then
+            // reports the FIN exactly as the read loop would have — a
+            // half-close via on_read_eof_ — once the OPEN_ACK is on the wire.
+            // (issue #33: "anything banked in the holdback dies with it" was
+            // silent truncation of a target that answered and closed before
+            // its tunnel was published.) read_closed_ keeps do_read() from
+            // ever posting a read for a socket whose peer has finished.
+            if (!close_ec && !peer_close_holdback_.empty()) {
+                peer_close_pending_ = true;
+                read_closed_ = true;
+                util::Logger::debug(
+                    "TcpConnection: peer closed behind {} read-ahead bytes; deferring the close "
+                    "until the read loop starts",
+                    peer_close_holdback_.size());
+                return;
             }
 
             // Readable with nothing to read is FIN; a failed probe, a failed
             // wait or a failed read is RST or worse. Either way the target is
             // gone, and it is gone before the tunnel was ever published — so
             // this is a hard close, not the half-close the read loop would
-            // report. Anything banked in the holdback dies with it.
-            peer_close_watch_active_ = false;
+            // report. A reset discards anything banked, as the kernel would.
             peer_close_holdback_.clear();
             peer_close_holdback_.shrink_to_fit();
             util::Logger::debug("TcpConnection: peer closed before the read loop started");
             set_state(ConnectionState::Disconnecting);
-            do_close(ec ? ec : std::error_code{});
+            do_close(close_ec);
         }));
 }
 
@@ -722,6 +882,7 @@ void TcpConnection::do_write() {
                 return;
             }
 
+            bytes_written_total_ += bytes_transferred;
             const std::size_t remaining =
                 write_buffer_bytes_.fetch_sub(inflight->size(), std::memory_order_relaxed) -
                 inflight->size();
@@ -775,7 +936,8 @@ void TcpConnection::maybe_shutdown_send_locked() {
     socket_.shutdown(asio::ip::tcp::socket::shutdown_send, shutdown_ec);
     if (!shutdown_ec || shutdown_ec == asio::error::not_connected) {
         send_shutdown_done_ = true;
-        util::Logger::debug("TcpConnection: send half shut down");
+        util::Logger::debug("TcpConnection: send half shut down (bytes_written_total={})",
+                            bytes_written_total_);
     } else {
         util::Logger::debug("TcpConnection: send half shutdown failed: {}", shutdown_ec.message());
         notify_error(shutdown_ec);

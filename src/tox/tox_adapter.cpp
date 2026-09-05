@@ -122,6 +122,14 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
     tox_options_set_ipv6_enabled(opts, config_.ipv6_enabled);
     tox_options_set_local_discovery_enabled(opts, config_.local_discovery_enabled);
 
+    // A fixed DHT port is start == end: toxcore walks [start, end] and stops
+    // at the first free one, so a single-port range binds exactly that port
+    // or fails (issue #32). Zero keeps the default walk.
+    if (config_.udp_port != 0) {
+        tox_options_set_start_port(opts, config_.udp_port);
+        tox_options_set_end_port(opts, config_.udp_port);
+    }
+
     if (config_.tcp_port != 0) {
         tox_options_set_tcp_port(opts, config_.tcp_port);
     }
@@ -171,13 +179,18 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
                 break;
             case TOX_ERR_NEW_PORT_ALLOC:
                 // The single most common startup failure on a host that already
-                // runs a toxtunnel: the UDP port walks to the next free one,
-                // the Tox TCP relay port does not. Say which port and which
-                // config key, because "could not bind to port" sent three
-                // separate people hunting the wrong thing.
-                msg += "could not bind Tox TCP relay port " + std::to_string(config_.tcp_port) +
-                       " (set tox.tcp_port to a free port; unlike the UDP port it does not "
-                       "auto-select)";
+                // runs a toxtunnel. toxcore does not say WHICH socket failed,
+                // so name both candidates with their config keys: the TCP
+                // relay port never auto-selects, and the UDP port only walks
+                // when tox.udp_port is unset (issue #32).
+                msg += "could not bind a Tox listening port: TCP relay port " +
+                       std::to_string(config_.tcp_port) + " (tox.tcp_port; never auto-selects)";
+                if (config_.udp_enabled) {
+                    msg += config_.udp_port != 0
+                               ? ", or fixed UDP port " + std::to_string(config_.udp_port) +
+                                     " (tox.udp_port; set 0 to let toxcore walk 33445..33545)"
+                               : ", or every UDP port in 33445..33545";
+                }
                 break;
             case TOX_ERR_NEW_PROXY_BAD_TYPE:
                 msg += "bad proxy type";
@@ -312,6 +325,11 @@ void ToxAdapter::stop() {
     // stop() until that curl returns.
     BootstrapSource::cancel_pending_refreshes();
 
+    // Same for the adapter-owned bootstrap-retry fetch worker (issue #34):
+    // disarm the retry, flag the worker, join it. After this no thread can
+    // deposit a node list into this adapter.
+    stop_bootstrap_retry_worker();
+
     if (iterate_thread_.joinable()) {
         iterate_thread_.join();
     }
@@ -353,7 +371,7 @@ std::size_t ToxAdapter::bootstrap() {
     }
 
     std::vector<BootstrapNode> bootstrap_nodes;
-    auto resolved = resolve_bootstrap_nodes_for_config(config_);
+    auto resolved = resolve_bootstrap_nodes_for_config(config_, config_.bootstrap_fetcher);
     if (resolved) {
         bootstrap_nodes = resolved.value();
         if (config_.bootstrap_mode == BootstrapMode::Lan && bootstrap_nodes.empty()) {
@@ -376,34 +394,23 @@ std::size_t ToxAdapter::bootstrap() {
     }
 
     std::size_t success_count = run_on_tox_thread([&]() -> std::size_t {
-        std::size_t count = 0;
         std::lock_guard<std::mutex> lock(tox_mutex_);
-
-        for (const auto& node : bootstrap_nodes) {
-            TOX_ERR_BOOTSTRAP err;
-            bool ok =
-                tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
-
-            if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
-                ++count;
-                util::Logger::debug("Bootstrap success: {}:{}", node.ip, node.port);
-            } else {
-                util::Logger::warn("Bootstrap failed for {}:{} (error {})", node.ip, node.port,
-                                   static_cast<int>(err));
-            }
-
-            // Also add as TCP relay for TCP-only connections.
-            TOX_ERR_BOOTSTRAP relay_err;
-            tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
-                              &relay_err);
-
-            if (relay_err != TOX_ERR_BOOTSTRAP_OK) {
-                util::Logger::debug("TCP relay add failed for {}:{} (error {})", node.ip, node.port,
-                                    static_cast<int>(relay_err));
-            }
-        }
-        return count;
+        return contact_bootstrap_nodes_locked(bootstrap_nodes);
     });
+
+    // Arm the lifetime retry (issue #34). LAN mode deliberately has no public
+    // node list to fetch and relies on local discovery, so it is left alone.
+    if (config_.bootstrap_mode != BootstrapMode::Lan &&
+        config_.bootstrap_retry_initial_delay.count() > 0) {
+        std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+        bootstrap_retry_.armed = true;
+        bootstrap_retry_.nodes = bootstrap_nodes;
+        bootstrap_retry_.attempts = 0;
+        bootstrap_retry_.delay = config_.bootstrap_retry_initial_delay;
+        bootstrap_retry_.next_attempt = std::chrono::steady_clock::now() + bootstrap_retry_.delay;
+        bootstrap_retry_.disconnected_since = std::chrono::steady_clock::now();
+        bootstrap_retry_.last_status_log = bootstrap_retry_.disconnected_since;
+    }
 
     if (success_count == 0) {
         // "Bootstrap complete: 0/0 nodes contacted" at info level reads as
@@ -422,6 +429,181 @@ std::size_t ToxAdapter::bootstrap() {
                            bootstrap_nodes.size());
     }
     return success_count;
+}
+
+std::size_t ToxAdapter::contact_bootstrap_nodes_locked(const std::vector<BootstrapNode>& nodes) {
+    std::size_t count = 0;
+    for (const auto& node : nodes) {
+        TOX_ERR_BOOTSTRAP err;
+        bool ok =
+            tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
+
+        if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
+            ++count;
+            util::Logger::debug("Bootstrap success: {}:{}", node.ip, node.port);
+        } else {
+            util::Logger::warn("Bootstrap failed for {}:{} (error {})", node.ip, node.port,
+                               static_cast<int>(err));
+        }
+
+        // Also add as TCP relay for TCP-only connections.
+        TOX_ERR_BOOTSTRAP relay_err;
+        tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
+                          &relay_err);
+
+        if (relay_err != TOX_ERR_BOOTSTRAP_OK) {
+            util::Logger::debug("TCP relay add failed for {}:{} (error {})", node.ip, node.port,
+                                static_cast<int>(relay_err));
+        }
+    }
+    return count;
+}
+
+unsigned ToxAdapter::bootstrap_retry_attempts() const {
+    std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+    return bootstrap_retry_.attempts;
+}
+
+std::size_t ToxAdapter::bootstrap_node_count() const {
+    std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+    return bootstrap_retry_.nodes.size();
+}
+
+void ToxAdapter::bootstrap_retry_tick() {
+    // Runs on the Tox thread once per iteration. Everything below is a few
+    // loads and one mutex when armed; the expensive part (the fetch) lives on
+    // the worker.
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<BootstrapNode> to_contact;
+    bool log_status = false;
+    bool spawn_fetch = false;
+    unsigned attempt = 0;
+    unsigned attempts_so_far = 0;
+    std::chrono::seconds disconnected_for{0};
+    std::chrono::seconds next_in{0};
+    std::size_t known_nodes = 0;
+    {
+        std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+        auto& r = bootstrap_retry_;
+        if (!r.armed) {
+            return;
+        }
+        // Reap a finished worker so a later spawn never blocks on join().
+        if (!r.fetch_in_flight && r.worker.joinable()) {
+            r.worker.join();
+        }
+        if (connected_.load(std::memory_order_acquire)) {
+            // Connected: toxcore keeps its own node tables alive from here.
+            // Reset so a LATER disconnect restarts the schedule from the
+            // short delay, and keep whatever list the retry last fetched.
+            r.attempts = 0;
+            r.delay = config_.bootstrap_retry_initial_delay;
+            r.next_attempt = now + r.delay;
+            r.disconnected_since = now;
+            r.last_status_log = now;
+            return;
+        }
+        if (r.has_fetched) {
+            // The worker deposited a fresh list: contact it right away, on this
+            // (the Tox) thread — the worker itself never touches tox_.
+            r.nodes = std::move(r.fetched);
+            r.fetched.clear();
+            r.has_fetched = false;
+            to_contact = r.nodes;
+        }
+        known_nodes = r.nodes.size();
+        disconnected_for =
+            std::chrono::duration_cast<std::chrono::seconds>(now - r.disconnected_since);
+        if (to_contact.empty() && now >= r.next_attempt) {
+            ++r.attempts;
+            attempt = r.attempts;
+            r.delay = std::min(r.delay * 2, config_.bootstrap_retry_max_delay);
+            r.next_attempt = now + r.delay;
+            if (r.nodes.empty()) {
+                // Nothing to contact: the startup fetch failed with no cache.
+                // Fetch again — on the worker, which may block for curl's
+                // full timeout — unless a fetch is still running.
+                if (!r.fetch_in_flight) {
+                    spawn_fetch = true;
+                }
+            } else {
+                to_contact = r.nodes;
+            }
+        }
+        next_in = std::chrono::duration_cast<std::chrono::seconds>(r.next_attempt - now);
+        if (next_in.count() < 0) {
+            next_in = std::chrono::seconds{0};
+        }
+        // Periodic status while never connected, so a log tail shows the state
+        // instead of only the single startup error (issue #34).
+        if (now - r.last_status_log >= std::chrono::seconds(60)) {
+            r.last_status_log = now;
+            log_status = true;
+        }
+        attempts_so_far = r.attempts;
+        if (spawn_fetch) {
+            r.fetch_in_flight = true;
+            r.worker_stop = std::make_shared<std::atomic<bool>>(false);
+            auto stop = r.worker_stop;
+            auto fetcher = config_.bootstrap_fetcher;
+            auto data_dir = config_.data_dir;
+            r.worker = std::thread([this, stop, fetcher, data_dir]() mutable {
+                auto result = BootstrapSource::fetch_and_cache_default_nodes(data_dir, fetcher);
+                std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+                bootstrap_retry_.fetch_in_flight = false;
+                if (stop->load(std::memory_order_acquire)) {
+                    return;  // stop() won; the adapter is going away.
+                }
+                if (result) {
+                    bootstrap_retry_.fetched = std::move(result.value());
+                    bootstrap_retry_.has_fetched = true;
+                } else {
+                    util::Logger::warn("Bootstrap node list fetch retry failed: {}",
+                                       result.error());
+                }
+            });
+        }
+    }
+
+    if (!to_contact.empty()) {
+        std::size_t contacted = 0;
+        {
+            std::lock_guard<std::mutex> lock(tox_mutex_);
+            contacted = contact_bootstrap_nodes_locked(to_contact);
+        }
+        util::Logger::info("Bootstrap retry {}: contacted {}/{} node(s)", attempt, contacted,
+                           to_contact.size());
+    } else if (spawn_fetch) {
+        util::Logger::info("Bootstrap retry {}: re-fetching the node list from {}", attempt,
+                           std::string(BootstrapSource::kDefaultNodesUrl));
+    }
+
+    if (log_status) {
+        util::Logger::warn(
+            "Not connected to the Tox DHT for {}s (known bootstrap nodes: {}, retry attempts: {}, "
+            "next retry in {}s); this daemon cannot reach any peer until it connects",
+            disconnected_for.count(), known_nodes, attempts_so_far, next_in.count());
+    }
+}
+
+void ToxAdapter::stop_bootstrap_retry_worker() {
+    std::thread worker;
+    std::shared_ptr<std::atomic<bool>> stop;
+    {
+        std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+        bootstrap_retry_.armed = false;
+        bootstrap_retry_.has_fetched = false;
+        bootstrap_retry_.fetched.clear();
+        worker = std::move(bootstrap_retry_.worker);
+        stop = std::move(bootstrap_retry_.worker_stop);
+    }
+    if (stop) {
+        stop->store(true, std::memory_order_release);
+    }
+    if (worker.joinable()) {
+        // Bounded by the fetcher's own timeout (curl --max-time 8).
+        worker.join();
+    }
 }
 
 bool ToxAdapter::add_bootstrap_node(const BootstrapNode& node) {
@@ -916,9 +1098,18 @@ void ToxAdapter::run_loop() {
     iterate_thread_id_ = std::this_thread::get_id();
     iterate_thread_id_valid_.store(true, std::memory_order_release);
 
+    // Phase reporting for the watchdog: cheap relaxed stores, so a stall
+    // names the step it is stuck in instead of just "no heartbeat".
+    const auto note_phase = [this](ToxWatchdog::Phase phase) {
+        if (auto* wd = watchdog_.load(std::memory_order_acquire)) {
+            wd->note_phase(phase);
+        }
+    };
+
     while (running_.load()) {
         uint32_t interval;
         {
+            note_phase(ToxWatchdog::Phase::Iterate);
             std::lock_guard<std::mutex> lock(tox_mutex_);
             const auto iterate_start = std::chrono::steady_clock::now();
             tox_iterate(tox_.get(), this);
@@ -942,9 +1133,17 @@ void ToxAdapter::run_loop() {
 
         // Execute any toxcore work posted from other threads. Runs outside the
         // tox_mutex_ lock above; each task re-acquires the mutex itself.
+        note_phase(ToxWatchdog::Phase::Tasks);
         process_tox_tasks();
 
+        note_phase(ToxWatchdog::Phase::Dispatch);
         dispatch_pending_events();
+
+        // DHT-bootstrap retry while disconnected (issue #34). Cheap when
+        // nothing is due; any toxcore call it makes takes tox_mutex_ itself.
+        note_phase(ToxWatchdog::Phase::Maintenance);
+        bootstrap_retry_tick();
+        note_phase(ToxWatchdog::Phase::Idle);
 
         // tox_iteration_interval() returns up to ~50ms when idle. wake_cv_
         // already short-circuits the wait when we have outbound work, but
@@ -1275,6 +1474,7 @@ void ToxAdapter::on_self_connection_status_cb(Tox* /*tox*/, TOX_CONNECTION conne
     auto* self = static_cast<ToxAdapter*>(user_data);
     bool connected = (connection_status != TOX_CONNECTION_NONE);
     self->connected_.store(connected);
+    util::MetricsRegistry::instance().set_dht_connected(connected);
 
     const char* type_str = "none";
     if (connection_status == TOX_CONNECTION_TCP) {

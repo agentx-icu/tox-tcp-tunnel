@@ -141,3 +141,89 @@ TEST(ToxAdapterTest, DirectoryAtSaveFilePathDoesNotCrash) {
 
 }  // namespace
 }  // namespace toxtunnel::tox
+
+namespace toxtunnel::tox {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Bootstrap lifetime retry (issue #34): a failed startup fetch of the node list
+// is retried for as long as the node is not connected to the DHT, on a worker
+// that never touches toxcore; the Tox thread consumes what it fetched.
+// ---------------------------------------------------------------------------
+
+TEST(ToxAdapterTest, BootstrapRetriesTheNodeListFetchUntilItSucceeds) {
+    const auto test_dir = std::filesystem::temp_directory_path() / "toxtunnel_bootstrap_retry_test";
+    std::filesystem::remove_all(test_dir);
+
+    std::atomic<int> fetches{0};
+    ToxAdapterConfig config;
+    config.data_dir = test_dir;
+    config.udp_enabled = false;  // no sockets needed; bootstrap() still runs
+    config.bootstrap_mode = BootstrapMode::Auto;
+    config.bootstrap_retry_initial_delay = std::chrono::milliseconds(30);
+    config.bootstrap_retry_max_delay = std::chrono::milliseconds(100);
+    config.bootstrap_fetcher = [&fetches]() -> util::Expected<std::string, BootstrapFetchError> {
+        const int n = fetches.fetch_add(1) + 1;
+        if (n < 3) {
+            return util::unexpected(BootstrapFetchError{std::string("simulated outage")});
+        }
+        return std::string(
+            R"({"nodes":[{"ipv4":"127.0.0.1","port":33445,"status_udp":true,)"
+            R"("public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}]})");
+    };
+
+    ToxAdapter adapter;
+    auto init = adapter.initialize(config);
+    ASSERT_TRUE(init.has_value()) << init.error();
+    ASSERT_TRUE(adapter.start());
+
+    // The startup fetch fails and there is no cache: zero nodes, as in the
+    // field. This must no longer be permanent.
+    EXPECT_EQ(adapter.bootstrap(), 0u);
+    EXPECT_EQ(adapter.bootstrap_node_count(), 0u);
+    EXPECT_EQ(fetches.load(), 1);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (adapter.bootstrap_node_count() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(adapter.bootstrap_node_count(), 1u) << "the retry must adopt the fetched list";
+    EXPECT_GE(fetches.load(), 3);
+    EXPECT_GE(adapter.bootstrap_retry_attempts(), 2u);
+    // The successful fetch also refreshed the cache for the next start.
+    EXPECT_TRUE(std::filesystem::exists(BootstrapSource::cache_file_path(test_dir)));
+
+    adapter.stop();
+    std::filesystem::remove_all(test_dir);
+}
+
+TEST(ToxAdapterTest, BootstrapRetryIsNotArmedInLanMode) {
+    const auto test_dir = std::filesystem::temp_directory_path() / "toxtunnel_bootstrap_lan_test";
+    std::filesystem::remove_all(test_dir);
+
+    std::atomic<int> fetches{0};
+    ToxAdapterConfig config;
+    config.data_dir = test_dir;
+    config.udp_enabled = false;
+    config.bootstrap_mode = BootstrapMode::Lan;
+    config.bootstrap_retry_initial_delay = std::chrono::milliseconds(10);
+    config.bootstrap_fetcher = [&fetches]() -> util::Expected<std::string, BootstrapFetchError> {
+        fetches.fetch_add(1);
+        return util::unexpected(BootstrapFetchError{std::string("must not be called")});
+    };
+
+    ToxAdapter adapter;
+    auto init = adapter.initialize(config);
+    ASSERT_TRUE(init.has_value()) << init.error();
+    ASSERT_TRUE(adapter.start());
+    EXPECT_EQ(adapter.bootstrap(), 0u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(fetches.load(), 0) << "LAN mode has no public node list to fetch";
+    EXPECT_EQ(adapter.bootstrap_retry_attempts(), 0u);
+
+    adapter.stop();
+    std::filesystem::remove_all(test_dir);
+}
+
+}  // namespace
+}  // namespace toxtunnel::tox

@@ -317,6 +317,24 @@ util::Expected<std::vector<BootstrapNode>, std::string> BootstrapSource::resolve
     return load_cached_nodes(cache_path, max_nodes);
 }
 
+util::Expected<std::vector<BootstrapNode>, std::string>
+BootstrapSource::fetch_and_cache_default_nodes(const std::filesystem::path& data_dir,
+                                               Fetcher fetcher, std::size_t max_nodes) {
+    if (!fetcher) {
+        fetcher = [] { return fetch_default_nodes_json(); };
+    }
+    const auto fetched_json = fetcher();
+    if (!fetched_json) {
+        return util::unexpected(fetched_json.error().message);
+    }
+    auto parsed = parse_nodes_json(fetched_json.value(), max_nodes);
+    if (!parsed) {
+        return util::unexpected(parsed.error());
+    }
+    write_cache(cache_file_path(data_dir), fetched_json.value());
+    return parsed;
+}
+
 util::Expected<std::string, BootstrapFetchError> BootstrapSource::fetch_default_nodes_json() {
     // H-11 (2026-05-26): popen()/curl cannot be interrupted mid-call, so the
     // background-refresh worker — which cancel_pending_refreshes() joins during

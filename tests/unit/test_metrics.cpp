@@ -166,6 +166,7 @@ TEST_F(MetricsTest, RenderEmitsHelpAndTypeForEveryMetric) {
              "toxtunnel_bytes_in_total",
              "toxtunnel_bytes_out_total",
              "toxtunnel_friends_online",
+             "toxtunnel_dht_connected",
              "toxtunnel_tox_iterate_lag_milliseconds",
          }) {
         const std::string help = "# HELP " + std::string(name);

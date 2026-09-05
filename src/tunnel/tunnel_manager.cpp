@@ -764,8 +764,16 @@ bool TunnelManager::remove_tunnel_impl(uint16_t tunnel_id, const Tunnel* expecte
         // a throwing DATA callback drove to Abort) no-ops on close(), which
         // would detach it here with nothing fired or released; sampling the
         // seal (abort_teardown_required) routes it to force_close instead.
+        //
+        // DrainIfClosed, not the default Abort: for a tunnel that is `Closed`
+        // because its own graceful teardown completed (the peer's CLOSE
+        // finalized it), this removal is only the resource release, and the
+        // local socket may still be draining bytes the peer delivered ahead
+        // of that CLOSE. Discarding them truncated the stream (issue #33).
+        // force_close() keeps the hard release for every other state and for
+        // a closed outbound gate, so session teardown is unaffected.
         if (impl != nullptr && impl->abort_teardown_required()) {
-            impl->force_close();
+            impl->force_close(TunnelImpl::ResourceRelease::DrainIfClosed);
         } else {
             doomed->close();
         }

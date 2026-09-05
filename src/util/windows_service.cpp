@@ -7,6 +7,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace toxtunnel::util {
 namespace {
@@ -132,10 +133,111 @@ std::wstring utf8_to_wide(const std::string& utf8) {
 
 namespace toxtunnel::util {
 
+#if defined(_WIN32)
+namespace {
+
+/// Whether the last install call found the service already registered and
+/// updated it in place rather than creating it.
+bool g_last_install_updated_existing = false;
+
+/// The recovery policy every ToxTunnel service registration carries.
+///
+/// Without it the SCM does nothing when the daemon stops with an error or
+/// crashes — a watchdog abort became 15 hours of silent downtime on a rig
+/// (issue #38), and a startup failure that a retry would fix (the data
+/// directory still held by the previous instance) left the service simply
+/// stopped. systemd (`Restart=on-failure`) and launchd
+/// (`KeepAlive{SuccessfulExit:false}`) already retry; this gives Windows the
+/// same behaviour. SERVICE_CONFIG_FAILURE_ACTIONS_FLAG is required as well:
+/// by default the SCM only counts a *crash* as a failure, not a clean exit
+/// reporting an error code, which is exactly how this daemon reports one.
+///
+/// Requires SERVICE_CHANGE_CONFIG on @p service. Returns false with the
+/// last-error text set if either half could not be applied.
+bool apply_recovery_policy(SC_HANDLE service) {
+    SC_ACTION actions[3];
+    actions[0].Type = SC_ACTION_RESTART;
+    actions[0].Delay = 10'000;  // 10 s
+    actions[1].Type = SC_ACTION_RESTART;
+    actions[1].Delay = 30'000;  // 30 s
+    actions[2].Type = SC_ACTION_RESTART;
+    actions[2].Delay = 60'000;  // then every minute
+    SERVICE_FAILURE_ACTIONSA failure_actions{};
+    failure_actions.dwResetPeriod = 86'400;  // forget the failure count after a day
+    failure_actions.lpRebootMsg = nullptr;
+    failure_actions.lpCommand = nullptr;
+    failure_actions.cActions = 3;
+    failure_actions.lpsaActions = actions;
+    if (!ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure_actions)) {
+        set_last_service_error("ChangeServiceConfig2(FAILURE_ACTIONS) failed", GetLastError());
+        return false;
+    }
+
+    SERVICE_FAILURE_ACTIONS_FLAG failure_flag{};
+    failure_flag.fFailureActionsOnNonCrashFailures = TRUE;
+    if (!ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failure_flag)) {
+        set_last_service_error("ChangeServiceConfig2(FAILURE_ACTIONS_FLAG) failed", GetLastError());
+        return false;
+    }
+    return true;
+}
+
+/// Standard two-call QueryServiceConfig2 read into a byte buffer. Returns an
+/// empty buffer on failure (with the last-error text set).
+std::vector<unsigned char> query_service_config2(SC_HANDLE service, DWORD info_level,
+                                                 const char* what) {
+    DWORD needed = 0;
+    if (!QueryServiceConfig2A(service, info_level, nullptr, 0, &needed) &&
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        set_last_service_error(what, GetLastError());
+        return {};
+    }
+    std::vector<unsigned char> buffer(needed > 0 ? needed : 1);
+    if (!QueryServiceConfig2A(service, info_level, buffer.data(), static_cast<DWORD>(buffer.size()),
+                              &needed)) {
+        set_last_service_error(what, GetLastError());
+        return {};
+    }
+    return buffer;
+}
+
+/// True when the service already carries a complete recovery policy: at
+/// least one failure action AND the non-crash flag. Either half missing is
+/// "not configured" — a service with actions but without the flag ignores an
+/// error exit, which is how this daemon reports a failed start.
+/// Requires SERVICE_QUERY_CONFIG. Sets @p ok false if the query itself failed.
+bool recovery_policy_present(SC_HANDLE service, bool& ok) {
+    ok = true;
+    auto actions = query_service_config2(service, SERVICE_CONFIG_FAILURE_ACTIONS,
+                                         "QueryServiceConfig2(FAILURE_ACTIONS) failed");
+    if (actions.size() < sizeof(SERVICE_FAILURE_ACTIONSA)) {
+        ok = false;
+        return false;
+    }
+    const auto* fa = reinterpret_cast<const SERVICE_FAILURE_ACTIONSA*>(actions.data());
+    if (fa->cActions == 0 || fa->lpsaActions == nullptr) {
+        return false;
+    }
+    auto flag = query_service_config2(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                                      "QueryServiceConfig2(FAILURE_ACTIONS_FLAG) failed");
+    if (flag.size() < sizeof(SERVICE_FAILURE_ACTIONS_FLAG)) {
+        ok = false;
+        return false;
+    }
+    const auto* ff = reinterpret_cast<const SERVICE_FAILURE_ACTIONS_FLAG*>(flag.data());
+    return ff->fFailureActionsOnNonCrashFailures != FALSE;
+}
+
+}  // namespace
+#endif
+
 bool install_windows_service(const std::string& service_name, const std::string& display_name,
                              const std::string& binary_path, const std::string& extra_arguments) {
 #if defined(_WIN32)
-    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+    g_last_install_updated_existing = false;
+    // CONNECT as well as CREATE_SERVICE: the update path below opens the
+    // existing service through this handle.
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
     if (!scm) {
         set_last_service_error("OpenSCManager failed", GetLastError());
         return false;
@@ -152,50 +254,92 @@ bool install_windows_service(const std::string& service_name, const std::string&
                        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
                        bin_line.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
     if (!service) {
-        set_last_service_error("CreateService failed", GetLastError());
-        CloseServiceHandle(scm);
-        return false;
+        const DWORD create_error = GetLastError();
+        if (create_error != ERROR_SERVICE_EXISTS) {
+            set_last_service_error("CreateService failed", create_error);
+            CloseServiceHandle(scm);
+            return false;
+        }
+        // Already registered — by an earlier build, typically one that
+        // predates the recovery policy, or by hand. Refusing here left every
+        // such install without recovery forever (issue #38): the MSI never
+        // touches the SCM entry, so nothing else would ever repair it.
+        // Update the registration in place instead: binary path and start
+        // type, then the recovery policy. SERVICE_NO_CHANGE / null keeps every
+        // unrelated field (account, dependencies, load order) as it was.
+        service =
+            OpenServiceA(scm, service_name.c_str(), SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG);
+        if (!service) {
+            set_last_service_error("OpenService failed", GetLastError());
+            CloseServiceHandle(scm);
+            return false;
+        }
+        if (!ChangeServiceConfigA(service, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+                                  bin_line.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr,
+                                  display_name.c_str())) {
+            set_last_service_error("ChangeServiceConfig failed", GetLastError());
+            CloseServiceHandle(service);
+            CloseServiceHandle(scm);
+            return false;
+        }
+        g_last_install_updated_existing = true;
     }
 
-    // Configure recovery actions. Without them the SCM does nothing when the
-    // daemon stops with an error, so a startup failure that a retry would fix
-    // — most importantly "the data directory is still held by the previous
-    // instance" during a restart — leaves the service simply stopped. systemd
-    // (`Restart=on-failure`) and launchd (`KeepAlive{SuccessfulExit:false}`)
-    // already retry; this gives Windows the same behaviour.
-    //
-    // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG is required as well: by default the
-    // SCM only counts a *crash* as a failure, not a clean exit reporting an
-    // error code, which is exactly how this daemon reports one.
-    SC_ACTION actions[3];
-    actions[0].Type = SC_ACTION_RESTART;
-    actions[0].Delay = 10'000;  // 10 s
-    actions[1].Type = SC_ACTION_RESTART;
-    actions[1].Delay = 30'000;  // 30 s
-    actions[2].Type = SC_ACTION_RESTART;
-    actions[2].Delay = 60'000;  // then every minute
-    SERVICE_FAILURE_ACTIONSA failure_actions{};
-    failure_actions.dwResetPeriod = 86'400;  // forget the failure count after a day
-    failure_actions.lpRebootMsg = nullptr;
-    failure_actions.lpCommand = nullptr;
-    failure_actions.cActions = 3;
-    failure_actions.lpsaActions = actions;
-    // Best-effort: a service that runs but has no recovery policy is still far
-    // better than failing the whole installation over it.
-    (void)ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure_actions);
-
-    SERVICE_FAILURE_ACTIONS_FLAG failure_flag{};
-    failure_flag.fFailureActionsOnNonCrashFailures = TRUE;
-    (void)ChangeServiceConfig2A(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &failure_flag);
-
+    // Not best-effort any more: a registration that reports success without a
+    // recovery policy is exactly the silent-downtime install this exists to
+    // prevent, so a failure here is a failure of the command.
+    const bool policy_ok = apply_recovery_policy(service);
     CloseServiceHandle(service);
     CloseServiceHandle(scm);
-    return true;
+    return policy_ok;
 #else
     (void)service_name;
     (void)display_name;
     (void)binary_path;
     (void)extra_arguments;
+    return false;
+#endif
+}
+
+bool last_windows_service_install_updated_existing() {
+#if defined(_WIN32)
+    return g_last_install_updated_existing;
+#else
+    return false;
+#endif
+}
+
+util::Expected<bool, std::string> ensure_windows_service_recovery_policy(
+    const std::string& service_name) {
+#if defined(_WIN32)
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        set_last_service_error("OpenSCManager failed", GetLastError());
+        return util::unexpected(last_service_error());
+    }
+    SC_HANDLE service =
+        OpenServiceA(scm, service_name.c_str(), SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG);
+    if (!service) {
+        set_last_service_error("OpenService failed", GetLastError());
+        CloseServiceHandle(scm);
+        return util::unexpected(last_service_error());
+    }
+    bool query_ok = true;
+    const bool present = recovery_policy_present(service, query_ok);
+    bool applied = false;
+    bool ok = query_ok;
+    if (ok && !present) {
+        ok = apply_recovery_policy(service);
+        applied = ok;
+    }
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    if (!ok) {
+        return util::unexpected(last_service_error());
+    }
+    return applied;
+#else
+    (void)service_name;
     return false;
 #endif
 }

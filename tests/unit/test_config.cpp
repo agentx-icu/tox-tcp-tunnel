@@ -1907,3 +1907,55 @@ TEST_F(ConfigTest, ClientEncodeRoundTripsThroughStandaloneDecoder) {
     const YAML::Node node = YAML::convert<ClientConfig>::encode(*populated.client);
     EXPECT_EQ(node.as<ClientConfig>(), *populated.client);
 }
+
+// ---------------------------------------------------------------------------
+// tox.udp_port (issue #32) and tunnel.open_timeout_seconds (issue #36)
+// ---------------------------------------------------------------------------
+
+TEST_F(ConfigTest, UdpPortDefaultsToZeroAndIsOmittedFromYaml) {
+    EXPECT_EQ(ToxConfig{}.udp_port, 0);
+    EXPECT_EQ(Config::default_client().tox.udp_port, 0);
+    // Zero means "toxcore's default walk"; it is not serialized, so a config
+    // written by this build stays readable by older ones.
+    const std::string out = Config::default_server().to_yaml();
+    EXPECT_EQ(out.find("udp_port"), std::string::npos) << out;
+}
+
+TEST_F(ConfigTest, UdpPortParsesAndRoundTrips) {
+    const char* yaml = R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+tox:
+  udp_port: 40000
+)";
+    auto parsed = Config::from_string(yaml);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_EQ(parsed.value().tox.udp_port, 40000);
+
+    const std::string out = parsed.value().to_yaml();
+    EXPECT_NE(out.find("udp_port: 40000"), std::string::npos) << out;
+    auto reparsed = Config::from_string(out);
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error();
+    EXPECT_EQ(reparsed.value().tox.udp_port, 40000);
+    EXPECT_EQ(reparsed.value().tox, parsed.value().tox);
+}
+
+TEST_F(ConfigTest, OpenTimeoutDefaultsTo30SecondsAndRoundTrips) {
+    EXPECT_EQ(TunnelConfig{}.open_timeout_seconds, 30u);
+
+    const char* yaml = R"(
+mode: client
+data_dir: ~/.config/toxtunnel
+tunnel:
+  open_timeout_seconds: 7
+)";
+    auto parsed = Config::from_string(yaml);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_EQ(parsed.value().tunnel.open_timeout_seconds, 7u);
+
+    const std::string out = parsed.value().to_yaml();
+    EXPECT_NE(out.find("open_timeout_seconds: 7"), std::string::npos) << out;
+    auto reparsed = Config::from_string(out);
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error();
+    EXPECT_EQ(reparsed.value().tunnel.open_timeout_seconds, 7u);
+}

@@ -105,6 +105,7 @@ TunnelImpl::TunnelImpl(asio::io_context& io_ctx, uint16_t tunnel_id, uint32_t fr
     : Tunnel(tunnel_id, io_ctx),
       open_retry_timer_(io_ctx),
       friend_number_(friend_number),
+      open_deadline_timer_(io_ctx),
       send_window_size_(send_window),
       last_activity_ns_(std::chrono::steady_clock::now().time_since_epoch().count()),
       error_retry_timer_(io_ctx),
@@ -123,6 +124,7 @@ TunnelImpl::~TunnelImpl() {
     util::cancel_timer_noexcept(open_retry_timer_);
     util::cancel_timer_noexcept(close_retry_timer_);
     util::cancel_timer_noexcept(error_retry_timer_);
+    cancel_open_deadline();
     // Backstop: a destroyed tunnel emits nothing, so a surviving parked
     // terminal ERROR settles here — the settle latch must not leak
     // cancel_close_retry/notify unrun (both are idempotent; the finalizer is
@@ -225,6 +227,12 @@ void TunnelImpl::set_state(State new_state) {
 }
 
 void TunnelImpl::notify_state_change(State new_state) {
+    // The OPEN_ACK deadline is disarmed on the transition itself, not in the
+    // replaceable state callback: whoever installed that callback must not be
+    // able to leave the deadline armed against a tunnel that has resolved.
+    if (new_state != State::Connecting) {
+        cancel_open_deadline();
+    }
     StateChangedCallback cb;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -232,6 +240,80 @@ void TunnelImpl::notify_state_change(State new_state) {
     }
     if (cb) {
         cb(new_state);
+    }
+}
+
+void TunnelImpl::book_close_once(util::MetricsRegistry::CloseReason reason) noexcept {
+    if (close_booked_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    util::MetricsRegistry::instance().inc_tunnels_closed(reason);
+}
+
+void TunnelImpl::set_open_timeout(std::chrono::seconds timeout) {
+    open_timeout_ = timeout;
+}
+
+void TunnelImpl::arm_open_deadline_timer() {
+    if (open_timeout_.count() <= 0) {
+        return;
+    }
+    // A tunnel that is not shared-owned (test fixtures on the stack) cannot
+    // hand a weak_ptr to the handler; it also cannot outlive the io_context
+    // it runs on, so it simply forgoes the deadline.
+    std::weak_ptr<Tunnel> weak;
+    try {
+        weak = weak_from_this();
+    } catch (...) {
+        return;
+    }
+    if (weak.expired()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(open_deadline_mutex_);
+    const auto epoch = ++open_deadline_epoch_;
+    open_deadline_timer_.expires_after(open_timeout_);
+    open_deadline_timer_.async_wait([weak, epoch](const std::error_code& ec) {
+        if (ec) {
+            return;
+        }
+        auto self = std::static_pointer_cast<TunnelImpl>(weak.lock());
+        if (!self) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(self->open_deadline_mutex_);
+            if (epoch != self->open_deadline_epoch_) {
+                return;  // Disarmed (the tunnel resolved) after this fired.
+            }
+        }
+        if (self->state_.load(std::memory_order_acquire) != State::Connecting) {
+            return;  // Cheap pre-check; the claim below is the real decision.
+        }
+        util::Logger::warn(
+            "Tunnel {} open timed out after {}s with no OPEN_ACK from the peer; closing",
+            self->tunnel_id_, self->open_timeout_.count());
+        // Claims Closed ONLY from Connecting (an ACK landing right now wins),
+        // announces a TUNNEL_CLOSE if the OPEN reached the peer, releases the
+        // local socket, fires on_close_. Contained at this timer boundary like
+        // every other asio handler in this class.
+        try {
+            self->expire_open_deadline();
+        } catch (const std::exception& e) {
+            util::Logger::warn("Tunnel {} open-timeout close threw: {}", self->tunnel_id_,
+                               e.what());
+        } catch (...) {
+            util::Logger::warn("Tunnel {} open-timeout close threw", self->tunnel_id_);
+        }
+    });
+}
+
+void TunnelImpl::cancel_open_deadline() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(open_deadline_mutex_);
+        ++open_deadline_epoch_;
+        util::cancel_timer_noexcept(open_deadline_timer_);
+    } catch (...) {
     }
 }
 
@@ -441,10 +523,12 @@ bool TunnelImpl::open(const std::string& host, uint16_t port) {
         // told about a tunnel it has never heard of.
         util::Logger::info("Tunnel {} opening: {}:{} (TUNNEL_OPEN backpressured; retrying)",
                            tunnel_id_, host, port);
+        arm_open_deadline_timer();
         return true;
     }
 
     util::Logger::info("Tunnel {} opening: {}:{}", tunnel_id_, host, port);
+    arm_open_deadline_timer();
     return true;
 }
 
@@ -631,8 +715,7 @@ void TunnelImpl::retry_open_send(unsigned attempt) {
         }
         util::Logger::warn("Tunnel {} TUNNEL_OPEN permanently failed on retry {}; giving up",
                            tunnel_id_, attempt);
-        util::MetricsRegistry::instance().inc_tunnels_closed(
-            util::MetricsRegistry::CloseReason::Error);
+        book_close_once(util::MetricsRegistry::CloseReason::Error);
         notify_close_once();
         return;
     }
@@ -731,7 +814,7 @@ TunnelImpl::CloseObligation TunnelImpl::cancel_open_retry_locked() {
     return CloseObligation::None;
 }
 
-TunnelImpl::TerminalClaim TunnelImpl::claim_terminal() {
+TunnelImpl::TerminalClaim TunnelImpl::claim_terminal(std::optional<State> only_from) {
     TerminalClaim result;
     // Both writes under close_frame_mutex_, which is what makes the pair atomic
     // to every observer — see the declaration for the interleaving this closes.
@@ -741,6 +824,9 @@ TunnelImpl::TerminalClaim TunnelImpl::claim_terminal() {
     // Closed, overwriting a resolution another path had already published.
     State previous = state_.load(std::memory_order_acquire);
     while (previous != State::Closed && previous != State::Error) {
+        if (only_from && previous != *only_from) {
+            break;  // Resolved past the state this caller may claim from.
+        }
         if (state_.compare_exchange_weak(previous, State::Closed, std::memory_order_acq_rel,
                                          std::memory_order_acquire)) {
             result.claimed = true;
@@ -748,6 +834,13 @@ TunnelImpl::TerminalClaim TunnelImpl::claim_terminal() {
         }
     }
     result.previous = previous;
+    if (only_from && !result.claimed) {
+        // A lost conditional claim must leave NOTHING behind: in particular it
+        // must not run cancel_open_retry_locked() below, which records a CLOSE
+        // obligation against an OPEN still inside the transport -- the sender
+        // would then emit a TUNNEL_CLOSE for the tunnel whose ACK just won.
+        return result;
+    }
 
     // Test seam. Deliberately INSIDE close_frame_mutex_: pausing here holds the
     // claimant still without opening the atomicity boundary, so a concurrent
@@ -1381,7 +1474,7 @@ void TunnelImpl::close() {
             util::Logger::debug("Tunnel {} close during handshake: already resolved", tunnel_id_);
             return;
         }
-        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
+        book_close_once(local_close_reason());
         notify_close_once();
         util::Logger::info("Tunnel {} closed during handshake", tunnel_id_);
         return;
@@ -1469,8 +1562,12 @@ void TunnelImpl::emit_close_and_transition() {
     // Through the shared latch, not a bare send: a force_close() racing this
     // graceful close can already have announced, and a second TUNNEL_CLOSE
     // names an id that may by then belong to a different tunnel.
-    if (should_send_close && emit_close_frame_once()) {
-        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
+    if (should_send_close) {
+        (void)emit_close_frame_once();
+        // Booked by the initiator: the peer's reciprocal CLOSE later finalizes
+        // this tunnel, and finalize_remote_close()'s own booking then finds
+        // the latch taken — one sample, reason "local".
+        book_close_once(local_close_reason());
     }
 
     // Conditional, not a blind store: the emit above runs a transport
@@ -1557,8 +1654,7 @@ void TunnelImpl::close_for_timeout() {
                     util::Logger::warn("Tunnel {} linger-timeout error kick threw", tunnel_id_);
                 }
             }
-            util::MetricsRegistry::instance().inc_tunnels_closed(
-                util::MetricsRegistry::CloseReason::Timeout);
+            book_close_once(util::MetricsRegistry::CloseReason::Timeout);
             transition_state(State::Closed);
             util::Logger::info(
                 "Tunnel {} force-closed after half-close linger timeout; peer notified",
@@ -1582,10 +1678,11 @@ void TunnelImpl::close_for_timeout() {
 }
 
 void TunnelImpl::emit_local_close_only() {
-    // Shared single-shot latch; see emit_close_and_transition().
-    if (emit_close_frame_once()) {
-        util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
-    }
+    // Shared single-shot latch; see emit_close_and_transition(). A half-close
+    // is NOT booked as a close: the tunnel is still open in the other
+    // direction, and whichever event ends it (the peer's CLOSE, a linger
+    // timeout, a force_close) books the one sample — see book_close_once().
+    (void)emit_close_frame_once();
     // Conditional for the same reason as emit_close_and_transition(): the
     // emit's transport callback can claim a terminal state re-entrantly, and
     // this transition must lose to it, not clobber it.
@@ -1678,8 +1775,7 @@ void TunnelImpl::finalize_remote_close() {
         }
     } fallback{this};
 
-    util::MetricsRegistry::instance().inc_tunnels_closed(
-        util::MetricsRegistry::CloseReason::Remote);
+    book_close_once(util::MetricsRegistry::CloseReason::Remote);
     transition_state(State::Closed);
 
     // maybe_notify_id_releasable() runs while ARMED (see
@@ -1690,14 +1786,38 @@ void TunnelImpl::finalize_remote_close() {
     notify_close_once();
 }
 
-void TunnelImpl::force_close() {
+void TunnelImpl::force_close(ResourceRelease release) {
+    force_close_impl(release, std::nullopt, /*mark_timeout=*/false);
+}
+
+void TunnelImpl::expire_open_deadline() {
+    force_close_impl(ResourceRelease::Abort, State::Connecting, /*mark_timeout=*/true);
+}
+
+void TunnelImpl::force_close_impl(ResourceRelease release, std::optional<State> only_from,
+                                  bool mark_timeout) {
     // ONE step claims the terminal edge AND publishes whether a TUNNEL_CLOSE is
     // owed. They used to be two, in different synchronization domains, and the
     // instant between them was observable as "terminal, owes nothing" — which is
     // precisely the state that says the id is free. See claim_terminal().
-    const TerminalClaim claim = claim_terminal();
+    const TerminalClaim claim = claim_terminal(only_from);
     const bool claimed_terminal = claim.claimed;
     const bool announce = claim.must_announce;
+    if (only_from && !claimed_terminal) {
+        // Conditional claim lost: the tunnel left the state this caller was
+        // allowed to close from (an ACK landed as the deadline fired). It is
+        // someone else's now; touch nothing.
+        util::Logger::debug("Tunnel {} conditional force_close declined: state is {}", tunnel_id_,
+                            to_string(claim.previous));
+        return;
+    }
+    if (mark_timeout && claimed_terminal) {
+        // Booked as a timeout, like the maintenance reapers' closes: it is a
+        // deadline, not an application-initiated close. Set only now, once the
+        // claim is ours -- a sticky marker set before a claim that then lost
+        // would mislabel the surviving tunnel's eventual ordinary close.
+        timeout_close_.store(true, std::memory_order_release);
+    }
 
     // The resource release is a SEPARATE one-shot, and the two are INDEPENDENT:
     // each gates only its own work, and it is taken AFTER the claim above so the
@@ -1763,12 +1883,26 @@ void TunnelImpl::force_close() {
     }
 
     try {
-        if (announce && emit_close_frame_once()) {
-            util::MetricsRegistry::instance().inc_tunnels_closed(local_close_reason());
+        if (announce) {
+            (void)emit_close_frame_once();
+        }
+        if (claimed_terminal) {
+            // The claimant books the close whether or not it owed the peer an
+            // announcement: a tunnel force-closed from Disconnecting (its own
+            // half-close already on the wire) used to end without any sample.
+            book_close_once(local_close_reason());
         }
     } catch (...) {
         note_ex();
     }
+
+    // Ordinary manager removal after the tunnel's own graceful completion: the
+    // socket still holds bytes the peer delivered ahead of its CLOSE (already
+    // acknowledged to it). Let the queue drain and FIN instead of discarding
+    // it (issue #33). Strictly narrower than "already Closed": a closed
+    // outbound gate means session teardown, and Error keeps the hard release.
+    const bool drain_socket = release == ResourceRelease::DrainIfClosed && !claimed_terminal &&
+                              claim.previous == State::Closed && !outbound_gate_closed();
 
     bool arrive_transport = false;
     if (owns_resources) {
@@ -1816,7 +1950,11 @@ void TunnelImpl::force_close() {
         try {
             std::lock_guard<std::mutex> lock(mutex_);
             if (tcp_conn_) {
-                tcp_conn_->force_close();
+                if (drain_socket) {
+                    tcp_conn_->close();
+                } else {
+                    tcp_conn_->force_close();
+                }
                 tcp_conn_.reset();
             }
         } catch (...) {
@@ -1940,6 +2078,8 @@ void TunnelImpl::handle_tunnel_data_frame(const ProtocolFrame& frame) {
 
     // Update receive statistics
     std::size_t data_size = data.size();
+    util::Logger::trace("Tunnel {} DATA in: {} bytes (total {} after)", tunnel_id_, data_size,
+                        total_bytes_received_.load(std::memory_order_relaxed) + data_size);
     total_bytes_received_.fetch_add(data_size, std::memory_order_relaxed);
     bytes_received_since_ack_.fetch_add(data_size, std::memory_order_relaxed);
     util::MetricsRegistry::instance().add_bytes_in(data_size);
@@ -2228,7 +2368,7 @@ void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
         util::Logger::error("Tunnel {} received TUNNEL_ERROR: code={}, desc='{}'", tunnel_id_,
                             payload->error_code, payload->description);
     }
-    util::MetricsRegistry::instance().inc_tunnels_closed(util::MetricsRegistry::CloseReason::Error);
+    book_close_once(util::MetricsRegistry::CloseReason::Error);
 
     transition_state(State::Error);
 
@@ -2304,6 +2444,9 @@ void TunnelImpl::on_tcp_data_received(const uint8_t* data, std::size_t length) {
 }
 
 void TunnelImpl::on_tcp_read_eof() {
+    util::Logger::debug("Tunnel {} TCP read EOF (accepted total {}, emitted total {})", tunnel_id_,
+                        total_bytes_sent_.load(std::memory_order_relaxed),
+                        total_bytes_emitted_.load(std::memory_order_relaxed));
     // See close(): after a terminal Abort the half-close CLOSE must not reach
     // the wire behind the terminal ERROR.
     if (outbound_abort_published_.load(std::memory_order_acquire)) {
@@ -2603,6 +2746,9 @@ void TunnelImpl::send_error(uint8_t error_code, const std::string& description) 
             break;
         }
         if (transition_state_if(current, State::Error)) {
+            // A locally generated terminal error ended this tunnel; it used to
+            // leave no tunnels_closed sample at all.
+            book_close_once(util::MetricsRegistry::CloseReason::Error);
             break;
         }
         // Lost to a concurrent transition; re-read and try again.
@@ -2614,6 +2760,70 @@ void TunnelImpl::send_error(uint8_t error_code, const std::string& description) 
     // Normal-path producer arrival, with propagation: if this completes the
     // two-party settle and the finalizer (notably a throwing on_close) throws,
     // it surfaces to send_error's caller rather than being swallowed.
+    producer_arrived = true;
+    if (auto ep = arrive_terminal_error_party(ErrorSettleParty::Producer,
+                                              /*defer_finalizer=*/false, /*propagate=*/true)) {
+        std::rethrow_exception(ep);
+    }
+}
+
+void TunnelImpl::fail_locally(uint8_t error_code, const std::string& description) {
+    // Recorded first, as a received TUNNEL_ERROR would be, so the state
+    // callback fired by the terminal transition below can already classify it
+    // (a SOCKS5 reply picks its status from last_error_code()).
+    last_error_code_.store(error_code, std::memory_order_release);
+    {
+        std::lock_guard lock(last_error_mutex_);
+        last_error_description_ = description;
+    }
+
+    // An EMPTY wire is a claim-without-deposit: the Abort seal, the fences
+    // and the settle-latch reset all happen exactly as for send_error(), but
+    // nothing is ever handed to the driver, so the transport party is settled
+    // right here and no retry timer is ever armed.
+    bool transport_settled = false;
+    if (!claim_terminal_error({}, &transport_settled)) {
+        util::Logger::debug("Tunnel {} suppressed duplicate local failure (code={}, desc='{}')",
+                            tunnel_id_, error_code, description);
+        return;
+    }
+
+    bool producer_arrived = false;
+    struct ProducerFallback {
+        TunnelImpl* self;
+        bool* done;
+        ~ProducerFallback() {
+            if (*done) {
+                return;
+            }
+            try {
+                self->arrive_terminal_error_party(ErrorSettleParty::Producer);
+            } catch (...) {
+            }
+        }
+    } producer_guard{this, &producer_arrived};
+
+    (void)transport_settled;  // Always true for an empty wire; settle it now.
+    arrive_terminal_error_party(ErrorSettleParty::Transport);
+
+    // Same claim loop as send_error(): a racing force_close() may already own
+    // a terminal state, in which case it also owns the booking.
+    for (;;) {
+        const State current = state_.load(std::memory_order_acquire);
+        if (current == State::Closed || current == State::Error) {
+            util::Logger::debug("Tunnel {} local failure: state already {}", tunnel_id_,
+                                to_string(current));
+            break;
+        }
+        if (transition_state_if(current, State::Error)) {
+            book_close_once(util::MetricsRegistry::CloseReason::Error);
+            break;
+        }
+    }
+
+    util::Logger::warn("Tunnel {} failed locally: code={}, desc='{}'", tunnel_id_, error_code,
+                       description);
+
     producer_arrived = true;
     if (auto ep = arrive_terminal_error_party(ErrorSettleParty::Producer,
                                               /*defer_finalizer=*/false, /*propagate=*/true)) {
@@ -3205,6 +3415,12 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
                             }
                         }
                         if (close_selected) {
+                            util::Logger::debug(
+                                "Tunnel {} CLOSE selected by the driver (fifo pending {}, emitted "
+                                "total {}, accepted total {})",
+                                tunnel_id_, outbound_fifo_pending_,
+                                total_bytes_emitted_.load(std::memory_order_relaxed),
+                                total_bytes_sent_.load(std::memory_order_relaxed));
                             span_frame.emplace(ProtocolFrame::make_tunnel_close(tunnel_id_));
                             current_sel = Sel::Close;
                         } else if (control_obligation_eligible_locked()) {
@@ -3349,6 +3565,9 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
             total_bytes_emitted_.fetch_add(frame_bytes, std::memory_order_release);
             const bool sent = zero_copy ? send_owned_data_to_tox(std::move(owned_frame))
                                         : send_frame_to_tox(*span_frame);
+            util::Logger::trace("Tunnel {} DATA out: {} bytes sent={} (emitted total {})",
+                                tunnel_id_, frame_bytes, sent,
+                                total_bytes_emitted_.load(std::memory_order_relaxed));
 
             // ---- Commit or roll back under the lock. ----
             {
@@ -3462,6 +3681,7 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
                             break;
                         }
                         if (transition_state_if(cur, State::Error)) {
+                            book_close_once(util::MetricsRegistry::CloseReason::Error);
                             break;
                         }
                     }

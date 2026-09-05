@@ -331,10 +331,18 @@ Create the config and register the service:
 mkdir 'C:\ProgramData\ToxTunnel' -Force
 notepad 'C:\ProgramData\ToxTunnel\config.yaml'
 
-# One-time service registration (run as Administrator):
+# Service registration (run as Administrator). Safe to re-run after an
+# upgrade: an existing registration is updated in place (binary path,
+# auto-start, restart-on-failure recovery policy).
 & 'C:\Program Files\ToxTunnel\bin\toxtunnel.exe' install-windows-service `
     -c 'C:\ProgramData\ToxTunnel\config.yaml'
 ```
+
+The registration carries a restart-on-failure policy (restart after 10 s /
+30 s / 60 s, failure count reset daily), so a crash or a watchdog abort is
+followed by an automatic restart, as under systemd and launchd. The daemon
+also verifies that policy every time the service starts and applies it if
+missing, so a registration made by an older release repairs itself.
 
 Service policy (`service.auto_start` / `service.allow_client_daemon`) decides whether the service
 process stays resident or exits successfully without opening ports.
@@ -705,7 +713,7 @@ Administrators on its pipe — run `inspect` from an elevated prompt.
 | Form                                      | Description                                  |
 | ----------------------------------------- | -------------------------------------------- |
 | `toxtunnel inspect tunnels [--json]`      | List open tunnels (id, peer, idle, bytes)    |
-| `toxtunnel inspect status [--json]`       | Daemon status: `mode`, `version`, `friends_online`, `peer_online_seconds` (client), `tunnels_active`, `bytes_in`, `bytes_out` |
+| `toxtunnel inspect status [--json]`       | Daemon status: `mode`, `version`, `friends_online`, `dht_connected`, `peer_online_seconds` (client), `tunnels_active`, `bytes_in`, `bytes_out` |
 | `-d, --data-dir DIR` / `-c, --config F`   | Where to find the IPC socket / `toxtunnel.pid` |
 
 The IPC endpoint is enabled by default (`inspect.enabled: true`). Set it to

@@ -256,3 +256,116 @@ TEST(ToxWatchdogTest, StopStartKeepsNewCycleTimerWhenPriorHookReturns) {
 
 }  // namespace
 }  // namespace toxtunnel::test
+
+namespace toxtunnel {
+using namespace std::chrono_literals;
+
+// ---------------------------------------------------------------------------
+// Suspend immunity (issue #38). Every watchdog abort on the Windows QA rig was
+// the hypervisor pausing the guest: the heartbeat looked hours old on resume
+// while the Tox thread was fine. A stale timestamp alone must not abort.
+// ---------------------------------------------------------------------------
+
+TEST(ToxWatchdogTest, StaleHeartbeatNeedsConfirmationTicksBeforeAbort) {
+    util::MetricsRegistry::instance().reset();
+    tox::ToxWatchdog wd;
+    wd.configure(5s, /*enabled=*/true);
+    std::atomic<int> aborts{0};
+    wd.set_abort_hook([&aborts] { aborts.fetch_add(1); });
+
+    wd.heartbeat();
+    wd.check_once();  // baseline: heartbeat seen, nothing stale
+    wd.backdate_heartbeat_for_test(60s);
+
+    // Each tick observes the same heartbeat count and a lag past the
+    // deadline; only the kConfirmationTicks-th one may abort.
+    for (unsigned i = 1; i < tox::ToxWatchdog::kConfirmationTicks; ++i) {
+        wd.check_once();
+        EXPECT_EQ(aborts.load(), 0) << "tick " << i << " must only confirm";
+        EXPECT_EQ(wd.over_deadline_ticks(), i);
+    }
+    wd.check_once();
+    EXPECT_EQ(aborts.load(), 1);
+    EXPECT_EQ(util::MetricsRegistry::instance().watchdog_aborts(), 1u);
+
+    // Latched: a further tick never re-fires the hook.
+    wd.check_once();
+    EXPECT_EQ(aborts.load(), 1);
+}
+
+TEST(ToxWatchdogTest, HeartbeatProgressResetsTheConfirmationCount) {
+    tox::ToxWatchdog wd;
+    wd.configure(5s, /*enabled=*/true);
+    std::atomic<int> aborts{0};
+    wd.set_abort_hook([&aborts] { aborts.fetch_add(1); });
+
+    wd.heartbeat();
+    wd.check_once();
+    wd.backdate_heartbeat_for_test(60s);
+    wd.check_once();
+    wd.check_once();
+    ASSERT_EQ(wd.over_deadline_ticks(), 2u);
+
+    // The Tox thread iterates again (a resume after a pause, or a slow but
+    // live thread): the count starts over, however stale the timestamp was.
+    wd.heartbeat();
+    wd.check_once();
+    EXPECT_EQ(wd.over_deadline_ticks(), 0u);
+    EXPECT_EQ(aborts.load(), 0);
+}
+
+TEST(ToxWatchdogTest, ObserverStallIsTreatedAsSuspendNotWedge) {
+    tox::ToxWatchdog wd;
+    wd.configure(5s, /*enabled=*/true);
+    std::atomic<int> aborts{0};
+    wd.set_abort_hook([&aborts] { aborts.fetch_add(1); });
+
+    wd.heartbeat();
+    wd.check_once();
+    // Simulate a resume: the observer's own previous check is as old as the
+    // heartbeat — the whole process was stopped, not just the Tox thread.
+    wd.backdate_heartbeat_for_test(2h);
+    wd.backdate_last_check_for_test(2h);
+    wd.check_once();
+    EXPECT_EQ(aborts.load(), 0);
+    EXPECT_EQ(wd.over_deadline_ticks(), 0u) << "a suspended observer counts nothing";
+
+    // The Tox thread runs on resume, exactly as observed on the rig.
+    wd.heartbeat();
+    wd.check_once();
+    EXPECT_EQ(aborts.load(), 0);
+}
+
+TEST(ToxWatchdogTest, PhaseIsReportedAndDefaultsToIdle) {
+    tox::ToxWatchdog wd;
+    EXPECT_EQ(wd.phase(), tox::ToxWatchdog::Phase::Idle);
+    wd.note_phase(tox::ToxWatchdog::Phase::Dispatch);
+    EXPECT_EQ(wd.phase(), tox::ToxWatchdog::Phase::Dispatch);
+    EXPECT_STREQ(tox::ToxWatchdog::phase_name(tox::ToxWatchdog::Phase::Iterate), "tox_iterate");
+}
+
+}  // namespace toxtunnel
+
+namespace toxtunnel {
+using namespace std::chrono_literals;
+
+TEST(ToxWatchdogTest, ObserverStallIsForgivenOnlyOncePerUnchangedHeartbeat) {
+    // A process starved so badly that the observer keeps arriving late while
+    // the Tox thread never iterates is a wedge, not a suspend: after the one
+    // forgiven tick, late ticks count towards confirmation.
+    tox::ToxWatchdog wd;
+    wd.configure(5s, /*enabled=*/true);
+    std::atomic<int> aborts{0};
+    wd.set_abort_hook([&aborts] { aborts.fetch_add(1); });
+
+    wd.heartbeat();
+    wd.check_once();
+    for (unsigned i = 0; i < tox::ToxWatchdog::kConfirmationTicks + 1; ++i) {
+        wd.backdate_heartbeat_for_test(10min);
+        wd.backdate_last_check_for_test(10min);
+        wd.check_once();
+    }
+    EXPECT_EQ(aborts.load(), 1) << "late observer ticks with a frozen heartbeat must still abort";
+}
+
+}  // namespace toxtunnel

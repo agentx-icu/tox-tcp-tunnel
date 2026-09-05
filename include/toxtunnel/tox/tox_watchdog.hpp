@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 
 namespace toxtunnel::tox {
 
@@ -73,7 +74,46 @@ class ToxWatchdog {
 
     /// Force a check now (test hook + main-thread shutdown path).
     /// Returns the observed lag in milliseconds.
+    ///
+    /// Suspend immunity (issue #38): a stale heartbeat alone does not abort.
+    /// A host that sleeps, or a hypervisor that pauses the guest, leaves the
+    /// heartbeat hours old on resume while the Tox thread is perfectly fine —
+    /// that was every watchdog abort on the Windows QA rig. So the observer
+    /// (a) ignores a tick after which it can see it was itself stalled for
+    /// longer than the deadline (the whole process was suspended), and
+    /// (b) requires the heartbeat COUNTER to stay unchanged for
+    /// `kConfirmationTicks` consecutive over-deadline ticks before it aborts.
+    /// A real wedge still trips after deadline + a few seconds.
     std::int64_t check_once() noexcept;
+
+    /// Consecutive over-deadline observer ticks, with no heartbeat progress,
+    /// required before the abort hook runs. Each tick is ~1 s of the observer
+    /// actually running, so a suspend/resume — which yields one tick with a
+    /// huge lag and then a moving heartbeat — never reaches it.
+    static constexpr unsigned kConfirmationTicks = 5;
+
+    /// What the Tox thread is doing right now, reported by its owner so a
+    /// stall names the phase it is stuck in (tox_iterate itself, a posted
+    /// task, an application callback, ...). Lock-free.
+    enum class Phase : std::uint8_t { Idle, Iterate, Tasks, Dispatch, Maintenance };
+    void note_phase(Phase phase) noexcept {
+        phase_.store(static_cast<std::uint8_t>(phase), std::memory_order_relaxed);
+    }
+    [[nodiscard]] Phase phase() const noexcept {
+        return static_cast<Phase>(phase_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] static const char* phase_name(Phase phase) noexcept;
+
+    /// Over-deadline ticks observed so far without heartbeat progress (test
+    /// observability; resets whenever the heartbeat moves).
+    [[nodiscard]] unsigned over_deadline_ticks() const noexcept {
+        return over_deadline_ticks_.load(std::memory_order_relaxed);
+    }
+
+    /// Test seams: make the last heartbeat / the observer's own last check
+    /// look @p age old, so the deadline logic can be driven without sleeping.
+    void backdate_heartbeat_for_test(std::chrono::milliseconds age) noexcept;
+    void backdate_last_check_for_test(std::chrono::milliseconds age) noexcept;
 
     /// Atomic counters surfaced to inspect / metrics.
     [[nodiscard]] std::uint64_t heartbeat_count() const noexcept {
@@ -111,6 +151,26 @@ class ToxWatchdog {
     std::atomic<int> deadline_seconds_{30};
     std::atomic<bool> enabled_{true};
     std::atomic<bool> aborted_{false};
+
+    /// Observer bookkeeping for the confirmation logic (see check_once()).
+    /// Written only by check_once(); atomics because the shutdown path may
+    /// call it from another thread than the timer.
+    std::atomic<std::uint64_t> last_seen_heartbeat_{0};
+    std::atomic<unsigned> over_deadline_ticks_{0};
+    std::atomic<std::int64_t> last_check_ns_{0};
+    /// One-shot per stall: the half-deadline early warning fires once and
+    /// re-arms only after the heartbeat moves again.
+    std::atomic<bool> stall_warned_{false};
+    std::atomic<std::uint8_t> phase_{0};
+    /// A stalled observer is forgiven ONCE per unchanged heartbeat: if the
+    /// observer keeps arriving late while the heartbeat still does not move,
+    /// that is a starved process with a wedged Tox thread, and the late ticks
+    /// count towards confirmation instead of resetting it every time.
+    std::atomic<bool> suspend_forgiven_{false};
+    /// Serialises check_once(): the 1 Hz timer and the shutdown path may both
+    /// call it, and two overlapping checks must not count one observer
+    /// interval twice. A check that finds another in progress skips itself.
+    std::mutex check_mutex_;
 
     asio::io_context* io_ctx_{nullptr};
     std::unique_ptr<asio::steady_timer> timer_;

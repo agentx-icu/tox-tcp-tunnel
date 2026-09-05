@@ -1314,7 +1314,12 @@ int main(int argc, char* argv[]) {
                       << "\n";
             return 1;
         }
-        std::cerr << "Registered Windows service ToxTunnel.\n";
+        if (util::last_windows_service_install_updated_existing()) {
+            std::cerr << "Updated the existing Windows service ToxTunnel (binary path, "
+                         "auto-start, restart-on-failure recovery).\n";
+        } else {
+            std::cerr << "Registered Windows service ToxTunnel.\n";
+        }
         return 0;
     }
     if (*uninstall_win_svc) {
@@ -1620,6 +1625,21 @@ int main(int argc, char* argv[]) {
     // On Windows, use service framework if --service is specified
     if (run_as_service) {
         exit_code = util::run_windows_service_main("ToxTunnel", [&]() {
+            // Self-heal the SCM recovery policy (issue #38): a registration
+            // made by an older build has none, and the MSI never touches the
+            // SCM entry, so a watchdog abort left the service stopped for
+            // good. Best-effort — the account may lack the right — and logged
+            // either way so the state is visible.
+            if (auto healed = util::ensure_windows_service_recovery_policy("ToxTunnel")) {
+                if (healed.value()) {
+                    Logger::warn(
+                        "Windows service ToxTunnel had no restart-on-failure recovery policy; "
+                        "applied one (restart after 10s/30s/60s, reset daily)");
+                }
+            } else {
+                Logger::warn("Could not verify the Windows service recovery policy: {}",
+                             healed.error());
+            }
             if (!config.should_run_as_service_daemon()) {
                 Logger::info(
                     "Service idle: disabled by config (service.auto_start / "

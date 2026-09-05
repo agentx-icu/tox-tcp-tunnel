@@ -79,6 +79,12 @@ class MetricsRegistry {
     /// from their own state; the registry only stores the latest value.
     void set_friends_online(std::size_t n);
 
+    /// `toxtunnel_dht_connected` gauge: 1 while this node is connected to the
+    /// Tox DHT, 0 otherwise. A daemon stuck at 0 DHT nodes used to look
+    /// perfectly healthy on /metrics (issue #34).
+    void set_dht_connected(bool connected);
+    [[nodiscard]] bool dht_connected() const;
+
     // -----------------------------------------------------------------
     // Tox iterate lag summary
     // -----------------------------------------------------------------
@@ -215,6 +221,7 @@ class MetricsRegistry {
     std::atomic<std::uint64_t> bytes_in_{0};
     std::atomic<std::uint64_t> bytes_out_{0};
     std::atomic<std::uint64_t> friends_online_{0};
+    std::atomic<bool> dht_connected_{false};
 
     // Iterate-lag summary: sum + count + max give Prometheus enough to
     // chart average + tail; full quantile estimation isn't worth the
