@@ -271,6 +271,42 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   general idle reaper above stays opt-in. Paused on a resume-hold, re-armed on
   resurrection.
 
+## v0.5.0 Default Behavior (additions on top of v0.4.x)
+
+- **Open handshake deadline** — `tunnel.open_timeout_seconds: 30` by
+  default (0 disables). Client-side: a tunnel whose TUNNEL_OPEN gets no
+  OPEN_ACK in time is closed through the handshake-close path and counted
+  under `tunnels_opened_total{result="failed"}`; failed opens are now
+  counted at all (issue #36).
+- **Fixed DHT UDP port** — `tox.udp_port: 0` by default (toxcore's
+  33445..33545 walk). Non-zero binds exactly that port (issue #32).
+- **Bootstrap retry** — while not DHT-connected, `ToxAdapter` re-contacts
+  its node list on a 10 s–5 min backoff and re-fetches the public list
+  when it has none (worker thread; only the Tox thread touches toxcore).
+  `inspect status` reports `dht_connected`; `/metrics` exports
+  `toxtunnel_dht_connected` (issue #34).
+- **Abnormal target end** — a target reset / transport error after the
+  tunnel is established is `TUNNEL_ERROR` code 4; the client answers with a
+  local RST (`TcpConnection::abort()`), and a declined resume ends the tunnel
+  through `TunnelImpl::fail_locally()` instead of a clean close (issue #35).
+- **Close bookkeeping** — `tunnels_closed_total` is booked once per tunnel
+  (`book_close_once`); a half-close no longer counts. Manager removal after a
+  tunnel's own graceful completion drains the local socket
+  (`force_close(ResourceRelease::DrainIfClosed)`) instead of discarding queued
+  writes, the pre-ACK peer-close watch keeps banked bytes and reports the
+  FIN after replaying them, and `TcpConnection::shutdown_send()` now takes
+  effect in strand order (the request flag is raised on the strand, not at
+  call time) so a peer CLOSE can no longer FIN the local socket ahead of
+  DATA writes still queued behind it — the actual field mechanism of the
+  1362-byte-aligned truncation (issue #33).
+- **Watchdog confirmation** — the abort requires 5 consecutive over-deadline
+  checks with no heartbeat progress, and a check after which the observer
+  itself was stalled past the deadline is discarded (host sleep / VM pause
+  immunity, issue #38). The critical line names the Tox thread's phase.
+- **Windows service** — `install-windows-service` updates an existing
+  registration in place; the daemon re-applies the restart-on-failure policy
+  at every service start if it is missing.
+
 ## Dependencies
 
 - **c-toxcore** — git submodule, built from source (`git clone --recursive` or `git submodule update --init`)

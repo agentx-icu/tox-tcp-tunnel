@@ -451,6 +451,14 @@ std::string InspectServer::render_status_json(const InspectProviders& providers)
     if (providers.friends_online) {
         append_kv_num(out, "friends_online", providers.friends_online(), first);
     }
+    if (providers.dht_connected) {
+        if (!first) {
+            out += ',';
+        }
+        first = false;
+        out += "\"dht_connected\":";
+        out += providers.dht_connected() ? "true" : "false";
+    }
     if (providers.peer_online_seconds) {
         append_kv_num(out, "peer_online_seconds", providers.peer_online_seconds(), first);
     }

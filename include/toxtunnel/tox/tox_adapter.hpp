@@ -94,6 +94,10 @@ struct ToxAdapterConfig {
     /// Whether to enable toxcore local discovery.
     bool local_discovery_enabled = false;
 
+    /// Fixed UDP port for the DHT socket (0 = toxcore's default 33445..33545
+    /// walk). Non-zero binds exactly this port or fails tox_new().
+    uint16_t udp_port = 0;
+
     /// Local TCP relay port (0 = disabled).
     uint16_t tcp_port = 0;
 
@@ -111,6 +115,17 @@ struct ToxAdapterConfig {
 
     /// Bootstrap policy to use when no explicit nodes are provided.
     BootstrapMode bootstrap_mode = BootstrapMode::Auto;
+
+    /// Node-list fetcher used by bootstrap() and its lifetime retry. Empty
+    /// means the default (`curl https://nodes.tox.chat/json`); tests inject a
+    /// fake so the retry path can be driven without a network.
+    BootstrapSource::Fetcher bootstrap_fetcher;
+
+    /// First delay before the DHT-bootstrap retry (issue #34); doubles on
+    /// every failed attempt up to `bootstrap_retry_max_delay`. Tests shorten
+    /// it. Zero disables the retry entirely.
+    std::chrono::milliseconds bootstrap_retry_initial_delay{std::chrono::seconds(10)};
+    std::chrono::milliseconds bootstrap_retry_max_delay{std::chrono::minutes(5)};
 
     /// Name to set on the Tox instance (visible to friends).
     std::string name = "toxtunnel";
@@ -226,8 +241,21 @@ class ToxAdapter {
 
     /// Bootstrap to the DHT by connecting to the configured bootstrap nodes.
     ///
+    /// Also arms the lifetime retry (issue #34): while this node is not
+    /// connected to the DHT, the iterate loop re-contacts the node list on a
+    /// capped exponential backoff, and — when the list is empty because the
+    /// startup fetch of the public node list failed and no cache existed —
+    /// fetches it again on a worker thread that never touches toxcore. A
+    /// transient network failure at startup is therefore no longer permanent
+    /// for the life of the process. Not armed in LAN mode.
+    ///
     /// @return The number of nodes that were successfully contacted.
     [[nodiscard]] std::size_t bootstrap();
+
+    /// Observability for the bootstrap retry: attempts made since the initial
+    /// bootstrap(), and the number of nodes currently known to it.
+    [[nodiscard]] unsigned bootstrap_retry_attempts() const;
+    [[nodiscard]] std::size_t bootstrap_node_count() const;
 
     /// Resolve bootstrap nodes for a config without touching a live Tox instance.
     [[nodiscard]] static util::Expected<std::vector<BootstrapNode>, std::string>
@@ -435,6 +463,21 @@ class ToxAdapter {
     /// The tox_iterate loop executed on the dedicated thread.
     void run_loop();
 
+    /// Contact every node in @p nodes (tox_bootstrap + tox_add_tcp_relay).
+    /// Must run on the Tox thread with `tox_mutex_` held. Returns how many
+    /// tox_bootstrap calls succeeded.
+    std::size_t contact_bootstrap_nodes_locked(const std::vector<BootstrapNode>& nodes);
+
+    /// One step of the DHT-bootstrap retry, run by the iterate loop after
+    /// every iteration (cheap when nothing is due). Adapter-owned state, so a
+    /// stop()/start() cycle or a second adapter can never observe another's
+    /// worker result. Only the Tox thread consumes a fetched list and calls
+    /// toxcore; the fetch worker only fetches, parses, caches and deposits.
+    void bootstrap_retry_tick();
+
+    /// Ask the fetch worker (if any) to stop and join it. Called from stop().
+    void stop_bootstrap_retry_worker();
+
     /// Register all toxcore callbacks on the Tox instance.
     void register_callbacks();
 
@@ -540,6 +583,24 @@ class ToxAdapter {
 
     /// Whether the node is currently connected to the DHT.
     std::atomic<bool> connected_{false};
+
+    /// DHT-bootstrap retry state (issue #34). Everything under `mutex`; the
+    /// worker thread is owned here, never process-global.
+    struct BootstrapRetry {
+        mutable std::mutex mutex;
+        bool armed{false};                   ///< set by bootstrap(), cleared by stop()
+        std::vector<BootstrapNode> nodes;    ///< last known list (may be empty)
+        std::vector<BootstrapNode> fetched;  ///< deposited by the worker, consumed by the tick
+        bool has_fetched{false};
+        bool fetch_in_flight{false};
+        std::thread worker;
+        std::shared_ptr<std::atomic<bool>> worker_stop;
+        std::chrono::steady_clock::time_point next_attempt{};
+        std::chrono::milliseconds delay{};
+        unsigned attempts{0};
+        std::chrono::steady_clock::time_point disconnected_since{};
+        std::chrono::steady_clock::time_point last_status_log{};
+    } bootstrap_retry_;
 
     struct FriendRequestEvent {
         PublicKeyArray public_key{};

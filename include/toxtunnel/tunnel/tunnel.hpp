@@ -450,9 +450,37 @@ class TunnelImpl : public Tunnel {
         return open_attempts_.load(std::memory_order_relaxed);
     }
 
-    /// Immediately close the tunnel without graceful shutdown.
-    void force_close();
+    /// How force_close() lets go of the local TCP socket.
+    ///
+    /// `Abort` (the default) discards whatever is still queued on the socket:
+    /// session teardown, replacement of a recycled id, a dead peer, an Error.
+    /// `DrainIfClosed` is for the ordinary manager removal that follows a
+    /// tunnel's OWN graceful completion — the tunnel is already `Closed`, so
+    /// force_close() here is merely the resource release, and the bytes the
+    /// peer delivered before its CLOSE (already TUNNEL_ACKed) are still on
+    /// their way through the socket's write queue. Discarding them truncated
+    /// the stream behind a clean EOF (issue #33); draining lets the queue
+    /// empty, then FINs. Every other state — Error, an unpublished tunnel, a
+    /// half-close the peer never reciprocated, a closed outbound gate — keeps
+    /// the hard release regardless of this argument.
+    enum class ResourceRelease : std::uint8_t { Abort, DrainIfClosed };
 
+    /// Immediately close the tunnel without graceful shutdown.
+    void force_close(ResourceRelease release = ResourceRelease::Abort);
+
+   private:
+    /// Body of force_close(). With @p only_from set the terminal claim is
+    /// conditional on that exact state and a failed claim returns at once,
+    /// touching nothing -- the tunnel has been resolved by someone else.
+    void force_close_impl(ResourceRelease release, std::optional<State> only_from,
+                          bool mark_timeout);
+
+    /// The OPEN_ACK deadline fired: close the tunnel if -- and only if -- it is
+    /// still `Connecting`, claimed atomically so an ACK that lands at the same
+    /// instant wins and the tunnel stays open.
+    void expire_open_deadline();
+
+   public:
     /// Publish this tunnel as `Connected`, but only from the unpublished
     /// `None` state, and report whether THIS call was the one that did it.
     ///
@@ -503,6 +531,15 @@ class TunnelImpl : public Tunnel {
     /// @param max_bytes     Maximum payload size per emitted TUNNEL_DATA
     ///                      frame. Hard-capped to the Tox-MTU ceiling.
     void configure_coalesce(std::uint32_t max_delay_us, std::uint32_t max_bytes);
+
+    /// Bound how long `open()` may wait in `Connecting` for the peer's
+    /// OPEN_ACK. Zero (the default) disables the bound. When it expires with
+    /// the tunnel still `Connecting`, the tunnel is closed through the ordinary
+    /// handshake-close path (a TUNNEL_CLOSE goes out only if the OPEN reached
+    /// the peer) so the local application gets a definite end instead of
+    /// waiting forever on a server that will never answer — a peer whose
+    /// TunnelManager is gone, say (issue #36). Configure before `open()`.
+    void set_open_timeout(std::chrono::seconds timeout);
 
     /// Set the operator-selected coalesce mode. The state machine in the
     /// per-tunnel `WriteCoalescer` runs on every `send_data_to_tox` and
@@ -566,6 +603,19 @@ class TunnelImpl : public Tunnel {
     /// abandonment). A second call is a suppressed duplicate: one tunnel,
     /// one terminal ERROR.
     void send_error(uint8_t error_code, const std::string& description);
+
+    /// Terminate this tunnel as an ERROR without putting anything on the wire.
+    ///
+    /// For failures the peer cannot be told about, or already knows about: a
+    /// resume the server declined (it no longer holds the tunnel), an OPEN
+    /// that never got its ACK. The tunnel takes the same terminal path as
+    /// `send_error()` — Abort seal, `State::Error`, the close booked as
+    /// `reason="error"`, one close notification — so the local application
+    /// sees an abnormal end (the client resets its socket) rather than the
+    /// clean EOF a graceful `close()` would produce (issue #35). Records
+    /// @p error_code / @p description as the last error, like a received
+    /// TUNNEL_ERROR would. A second terminal claim is a suppressed duplicate.
+    void fail_locally(uint8_t error_code, const std::string& description);
 
     // -----------------------------------------------------------------
     // Flow control
@@ -936,7 +986,12 @@ class TunnelImpl : public Tunnel {
     /// also reads `state_` under. A resolver therefore either takes the lock
     /// before this and sees a non-terminal state, or after it and sees `Owed`.
     /// There is no third observation.
-    [[nodiscard]] TerminalClaim claim_terminal();
+    /// @param only_from  When set, claim ONLY if the state is exactly this one;
+    ///                   any other state (a racing ACK's `Connected`, say)
+    ///                   leaves the claim unmade. Used by the OPEN_ACK
+    ///                   deadline, which must never close a tunnel that
+    ///                   connected while its timer was firing.
+    [[nodiscard]] TerminalClaim claim_terminal(std::optional<State> only_from = std::nullopt);
 
    public:
     /// Test seam: run @p hook inside `claim_terminal()`, immediately after the
@@ -1271,6 +1326,21 @@ class TunnelImpl : public Tunnel {
     /// Invoke the close callback at most once for terminal states (Closed/Error).
     void notify_close_once();
 
+    /// Book this tunnel's `tunnels_closed_total{reason=...}` sample, at most
+    /// once per tunnel. Every terminal path calls it with the reason it knows;
+    /// the first caller wins, later ones are no-ops. A half-close is NOT a
+    /// close and must not book — doing so counted a tunnel that half-closed
+    /// locally and was then closed by the peer twice (issue #36).
+    void book_close_once(util::MetricsRegistry::CloseReason reason) noexcept;
+
+    /// Arm / disarm the OPEN_ACK deadline (see set_open_timeout). The arm
+    /// happens once `open()` has an attempt in flight; the disarm on every
+    /// transition out of `Connecting` (notify_state_change) and in the
+    /// destructor. Epoch-checked so a handler already dispatched when the
+    /// tunnel resolved does nothing.
+    void arm_open_deadline_timer();
+    void cancel_open_deadline() noexcept;
+
     // -----------------------------------------------------------------
     // TUNNEL_OPEN ownership
     // -----------------------------------------------------------------
@@ -1325,6 +1395,17 @@ class TunnelImpl : public Tunnel {
     /// Set when a maintenance timer (idle reaper / half-close cap) is closing
     /// this tunnel, so the close is booked as CloseReason::Timeout.
     std::atomic<bool> timeout_close_{false};
+
+    /// One `tunnels_closed_total` sample per tunnel — see book_close_once().
+    std::atomic<bool> close_booked_{false};
+
+    /// OPEN_ACK deadline (see set_open_timeout). `open_timeout_` is written
+    /// during setup only; the timer and its epoch are guarded by
+    /// `open_deadline_mutex_`, which is never held across a callback.
+    std::chrono::seconds open_timeout_{0};
+    mutable std::mutex open_deadline_mutex_;
+    asio::steady_timer open_deadline_timer_;
+    std::uint64_t open_deadline_epoch_{0};
 
     /// Last TUNNEL_ERROR seen, exposed via last_error_code() /
     /// last_error_description() so callers (SOCKS5) can tell a rules denial

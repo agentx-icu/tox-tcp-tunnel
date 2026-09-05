@@ -33,6 +33,14 @@ class BootstrapSource {
     [[nodiscard]] static util::Expected<std::string, BootstrapFetchError>
     fetch_default_nodes_json();
 
+    /// Fetch the public node list with @p fetcher (default: curl), parse it,
+    /// and on success refresh the cache under @p data_dir. Blocking; meant for
+    /// a worker thread. This is the single retry step behind
+    /// `ToxAdapter::bootstrap_retry_tick()`.
+    [[nodiscard]] static util::Expected<std::vector<BootstrapNode>, std::string>
+    fetch_and_cache_default_nodes(const std::filesystem::path& data_dir, Fetcher fetcher = {},
+                                  std::size_t max_nodes = kDefaultMaxNodes);
+
     [[nodiscard]] static std::filesystem::path cache_file_path(
         const std::filesystem::path& data_dir);
 

@@ -46,6 +46,7 @@ inspect:
 tox:
   udp_enabled: true
   ipv6_enabled: false
+  udp_port: 33445
   tcp_port: 33445
   bootstrap_mode: auto
   bootstrap_nodes:
@@ -60,6 +61,7 @@ tunnel:
   reaper_tick_seconds: 10
   keepalive_interval_seconds: 0
   half_close_timeout_seconds: 120
+  open_timeout_seconds: 30
   resume:
     enabled: false
     max_age_seconds: 300

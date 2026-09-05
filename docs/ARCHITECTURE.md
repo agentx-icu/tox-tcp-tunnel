@@ -106,6 +106,7 @@ protocol meaning.
 | 1 | Policy-denied open | Rules denial, rate limit, concurrent-tunnel cap — anything the server *operator's* configuration refused | `Denied` → SOCKS5 `0x02` / HTTP `403` |
 | 2 | General non-policy failure | DNS failure, any connect failure that is not a refusal, "Tunnel ID in use", "Tunnel not found", target lost before the tunnel was established, half-close linger timeout | `Unreachable` → SOCKS5 `0x04` / HTTP `502` |
 | 3 | Actively refused | The target's TCP stack refused the connection, and nothing else | `Refused` → SOCKS5 `0x05` / HTTP `502` |
+| 4 | Target ended abnormally (v0.5.0+) | The established target connection was reset or failed with a read/write error that is not a clean end of stream | Post-open only: the client resets its local socket (RST) so the application sees `ECONNRESET`, not a clean EOF; counted under `tunnels_closed_total{reason="error"}` |
 
 The **Client outcome** column applies while an open is still pending — that is
 the window in which a SOCKS5 or HTTP CONNECT caller is waiting for its reply.
@@ -339,6 +340,7 @@ Exposed series (subject to growth — names are stable once shipped):
 | `toxtunnel_bytes_in_total` | counter | Bytes received from Tox peers (unlabeled total) |
 | `toxtunnel_bytes_out_total` | counter | Bytes sent to Tox peers (unlabeled total) |
 | `toxtunnel_friends_online` | gauge | Tox friends currently online |
+| `toxtunnel_dht_connected` | gauge | 1 while this node is connected to the Tox DHT, 0 otherwise (a daemon that never bootstrapped shows 0 for its whole life) |
 | `toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max}` | summary | `tox_iterate()` elapsed-time samples |
 
 There is no remote-command channel; the daemon does not export per-frame
@@ -370,7 +372,7 @@ Wire format is intentionally trivial:
 < {"mode":"client","version":"0.4.5","friends_online":1,"tunnels":[{"id":17,"friend_pk_prefix":"AA…","target":"127.0.0.1:22","state":"Connected","bytes_in":4096,"bytes_out":8192,"idle_seconds":3}]}
 
 > GET /status
-< {"mode":"client","version":"0.4.5","friends_online":1,"tunnels_active":4,"bytes_in":12345,"bytes_out":67890}
+< {"mode":"client","version":"0.5.0","friends_online":1,"dht_connected":true,"tunnels_active":4,"bytes_in":12345,"bytes_out":67890}
 ```
 
 The CLI ships only two subactions — `toxtunnel inspect tunnels` (default) and

@@ -98,6 +98,7 @@ void MetricsRegistry::reset() {
     bytes_in_.store(0, std::memory_order_relaxed);
     bytes_out_.store(0, std::memory_order_relaxed);
     friends_online_.store(0, std::memory_order_relaxed);
+    dht_connected_.store(false, std::memory_order_relaxed);
     iterate_lag_count_.store(0, std::memory_order_relaxed);
     iterate_lag_sum_ms_.store(0.0, std::memory_order_relaxed);
     iterate_lag_max_ms_.store(0.0, std::memory_order_relaxed);
@@ -166,6 +167,14 @@ void MetricsRegistry::add_bytes_out(std::size_t n) {
 
 void MetricsRegistry::set_friends_online(std::size_t n) {
     friends_online_.store(n, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::set_dht_connected(bool connected) {
+    dht_connected_.store(connected, std::memory_order_relaxed);
+}
+
+bool MetricsRegistry::dht_connected() const {
+    return dht_connected_.load(std::memory_order_relaxed);
 }
 
 void MetricsRegistry::observe_iterate_lag_ms(double ms) {
@@ -390,6 +399,12 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_friends_online gauge\n"
            "toxtunnel_friends_online "
         << friends_online() << "\n";
+
+    // dht_connected gauge
+    out << "# HELP toxtunnel_dht_connected 1 while this node is connected to the Tox DHT.\n"
+           "# TYPE toxtunnel_dht_connected gauge\n"
+           "toxtunnel_dht_connected "
+        << (dht_connected() ? 1 : 0) << "\n";
 
     // iterate-lag summary (count + sum + a `_max` companion gauge for
     // the maximum observation since process start)

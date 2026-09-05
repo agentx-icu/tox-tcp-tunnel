@@ -19,6 +19,7 @@ logging:
 
 tox:
   udp_enabled: true
+  udp_port: 0                      # 0 = toxcore's 33445..33545 walk; set to pin the DHT port
   tcp_port: 33445
   bootstrap_mode: auto             # auto or lan
   bootstrap_nodes:
@@ -474,6 +475,10 @@ tunnel:
                                     # each peer every interval and declares it
                                     # dead after 3× of no PONG.
 
+  open_timeout_seconds: 30         # client: give up on a TUNNEL_OPEN that gets
+                                    # no OPEN_ACK within this long (0 = wait
+                                    # forever, the pre-v0.5.0 behaviour).
+
   # Note: a tunnel stuck in "Disconnecting" is already covered by
   # `half_close_timeout_seconds`, which is ON by default (120s). Set
   # `idle_timeout_seconds` only to reclaim tunnels that are idle in a
@@ -496,6 +501,7 @@ tunnel:
 | `idle_timeout_seconds` | `0` (off) | restart | Idle reaper threshold. When >0 the reaper closes tunnels with no TUNNEL_DATA in either direction for the given duration. |
 | `reaper_tick_seconds` | `10` | restart | Reaper scan period. Lower = faster reclaim, higher = less wake-up overhead. |
 | `keepalive_interval_seconds` | `0` (off) | restart | Application-level PING/PONG liveness. When >0, each peer is PINGed every interval and declared dead after `3×interval` of no PONG — the server drops that friend's tunnels, the client marks the active server offline so failover promotes a fallback. Catches an app wedged while its toxcore link still looks alive. |
+| `open_timeout_seconds` | `30` | restart | Client-side bound on the open handshake. A tunnel whose TUNNEL_OPEN gets no OPEN_ACK in time is closed (a TUNNEL_CLOSE goes out if the OPEN reached the peer, the local socket ends) and counted under `tunnels_opened_total{result="failed"}` instead of sitting in `Connecting` forever with the application blocked (issue #36). `0` disables. |
 | `coalesce_max_delay_us` | `200` | restart | Max time a small write is buffered before being emitted. `0` disables coalescing — every write becomes its own TUNNEL_DATA frame, matching pre-v0.3.0 behaviour. |
 | `coalesce_max_bytes` | `1362` | restart | Buffer-size flush threshold. Should be ≤ TUNNEL_DATA payload MTU; higher values are clamped. |
 | `coalesce_mode` | `fixed` | restart | Coalescer policy. `fixed` (v0.3.0 behaviour), `adaptive` (state machine selects between bypass / drain / batch per push), `bypass` (no hold timer ever), `drain` (emit on overflow only). |
@@ -597,6 +603,18 @@ the in-process detector preserves a core dump for postmortem.
 Non-reloadable. `systemd_notify: true` periodically sends
 `sd_notify(WATCHDOG=1)` on the main thread so a stalled main thread is
 caught by `WatchdogSec` if the systemd unit declares one.
+
+The abort is **confirmed, not instantaneous**. A stale heartbeat alone is not
+proof of a wedge: a host that sleeps, or a hypervisor that pauses the guest,
+leaves the heartbeat hours old on resume while the Tox thread is perfectly
+healthy (every watchdog abort on the Windows QA rig was exactly that, issue
+#38). So the observer aborts only after the heartbeat *counter* has stayed
+unchanged for 5 consecutive over-deadline checks, and a check that finds the
+observer itself was stalled for longer than the deadline (the whole process
+was suspended) is discarded. A real wedge still trips after `deadline + ~5 s`;
+the log shows a `warning` at half the deadline, the confirmation ticks, and
+the final `critical` line names the phase the Tox thread was in
+(`tox_iterate`, posted tasks, application callbacks).
 
 ## Per-Friend Rate Limiting (`rules.yaml`)
 

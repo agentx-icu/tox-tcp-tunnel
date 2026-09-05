@@ -54,6 +54,7 @@ add_executable(unit_tests
     unit/tunnel_resume_test.cpp
     unit/t8_data_race_test.cpp
     unit/t2_atomic_persistence_test.cpp
+    unit/remote_close_drain_test.cpp
 )
 target_link_libraries(unit_tests PRIVATE
     toxtunnel_lib

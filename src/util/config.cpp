@@ -926,6 +926,9 @@ Node convert<ToxConfig>::encode(const ToxConfig& rhs) {
     Node node;
     node["udp_enabled"] = rhs.udp_enabled;
     node["ipv6_enabled"] = rhs.ipv6_enabled;
+    if (rhs.udp_port != 0) {
+        node["udp_port"] = rhs.udp_port;
+    }
     node["tcp_port"] = rhs.tcp_port;
     node["bootstrap_mode"] = rhs.bootstrap_mode;
     if (!rhs.bootstrap_nodes.empty()) {
@@ -944,6 +947,9 @@ bool convert<ToxConfig>::decode(const Node& node, ToxConfig& rhs) {
     }
     if (node["ipv6_enabled"]) {
         rhs.ipv6_enabled = node["ipv6_enabled"].as<bool>();
+    }
+    if (node["udp_port"]) {
+        rhs.udp_port = node["udp_port"].as<uint16_t>();
     }
     if (node["tcp_port"]) {
         rhs.tcp_port = node["tcp_port"].as<uint16_t>();
@@ -1111,6 +1117,7 @@ Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs
     node["reaper_tick_seconds"] = rhs.reaper_tick_seconds;
     node["half_close_timeout_seconds"] = rhs.half_close_timeout_seconds;
     node["keepalive_interval_seconds"] = rhs.keepalive_interval_seconds;
+    node["open_timeout_seconds"] = rhs.open_timeout_seconds;
     if (!(rhs.resume == toxtunnel::TunnelResumeConfig{})) {
         node["resume"] = rhs.resume;
     }
@@ -1141,6 +1148,9 @@ bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::Tunne
     }
     if (node["keepalive_interval_seconds"]) {
         rhs.keepalive_interval_seconds = node["keepalive_interval_seconds"].as<uint32_t>();
+    }
+    if (node["open_timeout_seconds"]) {
+        rhs.open_timeout_seconds = node["open_timeout_seconds"].as<uint32_t>();
     }
     if (node["resume"]) {
         rhs.resume = node["resume"].as<toxtunnel::TunnelResumeConfig>();

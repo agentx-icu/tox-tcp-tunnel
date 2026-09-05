@@ -140,14 +140,22 @@ struct ToxConfig {
     /// deaf on inbound IPv4 while looking healthy. See
     /// docs/FIELD_NOTES_SSH_TUNNEL.md #8.
     bool ipv6_enabled = true;
+    /// Fixed UDP port for the Tox DHT socket. 0 (the default) keeps toxcore's
+    /// own behaviour: bind 33445, walking up to 33545 if it is busy. A
+    /// non-zero value binds exactly that port and fails startup if it is
+    /// taken — for deterministic firewall / NAT rules, and to move a daemon
+    /// off the default port so it cannot silently swallow the inbound DHT
+    /// traffic of another Tox application on the same host (issue #32; see
+    /// docs/FIELD_NOTES_SSH_TUNNEL.md #8).
+    uint16_t udp_port = 0;
     uint16_t tcp_port = 33445;                           ///< TCP relay port (server use)
     BootstrapMode bootstrap_mode = BootstrapMode::Auto;  ///< Bootstrap behavior
     std::vector<BootstrapNodeConfig> bootstrap_nodes;    ///< Explicit bootstrap nodes
 
     bool operator==(const ToxConfig& other) const {
         return udp_enabled == other.udp_enabled && ipv6_enabled == other.ipv6_enabled &&
-               tcp_port == other.tcp_port && bootstrap_mode == other.bootstrap_mode &&
-               bootstrap_nodes == other.bootstrap_nodes;
+               udp_port == other.udp_port && tcp_port == other.tcp_port &&
+               bootstrap_mode == other.bootstrap_mode && bootstrap_nodes == other.bootstrap_nodes;
     }
 };
 
@@ -222,6 +230,14 @@ struct TunnelConfig {
     /// `keepalive_interval_seconds * 3` of no PONG. Detects an application that
     /// is wedged while its toxcore link still looks alive (M-02).
     uint32_t keepalive_interval_seconds = 0;
+    /// Client-side bound on the open handshake (seconds). A tunnel whose
+    /// TUNNEL_OPEN gets no OPEN_ACK within this long is closed (the local
+    /// socket ends, a TUNNEL_CLOSE goes out if the OPEN reached the peer) and
+    /// counted under `tunnels_opened_total{result="failed"}`, instead of
+    /// sitting in `Connecting` forever with the application blocked — which is
+    /// what a server that has lost this client's TunnelManager produced
+    /// (issue #36). 0 disables the bound. Non-reloadable.
+    uint32_t open_timeout_seconds = 30;
     TunnelResumeConfig resume;
 
     [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }

@@ -287,6 +287,7 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     tox_config.data_dir = config_.data_dir;
     tox_config.udp_enabled = tox_cfg.udp_enabled;
     tox_config.ipv6_enabled = tox_cfg.ipv6_enabled;
+    tox_config.udp_port = tox_cfg.udp_port;
     tox_config.tcp_port = tox_cfg.tcp_port;
     tox_config.bootstrap_mode = tox_cfg.bootstrap_mode;
     tox_config.local_discovery_enabled = tox_cfg.bootstrap_mode == BootstrapMode::Lan;
@@ -411,6 +412,7 @@ void TunnelServer::start() {
             std::lock_guard lock(managers_mutex_);
             return managers_.size();
         };
+        providers.dht_connected = [this]() -> bool { return tox_adapter_->is_connected(); };
         providers.friend_pk_prefix = [this](uint16_t tunnel_id) -> std::string {
             // Resolve tunnel_id -> friend_number under managers_mutex_, then
             // RELEASE the lock BEFORE get_friend_pk_hex(). That call marshals to
@@ -2484,30 +2486,57 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
             return;
         }
 
-        asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, tunnel_id]() {
-            // Resolve via weak_manager (works whether the manager is live or
-            // held for resume) instead of managers_.find(friend) — a held
-            // manager is absent from managers_, so a lookup would miss the
-            // target-TCP drop and strand the tunnel in a phantom-Connected
-            // state that a later RESUME_REQUEST would ACK Ok on a dead socket.
-            auto mgr = weak_manager.lock();
-            auto tunnel = weak_tunnel.lock();
-            if (!mgr || !tunnel) {
-                return;
-            }
-            // close_tunnel_if, not get_tunnel() + close(): this cleanup is
-            // deferred, and looking the id up and then closing unlocked let a
-            // replacement land in between, after which the old object's
-            // TUNNEL_CLOSE carried the NEW tunnel's id.
-            //
-            // Gracefully closes (outside managers_mutex_): flushes any buffered
-            // / backpressured bytes to the peer *before* emitting TUNNEL_CLOSE —
-            // deferring CLOSE until the coalesce buffer drains — then fires
-            // on_close_, which removes the tunnel. Emitting CLOSE and removing
-            // immediately (the old behaviour) discarded the still-in-flight
-            // data, truncating the transfer when the origin closed first.
-            (void)mgr->close_tunnel_if(tunnel_id, tunnel.get());
-        });
+        // An abnormal end of the target connection — a reset, or any read /
+        // write error that is not a clean end of stream — is reported to the
+        // peer as such. `operation_aborted` is our own force_close() and an
+        // empty code is a clean FIN teardown; everything else ends the tunnel
+        // with TUNNEL_ERROR code 4 so the client's application sees
+        // ECONNRESET rather than a complete-looking EOF (issue #35). The
+        // description is human-readable only; the code carries the meaning.
+        const bool abnormal = ec && ec != asio::error::eof && ec != asio::error::operation_aborted;
+        const std::string abnormal_reason =
+            abnormal ? std::string("target connection ended abnormally: ") + ec.message()
+                     : std::string();
+
+        asio::post(io_context_->get_io_context(),
+                   [weak_manager, weak_tunnel, tunnel_id, abnormal, abnormal_reason]() {
+                       // Resolve via weak_manager (works whether the manager is live or
+                       // held for resume) instead of managers_.find(friend) — a held
+                       // manager is absent from managers_, so a lookup would miss the
+                       // target-TCP drop and strand the tunnel in a phantom-Connected
+                       // state that a later RESUME_REQUEST would ACK Ok on a dead socket.
+                       auto mgr = weak_manager.lock();
+                       auto tunnel = weak_tunnel.lock();
+                       if (!mgr || !tunnel) {
+                           return;
+                       }
+                       if (abnormal) {
+                           // Identity-checked like close_tunnel_if below: a
+                           // replacement may have recycled the id while this
+                           // cleanup was queued. send_error() seals admission
+                           // and abandons what the target had left buffered,
+                           // which is what a reset means on the wire too.
+                           const auto state = tunnel->state();
+                           if (mgr->get_tunnel(tunnel_id).get() == tunnel.get() &&
+                               (state == tunnel::Tunnel::State::Connected ||
+                                state == tunnel::Tunnel::State::Disconnecting)) {
+                               tunnel->send_error(4, abnormal_reason);
+                               return;
+                           }
+                       }
+                       // close_tunnel_if, not get_tunnel() + close(): this cleanup is
+                       // deferred, and looking the id up and then closing unlocked let a
+                       // replacement land in between, after which the old object's
+                       // TUNNEL_CLOSE carried the NEW tunnel's id.
+                       //
+                       // Gracefully closes (outside managers_mutex_): flushes any buffered
+                       // / backpressured bytes to the peer *before* emitting TUNNEL_CLOSE —
+                       // deferring CLOSE until the coalesce buffer drains — then fires
+                       // on_close_, which removes the tunnel. Emitting CLOSE and removing
+                       // immediately (the old behaviour) discarded the still-in-flight
+                       // data, truncating the transfer when the origin closed first.
+                       (void)mgr->close_tunnel_if(tunnel_id, tunnel.get());
+                   });
     });
 
     // Tox data -> TCP: set up the callback so tunnel data is written to TCP.

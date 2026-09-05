@@ -30,6 +30,7 @@ InspectProviders make_providers_with_one_tunnel() {
     p.mode = [] { return std::string("server"); };
     p.version = [] { return std::string("0.0.0-test"); };
     p.friends_online = []() -> std::size_t { return 1; };
+    p.dht_connected = []() -> bool { return true; };
     p.friend_pk_prefix = [](uint16_t) -> std::string { return std::string("AABBCCDD"); };
     p.snapshot = []() -> tunnel::ManagerSnapshot {
         tunnel::ManagerSnapshot snap;
@@ -121,6 +122,7 @@ TEST(InspectServerJson, StatusContainsExpectedFields) {
 
     EXPECT_NE(json.find("\"mode\":\"server\""), std::string::npos) << json;
     EXPECT_NE(json.find("\"friends_online\":1"), std::string::npos) << json;
+    EXPECT_NE(json.find("\"dht_connected\":true"), std::string::npos) << json;
     EXPECT_NE(json.find("\"tunnels_active\":1"), std::string::npos) << json;
     EXPECT_NE(json.find("\"bytes_in\":1234"), std::string::npos) << json;
     EXPECT_NE(json.find("\"bytes_out\":5678"), std::string::npos) << json;
