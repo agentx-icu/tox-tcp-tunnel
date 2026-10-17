@@ -480,6 +480,10 @@ util::Expected<void, std::string> Config::validate() const {
         return util::make_unexpected(
             std::string("tunnel.resume.max_age_seconds must be > 0 when tunnel.resume.enabled"));
     }
+    if (tunnel.offline_open_wait_seconds > 3600) {
+        return util::make_unexpected(
+            std::string("tunnel.offline_open_wait_seconds must be <= 3600"));
+    }
     if (tunnel.resume.on_gap != "passthrough" && tunnel.resume.on_gap != "close") {
         return util::make_unexpected(std::string("Invalid tunnel.resume.on_gap '") +
                                      tunnel.resume.on_gap +
@@ -1168,6 +1172,7 @@ Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs
     node["half_close_timeout_seconds"] = rhs.half_close_timeout_seconds;
     node["keepalive_interval_seconds"] = rhs.keepalive_interval_seconds;
     node["open_timeout_seconds"] = rhs.open_timeout_seconds;
+    node["offline_open_wait_seconds"] = rhs.offline_open_wait_seconds;
     if (!(rhs.resume == toxtunnel::TunnelResumeConfig{})) {
         node["resume"] = rhs.resume;
     }
@@ -1201,6 +1206,9 @@ bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::Tunne
     }
     if (node["open_timeout_seconds"]) {
         rhs.open_timeout_seconds = node["open_timeout_seconds"].as<uint32_t>();
+    }
+    if (node["offline_open_wait_seconds"]) {
+        rhs.offline_open_wait_seconds = node["offline_open_wait_seconds"].as<uint32_t>();
     }
     if (node["resume"]) {
         rhs.resume = node["resume"].as<toxtunnel::TunnelResumeConfig>();

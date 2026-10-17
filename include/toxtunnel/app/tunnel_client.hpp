@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -534,6 +535,48 @@ class TunnelClient {
     void open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
                             uint16_t port, std::vector<uint8_t> initial_payload,
                             std::function<void(TunnelOpenOutcome)> on_tunnel_state);
+
+    // -----------------------------------------------------------------
+    // Held local connections (tunnel.offline_open_wait_seconds)
+    // -----------------------------------------------------------------
+    // A forward connection accepted while the active server is offline is
+    // held, unread, for up to the configured wait instead of being closed at
+    // once, and opened in arrival order when the server comes online.
+    // Decisions run on inbound_strand_, serialized with the transitions that
+    // change server_online_; held_mutex_ additionally lets stop() close the
+    // held sockets from its own thread. Declared last so these members go
+    // before io_ctx_ on destruction.
+
+    /// Accept decision for a forward connection (on the strand when there is
+    /// one): open now, hold, or close.
+    void accept_forward_connection(std::shared_ptr<core::TcpConnection> conn,
+                                   const ForwardRule& rule);
+    /// Wire and open the tunnel for an accepted forward connection.
+    void open_tunnel_for_connection(std::shared_ptr<core::TcpConnection> conn,
+                                    const ForwardRule& rule);
+    /// Open every held connection if the active server is online (strand).
+    void release_held_connections();
+    /// Queue release_held_connections() behind whatever the strand holds.
+    void post_release_held_connections();
+    /// Close held connections whose wait expired; re-arm while any remain.
+    void expire_held_connections();
+    void arm_held_timer_locked();
+    /// Close every held connection and cancel the timer (stop()).
+    void close_held_connections();
+
+    struct HeldConnection {
+        std::shared_ptr<core::TcpConnection> conn;
+        ForwardRule rule;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    static constexpr std::size_t kMaxHeldConnections = 64;
+    std::mutex held_mutex_;
+    std::deque<HeldConnection> held_;
+    std::unique_ptr<asio::steady_timer> held_timer_;  ///< only touched under held_mutex_
+    bool held_timer_armed_{false};
+    bool held_closed_{false};  ///< latched by close_held_connections() (stop)
+    /// tunnel.offline_open_wait_seconds, snapshotted in initialize().
+    std::atomic<std::uint32_t> held_wait_seconds_{0};
 };
 
 }  // namespace toxtunnel::app

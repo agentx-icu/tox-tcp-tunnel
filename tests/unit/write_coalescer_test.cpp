@@ -17,6 +17,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "toxtunnel/tunnel/bdp_flow_control.hpp"
 
 namespace toxtunnel::test {
@@ -258,6 +260,138 @@ TEST(BdpFlowControlTest, BdpModeSurvivesAdversarialSamplesWithoutOverflow) {
     const auto thr = bdp.ack_threshold_bytes();
     EXPECT_GT(thr, 0) << "ack threshold should never go negative";
     EXPECT_LE(thr, win) << "ack threshold should not exceed the window";
+}
+
+// v0.5.0: the seed is a starting point, not a floor. On a slow path the
+// window must shrink, or a bulk tunnel parks the whole seed in toxcore's
+// per-friend queue (observed: 256 KiB at 7 KB/s, OPEN_ACKs waiting > 30 s).
+TEST(BdpFlowControlTest, BdpModeShrinksBelowTheSeedOnASlowPath) {
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.min_window_bytes = 32 * 1024;
+    cfg.fixed_window_bytes = 256 * 1024;
+    cfg.safety_factor_x100 = 150;
+    BdpFlowControl bdp(cfg);
+    EXPECT_EQ(bdp.target_window_bytes(), 256 * 1024);  // seed
+
+    bdp.observe_rtt_us(300'000);      // 300 ms
+    bdp.observe_bandwidth_bps(7000);  // 7 KB/s -> BDP ~2 KiB
+    EXPECT_EQ(bdp.target_window_bytes(), 32 * 1024) << "clamped to the floor, below the seed";
+}
+
+TEST(BdpFlowControlTest, FloorNeverGoesBelowTwoAckThresholds) {
+    // A receiver ACKs every 16 KiB; a smaller window would stall for good.
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.min_window_bytes = 4096;
+    cfg.fixed_window_bytes = 8192;
+    BdpFlowControl bdp(cfg);
+    EXPECT_EQ(bdp.config().min_window_bytes, BdpFlowControl::kAckSafeFloorBytes);
+    EXPECT_EQ(bdp.target_window_bytes(), BdpFlowControl::kAckSafeFloorBytes);
+    bdp.observe_rtt_us(1000);
+    bdp.observe_bandwidth_bps(1000);
+    EXPECT_EQ(bdp.target_window_bytes(), BdpFlowControl::kAckSafeFloorBytes);
+}
+
+TEST(BdpFlowControlTest, TargetUsesMinRttNotTheQueueInflatedAverage) {
+    // A full window inflates every RTT sample with its own queue. Using those
+    // samples would keep the window large forever; the minimum is the path.
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.min_window_bytes = 32 * 1024;
+    cfg.max_window_bytes = 64 * 1024 * 1024;
+    cfg.fixed_window_bytes = 256 * 1024;
+    cfg.safety_factor_x100 = 100;
+    BdpFlowControl bdp(cfg);
+    const std::int64_t t0 = 1'000'000'000;
+    bdp.observe_bandwidth_bps(1'000'000);  // 1 MB/s
+    bdp.observe_rtt_us_at(100'000, t0);    // 100 ms path
+    for (int i = 1; i <= 20; ++i) {
+        bdp.observe_rtt_us_at(2'000'000, t0 + i * 100'000'000LL);  // 2 s with queue
+    }
+    EXPECT_EQ(bdp.min_rtt_us(), 100'000);
+    EXPECT_GT(bdp.rtt_us(), 1'000'000) << "the smoothed RTT still reports the queue";
+    // 1 MB/s x (100 ms + the 50 ms queue budget) = 150 KB, not 1 MB/s x ~2 s.
+    EXPECT_EQ(bdp.target_window_bytes(), 150'000);
+}
+
+// Review regression: under a saturating transfer every sample carries the
+// sender's own standing queue. If those samples were allowed to refill the
+// minimum once the clean one aged out, the target would ratchet x1.5 per
+// bucket up to max_window_bytes. Untrusted samples never touch the minimum,
+// and after kMinRttProbeAfterNs without a trusted sample the window drops to
+// the floor until a clean sample re-measures the path.
+TEST(BdpFlowControlTest, AStandingQueueCannotRatchetTheWindowUp) {
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.min_window_bytes = 32 * 1024;
+    cfg.max_window_bytes = 4 * 1024 * 1024;
+    cfg.fixed_window_bytes = 256 * 1024;
+    cfg.safety_factor_x100 = 150;
+    BdpFlowControl bdp(cfg);
+    const std::int64_t t0 = 1'000'000'000;
+    bdp.observe_bandwidth_bps(100'000);                        // 100 KB/s
+    bdp.observe_rtt_sample_at(200'000, t0, /*trusted=*/true);  // 200 ms path
+    const auto steady = bdp.target_window_bytes();
+
+    std::int64_t peak = 0;
+    for (int i = 1; i <= 210; ++i) {  // 21 s of samples behind a ~2.5 s queue
+        bdp.observe_rtt_sample_at(2'500'000, t0 + i * 100'000'000LL, /*trusted=*/false);
+        peak = std::max(peak, bdp.target_window_bytes());
+    }
+    EXPECT_EQ(bdp.min_rtt_us(), 200'000) << "queued samples must not become the minimum";
+    EXPECT_LE(peak, steady) << "the window grew from its own queue";
+    EXPECT_TRUE(bdp.probing_min_rtt());
+    EXPECT_EQ(bdp.target_window_bytes(), 32 * 1024) << "probe holds the floor";
+
+    // A clean sample ends the probe and re-measures the path: the 200 ms
+    // minimum aged out with its buckets, so 210 ms is the new minimum.
+    bdp.observe_rtt_sample_at(210'000, t0 + 22'000'000'000LL, /*trusted=*/true);
+    EXPECT_FALSE(bdp.probing_min_rtt());
+    EXPECT_EQ(bdp.min_rtt_us(), 210'000);
+    EXPECT_EQ(bdp.target_window_bytes(), 39'000);  // 100 KB/s x (210 + 50) ms x 1.5
+}
+
+// Trust is relative to the configured floor: with the pre-v0.5.0 64 KiB
+// minimum a probe drains to 64 KiB, and samples sent at that level must count
+// as clean or the probe would never end.
+TEST(BdpFlowControlTest, TrustFollowsTheConfiguredFloor) {
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.min_window_bytes = 64 * 1024;
+    BdpFlowControl bdp(cfg);
+    EXPECT_TRUE(bdp.is_trusted_inflight(64 * 1024));
+    EXPECT_TRUE(bdp.is_trusted_inflight(64 * 1024 + BdpFlowControl::kTrustedSlackBytes));
+    EXPECT_FALSE(bdp.is_trusted_inflight(80 * 1024));
+}
+
+TEST(BdpFlowControlTest, WithoutATrustedMinimumTheWindowNeverGrowsPastTheSeed) {
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.fixed_window_bytes = 256 * 1024;
+    BdpFlowControl bdp(cfg);
+    const std::int64_t t0 = 1'000'000'000;
+    bdp.observe_bandwidth_bps(1'000'000);
+    for (int i = 0; i < 50; ++i) {  // queued samples only, from the start
+        bdp.observe_rtt_samples_at(3'000'000, /*trusted_rtt_us=*/0, t0 + i * 10'000'000LL);
+    }
+    EXPECT_EQ(bdp.min_rtt_us(), 0);
+    EXPECT_LE(bdp.target_window_bytes(), 256 * 1024);
+}
+
+TEST(BdpFlowControlTest, MinRttForgetsAMinimumOlderThanTwoBuckets) {
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    BdpFlowControl bdp(cfg);
+    const std::int64_t t0 = 1'000'000'000;
+    const std::int64_t bucket = BdpFlowControl::kMinRttBucketNs;
+    bdp.observe_rtt_us_at(50'000, t0);
+    bdp.observe_rtt_us_at(80'000, t0 + bucket + 1);  // next bucket: 50 ms still counts
+    EXPECT_EQ(bdp.min_rtt_us(), 50'000);
+    bdp.observe_rtt_us_at(90'000, t0 + 2 * bucket + 2);  // 50 ms bucket now two back
+    EXPECT_EQ(bdp.min_rtt_us(), 80'000);
+    bdp.observe_rtt_us_at(120'000, t0 + 5 * bucket);  // long silence: nothing carried over
+    EXPECT_EQ(bdp.min_rtt_us(), 120'000);
 }
 
 }  // namespace

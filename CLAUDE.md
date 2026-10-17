@@ -222,8 +222,11 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   hold ever), `drain` (emit on overflow only). Non-reloadable.
 - **BDP-aware flow control** — `flow_control.mode: bdp` is the default
   since v0.4.1. The per-tunnel `BdpFlowControl` starts at the fixed
-  256 KiB seed window and dynamically resizes it (between 64 KiB and 4 MiB)
-  from RTT × bandwidth EWMA samples fed by `handle_tunnel_ack_frame`.
+  256 KiB seed window and resizes it (between 32 KiB and 4 MiB) to
+  bandwidth × windowed-min RTT × 1.5, from per-byte-range RTT samples
+  (emission driver -> `handle_tunnel_ack_frame`). Since v0.5.0 the seed is
+  not a floor; the floor never goes below 32 KiB (2× the receiver's 16 KiB
+  ACK threshold, or the sender stalls).
   Set `flow_control.mode: fixed` to lock to the legacy v0.3.0 behaviour.
   Non-reloadable.
 - **Per-friend rate limiting** — absent from `rules.yaml` means no
@@ -278,6 +281,11 @@ docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario 
   OPEN_ACK in time is closed through the handshake-close path and counted
   under `tunnels_opened_total{result="failed"}`; failed opens are now
   counted at all (issue #36).
+- **Held local connections** — `tunnel.offline_open_wait_seconds: 10`
+  (0 = old behaviour). A forward connection accepted while the active server
+  is offline is held unread (max 64) and opened when it comes back, instead
+  of being closed on the spot. Accept / release decisions run on the client's
+  inbound strand. SOCKS5 / HTTP CONNECT still fail immediately.
 - **Fixed DHT UDP port** — `tox.udp_port: 0` by default (toxcore's
   33445..33545 walk). Non-zero binds exactly that port (issue #32).
 - **Bootstrap retry** — while not DHT-connected, `ToxAdapter` re-contacts

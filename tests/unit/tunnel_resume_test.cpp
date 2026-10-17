@@ -16,11 +16,13 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "toxtunnel/app/tunnel_client.hpp"
 #include "toxtunnel/app/tunnel_server.hpp"
+#include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
@@ -230,6 +232,24 @@ class TunnelResumeTestAccess {
     static void apply_keepalive_dead_verdict(TunnelClient& c, std::uint32_t dead_friend) {
         c.apply_keepalive_dead_verdict(dead_friend);
     }
+    static void accept_forward_connection(TunnelClient& c,
+                                          std::shared_ptr<core::TcpConnection> conn,
+                                          const ForwardRule& rule) {
+        c.accept_forward_connection(std::move(conn), rule);
+    }
+    static std::size_t held_count(TunnelClient& c) {
+        std::lock_guard<std::mutex> lock(c.held_mutex_);
+        return c.held_.size();
+    }
+    static void expire_held_connections(TunnelClient& c) { c.expire_held_connections(); }
+    static void close_held_connections(TunnelClient& c) { c.close_held_connections(); }
+    static void release_held_connections(TunnelClient& c) { c.release_held_connections(); }
+    static std::atomic<bool>& stop_started(TunnelClient& c) { return c.stop_started_; }
+    static void set_held_wait(TunnelClient& c, std::uint32_t seconds) {
+        c.config_.tunnel.offline_open_wait_seconds = seconds;
+        c.held_wait_seconds_.store(seconds);  // what initialize() snapshots
+    }
+    static constexpr std::size_t kMaxHeld = TunnelClient::kMaxHeldConnections;
 };
 
 class TunnelServerResumeTestAccess {
@@ -584,6 +604,105 @@ TEST(KeepaliveVerdictOrderingTest, ClientVerdictAfterTheLinkDroppedLeavesResumab
     EXPECT_TRUE(mgr->has_tunnel(42));
 
     quiesce(io_ctx, mgr);
+}
+
+// ---------------------------------------------------------------------------
+// Held local connections (tunnel.offline_open_wait_seconds). A forward
+// connection accepted while the server is offline used to be closed on the
+// spot -- a matrix started 2 s before the friend link came up failed 14/15.
+// ---------------------------------------------------------------------------
+
+struct HeldConnectionFixture {
+    asio::io_context io_ctx;
+    app::TunnelClient client;
+    ForwardRule rule;
+    HeldConnectionFixture() {
+        rule.local_port = 31099;
+        rule.remote_host = "127.0.0.1";
+        rule.remote_port = 19099;
+        Access::server_online(client).store(false);
+    }
+    std::shared_ptr<core::TcpConnection> conn() {
+        return std::make_shared<core::TcpConnection>(io_ctx);
+    }
+};
+
+TEST(HeldConnectionTest, OfflineAcceptIsHeldNotClosed) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 10);
+    auto c = f.conn();
+    Access::accept_forward_connection(f.client, c, f.rule);
+    EXPECT_EQ(Access::held_count(f.client), 1u);
+    Access::close_held_connections(f.client);  // what stop() does
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, ZeroWaitKeepsTheOldCloseAtOnceBehaviour) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 0);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, HeldConnectionExpiresAfterTheWait) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 1);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    Access::expire_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 1u) << "not due yet";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    Access::expire_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, AnAcceptAfterStopIsClosedNotHeld) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 10);
+    Access::close_held_connections(f.client);  // stop() latched the queue shut
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+// The release path that does not need a live server: while offline nothing
+// is released; once online, an entry past its deadline (the expiry tick may
+// not have run yet) and every entry after stop() began are closed, not opened.
+TEST(HeldConnectionTest, ReleaseWaitsForTheServerAndDropsExpiredOrStoppedEntries) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 1);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    Access::release_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 1u) << "server still offline";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    Access::server_online(f.client).store(true);
+    Access::release_held_connections(f.client);  // expired: closed, never opened
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+
+    Access::server_online(f.client).store(false);
+    Access::set_held_wait(f.client, 30);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    Access::stop_started(f.client).store(true);
+    Access::server_online(f.client).store(true);
+    Access::release_held_connections(f.client);  // stopping: left for stop() to close
+    Access::close_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    Access::stop_started(f.client).store(false);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, HoldingIsBounded) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 10);
+    for (std::size_t i = 0; i < Access::kMaxHeld + 5; ++i) {
+        Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    }
+    EXPECT_EQ(Access::held_count(f.client), Access::kMaxHeld);
+    Access::close_held_connections(f.client);
+    f.io_ctx.poll();
 }
 
 TEST(KeepaliveVerdictOrderingTest, ServerVerdictSparesARevivedOrReplacedManager) {

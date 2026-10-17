@@ -2014,6 +2014,28 @@ TEST_F(ConfigTest, ToxProxyRejectsLanBootstrapMode) {
     EXPECT_NE(v.error().find("bootstrap_mode: lan"), std::string::npos) << v.error();
 }
 
+TEST_F(ConfigTest, OfflineOpenWaitDefaultsTo10SecondsAndRoundTrips) {
+    EXPECT_EQ(TunnelConfig{}.offline_open_wait_seconds, 10u);
+    auto parsed = Config::from_string(R"(
+mode: client
+data_dir: ~/.config/toxtunnel
+tunnel:
+  offline_open_wait_seconds: 45
+)");
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_EQ(parsed.value().tunnel.offline_open_wait_seconds, 45u);
+    auto reparsed = Config::from_string(parsed.value().to_yaml());
+    ASSERT_TRUE(reparsed.has_value()) << reparsed.error();
+    EXPECT_EQ(reparsed.value().tunnel.offline_open_wait_seconds, 45u);
+
+    Config too_long = Config::default_client();
+    too_long.client->server_id = std::string(76, 'A');
+    too_long.tunnel.offline_open_wait_seconds = 7200;
+    auto v = too_long.validate();
+    ASSERT_FALSE(v.has_value());
+    EXPECT_NE(v.error().find("offline_open_wait_seconds"), std::string::npos) << v.error();
+}
+
 TEST_F(ConfigTest, OpenTimeoutDefaultsTo30SecondsAndRoundTrips) {
     EXPECT_EQ(TunnelConfig{}.open_timeout_seconds, 30u);
 

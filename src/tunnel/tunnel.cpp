@@ -1700,11 +1700,13 @@ bool TunnelImpl::flush_pending_tcp_input() {
                 return true;
             }
 
+            // Same admission rule as send_data_to_tox(): once flow control
+            // is configured the BDP target alone governs (in fixed mode it
+            // is the fixed window). Taking max(seed, target) here let the
+            // backlog drain above the target.
             std::size_t effective_window = send_window_size_;
             if (flow_control_configured_.load(std::memory_order_acquire)) {
-                effective_window = std::max<std::size_t>(
-                    send_window_size_,
-                    static_cast<std::size_t>(flow_control_.target_window_bytes()));
+                effective_window = static_cast<std::size_t>(flow_control_.target_window_bytes());
             }
 
             const std::size_t used = send_window_used_.load(std::memory_order_relaxed);
@@ -2210,6 +2212,7 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
     // acquire-load always observes emitted >= the acked bytes — a legitimate
     // ACK is credited in full; only a forged over-ack is clamped.
     std::size_t credited = 0;
+    std::uint64_t acked_total = 0;  // cumulative, after this ACK (when credited)
     {
         const std::uint64_t emitted = total_bytes_emitted_.load(std::memory_order_acquire);
         std::uint64_t acked_so_far = total_bytes_acked_.load(std::memory_order_relaxed);
@@ -2222,6 +2225,7 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
             if (total_bytes_acked_.compare_exchange_weak(acked_so_far, acked_so_far + want,
                                                          std::memory_order_relaxed)) {
                 credited = static_cast<std::size_t>(want);
+                acked_total = acked_so_far + want;
                 break;
             }
             // CAS failed: acked_so_far refreshed; recompute against same emitted.
@@ -2244,50 +2248,67 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
     if (acked > 0 && flow_control_configured_.load(std::memory_order_acquire)) {
         const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 
-        // Bandwidth = bytes_acked / delta_t since the previous ACK. Skip the
-        // first sample (no prev_ns) and very-small intervals (avoid div-by-zero
-        // and bogus huge spikes from sub-millisecond jitter).
-        const auto prev_ack_ns = last_ack_ns_.exchange(now_ns, std::memory_order_relaxed);
-        if (prev_ack_ns > 0) {
-            const std::int64_t delta_ns = now_ns - prev_ack_ns;
-            if (delta_ns > 1'000'000) {  // > 1 ms
-                // C-S-2 (2026-05-20 fix-storm review): S21 protected
-                // `bps * rtt` in BdpFlowControl with __int128 but left
-                // the upstream `bps` producer at plain int64. `acked`
-                // is uint32_t, so `acked * 1e9` reaches ~4.3e18 — inside
-                // int64 today, but a single bytes_acked widening to
-                // uint64 in the future, or a coalesced ACK carrying
-                // more than 4 GiB, would silently wrap. Compute in
-                // __int128 and clamp to a sane 100 Gbps ceiling before
-                // feeding the EWMA so a hostile peer can't pump the
-                // estimator with bogus values.
-                constexpr std::int64_t kMaxBpsCap = 12'500'000'000LL;  // 100 Gbps
-                // C-S-2 (2026-05-20) used __int128; CI-pedantic-fix
-                // (2026-05-21) replaces it because MSVC has no __int128.
-                // `acked` is uint32_t so `acked * 1e9` tops out at
-                // ~4.3e18 < INT64_MAX with headroom — plain int64 is
-                // safe. The kMaxBpsCap saturation below still handles
-                // divide-by-tiny-delta_ns.
-                const std::int64_t bps_raw =
-                    (static_cast<std::int64_t>(acked) * 1'000'000'000LL) / delta_ns;
-                const std::int64_t bps = std::min(bps_raw, kMaxBpsCap);
-                observe_bandwidth_bps(bps);
-                util::MetricsRegistry::instance().observe_tunnel_bandwidth_bps(bps);
+        // One leaf-locked step for both estimators (see bdp_sample_mutex_):
+        //  - RTT from the newest send-time sample this ACK covers. ACKs are
+        //    delta credits on the wire; acked_total is the cumulative, clamped
+        //    offset they add up to, which is what the samples are keyed on.
+        //  - Bandwidth over the interval since the last sample. ACKs less
+        //    than 1 ms apart carry their bytes forward rather than losing
+        //    them (dropping them under-estimated fast links).
+        std::int64_t rtt_us = 0;
+        std::int64_t trusted_rtt_us = 0;
+        std::int64_t bps = 0;
+        {
+            std::lock_guard<std::mutex> lock(bdp_sample_mutex_);
+            // Newest covered sample for the smoothed RTT; newest covered
+            // TRUSTED one for the minimum (one large ACK may cover both).
+            std::int64_t sent_ns = 0;
+            std::int64_t trusted_sent_ns = 0;
+            while (!rtt_samples_.empty() && rtt_samples_.front().end_offset <= acked_total) {
+                sent_ns = rtt_samples_.front().sent_ns;
+                if (flow_control_.is_trusted_inflight(rtt_samples_.front().inflight)) {
+                    trusted_sent_ns = sent_ns;
+                }
+                rtt_samples_.pop_front();
             }
-        }
+            if (sent_ns > 0 && now_ns > sent_ns) {
+                rtt_us = (now_ns - sent_ns) / 1000;
+            }
+            if (trusted_sent_ns > 0 && now_ns > trusted_sent_ns) {
+                trusted_rtt_us = (now_ns - trusted_sent_ns) / 1000;
+            }
 
-        // RTT = (now - burst_start) when this ACK fully drains the window.
-        // burst_start_ns_ was stamped when send_window_used_ went 0 -> positive.
-        // Reset it to 0 on drain so the next burst gets its own sample.
-        if (new_window == 0) {
-            const auto burst_start = burst_start_ns_.exchange(0, std::memory_order_relaxed);
-            if (burst_start > 0) {
-                const std::int64_t rtt_us = (now_ns - burst_start) / 1000;
-                if (rtt_us > 0) {
-                    observe_rtt_us(rtt_us);
-                    util::MetricsRegistry::instance().observe_tunnel_rtt_us(rtt_us);
+            if (last_ack_ns_ == 0 || bw_window_drained_) {
+                // First ACK, or the first after the window ran dry: open a new
+                // interval rather than measure across a possible idle gap.
+                last_ack_ns_ = now_ns;
+                bw_carry_bytes_ = 0;
+            } else {
+                bw_carry_bytes_ += acked;
+                const std::int64_t delta_ns = now_ns - last_ack_ns_;
+                if (delta_ns > 1'000'000) {  // > 1 ms
+                    // Saturate the inputs so the product stays inside int64
+                    // (MSVC has no __int128), then cap the result: a hostile
+                    // peer must not be able to pump the estimator.
+                    constexpr std::uint64_t kMaxCarry = 4'000'000'000ULL;
+                    constexpr std::int64_t kMaxBpsCap = 12'500'000'000LL;  // 100 Gbps
+                    constexpr std::int64_t kNsPerSecond = 1'000'000'000;
+                    const auto carry =
+                        static_cast<std::int64_t>(std::min(bw_carry_bytes_, kMaxCarry));
+                    bps = std::min<std::int64_t>((carry * kNsPerSecond) / delta_ns, kMaxBpsCap);
+                    bw_carry_bytes_ = 0;
+                    last_ack_ns_ = now_ns;
                 }
             }
+            bw_window_drained_ = (new_window == 0);
+        }
+        if (bps > 0) {
+            observe_bandwidth_bps(bps);
+            util::MetricsRegistry::instance().observe_tunnel_bandwidth_bps(bps);
+        }
+        if (rtt_us > 0) {
+            flow_control_.observe_rtt_samples_at(rtt_us, trusted_rtt_us, now_ns);
+            util::MetricsRegistry::instance().observe_tunnel_rtt_us(rtt_us);
         }
 
         // Report current window target to /metrics so operators can watch
@@ -2534,8 +2555,7 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
     const std::size_t data_size = data.size();
     std::size_t effective_window = send_window_size_;
     if (flow_control_configured_.load(std::memory_order_acquire)) {
-        effective_window = std::max<std::size_t>(
-            send_window_size_, static_cast<std::size_t>(flow_control_.target_window_bytes()));
+        effective_window = static_cast<std::size_t>(flow_control_.target_window_bytes());
     }
     // Atomically check-and-reserve the window. A plain load-then-fetch_add
     // races: on_tcp_data_received (I/O thread) and flush_pending_tcp_input —
@@ -2557,13 +2577,6 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
         // CAS failed: `current` was refreshed with the latest value; re-check.
     }
     // On a successful CAS `current` still holds the pre-reservation usage.
-
-    // Mark burst-start when we go 0 -> positive so the next ACK that drains us
-    // back to 0 gives us an RTT sample.
-    if (current == 0) {
-        const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-        burst_start_ns_.store(now_ns, std::memory_order_relaxed);
-    }
 
     BumpActivity();
 
@@ -2963,8 +2976,13 @@ void TunnelImpl::reset_statistics() {
     total_bytes_sent_.store(0, std::memory_order_relaxed);
     bytes_received_since_ack_.store(0, std::memory_order_relaxed);
     send_window_used_.store(0, std::memory_order_relaxed);
-    burst_start_ns_.store(0, std::memory_order_relaxed);
-    last_ack_ns_.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(bdp_sample_mutex_);
+        rtt_samples_.clear();
+        last_ack_ns_ = 0;
+        bw_carry_bytes_ = 0;
+        bw_window_drained_ = false;
+    }
 }
 
 // ===========================================================================
@@ -3153,7 +3171,9 @@ namespace {
 /// even then the granularity would not reach the requested microseconds.
 [[nodiscard]] std::uint32_t clamp_coalesce_delay_to_platform(std::uint32_t max_delay_us) {
 #if defined(_WIN32)
-    constexpr std::uint32_t kWindowsTimerTickUs = kMinHonouredCoalesceDelayUs;
+    // static: the lambda below odr-uses it (fmt takes its arguments by
+    // reference), and MSVC 2026 rejects an uncaptured automatic constexpr there.
+    static constexpr std::uint32_t kWindowsTimerTickUs = kMinHonouredCoalesceDelayUs;
     if (max_delay_us > 0 && max_delay_us < kWindowsTimerTickUs) {
         static std::once_flag warned;
         std::call_once(warned, [max_delay_us] {
@@ -3214,6 +3234,28 @@ void TunnelImpl::configure_flow_control(const BdpFlowControl::Config& cfg) {
 
 void TunnelImpl::observe_rtt_us(std::int64_t rtt_us) {
     flow_control_.observe_rtt_us(rtt_us);
+}
+
+bool TunnelImpl::note_rtt_sample_sent(std::uint64_t end_offset) {
+    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::lock_guard<std::mutex> lock(bdp_sample_mutex_);
+    if (!rtt_samples_.empty() && end_offset - rtt_samples_.back().end_offset < kRttSampleSpacing) {
+        return false;
+    }
+    if (rtt_samples_.size() >= kMaxRttSamples) {
+        return false;  // bounded; ACKs pop from the front
+    }
+    const std::uint64_t acked = total_bytes_acked_.load(std::memory_order_relaxed);
+    const std::uint64_t inflight = end_offset > acked ? end_offset - acked : 0;
+    rtt_samples_.push_back(RttSample{end_offset, now_ns, inflight});
+    return true;
+}
+
+void TunnelImpl::drop_rtt_sample(std::uint64_t end_offset) {
+    std::lock_guard<std::mutex> lock(bdp_sample_mutex_);
+    if (!rtt_samples_.empty() && rtt_samples_.back().end_offset == end_offset) {
+        rtt_samples_.pop_back();
+    }
 }
 
 void TunnelImpl::observe_bandwidth_bps(std::int64_t bps) {
@@ -3562,7 +3604,13 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
             // returns, and its acquire-load of total_bytes_emitted_ must
             // already include these bytes or a legitimate ACK is
             // under-credited. Undone on failure. ----
-            total_bytes_emitted_.fetch_add(frame_bytes, std::memory_order_release);
+            const std::uint64_t end_offset =
+                total_bytes_emitted_.fetch_add(frame_bytes, std::memory_order_release) +
+                frame_bytes;
+            // RTT sample keyed on this frame's end offset, registered BEFORE
+            // the send for the same reason as the counter above.
+            const bool rtt_sampled = flow_control_configured_.load(std::memory_order_acquire) &&
+                                     note_rtt_sample_sent(end_offset);
             const bool sent = zero_copy ? send_owned_data_to_tox(std::move(owned_frame))
                                         : send_frame_to_tox(*span_frame);
             util::Logger::trace("Tunnel {} DATA out: {} bytes sent={} (emitted total {})",
@@ -3587,6 +3635,9 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
                 // bytes at the front of their cohort; the retry timer re-runs
                 // the driver.
                 total_bytes_emitted_.fetch_sub(frame_bytes, std::memory_order_release);
+                if (rtt_sampled) {
+                    drop_rtt_sample(end_offset);
+                }
                 util::Logger::debug_throttled(
                     backpressure_log_throttle(friend_number_, BackpressureSite::CoalesceDrain),
                     "Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_,

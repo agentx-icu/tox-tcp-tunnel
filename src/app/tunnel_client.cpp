@@ -153,6 +153,9 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     }
 
     config_ = config;
+    // Snapshot: read on the inbound strand, while a reload replaces config_
+    // on the I/O pool (the value itself is not reloadable).
+    held_wait_seconds_.store(config_.tunnel.offline_open_wait_seconds, std::memory_order_relaxed);
     const auto& client_cfg = config.client_config();
     const auto tox_cfg = config.effective_tox_config();
 
@@ -522,6 +525,7 @@ void TunnelClient::stop() {
     for (auto& listener : listeners_) {
         step("listener stop", [&listener] { listener->stop(); });
     }
+    step("held connections close", [this] { close_held_connections(); });
     {
         std::shared_ptr<StdioPipeBridge> pb;
         {
@@ -870,6 +874,9 @@ void TunnelClient::on_friend_connection(uint32_t friend_number, bool connected) 
             if (config_.tunnel.resume.enabled && running_) {
                 asio::post(*inbound_strand_, [this] { send_resume_requests(); });
             }
+            // Held local connections open now -- queued behind the resume
+            // batch above, so new tunnels never mix into it.
+            post_release_held_connections();
             if (is_pipe_mode() && running_) {
                 io_ctx_->post([this] { start_pipe_mode(); });
             }
@@ -1097,6 +1104,7 @@ void TunnelClient::setup_tunnel_manager() {
                     "connections",
                     friend_number);
                 send_info_request();
+                post_release_held_connections();
             }
         });
     }
@@ -1647,13 +1655,165 @@ void TunnelClient::handle_resume_ack(const tunnel::TunnelResumeAckPayload& ack,
 
 void TunnelClient::on_tcp_connection_accepted(std::shared_ptr<core::TcpConnection> conn,
                                               const ForwardRule& rule) {
-    if (!server_online_) {
-        util::Logger::warn("TCP connection accepted on port {} but server is offline, closing",
-                           rule.local_port);
+    // The decision runs on the inbound strand, ordered against the
+    // transitions that flip server_online_ (friend connection changes,
+    // keepalive verdicts and recoveries, failover switches): an accept can
+    // then never be parked just after the release it was waiting for ran.
+    if (!inbound_strand_) {
+        accept_forward_connection(std::move(conn), rule);
+        return;
+    }
+    asio::post(*inbound_strand_, [this, conn = std::move(conn), rule]() mutable {
+        accept_forward_connection(std::move(conn), rule);
+    });
+}
+
+void TunnelClient::accept_forward_connection(std::shared_ptr<core::TcpConnection> conn,
+                                             const ForwardRule& rule) {
+    if (stop_started_.load(std::memory_order_acquire)) {
         conn->close();
         return;
     }
+    if (server_online_.load(std::memory_order_acquire)) {
+        open_tunnel_for_connection(std::move(conn), rule);
+        return;
+    }
+    const auto wait = std::chrono::seconds(held_wait_seconds_.load(std::memory_order_relaxed));
+    if (wait.count() > 0) {
+        std::lock_guard<std::mutex> lock(held_mutex_);
+        // stop() latches this under the same lock it drains under, so an
+        // accept that loses the race is closed here instead of being parked
+        // behind a queue nobody will drain again.
+        if (held_closed_) {
+            conn->close();
+            return;
+        }
+        if (held_.size() < kMaxHeldConnections) {
+            held_.push_back(
+                HeldConnection{std::move(conn), rule, std::chrono::steady_clock::now() + wait});
+            util::Logger::info(
+                "TCP connection accepted on port {} while the server is offline; holding it "
+                "for up to {}s ({} held)",
+                rule.local_port, wait.count(), held_.size());
+            arm_held_timer_locked();
+            return;
+        }
+        util::Logger::warn(
+            "TCP connection accepted on port {} but server is offline and {} "
+            "connections are already held; closing",
+            rule.local_port, kMaxHeldConnections);
+        conn->close();
+        return;
+    }
+    util::Logger::warn("TCP connection accepted on port {} but server is offline, closing",
+                       rule.local_port);
+    conn->close();
+}
 
+void TunnelClient::post_release_held_connections() {
+    if (!inbound_strand_) {
+        release_held_connections();
+        return;
+    }
+    asio::post(*inbound_strand_, [this]() { release_held_connections(); });
+}
+
+void TunnelClient::release_held_connections() {
+    if (!server_online_.load(std::memory_order_acquire) ||
+        stop_started_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::deque<HeldConnection> ready;
+    {
+        std::lock_guard<std::mutex> lock(held_mutex_);
+        ready.swap(held_);
+    }
+    if (ready.empty()) {
+        return;
+    }
+    util::Logger::info("Server online; opening {} held connection(s)", ready.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& held : ready) {
+        if (stop_started_.load(std::memory_order_acquire) || held.deadline <= now) {
+            // Shutting down, or past its wait (the expiry tick may simply not
+            // have run yet): it gets the ending it was promised.
+            held.conn->close();
+            continue;
+        }
+        // A held socket is never read, so an application that gave up
+        // meanwhile is only noticed once the tunnel starts reading it (it then
+        // closes at once). Nothing to check here.
+        open_tunnel_for_connection(std::move(held.conn), held.rule);
+    }
+}
+
+void TunnelClient::arm_held_timer_locked() {
+    if (held_timer_armed_ || !io_ctx_) {
+        return;
+    }
+    if (!held_timer_) {
+        held_timer_ = std::make_unique<asio::steady_timer>(io_ctx_->get_io_context());
+    }
+    held_timer_armed_ = true;
+    held_timer_->expires_after(std::chrono::seconds(1));
+    auto handler = [this](const asio::error_code& ec) {
+        {
+            std::lock_guard<std::mutex> lock(held_mutex_);
+            held_timer_armed_ = false;
+        }
+        if (!ec) {
+            expire_held_connections();
+        }
+    };
+    if (inbound_strand_) {
+        held_timer_->async_wait(asio::bind_executor(*inbound_strand_, std::move(handler)));
+    } else {
+        held_timer_->async_wait(std::move(handler));
+    }
+}
+
+void TunnelClient::expire_held_connections() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<HeldConnection> expired;
+    {
+        std::lock_guard<std::mutex> lock(held_mutex_);
+        while (!held_.empty() && held_.front().deadline <= now) {
+            expired.push_back(std::move(held_.front()));
+            held_.pop_front();
+        }
+        if (!held_.empty()) {
+            arm_held_timer_locked();
+        }
+    }
+    for (auto& held : expired) {
+        util::Logger::warn(
+            "Held connection on port {} timed out after {}s waiting for the server; closing",
+            held.rule.local_port, held_wait_seconds_.load(std::memory_order_relaxed));
+        held.conn->close();
+    }
+}
+
+void TunnelClient::close_held_connections() {
+    std::deque<HeldConnection> held;
+    {
+        std::lock_guard<std::mutex> lock(held_mutex_);
+        held_closed_ = true;
+        held.swap(held_);
+        // Every touch of held_timer_ is under held_mutex_ (an asio timer is
+        // not thread-safe). cancel() never runs the handler inline -- it is
+        // bound to the strand and completes there later -- so taking the lock
+        // again in the handler cannot deadlock against this one.
+        if (held_timer_) {
+            util::cancel_timer_noexcept(*held_timer_);
+        }
+    }
+    for (auto& h : held) {
+        h.conn->close();
+    }
+}
+
+void TunnelClient::open_tunnel_for_connection(std::shared_ptr<core::TcpConnection> conn,
+                                              const ForwardRule& rule) {
     // Allocate a tunnel ID and create the tunnel. C-07: handle exhaustion
     // (nullopt) instead of proceeding with the control-plane id 0.
     auto allocated_id = tunnel_mgr_->allocate_tunnel_id();
@@ -2233,6 +2393,9 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
         record_server_connection(new_tox_id, new_friend_number);
         send_info_request();
     }
+    // Connections held while no server was usable go to the new one, after
+    // the route repin queued above has installed its send handler.
+    post_release_held_connections();
 }
 
 void TunnelClient::run_failover_tick() {

@@ -543,6 +543,19 @@ tunnel:
                                     # no OPEN_ACK within this long (0 = wait
                                     # forever, the pre-v0.5.0 behaviour).
 
+  offline_open_wait_seconds: 10    # client: a forward connection accepted while
+                                    # the server is offline (start-up, a brief
+                                    # link drop) is held unread for up to this
+                                    # long and opened once the server is back,
+                                    # instead of being closed at once. At most
+                                    # 64 are held. 0 = close at once (pre-v0.5.0).
+                                    # Forward rules only: SOCKS5 / HTTP CONNECT
+                                    # requests still fail immediately. Shorter
+                                    # than failover.timeout_seconds (60) by
+                                    # default, so a connection made while the
+                                    # primary is down is closed before failover
+                                    # promotes a fallback; raise it to cover that.
+
   # Note: a tunnel stuck in "Disconnecting" is already covered by
   # `half_close_timeout_seconds`, which is ON by default (120s). Set
   # `idle_timeout_seconds` only to reclaim tunnels that are idle in a
@@ -593,21 +606,47 @@ brief burst. Transitions log at DEBUG and increment
 ```yaml
 flow_control:
   mode: bdp                    # bdp (default since v0.4.1) | fixed (v0.3.0 cadence)
-  send_window_min_bytes: 65536           # 64 KiB clamp floor (bdp mode)
+  send_window_min_bytes: 32768           # 32 KiB clamp floor (bdp mode; never below 32 KiB)
   send_window_max_bytes: 4194304         # 4 MiB clamp ceiling (bdp mode)
   safety_factor_x100: 150                # 1.5× BDP headroom
   fixed_window_bytes: 262144             # 256 KiB — used in fixed mode
 ```
 
-`mode: bdp` is the default since v0.4.1. The per-tunnel
-`BdpFlowControl` updates an EWMA of RTT (from PING/PONG round-trip)
-and bandwidth (cumulative-ACK delta) and recomputes the target window
-as `bdp × safety_factor_x100 / 100` clamped to `[min, max]`. ACK
-threshold scales proportionally to keep ~16 ACKs in flight regardless
-of window size.
+`mode: bdp` is the default since v0.4.1. Each tunnel starts at
+`fixed_window_bytes` and then sizes its send window as
+`bandwidth × (min_rtt + 50 ms) × safety_factor_x100 / 100`, clamped to `[min, max]`:
 
-`mode: fixed` opts out and locks the v0.3.0 256 KiB / 16 KiB cadence
-byte-for-byte. Non-reloadable.
+- **RTT** is measured per byte range: the time from handing a DATA frame to
+  toxcore until the peer's TUNNEL_ACK covers it. The window uses the
+  **minimum** RTT of the last ~10 s, taken only from samples sent with little
+  in flight (no more than the 32 KiB floor plus a few frames) — a sample
+  sent behind a standing queue measures the queue. If a long transfer keeps
+  the window full for 10 s, the window briefly drops to the floor until a
+  clean sample re-measures the path (like BBR's ProbeRTT); otherwise a full
+  window could keep re-learning its own queue as the "minimum" and grow
+  without bound. Any sustained bulk transfer therefore dips to the floor about
+  every 10 s for a round trip or two (a few percent of throughput); that dip in
+  `toxtunnel_tunnel_send_window_bytes` is expected. The smoothed RTT of all
+  samples is exported alongside.
+- **Bandwidth** is the EWMA of bytes acknowledged per interval between ACKs.
+  After the window drains completely the next interval starts afresh; a pause
+  that leaves bytes unacknowledged still costs one slow sample (1/8 weight).
+
+The fixed 50 ms is a jitter / queue budget: on a fast path the RTT is mostly
+scheduling jitter and the minimum is a lucky sample, so without it the window
+would shrink round after round. With it and the 1.5× default headroom the
+window grows while the path has spare capacity and, once it is full, a bulk
+transfer parks at most about half a round trip plus 75 ms of data in
+toxcore's queue for the friend — the queue every other tunnel to that peer,
+and every control frame (OPEN_ACK, PONG, CLOSE), has to wait behind.
+`fixed_window_bytes` is only the starting point, not a floor (before v0.5.0 it
+was, so on a slow path the window never went below 256 KiB: at 7 KB/s that is
+over 30 s of queue). The floor is `send_window_min_bytes`, which is never less
+than 32 KiB: a receiver acknowledges every 16 KiB, so a smaller window would
+stall waiting for an ACK.
+
+`mode: fixed` opts out and pins the window at `fixed_window_bytes` (the v0.3.0
+256 KiB by default). Non-reloadable.
 
 ### Tunnel-resume protocol (`tunnel.resume:`) — opt-in
 

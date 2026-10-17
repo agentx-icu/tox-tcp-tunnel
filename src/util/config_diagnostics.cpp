@@ -55,10 +55,16 @@ const KeySet& resume_keys() {
     return k;
 }
 const KeySet& tunnel_keys() {
-    static const KeySet k{
-        "coalesce_max_delay_us",      "coalesce_max_bytes",   "coalesce_mode",
-        "idle_timeout_seconds",       "reaper_tick_seconds",  "keepalive_interval_seconds",
-        "half_close_timeout_seconds", "open_timeout_seconds", "resume"};
+    static const KeySet k{"coalesce_max_delay_us",
+                          "coalesce_max_bytes",
+                          "coalesce_mode",
+                          "idle_timeout_seconds",
+                          "reaper_tick_seconds",
+                          "keepalive_interval_seconds",
+                          "half_close_timeout_seconds",
+                          "open_timeout_seconds",
+                          "offline_open_wait_seconds",
+                          "resume"};
     return k;
 }
 const KeySet& flow_control_keys() {

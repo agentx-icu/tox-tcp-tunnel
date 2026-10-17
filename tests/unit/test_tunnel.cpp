@@ -643,6 +643,69 @@ TEST_F(TunnelTest, TcpConnection_DataFromTcpSendsToTox) {
     EXPECT_TRUE(data_sent_to_tox);
 }
 
+namespace {
+BdpFlowControl::Config bdp_config() {
+    BdpFlowControl::Config cfg;
+    cfg.mode = FlowControlMode::Bdp;
+    cfg.min_window_bytes = 32 * 1024;
+    cfg.max_window_bytes = 4 * 1024 * 1024;
+    cfg.safety_factor_x100 = 150;
+    cfg.fixed_window_bytes = 256 * 1024;
+    return cfg;
+}
+}  // namespace
+
+// The BDP estimator's RTT comes from per-byte-range samples: a DATA frame's
+// send time against the ACK that covers it. A later sample inflated by queueing
+// raises the smoothed RTT but not the windowed minimum the window is sized on.
+TEST_F(TunnelTest, BdpRttIsSampledPerByteRangeAndTheMinimumIgnoresTheQueue) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel.configure_coalesce(0, 1362);
+    tunnel.configure_flow_control(bdp_config());
+    tunnel.set_state(Tunnel::State::Connected);
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) { return SendOutcome::Sent; });
+
+    const std::vector<uint8_t> chunk(16 * 1024, 0x5A);
+    tunnel.on_tcp_data_received(chunk.data(), chunk.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 16 * 1024));
+    const auto first = tunnel.min_rtt_us();
+    EXPECT_GE(first, 25'000) << "sample = send time of the covered bytes to their ACK";
+    EXPECT_LT(first, 2'000'000);
+
+    tunnel.on_tcp_data_received(chunk.data(), chunk.size());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 16 * 1024));
+    EXPECT_EQ(tunnel.min_rtt_us(), first) << "a slower, queued sample must not raise the min";
+    EXPECT_GT(tunnel.rtt_us(), first);
+    EXPECT_EQ(tunnel.send_window_used(), 0u);
+}
+
+// The sampler's leaf lock is never held across the send callback, so an ACK
+// that comes back synchronously from inside it (in-process loopback) neither
+// deadlocks nor loses credit.
+TEST_F(TunnelTest, BdpSamplerToleratesAnAckReenteringFromTheSendCallback) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel.configure_coalesce(0, 1362);
+    tunnel.configure_flow_control(bdp_config());
+    tunnel.set_state(Tunnel::State::Connected);
+    std::size_t data_frames = 0;
+    tunnel.set_on_send_to_tox([this, &tunnel, &data_frames](std::span<const uint8_t> wire) {
+        auto frame = ProtocolFrame::deserialize(wire);
+        if (frame && frame.value().type() == FrameType::TUNNEL_DATA) {
+            ++data_frames;
+            tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(
+                test_tunnel_id, static_cast<uint32_t>(frame.value().as_tunnel_data().size())));
+        }
+        return SendOutcome::Sent;
+    });
+
+    const std::vector<uint8_t> chunk(64 * 1024, 0x33);
+    tunnel.on_tcp_data_received(chunk.data(), chunk.size());
+    EXPECT_GT(data_frames, 40u);
+    EXPECT_EQ(tunnel.send_window_used(), 0u);
+}
+
 TEST_F(TunnelTest, TcpBackpressureBuffersCurrentChunkUntilAck) {
     TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 8);
     tunnel.configure_coalesce(0, 1362);
