@@ -784,6 +784,12 @@ class TunnelServer {
     /// Tear down the TunnelManager for a disconnected friend.
     void teardown_tunnel_manager(uint32_t friend_number);
 
+    /// Strand-side half of a keepalive death verdict: tear the friend's manager
+    /// down only if @p verdict_manager is still its live manager and is still
+    /// latched dead (a frame queued ahead of the verdict may have revived it).
+    void teardown_after_keepalive_verdict(
+        uint32_t friend_number, const std::weak_ptr<tunnel::TunnelManager>& verdict_manager);
+
     /// Handle a TUNNEL_OPEN request: check access rules,
     /// create TcpConnection, and wire data flow.
     void handle_tunnel_open(uint32_t friend_number, const tunnel::ProtocolFrame& frame);

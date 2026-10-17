@@ -451,6 +451,7 @@ void TcpConnection::do_force_close(bool reset) {
     }
     util::Logger::debug("TcpConnection: {}", reset ? "abort (RST)" : "force close");
 
+    bool abortive = false;
     if (reset && socket_.is_open()) {
         // A zero linger turns the close below into an abortive one: the kernel
         // drops the send queue and answers with RST, so the peer's next read
@@ -460,6 +461,8 @@ void TcpConnection::do_force_close(bool reset) {
         if (linger_ec) {
             util::Logger::debug("TcpConnection: SO_LINGER for abortive close failed: {}",
                                 linger_ec.message());
+        } else {
+            abortive = true;
         }
     }
 
@@ -483,7 +486,7 @@ void TcpConnection::do_force_close(bool reset) {
     // completion lambda flips it back to false (or do_close handles
     // re-entry, since state_ is already Disconnected after do_close).
 
-    do_close(asio::error::operation_aborted);
+    do_close(asio::error::operation_aborted, abortive);
 }
 
 // ===========================================================================
@@ -959,14 +962,20 @@ void TcpConnection::close_on_callback_fault(const char* what) noexcept {
     }
 }
 
-void TcpConnection::do_close(const std::error_code& ec) {
+void TcpConnection::do_close(const std::error_code& ec, bool abortive) {
     if (state_.load(std::memory_order_acquire) == ConnectionState::Disconnected) {
         return;
     }
 
     std::error_code shutdown_ec;
     if (socket_.is_open()) {
-        socket_.shutdown(asio::ip::tcp::socket::shutdown_both, shutdown_ec);
+        // An abortive close must not shut down first: shutdown(both) queues a
+        // FIN, the peer reads it as a clean end of stream, and the RST from the
+        // zero-linger close() arrives behind it -- the application never sees
+        // ECONNRESET, which defeated issue #35 end to end.
+        if (!abortive) {
+            socket_.shutdown(asio::ip::tcp::socket::shutdown_both, shutdown_ec);
+        }
         socket_.close(shutdown_ec);
     }
 

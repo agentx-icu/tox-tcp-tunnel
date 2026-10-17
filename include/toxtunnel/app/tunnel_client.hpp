@@ -34,8 +34,13 @@ struct ClientServerEndpoint {
     std::string tox_id_hex;
     /// Friend number returned by ToxAdapter::add_friend / add_friend_norequest.
     uint32_t friend_number = 0;
-    /// Most recently reported online/offline state from toxcore.
+    /// Usable: the toxcore friend link is up AND (with keepalive) the server
+    /// application has not been judged unresponsive.
     bool online = false;
+    /// The toxcore friend link alone, as last reported by toxcore. Differs
+    /// from `online` only while a keepalive verdict holds the endpoint
+    /// offline over a link that never dropped; recovery needs it.
+    bool link_up = false;
     /// Timestamp (steady_clock) of the most recent online->offline transition
     /// (or the initial seed at construction). Zero for never observed.
     std::chrono::steady_clock::time_point offline_since{};
@@ -347,6 +352,14 @@ class TunnelClient {
     /// capture via TunnelResumeTestAccess to drive send_resume_requests()
     /// without toxcore. Args: friend number, prefixed packet bytes.
     std::function<void(std::uint32_t, const std::vector<std::uint8_t>&)> resume_request_sender_;
+
+    /// Apply a toxcore friend-connection change. Runs on the inbound strand.
+    void on_friend_connection(uint32_t friend_number, bool connected);
+
+    /// Apply a keepalive death verdict about @p dead_friend on the inbound
+    /// strand: a no-op unless that friend is still the active, routed server
+    /// and the manager is still latched dead.
+    void apply_keepalive_dead_verdict(uint32_t dead_friend);
 
     /// The friend the inbound routing path is currently pinned to (issue #30).
     /// Touched ONLY on `inbound_strand_`: the switch repins it together with

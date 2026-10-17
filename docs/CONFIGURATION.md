@@ -299,6 +299,70 @@ tox:
 Get current bootstrap nodes from:
 - https://nodes.tox.chat/json (official Tox node list)
 
+### Running behind a proxy (`tox.proxy`)
+
+For a host whose only way out is an HTTP CONNECT or SOCKS5 proxy (a corporate
+proxy, or a local proxy client such as Clash), route toxcore's TCP connections
+through it:
+
+```yaml
+tox:
+  udp_enabled: false        # optional: toxcore turns UDP off for a proxy anyway
+  proxy:
+    type: socks5            # none (default) | http | socks5
+    host: 127.0.0.1         # IP or DNS name (resolved locally)
+    port: 7890
+  bootstrap_nodes:          # pin them: see below
+    - address: 144.172.88.203
+      port: 33445
+      public_key: "2016A0F2797EE3A8B004BA623F11AAFC8146F1B8F45107232A1A1AECCE856674"
+```
+
+The daemon then reaches the network only through TCP relays, opened via the
+proxy; friends are reached through those relays.
+
+- **No UDP.** toxcore cannot proxy UDP, so it turns UDP off for a proxied
+  node whatever `udp_enabled` says: nothing bypasses the proxy, and the node
+  reaches peers only through TCP relays. For the same reason `tox.proxy`
+  cannot be combined with `bootstrap_mode: lan` (rejected at startup).
+- **Pin `bootstrap_nodes`.** The public node-list fetch in `bootstrap_mode:
+  auto` runs a separate `curl` process that does not use `tox.proxy`, and the
+  `address` of each node is resolved locally — use IP literals, or make sure
+  local DNS answers for the names.
+- Expect relay-bound throughput and latency: every packet crosses the proxy
+  and a TCP relay.
+- Not reloadable (part of `tox.*`); changing it needs a restart.
+
+### Bootstrapping from another ToxTunnel daemon
+
+Every daemon logs its DHT identity at startup and reports it in
+`toxtunnel inspect status`:
+
+```
+DHT node key: 6F2C…E1A0 (UDP port 34510, TCP relay port 34511; changes on every restart)
+```
+
+```json
+{"mode":"server", …, "dht_public_key":"6F2C…E1A0","udp_port":34510,"tcp_relay_port":34511, …}
+```
+
+A peer that cannot reach the public DHT but can reach this host directly (a
+VPN, an overlay network, a LAN) can pin it as a bootstrap node. Each entry is
+tried both as a UDP DHT node and as a TCP relay at its `port`, so list the UDP
+port and, for a server, the TCP relay port:
+
+```yaml
+tox:
+  bootstrap_nodes:
+    - {address: 10.0.0.5, port: 34510, public_key: "6F2C…E1A0"}   # UDP DHT
+    - {address: 10.0.0.5, port: 34511, public_key: "6F2C…E1A0"}   # TCP relay
+```
+
+The `dht_public_key` is **not** the Tox ID, and toxcore draws a new DHT keypair
+every time the daemon starts, so a pinned entry is valid only until that daemon
+restarts — keep at least one public node in the list as well. Pin the ports with
+`tox.udp_port` / `tox.tcp_port` so they do not move between restarts.
+
 ### Compatibility
 
 Legacy server bootstrap fields such as `server.tcp_port`, `server.udp_enabled`, and

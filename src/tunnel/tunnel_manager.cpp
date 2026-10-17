@@ -329,9 +329,38 @@ void TunnelManager::set_on_peer_dead(std::function<void()> cb) {
     on_peer_dead_ = std::move(cb);
 }
 
+void TunnelManager::set_on_peer_alive(std::function<void()> cb) {
+    std::lock_guard<std::mutex> lock(handler_mutex_);
+    on_peer_alive_ = std::move(cb);
+}
+
 void TunnelManager::note_pong() {
+    note_peer_activity();
+}
+
+void TunnelManager::note_peer_activity() {
     last_pong_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                         std::memory_order_relaxed);
+    // Cheap relaxed check first: this runs once per inbound frame.
+    if (!peer_dead_latched_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!peer_dead_latched_.exchange(false, std::memory_order_acq_rel)) {
+        return;  // another thread reported the recovery first
+    }
+    util::Logger::info("TunnelManager: keepalive — peer active again after a dead verdict");
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lock(handler_mutex_);
+        cb = on_peer_alive_;
+    }
+    if (cb) {
+        cb();
+    }
+}
+
+bool TunnelManager::peer_dead() const noexcept {
+    return peer_dead_latched_.load(std::memory_order_acquire);
 }
 
 void TunnelManager::enable_keepalive(uint32_t interval_seconds, uint32_t timeout_seconds) {
@@ -449,13 +478,24 @@ void TunnelManager::schedule_keepalive_tick_locked(std::uint64_t epoch) {
             self->last_pong_ns_.store(now_ns, std::memory_order_relaxed);
         }
 
-        // Liveness check: if no PONG within the timeout, declare the peer dead.
+        // Liveness check: if the peer has been silent (no frame of any kind,
+        // see note_peer_activity) for the timeout, declare it dead — once.
+        // The chain does NOT stop afterwards: the PING below keeps going out
+        // once per interval as a recovery probe. A dead verdict whose toxcore
+        // link never dropped used to be permanent, because nothing but a
+        // friend-connection change could ever bring the peer back; now its
+        // first frame (a PONG to this probe, or anything else) clears the latch
+        // and fires on_peer_alive. Owners that want the probes gone call
+        // disable_keepalive(), which the epoch gates below honour.
         const int64_t last_ns = self->last_pong_ns_.load(std::memory_order_relaxed);
-        if (last_ns > 0 && now_ns - last_ns > timeout_ns) {
+        if (last_ns > 0 && now_ns - last_ns > timeout_ns &&
+            !self->peer_dead_latched_.load(std::memory_order_acquire)) {
             if (!self->peer_dead_latched_.exchange(true, std::memory_order_acq_rel)) {
                 util::Logger::warn(
-                    "TunnelManager: keepalive — no PONG for >{}s, declaring peer dead",
-                    timeout_ns / 1'000'000'000);
+                    "TunnelManager: keepalive — peer silent for >{}s, declaring it dead "
+                    "(probing every {}s for recovery)",
+                    timeout_ns / 1'000'000'000,
+                    self->keepalive_interval_ns_.load(std::memory_order_relaxed) / 1'000'000'000);
                 std::function<void()> cb;
                 {
                     std::lock_guard<std::mutex> lock(self->handler_mutex_);
@@ -465,19 +505,6 @@ void TunnelManager::schedule_keepalive_tick_locked(std::uint64_t epoch) {
                     cb();
                 }
             }
-            // Stop pinging a peer we've given up on; re-enable on reconnect.
-            // Only if we are still the live generation — on_peer_dead_ runs
-            // application code that routinely calls enable_keepalive() on a
-            // replacement session, and clearing the flag then would silently
-            // stop the successor's chain. Under `timer_mutex_` so the check and
-            // the store cannot straddle a concurrent enable_keepalive().
-            {
-                std::lock_guard<std::mutex> lock(self->timer_mutex_);
-                if (self->keepalive_epoch_current(epoch)) {
-                    self->keepalive_active_.store(false, std::memory_order_release);
-                }
-            }
-            return;
         }
 
         // Gate 2 — before the send. The liveness branch above can invoke
@@ -1131,6 +1158,9 @@ void TunnelManager::close_all() {
 // ===========================================================================
 
 void TunnelManager::route_frame(const ProtocolFrame& frame) {
+    // Any frame from the peer proves its application is running (keepalive).
+    note_peer_activity();
+
     // Record statistics
     record_frame_received();
     record_bytes_received(frame.serialized_size());

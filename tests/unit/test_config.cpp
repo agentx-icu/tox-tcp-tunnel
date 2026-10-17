@@ -1940,6 +1940,80 @@ tox:
     EXPECT_EQ(reparsed.value().tox, parsed.value().tox);
 }
 
+// ---------------------------------------------------------------------------
+// tox.proxy (cross-machine rig: a host whose only egress is a local proxy)
+// ---------------------------------------------------------------------------
+
+TEST_F(ConfigTest, ToxProxyDefaultsToNoneAndIsOmittedFromYaml) {
+    EXPECT_FALSE(ToxConfig{}.proxy.enabled());
+    const std::string out = Config::default_client().to_yaml();
+    EXPECT_EQ(out.find("proxy"), std::string::npos) << out;
+}
+
+TEST_F(ConfigTest, ToxProxyParsesValidatesAndRoundTrips) {
+    for (const auto& [name, type] :
+         {std::pair{"socks5", ToxProxyType::Socks5}, std::pair{"http", ToxProxyType::Http}}) {
+        const std::string yaml = std::string(R"(
+mode: server
+data_dir: /var/lib/toxtunnel
+tox:
+  udp_enabled: false
+  proxy:
+    type: )") + name + R"(
+    host: 127.0.0.1
+    port: 7890
+)";
+        auto parsed = Config::from_string(yaml);
+        ASSERT_TRUE(parsed.has_value()) << parsed.error();
+        const auto& proxy = parsed.value().tox.proxy;
+        EXPECT_EQ(proxy.type, type);
+        EXPECT_EQ(proxy.host, "127.0.0.1");
+        EXPECT_EQ(proxy.port, 7890);
+        EXPECT_TRUE(parsed.value().validate().has_value());
+
+        auto reparsed = Config::from_string(parsed.value().to_yaml());
+        ASSERT_TRUE(reparsed.has_value()) << reparsed.error();
+        EXPECT_EQ(reparsed.value().tox, parsed.value().tox);
+    }
+}
+
+TEST_F(ConfigTest, ToxProxyRejectsUnknownTypeAndIncompleteEndpoints) {
+    auto bad_type = Config::from_string(R"(
+mode: client
+tox:
+  proxy:
+    type: socks4
+    host: 127.0.0.1
+    port: 1080
+)");
+    ASSERT_FALSE(bad_type.has_value());
+    EXPECT_NE(bad_type.error().find("tox.proxy.type"), std::string::npos) << bad_type.error();
+
+    Config no_host = Config::default_server();
+    no_host.tox.proxy.type = ToxProxyType::Socks5;
+    no_host.tox.proxy.port = 1080;
+    auto v1 = no_host.validate();
+    ASSERT_FALSE(v1.has_value());
+    EXPECT_NE(v1.error().find("tox.proxy.host"), std::string::npos) << v1.error();
+
+    Config no_port = Config::default_server();
+    no_port.tox.proxy.type = ToxProxyType::Http;
+    no_port.tox.proxy.host = "proxy.example";
+    auto v2 = no_port.validate();
+    ASSERT_FALSE(v2.has_value());
+    EXPECT_NE(v2.error().find("tox.proxy.port"), std::string::npos) << v2.error();
+}
+
+TEST_F(ConfigTest, ToxProxyRejectsLanBootstrapMode) {
+    // toxcore disables UDP for a proxied node, and LAN discovery with it.
+    Config cfg = Config::default_server();
+    cfg.tox.proxy = {ToxProxyType::Socks5, "127.0.0.1", 7890};
+    cfg.tox.bootstrap_mode = BootstrapMode::Lan;
+    auto v = cfg.validate();
+    ASSERT_FALSE(v.has_value());
+    EXPECT_NE(v.error().find("bootstrap_mode: lan"), std::string::npos) << v.error();
+}
+
 TEST_F(ConfigTest, OpenTimeoutDefaultsTo30SecondsAndRoundTrips) {
     EXPECT_EQ(TunnelConfig{}.open_timeout_seconds, 30u);
 

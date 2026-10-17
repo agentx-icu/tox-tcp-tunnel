@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -796,6 +797,62 @@ TEST_F(TcpLoopbackTest, WriteThenCloseDeliversEveryByte) {
         reader->close();
         listener->stop();
     }
+}
+
+// ===========================================================================
+// abort() must reach the peer as a reset, not as end-of-stream.
+//
+// Regression: do_close() always ran shutdown(both) before close(), so an
+// abortive close queued a FIN ahead of the zero-linger RST. The peer's read
+// returned a clean EOF and the RST arrived behind it, which made a target
+// reset look like a complete transfer through the tunnel (issue #35 never
+// worked end to end; the cross-machine rig caught it, the unit tests could not
+// because none of them read the peer side of an aborted socket).
+// ===========================================================================
+
+TEST_F(TcpLoopbackTest, AbortDeliversResetNotEndOfStream) {
+    auto listener = make_listener();
+    const auto port = listener->port();
+
+    std::promise<std::shared_ptr<core::TcpConnection>> server_conn_promise;
+    auto server_conn_future = server_conn_promise.get_future();
+    listener->start_accept([&server_conn_promise](std::shared_ptr<core::TcpConnection> conn) {
+        server_conn_promise.set_value(std::move(conn));
+    });
+
+    // A plain blocking socket stands in for the local application, so the
+    // observed ending is exactly what a user program would see.
+    asio::io_context raw_io;
+    asio::ip::tcp::socket raw(raw_io);
+    std::error_code connect_ec;
+    raw.connect(loopback(port), connect_ec);
+    ASSERT_FALSE(connect_ec) << connect_ec.message();
+
+    ASSERT_EQ(server_conn_future.wait_for(kTimeout), std::future_status::ready);
+    auto server = server_conn_future.get();
+    server->start_read();
+
+    server->abort();
+
+    // Non-blocking poll with a deadline: a blocking read cannot be safely
+    // interrupted from another thread on every platform.
+    raw.non_blocking(true);
+    std::error_code ec;
+    const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+    for (;;) {
+        std::array<char, 16> buf{};
+        (void)raw.read_some(asio::buffer(buf), ec);
+        if (ec != asio::error::would_block && ec != asio::error::try_again) {
+            break;
+        }
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "peer read never completed after abort()";
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(ec, asio::error::connection_reset)
+        << "peer saw '" << ec.message() << "' instead of a reset";
+
+    listener->stop();
 }
 
 }  // namespace

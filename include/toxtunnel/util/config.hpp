@@ -129,6 +129,23 @@ struct BootstrapNodeConfig {
 
 using BootstrapMode = tox::BootstrapMode;
 
+/// Proxy kind for toxcore's TCP connections (`tox.proxy.type`).
+enum class ToxProxyType { None, Http, Socks5 };
+
+/// `tox.proxy`: route toxcore's TCP traffic (TCP relays, and through them the
+/// DHT/onion) via an HTTP CONNECT or SOCKS5 proxy. For hosts whose only way
+/// out is a proxy. toxcore turns UDP off whenever a proxy is set (it cannot
+/// proxy UDP), so a proxied node is TCP-relay-only regardless of
+/// `tox.udp_enabled`.
+struct ToxProxyConfig {
+    ToxProxyType type = ToxProxyType::None;
+    std::string host;  ///< Proxy host (IP or DNS name, resolved locally)
+    uint16_t port = 0;
+
+    [[nodiscard]] bool enabled() const noexcept { return type != ToxProxyType::None; }
+    bool operator==(const ToxProxyConfig& other) const = default;
+};
+
 /// Shared toxcore network configuration.
 struct ToxConfig {
     bool udp_enabled = true;  ///< Enable UDP for toxcore
@@ -151,11 +168,13 @@ struct ToxConfig {
     uint16_t tcp_port = 33445;                           ///< TCP relay port (server use)
     BootstrapMode bootstrap_mode = BootstrapMode::Auto;  ///< Bootstrap behavior
     std::vector<BootstrapNodeConfig> bootstrap_nodes;    ///< Explicit bootstrap nodes
+    ToxProxyConfig proxy;                                ///< Optional TCP proxy
 
     bool operator==(const ToxConfig& other) const {
         return udp_enabled == other.udp_enabled && ipv6_enabled == other.ipv6_enabled &&
                udp_port == other.udp_port && tcp_port == other.tcp_port &&
-               bootstrap_mode == other.bootstrap_mode && bootstrap_nodes == other.bootstrap_nodes;
+               bootstrap_mode == other.bootstrap_mode && bootstrap_nodes == other.bootstrap_nodes &&
+               proxy == other.proxy;
     }
 };
 

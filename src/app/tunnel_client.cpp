@@ -177,6 +177,16 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     tox_config.udp_port = tox_cfg.udp_port;
     tox_config.bootstrap_mode = tox_cfg.bootstrap_mode;
     tox_config.local_discovery_enabled = tox_cfg.bootstrap_mode == BootstrapMode::Lan;
+    if (tox_cfg.proxy.enabled()) {
+        tox_config.proxy_type = tox_cfg.proxy.type == ToxProxyType::Http ? 1 : 2;
+        tox_config.proxy_host = tox_cfg.proxy.host;
+        tox_config.proxy_port = tox_cfg.proxy.port;
+        util::Logger::info(
+            "Tox traffic goes through {} proxy {}:{} (TCP relays only; toxcore disables UDP "
+            "for a proxied node)",
+            tox_cfg.proxy.type == ToxProxyType::Http ? "HTTP" : "SOCKS5", tox_cfg.proxy.host,
+            tox_cfg.proxy.port);
+    }
     tox_config.name = "toxtunnel-client";
     tox_config.status_message = "toxtunnel client node";
     for (const auto& node_cfg : tox_cfg.bootstrap_nodes) {
@@ -341,6 +351,10 @@ void TunnelClient::start() {
             return server_online_.load(std::memory_order_acquire) ? 1u : 0u;
         };
         providers.dht_connected = [this]() -> bool { return tox_adapter_->is_connected(); };
+        providers.dht_node = [this]() -> InspectProviders::DhtNode {
+            const auto& info = tox_adapter_->dht_node_info();
+            return {info.public_key_hex, info.udp_port, info.tcp_relay_port};
+        };
         providers.peer_online_seconds = [this]() -> std::size_t {
             // Seconds the active server has been continuously online, or 0 when
             // offline. Snapshot under endpoints_mutex_ to avoid racing with
@@ -797,88 +811,105 @@ std::string TunnelClient::get_tox_address() const {
 // Internal helpers
 // -------------------------------------------------------------------------
 
+void TunnelClient::on_friend_connection(uint32_t friend_number, bool connected) {
+    const auto now = std::chrono::steady_clock::now();
+
+    std::size_t hit_index = endpoints_.size();
+    bool is_active = false;
+    // S15 / 2026-05-20 follow-up: capture the endpoint's tox_id while
+    // holding endpoints_mutex_, so a concurrent switch_active_endpoint
+    // cannot misattribute the connection event to the new server.
+    std::string sender_tox_id;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+            if (endpoints_[i].friend_number == friend_number) {
+                hit_index = i;
+                break;
+            }
+        }
+        if (hit_index == endpoints_.size()) {
+            return;  // Not one of our configured servers.
+        }
+        auto& ep = endpoints_[hit_index];
+        if (connected && !ep.online) {
+            ep.online_since = now;
+        }
+        if (!connected && ep.online) {
+            ep.offline_since = now;
+        }
+        ep.online = connected;
+        ep.link_up = connected;
+        sender_tox_id = ep.tox_id_hex;
+        is_active = (hit_index == active_index_);
+        if (is_active) {
+            server_online_.store(connected, std::memory_order_release);
+            util::MetricsRegistry::instance().set_friends_online(connected ? 1 : 0);
+            // The active session ended (disconnect) or a new one began
+            // (reconnect); either way ids may be reused, so invalidate any
+            // outstanding RESUME_ACK from the prior session (issue #28).
+            ++resume_session_generation_;
+        }
+    }
+
+    if (is_active) {
+        if (connected) {
+            util::Logger::info("Server friend {} is now online", friend_number);
+            record_server_connection(sender_tox_id, friend_number);
+            send_info_request();
+            // M-02: (re)start keepalive — enable_keepalive resets the
+            // liveness baseline + dead latch, so a reconnect starts fresh.
+            if (config_.tunnel.keepalive_enabled() && tunnel_mgr_) {
+                tunnel_mgr_->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
+            }
+            // H-07: ask the server to reattach any tunnels that survived a
+            // brief disconnect (no-op on the first connect / when disabled).
+            // On the inbound strand, queued behind this transition: a failover
+            // switch (also strand-side) can then never interleave with the
+            // batch, which snapshots the session and sends outside the lock.
+            if (config_.tunnel.resume.enabled && running_) {
+                asio::post(*inbound_strand_, [this] { send_resume_requests(); });
+            }
+            if (is_pipe_mode() && running_) {
+                io_ctx_->post([this] { start_pipe_mode(); });
+            }
+        } else {
+            util::Logger::warn("Server friend {} went offline", friend_number);
+            info_request_sent_.store(false);
+            if (tunnel_mgr_) {
+                tunnel_mgr_->disable_keepalive();
+                // Drop any control frames the manager parked for this
+                // peer. The drain timer would otherwise keep retrying
+                // PermanentFail-class sends until the queue cap forces
+                // a drop (or, on reconnect, deliver a stale OPEN_ACK
+                // for a tunnel the peer no longer remembers).
+                tunnel_mgr_->clear_pending_outbound();
+            }
+            if (is_pipe_mode() && running_) {
+                request_stop();
+            }
+        }
+    } else {
+        // Non-active endpoint state change — informational only; the
+        // failover state machine tick will decide whether to switch.
+        util::Logger::debug("Fallback server friend {} is now {}", friend_number,
+                            connected ? "online" : "offline");
+    }
+}
+
 void TunnelClient::setup_tox_callbacks() {
     // Friend connection status changes. We track per-endpoint online/offline
     // timestamps; the failover state machine tick consumes them.
     tox_adapter_->set_on_friend_connection([this](uint32_t friend_number, bool connected) {
-        const auto now = std::chrono::steady_clock::now();
-        std::size_t hit_index = endpoints_.size();
-        bool is_active = false;
-        // S15 / 2026-05-20 follow-up: capture the endpoint's tox_id while
-        // holding endpoints_mutex_, so a concurrent switch_active_endpoint
-        // cannot misattribute the connection event to the new server.
-        std::string sender_tox_id;
-        {
-            std::lock_guard<std::mutex> lock(endpoints_mutex_);
-            for (std::size_t i = 0; i < endpoints_.size(); ++i) {
-                if (endpoints_[i].friend_number == friend_number) {
-                    hit_index = i;
-                    break;
-                }
-            }
-            if (hit_index == endpoints_.size()) {
-                return;  // Not one of our configured servers.
-            }
-            auto& ep = endpoints_[hit_index];
-            if (connected && !ep.online) {
-                ep.online_since = now;
-            }
-            if (!connected && ep.online) {
-                ep.offline_since = now;
-            }
-            ep.online = connected;
-            sender_tox_id = ep.tox_id_hex;
-            is_active = (hit_index == active_index_);
-            if (is_active) {
-                server_online_.store(connected, std::memory_order_release);
-                util::MetricsRegistry::instance().set_friends_online(connected ? 1 : 0);
-                // The active session ended (disconnect) or a new one began
-                // (reconnect); either way ids may be reused, so invalidate any
-                // outstanding RESUME_ACK from the prior session (issue #28).
-                ++resume_session_generation_;
-            }
-        }
-
-        if (is_active) {
-            if (connected) {
-                util::Logger::info("Server friend {} is now online", friend_number);
-                record_server_connection(sender_tox_id, friend_number);
-                send_info_request();
-                // M-02: (re)start keepalive — enable_keepalive resets the
-                // liveness baseline + dead latch, so a reconnect starts fresh.
-                if (config_.tunnel.keepalive_enabled() && tunnel_mgr_) {
-                    tunnel_mgr_->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
-                }
-                // H-07: ask the server to reattach any tunnels that survived a
-                // brief disconnect (no-op on the first connect / when disabled).
-                if (config_.tunnel.resume.enabled && running_) {
-                    io_ctx_->post([this] { send_resume_requests(); });
-                }
-                if (is_pipe_mode() && running_) {
-                    io_ctx_->post([this] { start_pipe_mode(); });
-                }
-            } else {
-                util::Logger::warn("Server friend {} went offline", friend_number);
-                info_request_sent_.store(false);
-                if (tunnel_mgr_) {
-                    tunnel_mgr_->disable_keepalive();
-                    // Drop any control frames the manager parked for this
-                    // peer. The drain timer would otherwise keep retrying
-                    // PermanentFail-class sends until the queue cap forces
-                    // a drop (or, on reconnect, deliver a stale OPEN_ACK
-                    // for a tunnel the peer no longer remembers).
-                    tunnel_mgr_->clear_pending_outbound();
-                }
-                if (is_pipe_mode() && running_) {
-                    request_stop();
-                }
-            }
-        } else {
-            // Non-active endpoint state change — informational only; the
-            // failover state machine tick will decide whether to switch.
-            util::Logger::debug("Fallback server friend {} is now {}", friend_number,
-                                connected ? "online" : "offline");
-        }
+        // Onto the inbound strand, like every other client lifecycle
+        // transition (keepalive verdicts and recoveries, failover switches):
+        // serialized there, a reconnect cannot interleave with a queued dead
+        // verdict, nor a disconnect with a recovery. toxcore's own ordering is
+        // kept, since packets from the same dispatch pass are queued onto the
+        // same strand in the same order.
+        asio::post(*inbound_strand_, [this, friend_number, connected]() {
+            on_friend_connection(friend_number, connected);
+        });
     });
 
     // Lossless packet handler: deserialize and route to TunnelManager.
@@ -931,6 +962,15 @@ void TunnelClient::setup_tox_callbacks() {
                 if (!frame_result) {
                     util::Logger::error("Failed to deserialize ProtocolFrame from lossless packet");
                     return;
+                }
+
+                // Keepalive liveness: every frame the active server sends
+                // counts, including the control frames intercepted below
+                // before routing. Same friend gate as the routing path, so a
+                // late frame from a demoted server is not credited to the new
+                // one.
+                if (friend_number == strand_route_friend_) {
+                    tunnel_mgr_->note_peer_activity();
                 }
 
                 // INFO_REPLY is a per-friend control frame outside the per-tunnel
@@ -1017,26 +1057,86 @@ void TunnelClient::setup_tunnel_manager() {
     // toxcore link still looks alive but the app is wedged), mark it offline
     // and drop its tunnels so the failover state machine promotes a fallback.
     if (config_.tunnel.keepalive_enabled()) {
+        // Both transitions run on the inbound strand, which also carries the
+        // frames that report recovery, and each re-checks the manager's latch
+        // there: a dead verdict that is overtaken by a recovery (or the other
+        // way round) applies only if it is still the current state. Each is
+        // also pinned to the friend that was active when it was raised, so a
+        // verdict about a server that failover has since replaced is dropped
+        // instead of being applied to its successor.
         tunnel_mgr_->set_on_peer_dead([this]() {
-            io_ctx_->post([this]() {
-                util::Logger::warn(
-                    "Active server unresponsive (keepalive); marking offline and failing over");
-                {
-                    std::lock_guard<std::mutex> lock(endpoints_mutex_);
-                    if (active_index_ < endpoints_.size() && endpoints_[active_index_].online) {
-                        endpoints_[active_index_].online = false;
-                        endpoints_[active_index_].offline_since = std::chrono::steady_clock::now();
-                    }
-                    server_online_.store(false, std::memory_order_release);
-                    util::MetricsRegistry::instance().set_friends_online(0);
+            const auto dead_friend = server_friend_number_.load(std::memory_order_acquire);
+            asio::post(*inbound_strand_,
+                       [this, dead_friend]() { apply_keepalive_dead_verdict(dead_friend); });
+        });
+        // Runs on the inbound strand (note_peer_activity is called from there),
+        // so it is ordered after any dead verdict posted before it.
+        tunnel_mgr_->set_on_peer_alive([this]() {
+            const auto friend_number = strand_route_friend_;
+            bool restored = false;
+            {
+                std::lock_guard<std::mutex> lock(endpoints_mutex_);
+                // link_up is maintained by on_friend_connection on this same
+                // strand, so it cannot change under us: a link that went down
+                // stays with the friend-connection path, which owns that
+                // transition (and has already disabled keepalive).
+                if (active_index_ < endpoints_.size() &&
+                    endpoints_[active_index_].friend_number == friend_number &&
+                    endpoints_[active_index_].link_up && !endpoints_[active_index_].online) {
+                    auto& ep = endpoints_[active_index_];
+                    ep.online = true;
+                    ep.online_since = std::chrono::steady_clock::now();
+                    server_online_.store(true, std::memory_order_release);
+                    util::MetricsRegistry::instance().set_friends_online(1);
+                    restored = true;
                 }
-                if (tunnel_mgr_) {
-                    tunnel_mgr_->close_all();
-                }
-                info_request_sent_.store(false);
-            });
+            }
+            if (restored) {
+                util::Logger::info(
+                    "Active server friend {} responsive again (keepalive); accepting "
+                    "connections",
+                    friend_number);
+                send_info_request();
+            }
         });
     }
+}
+
+// Strand-side half of a keepalive death verdict about `dead_friend` (see
+// setup_tunnel_manager). Runs on inbound_strand_, which also carries the
+// frames that report recovery, so the latch re-check is ordered against them.
+void TunnelClient::apply_keepalive_dead_verdict(uint32_t dead_friend) {
+    if (!tunnel_mgr_ || !tunnel_mgr_->peer_dead() || dead_friend != strand_route_friend_) {
+        return;  // recovered meanwhile, or no longer the active server
+    }
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        // switch_active_endpoint() publishes the new endpoint
+        // before it repins strand_route_friend_, so the route
+        // check above can still pass for a verdict about the
+        // server that was just replaced. Nothing may happen then:
+        // the global flags and close_all() belong to the successor.
+        // A link that went down after the verdict was raised belongs to the
+        // friend-connection path: its tunnels may be held for resume, and
+        // tearing them down here would defeat that.
+        if (active_index_ >= endpoints_.size() ||
+            endpoints_[active_index_].friend_number != dead_friend ||
+            !endpoints_[active_index_].link_up) {
+            return;
+        }
+        auto& ep = endpoints_[active_index_];
+        if (ep.online) {
+            ep.online = false;
+            ep.offline_since = std::chrono::steady_clock::now();
+        }
+        server_online_.store(false, std::memory_order_release);
+        util::MetricsRegistry::instance().set_friends_online(0);
+    }
+    util::Logger::warn(
+        "Active server unresponsive (keepalive); marking offline and failing over "
+        "(still probing it, so it is restored if it answers again)");
+    tunnel_mgr_->close_all();
+    info_request_sent_.store(false);
 }
 
 util::Expected<void, std::string> TunnelClient::create_listeners(
@@ -2118,6 +2218,14 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
     info_request_sent_.store(false);
     if (tunnel_mgr_) {
         tunnel_mgr_->close_all();
+        // Fresh keepalive baseline for the new server: the silence (or the
+        // dead verdict) accrued while talking to the old one is not evidence
+        // against its successor. Re-enabling also clears the dead latch, which
+        // turns any verdict about the old server still queued on the strand
+        // into a no-op (apply_keepalive_dead_verdict re-checks it).
+        if (config_.tunnel.keepalive_enabled()) {
+            tunnel_mgr_->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
+        }
     }
 
     // Refresh known-servers metadata if the new endpoint is already online.
@@ -2143,9 +2251,32 @@ void TunnelClient::run_failover_tick() {
         switch_to = decide_failover_switch(endpoints_, active_index_, failover_cfg, now);
     }
 
-    if (switch_to.has_value()) {
-        switch_active_endpoint(*switch_to);
+    if (!switch_to.has_value()) {
+        return;
     }
+    if (!inbound_strand_) {
+        switch_active_endpoint(*switch_to);
+        return;
+    }
+    // Apply the switch on the inbound strand, where keepalive verdicts are
+    // applied too (apply_keepalive_dead_verdict): a verdict about the old
+    // server can then never interleave with the switch and close the
+    // successor's fresh tunnels. Re-decide there, since endpoint state may
+    // have moved since this timer tick looked.
+    asio::post(*inbound_strand_, [this]() {
+        if (!running_.load(std::memory_order_acquire) || !config_.client.has_value()) {
+            return;
+        }
+        std::optional<std::size_t> again;
+        {
+            std::lock_guard<std::mutex> lock(endpoints_mutex_);
+            again = decide_failover_switch(endpoints_, active_index_, config_.client->failover,
+                                           std::chrono::steady_clock::now());
+        }
+        if (again.has_value()) {
+            switch_active_endpoint(*again);
+        }
+    });
 }
 
 void TunnelClient::schedule_failover_tick() {

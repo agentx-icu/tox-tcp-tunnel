@@ -3,6 +3,8 @@
 #include <chrono>
 #include <filesystem>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "toxtunnel/tox/tox_adapter.hpp"
 
@@ -29,6 +31,57 @@ TEST(ToxAdapterTest, DispatchesQueuedFriendRequestCallbacksOnlyWhenDrained) {
     adapter.dispatch_pending_events_for_test();
     EXPECT_TRUE(called);
     EXPECT_EQ(observed_message, "hello");
+}
+
+// toxcore reports TCP <-> UDP transport changes through the same callback as
+// connects and disconnects. Only a change in connected-ness may reach the
+// daemons: a relay-to-direct upgrade used to arrive as a second "connected",
+// which the client treated as a fresh reconnect (resume requests for live
+// tunnels, keepalive restart, a second pipe-mode start).
+TEST(ToxAdapterTest, TransportChangeIsNotDeliveredAsAReconnect) {
+    ToxAdapter adapter;
+    std::vector<std::pair<uint32_t, bool>> events;
+    adapter.set_on_friend_connection(
+        [&events](uint32_t fn, bool connected) { events.emplace_back(fn, connected); });
+
+    adapter.report_friend_connection_status_for_test(3, TOX_CONNECTION_TCP);
+    adapter.report_friend_connection_status_for_test(3, TOX_CONNECTION_UDP);  // upgrade
+    adapter.report_friend_connection_status_for_test(3, TOX_CONNECTION_TCP);  // downgrade
+    adapter.dispatch_pending_events_for_test();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0], std::make_pair(3u, true));
+
+    adapter.report_friend_connection_status_for_test(3, TOX_CONNECTION_NONE);
+    adapter.report_friend_connection_status_for_test(3, TOX_CONNECTION_NONE);  // repeat
+    adapter.report_friend_connection_status_for_test(3, TOX_CONNECTION_UDP);
+    adapter.dispatch_pending_events_for_test();
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_EQ(events[1], std::make_pair(3u, false));
+    EXPECT_EQ(events[2], std::make_pair(3u, true));
+
+    // Friends are tracked independently.
+    adapter.report_friend_connection_status_for_test(4, TOX_CONNECTION_UDP);
+    adapter.dispatch_pending_events_for_test();
+    ASSERT_EQ(events.size(), 4u);
+    EXPECT_EQ(events[3], std::make_pair(4u, true));
+}
+
+// A deleted friend's number is reused by toxcore and no disconnect is fired
+// for it, so the tracked status must be forgotten or the new friend's first
+// "connected" would be swallowed as a transport change.
+TEST(ToxAdapterTest, ForgottenFriendNumberDeliversTheNextConnect) {
+    ToxAdapter adapter;
+    int connects = 0;
+    adapter.set_on_friend_connection([&connects](uint32_t, bool connected) {
+        if (connected) {
+            ++connects;
+        }
+    });
+    adapter.report_friend_connection_status_for_test(0, TOX_CONNECTION_UDP);
+    adapter.forget_friend_status_for_test(0);
+    adapter.report_friend_connection_status_for_test(0, TOX_CONNECTION_TCP);
+    adapter.dispatch_pending_events_for_test();
+    EXPECT_EQ(connects, 2);
 }
 
 TEST(ToxAdapterTest, ResolveBootstrapNodesForConfigSkipsFetchInLanModeWithoutNodes) {

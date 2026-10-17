@@ -1,6 +1,7 @@
 #include "toxtunnel/tox/tox_adapter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -248,16 +249,38 @@ util::Expected<void, std::string> ToxAdapter::initialize(const ToxAdapterConfig&
     // collision in docs/FIELD_NOTES_SSH_TUNNEL.md #8 invisible. Safe to call
     // directly: the dedicated Tox iterate thread has not been started yet, so
     // this init context is the only thread touching tox_.
-    if (config_.udp_enabled) {
+    // A proxied node has no UDP socket: toxcore turns UDP off for it.
+    if (config_.udp_enabled && config_.proxy_type == 0) {
         Tox_Err_Get_Port port_err;
         uint16_t udp_port = tox_self_get_udp_port(tox_.get(), &port_err);
         if (port_err == TOX_ERR_GET_PORT_OK) {
+            dht_node_info_.udp_port = udp_port;
             util::Logger::info("Tox UDP socket bound to port {} (IPv6 {})", udp_port,
                                config_.ipv6_enabled ? "enabled" : "disabled");
         } else {
             util::Logger::warn(
                 "Could not determine bound Tox UDP port (udp_enabled but no UDP socket?)");
         }
+    }
+
+    // The DHT key (not the Tox ID) plus the bound ports is what another node
+    // needs to bootstrap from this one, or to use its TCP relay: the recipe
+    // for a private network that cannot reach the public DHT. toxcore draws a
+    // fresh DHT keypair on every start, so this is valid only for the lifetime
+    // of this process. Captured once here; immutable afterwards, so it can be
+    // read from any thread without touching tox_.
+    {
+        std::array<uint8_t, TOX_PUBLIC_KEY_SIZE> dht_id{};
+        tox_self_get_dht_id(tox_.get(), dht_id.data());
+        dht_node_info_.public_key_hex = bytes_to_hex(dht_id.data(), dht_id.size());
+        Tox_Err_Get_Port tcp_err;
+        const uint16_t tcp_port = tox_self_get_tcp_port(tox_.get(), &tcp_err);
+        if (tcp_err == TOX_ERR_GET_PORT_OK) {
+            dht_node_info_.tcp_relay_port = tcp_port;
+        }
+        util::Logger::info(
+            "DHT node key: {} (UDP port {}, TCP relay port {}; changes on every restart)",
+            dht_node_info_.public_key_hex, dht_node_info_.udp_port, dht_node_info_.tcp_relay_port);
     }
 
     // Persist the (possibly new) identity — and refuse to run if that
@@ -736,6 +759,10 @@ bool ToxAdapter::remove_friend(uint32_t friend_number) {
         bool ok = tox_friend_delete(tox_.get(), friend_number, &err);
 
         if (ok && err == TOX_ERR_FRIEND_DELETE_OK) {
+            // toxcore reuses friend numbers and fires no disconnect for a
+            // deleted friend: forget its status so a later friend given the
+            // same number gets its first "connected" delivered.
+            friend_transport_.erase(friend_number);
             (void)write_save_data_locked();
             util::Logger::info("Friend removed: number={}", friend_number);
             return true;
@@ -1083,6 +1110,15 @@ void ToxAdapter::enqueue_friend_request_for_test(const PublicKeyArray& public_ke
 
 void ToxAdapter::dispatch_pending_events_for_test() {
     dispatch_pending_events();
+}
+
+void ToxAdapter::report_friend_connection_status_for_test(uint32_t friend_number,
+                                                          TOX_CONNECTION connection_status) {
+    on_friend_connection_status_cb(nullptr, friend_number, connection_status, this);
+}
+
+void ToxAdapter::forget_friend_status_for_test(uint32_t friend_number) {
+    friend_transport_.erase(friend_number);
 }
 
 // ===========================================================================
@@ -1433,10 +1469,34 @@ void ToxAdapter::on_friend_request_cb(Tox* /*tox*/, const uint8_t* public_key,
 void ToxAdapter::on_friend_connection_status_cb(Tox* /*tox*/, uint32_t friend_number,
                                                 TOX_CONNECTION connection_status, void* user_data) {
     auto* self = static_cast<ToxAdapter*>(user_data);
-    bool connected = (connection_status != TOX_CONNECTION_NONE);
+    const bool connected = (connection_status != TOX_CONNECTION_NONE);
+    const auto transport_name = [](TOX_CONNECTION c) {
+        return c == TOX_CONNECTION_UDP ? "UDP" : c == TOX_CONNECTION_TCP ? "TCP" : "none";
+    };
 
-    util::Logger::info("Friend {} connection status: {}", friend_number,
-                       connected ? "connected" : "disconnected");
+    // A value-initialised entry is TOX_CONNECTION_NONE, i.e. "never connected".
+    TOX_CONNECTION& last = self->friend_transport_[friend_number];
+    const TOX_CONNECTION previous = last;
+    last = connection_status;
+    const bool was_connected = (previous != TOX_CONNECTION_NONE);
+
+    if (connected == was_connected) {
+        // Transport change only (typically a TCP relay upgrading to direct
+        // UDP). The friend never went away, so it is not an event: the
+        // daemons would otherwise treat it as a fresh reconnect.
+        if (connected && previous != connection_status) {
+            util::Logger::info("Friend {} transport changed: {} -> {}", friend_number,
+                               transport_name(previous), transport_name(connection_status));
+        }
+        return;
+    }
+
+    if (connected) {
+        util::Logger::info("Friend {} connection status: connected ({})", friend_number,
+                           transport_name(connection_status));
+    } else {
+        util::Logger::info("Friend {} connection status: disconnected", friend_number);
+    }
     self->enqueue_event(FriendConnectionEvent{friend_number, connected});
 }
 
