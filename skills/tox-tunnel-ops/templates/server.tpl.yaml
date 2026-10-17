@@ -89,14 +89,16 @@ logging:
 #   systemd_notify: true          # sd_notify(WATCHDOG=1) on Linux only
 # flow_control:
 #   mode: bdp                     # bdp (default since v0.4.1) | fixed (v0.3.0 cadence)
-#   send_window_min_bytes: 65536  # 64 KiB clamp floor (bdp mode)
+#   send_window_min_bytes: 32768  # 32 KiB clamp floor (bdp mode; v0.5.0+, never below 32 KiB)
 #   send_window_max_bytes: 4194304   # 4 MiB clamp ceiling (bdp mode)
 #   safety_factor_x100: 150       # 1.5× BDP headroom
-#   fixed_window_bytes: 262144    # 256 KiB — used in fixed mode
+#   fixed_window_bytes: 262144    # 256 KiB — fixed-mode window; bdp-mode starting point
 
 tox:
   udp_enabled: true
   tcp_port: {{TCP_PORT|33445}}
+  # udp_port: 0                   # v0.5.0+: 0 = 33445..33545 walk; pin it to make this
+  #                               # daemon a stable bootstrap node for private peers
   # auto: connect via public DHT nodes (requires internet)
   # lan:  LAN-only discovery (no internet needed, both machines must be on same subnet)
   bootstrap_mode: {{BOOTSTRAP_MODE|auto}}
@@ -105,6 +107,13 @@ tox:
   #   - address: 198.199.98.108
   #     port: 33445
   #     public_key: <64-hex-chars>
+  # Only egress is an HTTP CONNECT / SOCKS5 proxy (v0.5.0+)? Route Tox through it.
+  # toxcore then runs TCP-relay-only (no UDP), so pin bootstrap_nodes by IP; not
+  # allowed with bootstrap_mode: lan.
+  # proxy:
+  #   type: socks5                # none | http | socks5
+  #   host: 127.0.0.1
+  #   port: 7890
 
 {{#RULES_FILE}}
 server:

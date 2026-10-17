@@ -697,6 +697,17 @@ if [ -n "$TOXTUNNEL_BIN" ] && [ -n "$DATA_DIR" ] && [ -S "$DATA_DIR/toxtunnel.so
             fail "Daemon reports friends_online=0 — no Tox peer is connected"
             echo "       Nothing can be forwarded until this is non-zero."
         fi
+        # v0.5.0+ reports DHT connectivity directly; older daemons omit the field.
+        DHT=$(printf '%s' "$STATUS" | tr ',{}' '\n\n\n' | grep '"dht_connected"' \
+              | head -1 | grep -oE '(true|false)$' || true)
+        if [ "$DHT" = true ]; then
+            info "Daemon reports dht_connected=true"
+        elif [ "$DHT" = false ]; then
+            fail "Daemon reports dht_connected=false — not currently connected to the Tox DHT"
+            echo "       Look for 'Bootstrap contacted 0 of N node(s)' in its log. Fix outbound"
+            echo "       UDP/TCP to the bootstrap nodes, pin tox.bootstrap_nodes by IP, or on a"
+            echo "       proxy-only host set tox.proxy (v0.5.0+)."
+        fi
         printf '%s\n' "$STATUS" | sed 's/^/       /' | head -5
     else
         warn "'toxtunnel inspect status' returned nothing (inspect disabled, or stale socket)"
