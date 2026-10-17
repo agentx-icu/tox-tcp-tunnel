@@ -79,10 +79,11 @@ Forward any TCP port through Tox with end-to-end encryption, no central server, 
   defaults to `fixed` (v0.3.0 behaviour) for one release of soak.
 
 - **BDP-aware flow control** — `flow_control.mode: bdp` is the **default**
-  since v0.4.1. The per-tunnel send window is recomputed from RTT × bandwidth
-  EWMA and clamped to `[64 KiB, 4 MiB]`, replacing the v0.3.0 fixed 256 KiB cap
-  on high-RTT × high-bandwidth links. Set `mode: fixed` to pin the v0.3.0
-  behaviour.
+  since v0.4.1. The per-tunnel send window is recomputed from bandwidth ×
+  minimum RTT and clamped to `[32 KiB, 4 MiB]`: it grows past the v0.3.0 fixed
+  256 KiB on high-RTT × high-bandwidth links and, since v0.5.0, shrinks below
+  it on slow ones so a bulk transfer does not queue tens of seconds ahead of
+  every other tunnel. Set `mode: fixed` to pin the v0.3.0 behaviour.
 
 - **Per-friend rate limiting** — anti-DoS layer in `rules.yaml`. Per-
   friend `rate_limit:` blocks and a top-level `rate_limit_defaults:`

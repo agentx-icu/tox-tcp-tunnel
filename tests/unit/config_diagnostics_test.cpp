@@ -145,6 +145,29 @@ tox:
     EXPECT_EQ(paths_of(yaml), std::vector<std::string>{"tox.local_discovery_enabled"});
 }
 
+TEST(ConfigDiagnosticsTest, OfflineOpenWaitIsUnderstood) {
+    constexpr std::string_view yaml = R"(
+mode: client
+tunnel:
+  offline_open_wait_seconds: 30
+)";
+    EXPECT_TRUE(paths_of(yaml).empty());
+}
+
+TEST(ConfigDiagnosticsTest, ToxProxyBlockIsUnderstoodAndItsTyposReported) {
+    constexpr std::string_view yaml = R"(
+mode: client
+tox:
+  udp_enabled: false
+  proxy:
+    type: socks5
+    host: 127.0.0.1
+    port: 7890
+    username: x
+)";
+    EXPECT_EQ(paths_of(yaml), std::vector<std::string>{"tox.proxy.username"});
+}
+
 TEST(ConfigDiagnosticsTest, ReportsTyposAtEveryNestingLevel) {
     constexpr std::string_view yaml = R"(
 mode: client

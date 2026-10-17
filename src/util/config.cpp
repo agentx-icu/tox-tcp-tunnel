@@ -404,6 +404,24 @@ util::Expected<void, std::string> Config::validate() const {
             std::string("LAN bootstrap mode requires tox.udp_enabled to be true"));
     }
 
+    if (effective_tox.proxy.enabled()) {
+        if (effective_tox.proxy.host.empty()) {
+            return util::make_unexpected(
+                std::string("tox.proxy.host is required when tox.proxy.type is set"));
+        }
+        if (effective_tox.proxy.port == 0) {
+            return util::make_unexpected(
+                std::string("tox.proxy.port must be 1-65535 when tox.proxy.type is set"));
+        }
+        // toxcore turns UDP off for a proxied node, and LAN discovery with it,
+        // so this combination would silently discover nothing.
+        if (effective_tox.bootstrap_mode == BootstrapMode::Lan) {
+            return util::make_unexpected(std::string(
+                "tox.proxy cannot be combined with tox.bootstrap_mode: lan (a proxied node has no "
+                "UDP, so LAN discovery cannot work)"));
+        }
+    }
+
     // H-09: validate the coalesce / flow-control / resume knobs. The YAML
     // decoders keep these as plain strings/ints and `parse_*_mode` ignore
     // failures (silently falling back to defaults), so a typo like
@@ -461,6 +479,10 @@ util::Expected<void, std::string> Config::validate() const {
     if (tunnel.resume.enabled && tunnel.resume.max_age_seconds == 0) {
         return util::make_unexpected(
             std::string("tunnel.resume.max_age_seconds must be > 0 when tunnel.resume.enabled"));
+    }
+    if (tunnel.offline_open_wait_seconds > 3600) {
+        return util::make_unexpected(
+            std::string("tunnel.offline_open_wait_seconds must be <= 3600"));
     }
     if (tunnel.resume.on_gap != "passthrough" && tunnel.resume.on_gap != "close") {
         return util::make_unexpected(std::string("Invalid tunnel.resume.on_gap '") +
@@ -934,6 +956,13 @@ Node convert<ToxConfig>::encode(const ToxConfig& rhs) {
     if (!rhs.bootstrap_nodes.empty()) {
         node["bootstrap_nodes"] = rhs.bootstrap_nodes;
     }
+    if (rhs.proxy.enabled()) {
+        Node proxy;
+        proxy["type"] = rhs.proxy.type == toxtunnel::ToxProxyType::Http ? "http" : "socks5";
+        proxy["host"] = rhs.proxy.host;
+        proxy["port"] = rhs.proxy.port;
+        node["proxy"] = proxy;
+    }
     return node;
 }
 
@@ -959,6 +988,31 @@ bool convert<ToxConfig>::decode(const Node& node, ToxConfig& rhs) {
     }
     if (node["bootstrap_nodes"]) {
         rhs.bootstrap_nodes = node["bootstrap_nodes"].as<std::vector<BootstrapNodeConfig>>();
+    }
+    if (const Node proxy = node["proxy"]) {
+        if (!proxy.IsMap()) {
+            throw YAML::RepresentationException(proxy.Mark(),
+                                                "tox.proxy must be a map with type, host and port");
+        }
+        if (const Node type = proxy["type"]) {
+            const auto name = type.as<std::string>();
+            if (name == "none") {
+                rhs.proxy.type = toxtunnel::ToxProxyType::None;
+            } else if (name == "http") {
+                rhs.proxy.type = toxtunnel::ToxProxyType::Http;
+            } else if (name == "socks5") {
+                rhs.proxy.type = toxtunnel::ToxProxyType::Socks5;
+            } else {
+                throw YAML::RepresentationException(
+                    type.Mark(), "tox.proxy.type '" + name + "' must be one of none, http, socks5");
+            }
+        }
+        if (proxy["host"]) {
+            rhs.proxy.host = proxy["host"].as<std::string>();
+        }
+        if (proxy["port"]) {
+            rhs.proxy.port = proxy["port"].as<uint16_t>();
+        }
     }
 
     return true;
@@ -1118,6 +1172,7 @@ Node convert<toxtunnel::TunnelConfig>::encode(const toxtunnel::TunnelConfig& rhs
     node["half_close_timeout_seconds"] = rhs.half_close_timeout_seconds;
     node["keepalive_interval_seconds"] = rhs.keepalive_interval_seconds;
     node["open_timeout_seconds"] = rhs.open_timeout_seconds;
+    node["offline_open_wait_seconds"] = rhs.offline_open_wait_seconds;
     if (!(rhs.resume == toxtunnel::TunnelResumeConfig{})) {
         node["resume"] = rhs.resume;
     }
@@ -1151,6 +1206,9 @@ bool convert<toxtunnel::TunnelConfig>::decode(const Node& node, toxtunnel::Tunne
     }
     if (node["open_timeout_seconds"]) {
         rhs.open_timeout_seconds = node["open_timeout_seconds"].as<uint32_t>();
+    }
+    if (node["offline_open_wait_seconds"]) {
+        rhs.offline_open_wait_seconds = node["offline_open_wait_seconds"].as<uint32_t>();
     }
     if (node["resume"]) {
         rhs.resume = node["resume"].as<toxtunnel::TunnelResumeConfig>();

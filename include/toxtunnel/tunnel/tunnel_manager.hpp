@@ -219,12 +219,30 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     void disable_keepalive();
 
     /// Set the callback fired once when the peer is declared dead by the
-    /// keepalive check. Invoked on an io_context thread.
+    /// keepalive check. Invoked on an io_context thread. After the verdict the
+    /// manager keeps sending one PING per interval as a recovery probe (until
+    /// disable_keepalive()), so a peer that comes back can be noticed even when
+    /// its toxcore link never dropped.
     void set_on_peer_dead(std::function<void()> cb);
 
-    /// Record a PONG (or any liveness signal) — refreshes the keepalive
-    /// deadline. Exposed for tests; production calls it from handle_pong_frame.
+    /// Set the callback fired once when a peer previously declared dead shows
+    /// activity again (see note_peer_activity()). Invoked synchronously on the
+    /// thread that reported the activity.
+    void set_on_peer_alive(std::function<void()> cb);
+
+    /// Record a PONG — alias of note_peer_activity(), kept for tests.
     void note_pong();
+
+    /// Record any inbound frame attributed to this peer. Every frame is
+    /// produced by the peer application, so it refreshes the keepalive deadline
+    /// as a PONG would: a PONG shares the ordered lossless stream with bulk
+    /// TUNNEL_DATA and can wait behind it for longer than the timeout on a
+    /// slow link. While the peer is latched dead this clears the latch and
+    /// fires on_peer_alive.
+    void note_peer_activity();
+
+    /// True between a keepalive death verdict and the next peer activity.
+    [[nodiscard]] bool peer_dead() const noexcept;
 
     /// Keepalive counterpart of `rearm_reaper_after_tick()`.
     void rearm_keepalive_after_tick(std::uint64_t epoch);
@@ -926,6 +944,7 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     std::atomic<bool> peer_dead_latched_{false};
     /// Fired once when the peer is declared dead. Guarded by handler_mutex_.
     std::function<void()> on_peer_dead_;
+    std::function<void()> on_peer_alive_;
 };
 
 /// Decide what a per-tunnel `SendToToxCallback` reports — and whether it parks
@@ -978,8 +997,9 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
 /// before being handed to toxcore on the direct per-tunnel path.
 ///
 /// Only TUNNEL_OPEN and TUNNEL_ACK — see the definition for why TUNNEL_DATA is
-/// covered transitively and why the still-parked control frames are not covered
-/// at all.
+/// covered transitively (for ordering; the senders still make DATA yield to
+/// parked frames, for priority) and why the still-parked control frames are not
+/// covered at all.
 [[nodiscard]] bool frame_must_respect_outbound_barrier(FrameType type) noexcept;
 
 }  // namespace toxtunnel::tunnel

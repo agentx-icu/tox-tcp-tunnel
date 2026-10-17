@@ -8,6 +8,15 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      packages:
+        description: "Also build the installer packages (QA artifacts only; nothing is released)"
+        type: boolean
+        default: false
+      package_version:
+        description: "Numeric x.y.z version stamped into QA packages (MSI/RPM need a plain number)"
+        type: string
+        default: "0.5.0"
 
 permissions:
   contents: read
@@ -43,7 +52,9 @@ jobs:
             platform: windows
             vcpkg_triplet: arm64-windows
             cmake_arch: ARM64
-            vs_generator: "Visual Studio 17 2022"
+            # The windows-11-arm image moved to VS 2026 (windows-11-vs2026-arm64)
+            # around 2026-10-01 and no longer has VS 2022 installed.
+            vs_generator: "Visual Studio 18 2026"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -118,7 +129,10 @@ jobs:
   build-installers:
     name: Package ${{ matrix.target.id }}
     needs: build-and-test
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Tags build the release packages; a manual run with `packages: true` builds
+    # the same installers as downloadable QA artifacts for a branch (the release
+    # job below stays tag-only).
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.packages)
     runs-on: ${{ matrix.target.runner }}
     strategy:
       fail-fast: false
@@ -169,7 +183,9 @@ jobs:
             generator: "WIX"
             vcpkg_triplet: arm64-windows-static
             cmake_arch: ARM64
-            vs_generator: "Visual Studio 17 2022"
+            # The windows-11-arm image moved to VS 2026 (windows-11-vs2026-arm64)
+            # around 2026-10-01 and no longer has VS 2022 installed.
+            vs_generator: "Visual Studio 18 2026"
     env:
       RELEASE_VERSION: ${{ github.ref_name }}
     steps:
@@ -180,7 +196,19 @@ jobs:
       - name: Derive version from tag
         id: version
         shell: bash
-        run: echo "version=${RELEASE_VERSION#v}" >> "$GITHUB_OUTPUT"
+        env:
+          QA_PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${RELEASE_VERSION#v}"
+          else
+            version="$QA_PACKAGE_VERSION"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::package_version must be x.y.z, got '$version'"
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux dependencies
         if: matrix.target.platform == 'linux'

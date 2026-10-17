@@ -336,7 +336,10 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     void do_write();
 
     /// Perform the final socket close and invoke the disconnect callback.
-    void do_close(const std::error_code& ec);
+    /// @p abortive skips the shutdown(both) that normally precedes close():
+    /// that shutdown sends a FIN, which the peer reads as a clean end of
+    /// stream before the zero-linger close's RST can reach it.
+    void do_close(const std::error_code& ec, bool abortive = false);
 
     /// Shared body of force_close() / abort(): discard queued writes and close.
     /// Runs on the strand. @p reset requests an RST (SO_LINGER 0) first.

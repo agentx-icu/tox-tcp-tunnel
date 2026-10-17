@@ -10,15 +10,19 @@
 #include <gtest/gtest.h>
 
 #include <asio.hpp>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "toxtunnel/app/tunnel_client.hpp"
 #include "toxtunnel/app/tunnel_server.hpp"
+#include "toxtunnel/core/tcp_connection.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
@@ -223,6 +227,29 @@ class TunnelResumeTestAccess {
         std::lock_guard<std::mutex> lock(c.resume_tokens_mutex_);
         return c.resume_tokens_.size();
     }
+    static std::uint32_t& strand_route_friend(TunnelClient& c) { return c.strand_route_friend_; }
+    static std::atomic<bool>& server_online(TunnelClient& c) { return c.server_online_; }
+    static void apply_keepalive_dead_verdict(TunnelClient& c, std::uint32_t dead_friend) {
+        c.apply_keepalive_dead_verdict(dead_friend);
+    }
+    static void accept_forward_connection(TunnelClient& c,
+                                          std::shared_ptr<core::TcpConnection> conn,
+                                          const ForwardRule& rule) {
+        c.accept_forward_connection(std::move(conn), rule);
+    }
+    static std::size_t held_count(TunnelClient& c) {
+        std::lock_guard<std::mutex> lock(c.held_mutex_);
+        return c.held_.size();
+    }
+    static void expire_held_connections(TunnelClient& c) { c.expire_held_connections(); }
+    static void close_held_connections(TunnelClient& c) { c.close_held_connections(); }
+    static void release_held_connections(TunnelClient& c) { c.release_held_connections(); }
+    static std::atomic<bool>& stop_started(TunnelClient& c) { return c.stop_started_; }
+    static void set_held_wait(TunnelClient& c, std::uint32_t seconds) {
+        c.config_.tunnel.offline_open_wait_seconds = seconds;
+        c.held_wait_seconds_.store(seconds);  // what initialize() snapshots
+    }
+    static constexpr std::size_t kMaxHeld = TunnelClient::kMaxHeldConnections;
 };
 
 class TunnelServerResumeTestAccess {
@@ -239,6 +266,11 @@ class TunnelServerResumeTestAccess {
     static void handle_resume_request(TunnelServer& s, std::uint32_t friend_number,
                                       const tunnel::ProtocolFrame& frame) {
         s.handle_resume_request(friend_number, frame);
+    }
+    static void teardown_after_keepalive_verdict(
+        TunnelServer& s, std::uint32_t friend_number,
+        const std::weak_ptr<tunnel::TunnelManager>& verdict_manager) {
+        s.teardown_after_keepalive_verdict(friend_number, verdict_manager);
     }
 };
 
@@ -453,6 +485,253 @@ TEST(ResumeAbortTest, ServerDeclinesAndRemovesAbortedHeldTunnel) {
         << "an aborted held tunnel must be declined, not reattached";
     EXPECT_EQ(mgr->get_tunnel(kTunnelId), nullptr)
         << "the aborted held tunnel must be removed from the manager";
+}
+
+// ---------------------------------------------------------------------------
+// Keepalive verdict ordering. A dead verdict is raised on a timer thread and
+// applied later on the inbound strand; by then the peer may have answered, or
+// failover may have replaced it. Either way the stale verdict must be a no-op.
+// ---------------------------------------------------------------------------
+
+// Drive a manager holding one tunnel to a keepalive dead verdict.
+void drive_to_dead_verdict(asio::io_context& io_ctx, const std::shared_ptr<TunnelManager>& mgr) {
+    mgr->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (!mgr->peer_dead() && std::chrono::steady_clock::now() < deadline) {
+        io_ctx.restart();
+        io_ctx.run_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(mgr->peer_dead());
+}
+
+std::shared_ptr<TunnelManager> make_manager_with_tunnel(asio::io_context& io_ctx,
+                                                        std::uint16_t id) {
+    auto mgr = std::make_shared<TunnelManager>(io_ctx);
+    mgr->set_send_handler(
+        [](const std::vector<std::uint8_t>&) { return tunnel::SendOutcome::Sent; });
+    make_connected_tunnel(io_ctx, mgr, id);
+    return mgr;
+}
+
+void quiesce(asio::io_context& io_ctx, const std::shared_ptr<TunnelManager>& mgr) {
+    mgr->disable_keepalive();
+    io_ctx.restart();
+    io_ctx.poll();
+    mgr->close_all();
+    io_ctx.restart();
+    io_ctx.poll();
+}
+
+TEST(KeepaliveVerdictOrderingTest, StaleClientVerdictAfterFailoverLeavesTheSuccessorAlone) {
+    asio::io_context io_ctx;
+    app::TunnelClient client;
+    auto mgr = make_manager_with_tunnel(io_ctx, 40);
+    Access::tunnel_mgr(client) = mgr;
+    for (std::uint32_t fn : {0u, 1u}) {
+        app::ClientServerEndpoint ep;
+        ep.friend_number = fn;
+        ep.tox_id_hex = std::string(76, fn == 0 ? 'A' : 'B');
+        ep.online = true;
+        ep.link_up = true;
+        Access::endpoints(client).push_back(ep);
+    }
+    drive_to_dead_verdict(io_ctx, mgr);
+
+    // Failover already published endpoint 1 as active, but the strand has not
+    // repinned the route yet: the verdict about friend 0 still passes the
+    // route check and must stop at the endpoint check, before any side effect.
+    Access::active_index(client) = 1;
+    Access::strand_route_friend(client) = 0;
+    Access::server_online(client).store(true);
+    Access::apply_keepalive_dead_verdict(client, 0);
+    EXPECT_TRUE(Access::server_online(client).load());
+    EXPECT_TRUE(Access::endpoints(client)[1].online);
+    EXPECT_TRUE(mgr->has_tunnel(40)) << "a stale verdict closed the successor's tunnels";
+
+    // The verdict about the server that IS active still applies.
+    Access::active_index(client) = 0;
+    Access::apply_keepalive_dead_verdict(client, 0);
+    EXPECT_FALSE(Access::server_online(client).load());
+    EXPECT_FALSE(Access::endpoints(client)[0].online);
+    EXPECT_FALSE(mgr->has_tunnel(40));
+
+    quiesce(io_ctx, mgr);
+}
+
+TEST(KeepaliveVerdictOrderingTest, ClientVerdictOvertakenByRecoveryIsDropped) {
+    asio::io_context io_ctx;
+    app::TunnelClient client;
+    auto mgr = make_manager_with_tunnel(io_ctx, 41);
+    Access::tunnel_mgr(client) = mgr;
+    app::ClientServerEndpoint ep;
+    ep.friend_number = 0;
+    ep.tox_id_hex = std::string(76, 'A');
+    ep.online = true;
+    ep.link_up = true;
+    Access::endpoints(client).push_back(ep);
+    Access::active_index(client) = 0;
+    Access::strand_route_friend(client) = 0;
+    Access::server_online(client).store(true);
+    drive_to_dead_verdict(io_ctx, mgr);
+
+    mgr->note_peer_activity();  // a frame queued ahead of the verdict
+    Access::apply_keepalive_dead_verdict(client, 0);
+    EXPECT_TRUE(Access::server_online(client).load());
+    EXPECT_TRUE(mgr->has_tunnel(41));
+
+    quiesce(io_ctx, mgr);
+}
+
+TEST(KeepaliveVerdictOrderingTest, ClientVerdictAfterTheLinkDroppedLeavesResumableTunnels) {
+    // The friend-connection path owns a link that went down: with resume
+    // enabled its tunnels are kept for the reconnect, and a verdict queued
+    // behind the disconnect must not tear them down.
+    asio::io_context io_ctx;
+    app::TunnelClient client;
+    auto mgr = make_manager_with_tunnel(io_ctx, 42);
+    Access::tunnel_mgr(client) = mgr;
+    app::ClientServerEndpoint ep;
+    ep.friend_number = 0;
+    ep.tox_id_hex = std::string(76, 'A');
+    ep.online = false;  // what on_friend_connection(false) leaves behind
+    ep.link_up = false;
+    Access::endpoints(client).push_back(ep);
+    Access::active_index(client) = 0;
+    Access::strand_route_friend(client) = 0;
+    drive_to_dead_verdict(io_ctx, mgr);
+
+    Access::apply_keepalive_dead_verdict(client, 0);
+    EXPECT_TRUE(mgr->has_tunnel(42));
+
+    quiesce(io_ctx, mgr);
+}
+
+// ---------------------------------------------------------------------------
+// Held local connections (tunnel.offline_open_wait_seconds). A forward
+// connection accepted while the server is offline used to be closed on the
+// spot -- a matrix started 2 s before the friend link came up failed 14/15.
+// ---------------------------------------------------------------------------
+
+struct HeldConnectionFixture {
+    asio::io_context io_ctx;
+    app::TunnelClient client;
+    ForwardRule rule;
+    HeldConnectionFixture() {
+        rule.local_port = 31099;
+        rule.remote_host = "127.0.0.1";
+        rule.remote_port = 19099;
+        Access::server_online(client).store(false);
+    }
+    std::shared_ptr<core::TcpConnection> conn() {
+        return std::make_shared<core::TcpConnection>(io_ctx);
+    }
+};
+
+TEST(HeldConnectionTest, OfflineAcceptIsHeldNotClosed) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 10);
+    auto c = f.conn();
+    Access::accept_forward_connection(f.client, c, f.rule);
+    EXPECT_EQ(Access::held_count(f.client), 1u);
+    Access::close_held_connections(f.client);  // what stop() does
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, ZeroWaitKeepsTheOldCloseAtOnceBehaviour) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 0);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, HeldConnectionExpiresAfterTheWait) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 1);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    Access::expire_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 1u) << "not due yet";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    Access::expire_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, AnAcceptAfterStopIsClosedNotHeld) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 10);
+    Access::close_held_connections(f.client);  // stop() latched the queue shut
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    f.io_ctx.poll();
+}
+
+// The release path that does not need a live server: while offline nothing
+// is released; once online, an entry past its deadline (the expiry tick may
+// not have run yet) and every entry after stop() began are closed, not opened.
+TEST(HeldConnectionTest, ReleaseWaitsForTheServerAndDropsExpiredOrStoppedEntries) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 1);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    Access::release_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 1u) << "server still offline";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    Access::server_online(f.client).store(true);
+    Access::release_held_connections(f.client);  // expired: closed, never opened
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+
+    Access::server_online(f.client).store(false);
+    Access::set_held_wait(f.client, 30);
+    Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    Access::stop_started(f.client).store(true);
+    Access::server_online(f.client).store(true);
+    Access::release_held_connections(f.client);  // stopping: left for stop() to close
+    Access::close_held_connections(f.client);
+    EXPECT_EQ(Access::held_count(f.client), 0u);
+    Access::stop_started(f.client).store(false);
+    f.io_ctx.poll();
+}
+
+TEST(HeldConnectionTest, HoldingIsBounded) {
+    HeldConnectionFixture f;
+    Access::set_held_wait(f.client, 10);
+    for (std::size_t i = 0; i < Access::kMaxHeld + 5; ++i) {
+        Access::accept_forward_connection(f.client, f.conn(), f.rule);
+    }
+    EXPECT_EQ(Access::held_count(f.client), Access::kMaxHeld);
+    Access::close_held_connections(f.client);
+    f.io_ctx.poll();
+}
+
+TEST(KeepaliveVerdictOrderingTest, ServerVerdictSparesARevivedOrReplacedManager) {
+    using ServerAccess = toxtunnel::app::TunnelServerResumeTestAccess;
+    asio::io_context io_ctx;
+    app::TunnelServer server;
+    auto judged = make_manager_with_tunnel(io_ctx, 50);
+    ServerAccess::managers(server)[7] = judged;
+    drive_to_dead_verdict(io_ctx, judged);
+
+    // Revived by a frame that reached the strand before the verdict did.
+    judged->note_peer_activity();
+    ServerAccess::teardown_after_keepalive_verdict(server, 7, judged);
+    ASSERT_EQ(ServerAccess::managers(server).count(7), 1u);
+    EXPECT_EQ(ServerAccess::managers(server)[7], judged);
+    EXPECT_TRUE(judged->has_tunnel(50));
+
+    // Judged dead again, but the friend has a different live manager by now.
+    drive_to_dead_verdict(io_ctx, judged);
+    auto successor = make_manager_with_tunnel(io_ctx, 51);
+    ServerAccess::managers(server)[7] = successor;
+    ServerAccess::teardown_after_keepalive_verdict(server, 7, judged);
+    ASSERT_EQ(ServerAccess::managers(server).count(7), 1u);
+    EXPECT_EQ(ServerAccess::managers(server)[7], successor);
+    EXPECT_TRUE(successor->has_tunnel(51));
+
+    ServerAccess::managers(server).clear();
+    quiesce(io_ctx, judged);
+    quiesce(io_ctx, successor);
 }
 
 }  // namespace

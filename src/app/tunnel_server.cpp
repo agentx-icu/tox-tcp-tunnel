@@ -291,6 +291,16 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     tox_config.tcp_port = tox_cfg.tcp_port;
     tox_config.bootstrap_mode = tox_cfg.bootstrap_mode;
     tox_config.local_discovery_enabled = tox_cfg.bootstrap_mode == BootstrapMode::Lan;
+    if (tox_cfg.proxy.enabled()) {
+        tox_config.proxy_type = tox_cfg.proxy.type == ToxProxyType::Http ? 1 : 2;
+        tox_config.proxy_host = tox_cfg.proxy.host;
+        tox_config.proxy_port = tox_cfg.proxy.port;
+        util::Logger::info(
+            "Tox traffic goes through {} proxy {}:{} (TCP relays only; toxcore disables UDP "
+            "for a proxied node)",
+            tox_cfg.proxy.type == ToxProxyType::Http ? "HTTP" : "SOCKS5", tox_cfg.proxy.host,
+            tox_cfg.proxy.port);
+    }
 
     // Convert bootstrap nodes from config format.
     for (const auto& node_cfg : tox_cfg.bootstrap_nodes) {
@@ -413,6 +423,10 @@ void TunnelServer::start() {
             return managers_.size();
         };
         providers.dht_connected = [this]() -> bool { return tox_adapter_->is_connected(); };
+        providers.dht_node = [this]() -> InspectProviders::DhtNode {
+            const auto& info = tox_adapter_->dht_node_info();
+            return {info.public_key_hex, info.udp_port, info.tcp_relay_port};
+        };
         providers.friend_pk_prefix = [this](uint16_t tunnel_id) -> std::string {
             // Resolve tunnel_id -> friend_number under managers_mutex_, then
             // RELEASE the lock BEFORE get_friend_pk_hex(). That call marshals to
@@ -739,6 +753,24 @@ void TunnelServer::on_lossless_packet(uint32_t friend_number, const uint8_t* dat
 
     auto& frame = frame_result.value();
 
+    // Keepalive liveness: credit the friend's manager with every frame it
+    // sends, at ingress -- before the special-cased control frames below are
+    // dispatched outside the manager, and before the byte throttle can park the
+    // frame. A PONG alone is not enough: it rides the same ordered lossless
+    // stream as the client's upload and can wait behind it past the timeout.
+    {
+        std::shared_ptr<tunnel::TunnelManager> mgr;
+        {
+            std::lock_guard lock(managers_mutex_);
+            if (auto it = managers_.find(friend_number); it != managers_.end()) {
+                mgr = it->second;
+            }
+        }
+        if (mgr) {
+            mgr->note_peer_activity();
+        }
+    }
+
     // Per-friend inbound byte budget (`rate_limit.bytes_per_sec`). The gate
     // either lets the frame through, parks it in arrival order until the bucket
     // refills, or reports that the friend has buried us in deferred bytes. It
@@ -839,12 +871,29 @@ void TunnelServer::dispatch_inbound_frame(uint32_t friend_number,
     {
         std::lock_guard lock(managers_mutex_);
         auto it = managers_.find(friend_number);
-        if (it == managers_.end()) {
-            util::Logger::warn("Received frame from friend {} but no TunnelManager exists",
-                               friend_number);
+        if (it != managers_.end()) {
+            manager_ptr = it->second;
+        }
+    }
+    if (!manager_ptr) {
+        // No live manager: typically a keepalive verdict tore it down while the
+        // friend's toxcore link stayed up. Still answer its PINGs. The client
+        // keeps probing a server it declared dead and restores it on the first
+        // reply; without a PONG here, two peers that each gave up on the other
+        // would stay apart until the link itself flapped. Its next TUNNEL_OPEN
+        // rebuilds the manager (handle_tunnel_open -> setup_tunnel_manager).
+        if (frame.type() == tunnel::FrameType::PING && frame.tunnel_id() == 0) {
+            const auto wire = tunnel::ProtocolFrame::make_pong().serialize();
+            std::vector<uint8_t> packet;
+            packet.reserve(1 + wire.size());
+            packet.push_back(kLosslessPacketByte);
+            packet.insert(packet.end(), wire.begin(), wire.end());
+            (void)tox_adapter_->send_lossless_packet(friend_number, packet.data(), packet.size());
             return;
         }
-        manager_ptr = it->second;
+        util::Logger::warn("Received frame from friend {} but no TunnelManager exists",
+                           friend_number);
+        return;
     }
 
     manager_ptr->route_frame(frame);
@@ -1260,13 +1309,16 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view
         if (resurrected) {
             // Re-arm keepalive (it was paused while held).
             if (config_.tunnel.keepalive_enabled()) {
-                resurrected->set_on_peer_dead([this, friend_number]() {
-                    // Onto the lifecycle strand, not the raw pool: see
-                    // on_friend_connection() for why every transition is
-                    // serialised.
-                    asio::post(*inbound_strand_,
-                               [this, friend_number]() { teardown_tunnel_manager(friend_number); });
-                });
+                resurrected->set_on_peer_dead(
+                    [this, friend_number,
+                     weak = std::weak_ptr<tunnel::TunnelManager>(resurrected)]() {
+                        // Onto the lifecycle strand, not the raw pool: see
+                        // on_friend_connection() for why every transition is
+                        // serialised.
+                        asio::post(*inbound_strand_, [this, friend_number, weak]() {
+                            teardown_after_keepalive_verdict(friend_number, weak);
+                        });
+                    });
                 resurrected->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
             }
             // Re-arm the maintenance scan (paused while held).
@@ -1357,13 +1409,13 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view
     // tear down its tunnels — defer via post so we don't re-enter
     // managers_mutex_ from inside the keepalive timer handler.
     if (config_.tunnel.keepalive_enabled()) {
-        manager->set_on_peer_dead([this, friend_number]() {
-            util::Logger::warn("Friend {} unresponsive (keepalive); tearing down its tunnels",
-                               friend_number);
-            // Lifecycle strand, not the raw pool — see on_friend_connection().
-            asio::post(*inbound_strand_,
-                       [this, friend_number]() { teardown_tunnel_manager(friend_number); });
-        });
+        manager->set_on_peer_dead(
+            [this, friend_number, weak = std::weak_ptr<tunnel::TunnelManager>(manager)]() {
+                // Lifecycle strand, not the raw pool — see on_friend_connection().
+                asio::post(*inbound_strand_, [this, friend_number, weak]() {
+                    teardown_after_keepalive_verdict(friend_number, weak);
+                });
+            });
         manager->enable_keepalive(config_.tunnel.keepalive_interval_seconds, 0);
     }
 
@@ -1386,6 +1438,30 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view
             "keeping the existing one",
             friend_number);
     }
+}
+
+void TunnelServer::teardown_after_keepalive_verdict(
+    uint32_t friend_number, const std::weak_ptr<tunnel::TunnelManager>& verdict_manager) {
+    // The verdict was raised on a timer thread and queued behind whatever the
+    // strand already held -- possibly a frame from this very friend, which
+    // cleared the dead latch (note_peer_activity) before we got here. Ingress
+    // runs on this strand too, so re-checking here is race-free: tear down
+    // only if the manager that was judged is still this friend's live manager
+    // and is still judged dead.
+    auto judged = verdict_manager.lock();
+    if (!judged || !judged->peer_dead()) {
+        return;
+    }
+    {
+        std::lock_guard lock(managers_mutex_);
+        auto it = managers_.find(friend_number);
+        if (it == managers_.end() || it->second != judged) {
+            return;
+        }
+    }
+    util::Logger::warn("Friend {} unresponsive (keepalive); tearing down its tunnels",
+                       friend_number);
+    teardown_tunnel_manager(friend_number);
 }
 
 void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {

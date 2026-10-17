@@ -146,6 +146,30 @@ TEST(InspectServerJson, StatusOmitsPeerOnlineSecondsWhenProviderUnset) {
     EXPECT_EQ(json.find("peer_online_seconds"), std::string::npos) << json;
 }
 
+TEST(InspectServerJson, StatusReportsTheDhtNodeIdentity) {
+    // What a peer on a private network needs to bootstrap from / relay through
+    // this node: the DHT key (not the Tox ID) and the bound ports.
+    auto providers = make_providers_with_one_tunnel();
+    providers.dht_node = []() -> InspectProviders::DhtNode {
+        return {std::string(64, 'C'), 34510, 34511};
+    };
+    const auto json = InspectServer::render_status_json(providers);
+    EXPECT_NE(json.find("\"dht_public_key\":\"" + std::string(64, 'C') + "\""), std::string::npos)
+        << json;
+    EXPECT_NE(json.find("\"udp_port\":34510"), std::string::npos) << json;
+    EXPECT_NE(json.find("\"tcp_relay_port\":34511"), std::string::npos) << json;
+}
+
+TEST(InspectServerJson, StatusOmitsUnboundDhtPorts) {
+    // A client runs no TCP relay; a proxied node has no UDP socket.
+    auto providers = make_providers_with_one_tunnel();
+    providers.dht_node = []() -> InspectProviders::DhtNode { return {std::string(64, 'D'), 0, 0}; };
+    const auto json = InspectServer::render_status_json(providers);
+    EXPECT_NE(json.find("dht_public_key"), std::string::npos) << json;
+    EXPECT_EQ(json.find("udp_port"), std::string::npos) << json;
+    EXPECT_EQ(json.find("tcp_relay_port"), std::string::npos) << json;
+}
+
 TEST(InspectServerJson, ErrorRendersWellFormedObject) {
     const auto json = InspectServer::render_error_json("bad request");
     EXPECT_EQ(json, std::string("{\"error\":\"bad request\"}"));

@@ -564,6 +564,9 @@ TEST_F(KeepaliveTest, ExemptTimeDoesNotAccrueEvenWhenTimeoutEqualsInterval) {
 }
 
 TEST_F(KeepaliveTest, StaysAliveWhilePongsArrive) {
+    // Hold a tunnel: with none, the empty-manager exemption alone would keep
+    // the peer alive and the test would prove nothing about PONGs.
+    manager->add_tunnel(903, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/903));
     std::atomic<bool> dead{false};
     manager->set_on_peer_dead([&dead]() { dead.store(true); });
     manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/2);
@@ -576,6 +579,66 @@ TEST_F(KeepaliveTest, StaysAliveWhilePongsArrive) {
         std::this_thread::sleep_for(200ms);
     }
     EXPECT_FALSE(dead.load());
+}
+
+// Field regression (cross-machine rig, ~8 KB/s relay link): a bulk transfer
+// kept TUNNEL_DATA flowing while the PONG waited behind it in the ordered
+// lossless stream, and the peer was declared dead mid-transfer. Any frame the
+// peer sends is proof of life.
+TEST_F(KeepaliveTest, StaysAliveWhileOtherFramesArriveWithoutPongs) {
+    manager->add_tunnel(904, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/904));
+    std::atomic<bool> dead{false};
+    manager->set_on_peer_dead([&dead]() { dead.store(true); });
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/2);
+
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < 3500ms) {
+        manager->note_peer_activity();  // e.g. TUNNEL_DATA, never a PONG
+        io_ctx.poll();
+        std::this_thread::sleep_for(200ms);
+    }
+    EXPECT_FALSE(dead.load());
+    EXPECT_FALSE(manager->peer_dead());
+}
+
+// A dead verdict whose toxcore link never dropped used to be permanent: the
+// manager stopped pinging and only a friend-connection change could revive
+// the peer. It must keep probing, report the first sign of life exactly once,
+// and be able to reach a fresh verdict afterwards.
+TEST_F(KeepaliveTest, KeepsProbingAfterDeathAndReportsRecoveryOnce) {
+    manager->add_tunnel(905, MakeConnectedTunnel(io_ctx, /*tunnel_id=*/905));
+    // Shared, not test-body locals: TearDown() closes the tunnel through these
+    // handlers after the body has returned.
+    auto pings = std::make_shared<std::atomic<int>>(0);
+    auto deaths = std::make_shared<std::atomic<int>>(0);
+    auto recoveries = std::make_shared<std::atomic<int>>(0);
+    manager->set_send_handler([pings](const std::vector<uint8_t>& f) {
+        if (!f.empty() && f[0] == static_cast<uint8_t>(FrameType::PING)) {
+            pings->fetch_add(1);
+        }
+        return SendOutcome::Sent;
+    });
+    manager->set_on_peer_dead([deaths]() { deaths->fetch_add(1); });
+    manager->set_on_peer_alive([recoveries]() { recoveries->fetch_add(1); });
+    manager->enable_keepalive(/*interval_seconds=*/1, /*timeout_seconds=*/1);
+
+    ASSERT_TRUE(RunUntil(io_ctx, [deaths] { return deaths->load() == 1; }, 5000ms));
+    EXPECT_TRUE(manager->peer_dead());
+
+    // Probes continue after the verdict, and the verdict is not repeated.
+    const int pings_at_death = pings->load();
+    EXPECT_TRUE(RunUntil(
+        io_ctx, [pings, pings_at_death] { return pings->load() >= pings_at_death + 2; }, 5000ms));
+    EXPECT_EQ(deaths->load(), 1);
+
+    // First sign of life: one recovery, however many frames report it.
+    manager->note_peer_activity();
+    manager->note_peer_activity();
+    EXPECT_EQ(recoveries->load(), 1);
+    EXPECT_FALSE(manager->peer_dead());
+
+    // Silence again -> a second, independent verdict.
+    EXPECT_TRUE(RunUntil(io_ctx, [deaths] { return deaths->load() == 2; }, 5000ms));
 }
 
 TEST_F(KeepaliveTest, SendsPeriodicPingFrames) {

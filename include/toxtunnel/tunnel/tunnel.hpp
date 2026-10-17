@@ -553,11 +553,11 @@ class TunnelImpl : public Tunnel {
     /// Configure the BDP-aware flow-control window. Replaces the constructor
     /// fixed-window argument. When `mode: bdp` is selected, RTT and bandwidth
     /// observations from `observe_rtt_us`/`observe_bandwidth_bps` (driven by
-    /// the existing PING/PONG and ACK paths) resize the window in place.
+    /// the TUNNEL_ACK path, see rtt_samples_) resize the window in place.
     void configure_flow_control(const BdpFlowControl::Config& cfg);
 
-    /// Observation hooks for the BDP estimator. Wired from the PING/PONG and
-    /// TUNNEL_ACK paths. Calling these has no effect when flow control is in
+    /// Observation hooks for the BDP estimator. Wired from the TUNNEL_ACK
+    /// path. Calling these has no effect when flow control is in
     /// fixed mode (the EWMA is still updated for telemetry).
     void observe_rtt_us(std::int64_t rtt_us);
     void observe_bandwidth_bps(std::int64_t bps);
@@ -569,6 +569,12 @@ class TunnelImpl : public Tunnel {
 
     /// Current EWMA RTT in microseconds.
     [[nodiscard]] std::int64_t rtt_us() const noexcept { return flow_control_.rtt_us(); }
+
+    /// True while the BDP estimator probes for a fresh minimum RTT.
+    [[nodiscard]] bool probing_min_rtt() const noexcept { return flow_control_.probing_min_rtt(); }
+
+    /// Windowed minimum RTT in microseconds (what the BDP target uses).
+    [[nodiscard]] std::int64_t min_rtt_us() const noexcept { return flow_control_.min_rtt_us(); }
 
     /// Current EWMA bandwidth estimate (bytes/sec).
     [[nodiscard]] std::int64_t bandwidth_bps() const noexcept {
@@ -1268,7 +1274,13 @@ class TunnelImpl : public Tunnel {
 
     /// (Re)arm the flush timer if the buffer is non-empty and no timer is
     /// pending. The caller must hold `coalesce_mutex_`.
-    void coalesce_arm_timer_locked();
+    /// @p backpressured: re-arm after toxcore refused DATA (SENDQ full). The
+    /// wait is then at least kBackpressureRetryUs -- toxcore frees capacity
+    /// only from its iterate loop (<= 5 ms), so retrying at the coalesce delay
+    /// (200 us, 0 on Windows) just spun every congested tunnel at kHz rates
+    /// through the blocking Tox-thread bridge.
+    void coalesce_arm_timer_locked(bool backpressured = false);
+    static constexpr std::uint32_t kBackpressureRetryUs = 5000;
 
     /// Bytes still pending in the outbound cohort FIFO. The caller must hold
     /// `coalesce_mutex_`.
@@ -1606,15 +1618,46 @@ class TunnelImpl : public Tunnel {
     std::atomic<bool> flow_control_configured_{false};
     std::atomic<std::int64_t> last_push_ns_{0};
 
-    /// BDP sampling state.
-    /// `burst_start_ns_`: steady_clock ns when send_window_used_ went 0->positive
-    ///   (we use this to time the round-trip from first byte sent → first ACK
-    ///   that brings the window back to zero). Stored as 0 when no burst is
-    ///   in-flight.
-    /// `last_ack_ns_`: steady_clock ns of the previous TUNNEL_ACK arrival,
-    ///   used to compute instantaneous bandwidth = bytes_acked / delta_t.
-    std::atomic<std::int64_t> burst_start_ns_{0};
-    std::atomic<std::int64_t> last_ack_ns_{0};
+    /// BDP sampling state, all guarded by `bdp_sample_mutex_` -- a leaf: the
+    /// emission driver takes it around (never across) its send callback and
+    /// may hold coalesce_mutex_ while doing so; the ACK handler takes nothing
+    /// else under it. So a synchronous ACK re-entering from inside the send
+    /// callback is fine.
+    ///  - `rtt_samples_`: {cumulative emitted offset, send time} recorded by
+    ///    the driver as DATA is handed to toxcore, at most one per
+    ///    kRttSampleSpacing bytes. An ACK that brings total_bytes_acked_ past
+    ///    a sample's offset yields RTT = now - its send time: a per-byte round
+    ///    trip, where the old "first byte of a burst until the window drained"
+    ///    sample included the whole queue and was rare under sustained load.
+    ///  - `last_ack_ns_` / `bw_carry_bytes_`: bandwidth = bytes acked over the
+    ///    interval since the last sample, which spans at least
+    ///    max(kMinBandwidthIntervalNs, min RTT / 2); ACKs inside it carry
+    ///    their bytes forward (batched ACKs must not read as a burst rate).
+    struct RttSample {
+        std::uint64_t end_offset;
+        std::int64_t sent_ns;
+        std::uint64_t inflight;  ///< bytes emitted but unacked when this was sent
+    };
+    // Whether a sample is trusted for the min-RTT filter is decided by
+    // BdpFlowControl::is_trusted_inflight() (relative to the configured floor).
+    static constexpr std::uint64_t kRttSampleSpacing = 8 * 1024;
+    /// Shortest interval a bandwidth sample may span (see the ACK handler).
+    static constexpr std::int64_t kMinBandwidthIntervalNs = 20'000'000;
+    static constexpr std::size_t kMaxRttSamples = 64;
+    std::mutex bdp_sample_mutex_;
+    std::deque<RttSample> rtt_samples_;
+    std::int64_t last_ack_ns_{0};
+    std::uint64_t bw_carry_bytes_{0};
+    /// The previous ACK left nothing outstanding: the sender may have gone
+    /// idle, so the next interval would count idle time as slow delivery and
+    /// shrink the window. It restarts the interval instead.
+    bool bw_window_drained_{false};
+
+    /// Emission-driver side of the RTT sampler; see rtt_samples_. Returns
+    /// whether a sample was recorded for @p end_offset.
+    bool note_rtt_sample_sent(std::uint64_t end_offset);
+    /// Undo note_rtt_sample_sent() for a send that did not go out.
+    void drop_rtt_sample(std::uint64_t end_offset);
 
     /// Protects non-atomic members.
     mutable std::mutex mutex_;

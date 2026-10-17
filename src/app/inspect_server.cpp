@@ -459,6 +459,18 @@ std::string InspectServer::render_status_json(const InspectProviders& providers)
         out += "\"dht_connected\":";
         out += providers.dht_connected() ? "true" : "false";
     }
+    if (providers.dht_node) {
+        const auto node = providers.dht_node();
+        if (!node.public_key_hex.empty()) {
+            append_kv_string(out, "dht_public_key", node.public_key_hex, first);
+        }
+        if (node.udp_port != 0) {
+            append_kv_num(out, "udp_port", node.udp_port, first);
+        }
+        if (node.tcp_relay_port != 0) {
+            append_kv_num(out, "tcp_relay_port", node.tcp_relay_port, first);
+        }
+    }
     if (providers.peer_online_seconds) {
         append_kv_num(out, "peer_online_seconds", providers.peer_online_seconds(), first);
     }

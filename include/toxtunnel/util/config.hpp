@@ -129,6 +129,23 @@ struct BootstrapNodeConfig {
 
 using BootstrapMode = tox::BootstrapMode;
 
+/// Proxy kind for toxcore's TCP connections (`tox.proxy.type`).
+enum class ToxProxyType { None, Http, Socks5 };
+
+/// `tox.proxy`: route toxcore's TCP traffic (TCP relays, and through them the
+/// DHT/onion) via an HTTP CONNECT or SOCKS5 proxy. For hosts whose only way
+/// out is a proxy. toxcore turns UDP off whenever a proxy is set (it cannot
+/// proxy UDP), so a proxied node is TCP-relay-only regardless of
+/// `tox.udp_enabled`.
+struct ToxProxyConfig {
+    ToxProxyType type = ToxProxyType::None;
+    std::string host;  ///< Proxy host (IP or DNS name, resolved locally)
+    uint16_t port = 0;
+
+    [[nodiscard]] bool enabled() const noexcept { return type != ToxProxyType::None; }
+    bool operator==(const ToxProxyConfig& other) const = default;
+};
+
 /// Shared toxcore network configuration.
 struct ToxConfig {
     bool udp_enabled = true;  ///< Enable UDP for toxcore
@@ -151,11 +168,13 @@ struct ToxConfig {
     uint16_t tcp_port = 33445;                           ///< TCP relay port (server use)
     BootstrapMode bootstrap_mode = BootstrapMode::Auto;  ///< Bootstrap behavior
     std::vector<BootstrapNodeConfig> bootstrap_nodes;    ///< Explicit bootstrap nodes
+    ToxProxyConfig proxy;                                ///< Optional TCP proxy
 
     bool operator==(const ToxConfig& other) const {
         return udp_enabled == other.udp_enabled && ipv6_enabled == other.ipv6_enabled &&
                udp_port == other.udp_port && tcp_port == other.tcp_port &&
-               bootstrap_mode == other.bootstrap_mode && bootstrap_nodes == other.bootstrap_nodes;
+               bootstrap_mode == other.bootstrap_mode && bootstrap_nodes == other.bootstrap_nodes &&
+               proxy == other.proxy;
     }
 };
 
@@ -238,6 +257,12 @@ struct TunnelConfig {
     /// what a server that has lost this client's TunnelManager produced
     /// (issue #36). 0 disables the bound. Non-reloadable.
     uint32_t open_timeout_seconds = 30;
+    /// Client: how long a local connection accepted while the active server is
+    /// offline is held (unread) waiting for it to come back, instead of being
+    /// closed at once. Covers the start-up race and brief link blips. Forward
+    /// rules only (SOCKS5 / HTTP CONNECT still fail immediately). 0 = close at
+    /// once (pre-v0.5.0). Non-reloadable.
+    uint32_t offline_open_wait_seconds = 10;
     TunnelResumeConfig resume;
 
     [[nodiscard]] bool reaper_enabled() const noexcept { return idle_timeout_seconds > 0; }
@@ -265,8 +290,10 @@ struct WatchdogConfig {
 /// estimates fed by `handle_tunnel_ack_frame`. Use `mode: fixed` to lock to
 /// the legacy v0.3.0 256 KiB / 16 KiB window (e.g. for soak-test reproducibility).
 struct FlowControlConfig {
-    std::string mode = "bdp";                          ///< "bdp" or "fixed"
-    uint32_t send_window_min_bytes = 65536;            ///< 64 KiB clamp floor
+    std::string mode = "bdp";  ///< "bdp" or "fixed"
+    /// Clamp floor (bdp mode). Never effectively below 32 KiB: twice the
+    /// receiver's fixed 16 KiB ACK threshold (BdpFlowControl::kAckSafeFloorBytes).
+    uint32_t send_window_min_bytes = 32768;
     uint32_t send_window_max_bytes = 4 * 1024 * 1024;  ///< 4 MiB clamp ceiling
     uint32_t safety_factor_x100 = 150;                 ///< 1.5× BDP headroom
     uint32_t fixed_window_bytes = 262144;  ///< 256 KiB — used in fixed mode and as the initial BDP

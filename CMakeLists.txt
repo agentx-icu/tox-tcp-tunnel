@@ -1,13 +1,88 @@
 cmake_minimum_required(VERSION 3.16)
-project(toxtunnel VERSION 0.1.11 LANGUAGES C CXX)
+project(toxtunnel VERSION 0.5.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
-if(DEFINED RELEASE_VERSION)
+# Two version values:
+#   TOXTUNNEL_VERSION        package version (CPack: DEB/RPM/MSI/pkg) -- must stay
+#                            a plain dotted number.
+#   TOXTUNNEL_VERSION_STRING what the binary reports (--version, logs, metrics,
+#                            INFO_REPLY disclosure).
+# A release build passes -DRELEASE_VERSION=<x.y.z> and both are that. Any other
+# build reports `git describe` (e.g. 0.4.14-9-g52154ee-dirty), so a source build
+# says which commit it is instead of the stale project() number every dev build
+# used to claim. RELEASE_VERSION is consumed and dropped from the cache: a build
+# directory configured once for a release no longer reports that release
+# forever after.
+if(DEFINED RELEASE_VERSION AND NOT RELEASE_VERSION STREQUAL "")
     set(TOXTUNNEL_VERSION "${RELEASE_VERSION}")
+    set(TOXTUNNEL_VERSION_STRING "${RELEASE_VERSION}")
+    set(_toxtunnel_version_source "RELEASE_VERSION")
 else()
     set(TOXTUNNEL_VERSION "${PROJECT_VERSION}")
+    set(TOXTUNNEL_VERSION_STRING "${PROJECT_VERSION}")
+    set(_toxtunnel_version_source "project()")
+    find_package(Git QUIET)
+    if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" describe --tags --match "v[0-9]*" --dirty
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            RESULT_VARIABLE _git_describe_result
+            OUTPUT_VARIABLE _git_describe
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(_git_describe_result EQUAL 0 AND NOT _git_describe STREQUAL "")
+            string(REGEX REPLACE "^v" "" TOXTUNNEL_VERSION_STRING "${_git_describe}")
+            set(_toxtunnel_version_source "git describe")
+        endif()
+        # Re-run configure when the checked-out commit moves, so the string
+        # does not go stale across commits / checkouts in one build dir. Ask
+        # git for the paths rather than assuming .git is a directory: in a
+        # worktree or submodule it is a file pointing elsewhere.
+        foreach(_git_path_arg HEAD packed-refs)
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" rev-parse --git-path ${_git_path_arg}
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                RESULT_VARIABLE _git_path_result
+                OUTPUT_VARIABLE _git_path
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(_git_path_result EQUAL 0)
+                get_filename_component(_git_path "${_git_path}" ABSOLUTE
+                                       BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+                if(EXISTS "${_git_path}")
+                    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_git_path}")
+                endif()
+            endif()
+        endforeach()
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" symbolic-ref -q HEAD
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            RESULT_VARIABLE _git_ref_result
+            OUTPUT_VARIABLE _git_ref
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(_git_ref_result EQUAL 0 AND NOT _git_ref STREQUAL "")
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" rev-parse --git-path "${_git_ref}"
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                RESULT_VARIABLE _git_path_result
+                OUTPUT_VARIABLE _git_path
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(_git_path_result EQUAL 0)
+                get_filename_component(_git_path "${_git_path}" ABSOLUTE
+                                       BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+                if(EXISTS "${_git_path}")
+                    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_git_path}")
+                endif()
+            endif()
+        endif()
+    endif()
 endif()
+unset(RELEASE_VERSION CACHE)
+message(STATUS "toxtunnel version: ${TOXTUNNEL_VERSION_STRING} "
+               "(package ${TOXTUNNEL_VERSION}, from ${_toxtunnel_version_source})")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -178,7 +253,7 @@ target_link_libraries(toxtunnel_lib PUBLIC
 target_compile_definitions(toxtunnel_lib PUBLIC
     ASIO_STANDALONE
     ASIO_NO_DEPRECATED
-    TOXTUNNEL_VERSION="${TOXTUNNEL_VERSION}"
+    TOXTUNNEL_VERSION="${TOXTUNNEL_VERSION_STRING}"
 )
 if(WIN32 AND TOXTUNNEL_PORTABLE_RELEASE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
     # Windows 7 API floor for x64 release artifacts.

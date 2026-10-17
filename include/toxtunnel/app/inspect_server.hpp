@@ -39,6 +39,16 @@ struct InspectProviders {
     /// existed `inspect status` reported it as healthy (issue #34).
     std::function<bool()> dht_connected;
 
+    /// Optional: this node's DHT identity and bound ports, so an operator can
+    /// pin it as a bootstrap node / TCP relay for peers that cannot reach the
+    /// public DHT. Fields that are empty / 0 are omitted from the reply.
+    struct DhtNode {
+        std::string public_key_hex;
+        uint16_t udp_port = 0;
+        uint16_t tcp_relay_port = 0;
+    };
+    std::function<DhtNode()> dht_node;
+
     /// Optional (client mode): seconds the active server has been continuously
     /// online, or 0 when offline. Lets `inspect status` answer "is the tunnel
     /// up, and since when" directly instead of inferring it from lifecycle log

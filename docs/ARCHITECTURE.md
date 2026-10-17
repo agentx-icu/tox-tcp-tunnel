@@ -42,7 +42,7 @@
 | `WriteQueue`        | Per-tunnel write coalescer in `TunnelManager`. Accumulates small writes for up to `tunnel.coalesce_max_delay_us` (200µs default) or `tunnel.coalesce_max_bytes` (1362 = TUNNEL_DATA MTU) before flushing one TUNNEL_DATA frame. Wire-format unchanged. |
 | `OwnedFrameBuffer`  | Outbound zero-copy buffer (Wave B). Reserves 6 bytes of prefix (`0xA0` lossless byte + 5-byte tunnel frame header) inside a single `shared_ptr<vector<uint8_t>>` allocation; the TCP read path writes directly into the payload region and `ProtocolFrame::serialize_tunnel_data_in_place()` fills in the header before toxcore is called. See [Outbound Copy Path](#outbound-copy-path). |
 | `WriteCoalescer`    | Per-tunnel EWMA + policy state machine. Selects between `Bypass`, `Drain`, and `Batch` policies based on `avg_write_size` vs MTU and `avg_write_gap` vs `4 × max_delay_us`. α = 1/8, 4-tick hysteresis. Operator pins mode via `tunnel.coalesce_mode`. |
-| `BdpFlowControl`    | Per-tunnel send-window state. Tracks RTT (PING/PONG round-trip) and bandwidth (cumulative-ACK delta) as EWMAs; recomputes the target window as `bdp × safety_factor` clamped to `[min, max]`. In `mode: fixed` the window is pinned to the v0.3.0 value; `mode: bdp` (the default since v0.4.1) sizes it dynamically. |
+| `BdpFlowControl`    | Per-tunnel send-window state. RTT comes from per-byte-range samples (a DATA frame's hand-off to toxcore until the TUNNEL_ACK that covers it); bandwidth from bytes acknowledged per ACK interval. The target window is `bandwidth × (windowed-min RTT + 50 ms) × safety_factor`, clamped to `[min, max]` with min never below 32 KiB (twice the receiver's 16 KiB ACK threshold). The seed window is only the starting point. In `mode: fixed` the window is pinned to the v0.3.0 value; `mode: bdp` (the default since v0.4.1) sizes it dynamically. |
 | `RateLimiter`       | Per-friend token-bucket layer that runs before `RulesEngine` on TUNNEL_OPEN. Modes: `off \| report \| enforce`. Hot-reloadable via the rules file. Defaults to `off` (no v0.3.0 behaviour change). A per-friend `rate_limit:` block **overrides only the fields it names**, inheriting the rest from `rate_limit_defaults`. Byte limiting (`bytes_per_sec` / `bytes_burst`) is live since v0.4.11: inbound `TUNNEL_DATA` from the friend is metered per friend, and `enforce` defers and replays over-budget frames in arrival order rather than dropping them. It is self-bounding — a parked frame emits no `TUNNEL_ACK`, so the peer's window fills and it stops sending. A receiver-side deferral cannot hold an average rate against a peer that ignores flow control; `max_concurrent_tunnels` / `open_per_sec` remain the anti-DoS knobs. |
 | `ToxWatchdog`       | Heartbeat-based detector for a stalled `tox_iterate`. The Tox thread bumps the counter on every return; a 1 Hz observer on the main IO context calls `std::abort()` if the deadline is exceeded. Persistent abort count lives at `<data_dir>/abort_count`. |
 | `TunnelIdAllocator` | Bitset-backed 1..65535 allocator with a roving cursor and an explicit `reserve(id)` API for the tunnel-resume path. |
@@ -579,8 +579,14 @@ Key properties:
   sub-MTU writes (emit on overflow only), and `Batch` for trickle
   workloads (the v0.3.0 default behaviour, with a 200 µs hold timer).
 - The `BdpFlowControl` window resizes between `min_window_bytes` and
-  `max_window_bytes` when `flow_control.mode: bdp`; in `fixed` mode
-  the v0.3.0 256 KiB / 16 KiB cadence is preserved.
+  `max_window_bytes` when `flow_control.mode: bdp` (and since v0.5.0 also
+  below the 256 KiB seed, so a bulk tunnel on a slow path does not queue
+  tens of seconds of data ahead of every other frame for that friend); in
+  `fixed` mode the v0.3.0 256 KiB / 16 KiB cadence is preserved.
+- A forward connection accepted while the active server is offline is held
+  unread (`tunnel.offline_open_wait_seconds`, max 64) and opened once the
+  server is back; the accept / release decisions run on the client's inbound
+  strand with the transitions that change `server_online_`.
 - When the tunnel send window is full, the currently-read TCP chunk is
   retained in `pending_tcp_input_`, `TcpConnection::pause_read()` stops
   further socket reads, and later `TUNNEL_ACK`s retry that backlog before

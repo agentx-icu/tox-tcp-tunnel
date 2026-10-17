@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -34,8 +35,13 @@ struct ClientServerEndpoint {
     std::string tox_id_hex;
     /// Friend number returned by ToxAdapter::add_friend / add_friend_norequest.
     uint32_t friend_number = 0;
-    /// Most recently reported online/offline state from toxcore.
+    /// Usable: the toxcore friend link is up AND (with keepalive) the server
+    /// application has not been judged unresponsive.
     bool online = false;
+    /// The toxcore friend link alone, as last reported by toxcore. Differs
+    /// from `online` only while a keepalive verdict holds the endpoint
+    /// offline over a link that never dropped; recovery needs it.
+    bool link_up = false;
     /// Timestamp (steady_clock) of the most recent online->offline transition
     /// (or the initial seed at construction). Zero for never observed.
     std::chrono::steady_clock::time_point offline_since{};
@@ -348,6 +354,14 @@ class TunnelClient {
     /// without toxcore. Args: friend number, prefixed packet bytes.
     std::function<void(std::uint32_t, const std::vector<std::uint8_t>&)> resume_request_sender_;
 
+    /// Apply a toxcore friend-connection change. Runs on the inbound strand.
+    void on_friend_connection(uint32_t friend_number, bool connected);
+
+    /// Apply a keepalive death verdict about @p dead_friend on the inbound
+    /// strand: a no-op unless that friend is still the active, routed server
+    /// and the manager is still latched dead.
+    void apply_keepalive_dead_verdict(uint32_t dead_friend);
+
     /// The friend the inbound routing path is currently pinned to (issue #30).
     /// Touched ONLY on `inbound_strand_`: the switch repins it together with
     /// the manager send handler in one strand task, and the inbound routing
@@ -521,6 +535,48 @@ class TunnelClient {
     void open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn, std::string host,
                             uint16_t port, std::vector<uint8_t> initial_payload,
                             std::function<void(TunnelOpenOutcome)> on_tunnel_state);
+
+    // -----------------------------------------------------------------
+    // Held local connections (tunnel.offline_open_wait_seconds)
+    // -----------------------------------------------------------------
+    // A forward connection accepted while the active server is offline is
+    // held, unread, for up to the configured wait instead of being closed at
+    // once, and opened in arrival order when the server comes online.
+    // Decisions run on inbound_strand_, serialized with the transitions that
+    // change server_online_; held_mutex_ additionally lets stop() close the
+    // held sockets from its own thread. Declared last so these members go
+    // before io_ctx_ on destruction.
+
+    /// Accept decision for a forward connection (on the strand when there is
+    /// one): open now, hold, or close.
+    void accept_forward_connection(std::shared_ptr<core::TcpConnection> conn,
+                                   const ForwardRule& rule);
+    /// Wire and open the tunnel for an accepted forward connection.
+    void open_tunnel_for_connection(std::shared_ptr<core::TcpConnection> conn,
+                                    const ForwardRule& rule);
+    /// Open every held connection if the active server is online (strand).
+    void release_held_connections();
+    /// Queue release_held_connections() behind whatever the strand holds.
+    void post_release_held_connections();
+    /// Close held connections whose wait expired; re-arm while any remain.
+    void expire_held_connections();
+    void arm_held_timer_locked();
+    /// Close every held connection and cancel the timer (stop()).
+    void close_held_connections();
+
+    struct HeldConnection {
+        std::shared_ptr<core::TcpConnection> conn;
+        ForwardRule rule;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    static constexpr std::size_t kMaxHeldConnections = 64;
+    std::mutex held_mutex_;
+    std::deque<HeldConnection> held_;
+    std::unique_ptr<asio::steady_timer> held_timer_;  ///< only touched under held_mutex_
+    bool held_timer_armed_{false};
+    bool held_closed_{false};  ///< latched by close_held_connections() (stop)
+    /// tunnel.offline_open_wait_seconds, snapshotted in initialize().
+    std::atomic<std::uint32_t> held_wait_seconds_{0};
 };
 
 }  // namespace toxtunnel::app

@@ -156,6 +156,15 @@ TEST(CheckReloadableTest, RejectsToxUdpEnabledChange) {
     EXPECT_NE(res.error().find("tox"), std::string::npos) << res.error();
 }
 
+TEST(CheckReloadableTest, RejectsToxProxyChange) {
+    auto a = make_server_config();
+    auto b = a;
+    b.tox.proxy = {ToxProxyType::Socks5, "127.0.0.1", 7890};
+    auto res = check_reloadable(a, b);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_NE(res.error().find("tox"), std::string::npos) << res.error();
+}
+
 TEST(CheckReloadableTest, RejectsServerTcpPortChange) {
     auto a = make_server_config();
     auto b = a;

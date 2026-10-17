@@ -37,8 +37,12 @@ const KeySet& bootstrap_node_keys() {
     return k;
 }
 const KeySet& tox_keys() {
-    static const KeySet k{"udp_enabled", "ipv6_enabled",   "udp_port",
-                          "tcp_port",    "bootstrap_mode", "bootstrap_nodes"};
+    static const KeySet k{"udp_enabled",    "ipv6_enabled",    "udp_port", "tcp_port",
+                          "bootstrap_mode", "bootstrap_nodes", "proxy"};
+    return k;
+}
+const KeySet& tox_proxy_keys() {
+    static const KeySet k{"type", "host", "port"};
     return k;
 }
 const KeySet& resume_keys() {
@@ -51,10 +55,16 @@ const KeySet& resume_keys() {
     return k;
 }
 const KeySet& tunnel_keys() {
-    static const KeySet k{
-        "coalesce_max_delay_us",      "coalesce_max_bytes",   "coalesce_mode",
-        "idle_timeout_seconds",       "reaper_tick_seconds",  "keepalive_interval_seconds",
-        "half_close_timeout_seconds", "open_timeout_seconds", "resume"};
+    static const KeySet k{"coalesce_max_delay_us",
+                          "coalesce_max_bytes",
+                          "coalesce_mode",
+                          "idle_timeout_seconds",
+                          "reaper_tick_seconds",
+                          "keepalive_interval_seconds",
+                          "half_close_timeout_seconds",
+                          "open_timeout_seconds",
+                          "offline_open_wait_seconds",
+                          "resume"};
     return k;
 }
 const KeySet& flow_control_keys() {
@@ -133,6 +143,8 @@ void walk_child(const YAML::Node& child, const std::string& child_path, const st
         walk_map(child, child_path, inspect_keys(), out);
     } else if (key == "tox" && child.IsMap()) {
         walk_map(child, child_path, tox_keys(), out);
+    } else if (key == "proxy" && child.IsMap()) {
+        walk_map(child, child_path, tox_proxy_keys(), out);
     } else if (key == "tunnel" && child.IsMap()) {
         walk_map(child, child_path, tunnel_keys(), out);
     } else if (key == "resume" && child.IsMap()) {

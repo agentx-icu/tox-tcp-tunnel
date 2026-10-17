@@ -1137,21 +1137,25 @@ TEST_F(TunnelSendersTest, OpenAckAlsoWaitsBehindAParkedFrame) {
     EXPECT_EQ(on_wire, (std::vector<FrameType>{FrameType::TUNNEL_CLOSE, FrameType::TUNNEL_ACK}));
 }
 
-TEST_F(TunnelSendersTest, DataIsNotHeldBehindAnUnrelatedParkedFrame) {
-    // DATA deliberately skips the barrier: it can only flow on a Connected
-    // tunnel, which required a barriered OPEN or OPEN_ACK, so it is already
-    // ordered behind them. Stalling a live stream behind an unrelated parked
-    // PING would be a pure regression.
+TEST_F(TunnelSendersTest, DataYieldsToAParkedControlFrame) {
+    // Control frames go first. A control frame that toxcore refused is parked
+    // and retried on a timer, while DATA is re-offered the moment capacity
+    // frees; letting DATA through here meant a bulk transfer took every freed
+    // slot and an OPEN_ACK waited past the 30 s open deadline on the
+    // cross-machine rig. DATA now reports backpressure until the parked frame
+    // is out (its own retry owns the bytes, so nothing is lost or doubled).
     refuse_next_manager_send = true;
     ASSERT_TRUE(manager->send_frame(ProtocolFrame::make_ping()));
 
     const std::array<std::uint8_t, 2> payload{1, 2};
-    EXPECT_EQ(send_direct(ProtocolFrame::make_tunnel_data(
-                  kTunnelId, std::span<const std::uint8_t>(payload.data(), payload.size()))),
-              SendOutcome::Sent);
-    EXPECT_EQ(on_wire, (std::vector<FrameType>{FrameType::TUNNEL_DATA}));
+    const auto data = ProtocolFrame::make_tunnel_data(
+        kTunnelId, std::span<const std::uint8_t>(payload.data(), payload.size()));
+    EXPECT_EQ(send_direct(data), SendOutcome::SendqFull);
+    EXPECT_TRUE(on_wire.empty());
 
-    io_ctx.run();
+    io_ctx.run();  // the parked PING drains
+    EXPECT_EQ(send_direct(data), SendOutcome::Sent);
+    EXPECT_EQ(on_wire, (std::vector<FrameType>{FrameType::PING, FrameType::TUNNEL_DATA}));
 }
 
 // ===========================================================================
