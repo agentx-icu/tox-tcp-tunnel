@@ -2248,15 +2248,14 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
     // Feed BDP flow control + metrics histograms. Only meaningful when an
     // ACK actually moved bytes; the OPEN-ACK path returns earlier above.
     if (acked > 0 && flow_control_configured_.load(std::memory_order_acquire)) {
-        const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto now_ns = sampler_now_ns();
 
         // One leaf-locked step for both estimators (see bdp_sample_mutex_):
         //  - RTT from the newest send-time sample this ACK covers. ACKs are
         //    delta credits on the wire; acked_total is the cumulative, clamped
         //    offset they add up to, which is what the samples are keyed on.
-        //  - Bandwidth over the interval since the last sample, which spans
-        //    at least max(20 ms, min RTT / 2); ACKs inside it carry their
-        //    bytes forward (see below).
+        //  - Bandwidth as a delivery rate from the anchor sample (see
+        //    rtt_samples_ in the header).
         std::int64_t rtt_us = 0;
         std::int64_t trusted_rtt_us = 0;
         std::int64_t bps = 0;
@@ -2266,10 +2265,19 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
             // TRUSTED one for the minimum (one large ACK may cover both).
             std::int64_t sent_ns = 0;
             std::int64_t trusted_sent_ns = 0;
-            while (!rtt_samples_.empty() && rtt_samples_.front().end_offset <= acked_total) {
-                sent_ns = rtt_samples_.front().sent_ns;
-                if (flow_control_.is_trusted_inflight(rtt_samples_.front().inflight)) {
+            // Concurrent ACK handlers may reach this lock out of order; the
+            // sampler works on its own monotonic offset, never a stale local.
+            sampler_delivered_ = std::max(sampler_delivered_, acked_total);
+            last_delivered_ns_ = std::max(last_delivered_ns_, now_ns);
+            const std::uint64_t delivered_now = sampler_delivered_;
+            while (!rtt_samples_.empty() && rtt_samples_.front().end_offset <= delivered_now) {
+                const RttSample& s = rtt_samples_.front();
+                sent_ns = s.sent_ns;
+                if (flow_control_.is_trusted_inflight(s.inflight)) {
                     trusted_sent_ns = sent_ns;
+                }
+                if (!bw_anchor_) {
+                    bw_anchor_ = s;
                 }
                 rtt_samples_.pop_front();
             }
@@ -2280,37 +2288,39 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
                 trusted_rtt_us = (now_ns - trusted_sent_ns) / 1000;
             }
 
-            if (last_ack_ns_ == 0 || bw_window_drained_) {
-                // First ACK, or the first after the window ran dry: open a new
-                // interval rather than measure across a possible idle gap.
-                last_ack_ns_ = now_ns;
-                bw_carry_bytes_ = 0;
-            } else {
-                bw_carry_bytes_ += acked;
-                const std::int64_t delta_ns = now_ns - last_ack_ns_;
-                // Measure over at least max(20 ms, min RTT / 2), not ACK to
-                // ACK. toxcore hands over several ACKs in one iterate pass
-                // ("ACK compression"): two 16 KiB ACKs 1.5 ms apart read as
-                // 10 MB/s on an 80 KB/s path, which pumped the EWMA and
+            if (bw_anchor_) {
+                // Measure over at least max(20 ms, min RTT / 2). toxcore hands
+                // over several ACKs in one iterate pass ("ACK compression"),
+                // and a reverse path busy with data releases queued ACKs in a
+                // burst; ACK-to-ACK that read as MB/s on an 80 KB/s path and
                 // inflated the window to MiBs -- the very queue the BDP
-                // window exists to bound (rig: 11-22 s head-of-line).
+                // window exists to bound (rig: 11-22 s head-of-line). Until
+                // the interval is long enough the anchor stays, so a path
+                // with an RTT under 20 ms still gets measured.
+                // Delivered offset and its time both come from the sampler's
+                // own monotonic pair, so they always describe the same moment.
+                const std::int64_t interval_ns = last_delivered_ns_ - bw_anchor_->delivered_ns;
                 const std::int64_t min_interval_ns = std::max<std::int64_t>(
                     kMinBandwidthIntervalNs, flow_control_.min_rtt_us() * 1000 / 2);
-                if (delta_ns >= min_interval_ns) {
+                if (interval_ns >= min_interval_ns && delivered_now > bw_anchor_->delivered) {
                     // Saturate the inputs so the product stays inside int64
                     // (MSVC has no __int128), then cap the result: a hostile
                     // peer must not be able to pump the estimator.
-                    constexpr std::uint64_t kMaxCarry = 4'000'000'000ULL;
+                    constexpr std::uint64_t kMaxDelivered = 4'000'000'000ULL;
                     constexpr std::int64_t kMaxBpsCap = 12'500'000'000LL;  // 100 Gbps
                     constexpr std::int64_t kNsPerSecond = 1'000'000'000;
-                    const auto carry =
-                        static_cast<std::int64_t>(std::min(bw_carry_bytes_, kMaxCarry));
-                    bps = std::min<std::int64_t>((carry * kNsPerSecond) / delta_ns, kMaxBpsCap);
-                    bw_carry_bytes_ = 0;
-                    last_ack_ns_ = now_ns;
+                    const auto delivered = static_cast<std::int64_t>(
+                        std::min(delivered_now - bw_anchor_->delivered, kMaxDelivered));
+                    bps = std::min<std::int64_t>((delivered * kNsPerSecond) / interval_ns,
+                                                 kMaxBpsCap);
+                    // An application-limited sample measures the application,
+                    // not the path: it may raise the estimate, never lower it.
+                    if (bw_anchor_->app_limited && bps <= flow_control_.bandwidth_bps()) {
+                        bps = 0;
+                    }
+                    bw_anchor_.reset();
                 }
             }
-            bw_window_drained_ = (new_window == 0);
         }
         if (bps > 0) {
             observe_bandwidth_bps(bps);
@@ -2989,9 +2999,9 @@ void TunnelImpl::reset_statistics() {
     {
         std::lock_guard<std::mutex> lock(bdp_sample_mutex_);
         rtt_samples_.clear();
-        last_ack_ns_ = 0;
-        bw_carry_bytes_ = 0;
-        bw_window_drained_ = false;
+        sampler_delivered_ = total_bytes_acked_.load(std::memory_order_relaxed);
+        last_delivered_ns_ = 0;
+        bw_anchor_.reset();
     }
 }
 
@@ -3246,18 +3256,44 @@ void TunnelImpl::observe_rtt_us(std::int64_t rtt_us) {
     flow_control_.observe_rtt_us(rtt_us);
 }
 
-bool TunnelImpl::note_rtt_sample_sent(std::uint64_t end_offset) {
-    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+std::int64_t TunnelImpl::sampler_now_ns() const noexcept {
+    const std::int64_t injected = test_now_ns_.load(std::memory_order_relaxed);
+    return injected != 0 ? injected : std::chrono::steady_clock::now().time_since_epoch().count();
+}
+
+bool TunnelImpl::note_rtt_sample_sent(std::uint64_t end_offset, std::uint64_t frame_bytes,
+                                      bool more_queued) {
+    const auto now_ns = sampler_now_ns();
     std::lock_guard<std::mutex> lock(bdp_sample_mutex_);
+    const std::uint64_t acked = sampler_delivered_;
+    const std::uint64_t inflight = end_offset > acked ? end_offset - acked : 0;
+    // Nothing was in flight before this frame: the sender was idle. A
+    // bandwidth sample still open from before the gap would count the idle
+    // time as slow delivery, so drop it, and date this frame's delivery
+    // baseline from its own send.
+    const bool restart = inflight <= frame_bytes || last_delivered_ns_ == 0;
+    if (inflight <= frame_bytes) {
+        bw_anchor_.reset();
+    }
     if (!rtt_samples_.empty() && end_offset - rtt_samples_.back().end_offset < kRttSampleSpacing) {
         return false;
     }
     if (rtt_samples_.size() >= kMaxRttSamples) {
         return false;  // bounded; ACKs pop from the front
     }
-    const std::uint64_t acked = total_bytes_acked_.load(std::memory_order_relaxed);
-    const std::uint64_t inflight = end_offset > acked ? end_offset - acked : 0;
-    rtt_samples_.push_back(RttSample{end_offset, now_ns, inflight});
+    // Application-limited (BBR): nothing queued behind this frame although
+    // the window still had room for another full one. Room is judged by the
+    // reserved window bytes, not the in-flight count: a producer on another
+    // thread reserves before it appends, so a reservation not yet in the FIFO
+    // still counts as data to send. When that race makes the call uncertain it
+    // errs towards "path-limited", which can only lower the estimate (a
+    // smaller window), never let a slow sample be ignored and the queue grow.
+    const std::uint64_t reserved = send_window_used_.load(std::memory_order_acquire);
+    const bool app_limited =
+        !more_queued && reserved + kDefaultCoalesceMaxBytes <
+                            static_cast<std::uint64_t>(flow_control_.target_window_bytes());
+    rtt_samples_.push_back(RttSample{end_offset, now_ns, inflight, acked,
+                                     restart ? now_ns : last_delivered_ns_, app_limited});
     return true;
 }
 
@@ -3390,6 +3426,7 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
             std::optional<ProtocolFrame> span_frame;
             std::vector<std::uint8_t> error_wire;
             std::size_t frame_bytes = 0;
+            bool more_data_queued = false;  // for the RTT sampler's app-limited flag
             {
                 std::lock_guard<std::mutex> lock(coalesce_mutex_);
 
@@ -3446,6 +3483,7 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
                             span_frame.emplace(
                                 ProtocolFrame::make_tunnel_data(tunnel_id_, payload));
                         }
+                        more_data_queued = outbound_fifo_pending_ > frame_bytes;
                         current_sel = Sel::Data;
                     } else {
                         // FIFO empty. (3) A requested CLOSE, selection-is-
@@ -3619,8 +3657,9 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
                 frame_bytes;
             // RTT sample keyed on this frame's end offset, registered BEFORE
             // the send for the same reason as the counter above.
-            const bool rtt_sampled = flow_control_configured_.load(std::memory_order_acquire) &&
-                                     note_rtt_sample_sent(end_offset);
+            const bool rtt_sampled =
+                flow_control_configured_.load(std::memory_order_acquire) &&
+                note_rtt_sample_sent(end_offset, frame_bytes, more_data_queued);
             const bool sent = zero_copy ? send_owned_data_to_tox(std::move(owned_frame))
                                         : send_frame_to_tox(*span_frame);
             util::Logger::trace("Tunnel {} DATA out: {} bytes sent={} (emitted total {})",

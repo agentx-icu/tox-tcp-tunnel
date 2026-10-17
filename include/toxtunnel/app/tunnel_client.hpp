@@ -563,6 +563,13 @@ class TunnelClient {
     void arm_held_timer_locked();
     /// Close every held connection and cancel the timer (stop()).
     void close_held_connections();
+    /// Call right after registering a new tunnel with tunnel_mgr_. If stop()
+    /// has begun, its close_all() may already have run and would never see
+    /// this tunnel, so remove (and tear down) it here and return true; the
+    /// caller then abandons the open. The manager mutex orders the
+    /// registration against close_all(), which runs after stop_started_ is
+    /// set, so one of the two always catches the tunnel.
+    bool abandon_tunnel_if_stopping(uint16_t tunnel_id);
 
     struct HeldConnection {
         std::shared_ptr<core::TcpConnection> conn;

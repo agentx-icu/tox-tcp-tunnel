@@ -709,6 +709,138 @@ TEST_F(TunnelTest, BdpBandwidthIsNotMeasuredAcrossBatchedAcks) {
     EXPECT_LT(tunnel.bandwidth_bps(), 2'000'000);
 }
 
+// The bandwidth sampler on an injected clock (TunnelImpl::set_clock_for_test):
+// every send and ACK below happens at an exact time, so the tests do not depend
+// on the scheduler.
+namespace {
+constexpr std::int64_t kMs = 1'000'000;  // ns
+struct ClockedBdpTunnel {
+    TunnelImpl tunnel;
+    std::int64_t now_ns = 1'000 * kMs;
+    ClockedBdpTunnel(asio::io_context& io, uint16_t id, uint32_t friend_number)
+        : tunnel(io, id, friend_number) {
+        tunnel.set_clock_for_test(now_ns);
+        tunnel.configure_coalesce(0, 1362);
+        tunnel.configure_flow_control(bdp_config());
+        tunnel.set_state(Tunnel::State::Connected);
+        tunnel.set_on_send_to_tox([](std::span<const uint8_t>) { return SendOutcome::Sent; });
+    }
+    void at_ms(std::int64_t ms) {
+        now_ns = 1'000 * kMs + ms * kMs;
+        tunnel.set_clock_for_test(now_ns);
+    }
+    void send(std::size_t bytes) {
+        const std::vector<uint8_t> chunk(bytes, 0x5A);
+        tunnel.on_tcp_data_received(chunk.data(), chunk.size());
+    }
+    void ack(uint32_t bytes, uint16_t id) {
+        tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(id, bytes));
+    }
+};
+}  // namespace
+
+// ACKs held back and then released in a burst (toxcore batching them, or a
+// reverse path queueing them behind its own data) must not read as a burst
+// rate. Steady state here is a 4 KiB ACK every 25 ms (~160 KB/s), each
+// answered by 4 KiB more; then 600 ms without an ACK, all but the last 4 KiB
+// of the window's ACKs at once (so the window never drains, which would have
+// restarted the old interval), and steady state again. An estimator that
+// divides by the time since its previous ACK reads the burst as ~1 MB/s and
+// jumps; a delivery rate measures it from before the round trip it ended.
+TEST_F(TunnelTest, BdpBandwidthIsNotInflatedByADelayedAckBurst) {
+    ClockedBdpTunnel c(io_ctx, test_tunnel_id, test_friend_number);
+    c.send(32 * 1024);
+    std::int64_t t = 0;
+    for (int step = 0; step < 20; ++step) {
+        t += 25;
+        c.at_ms(t);
+        c.ack(4 * 1024, test_tunnel_id);
+        c.send(4 * 1024);
+    }
+    const std::int64_t established = c.tunnel.bandwidth_bps();
+    ASSERT_GT(established, 100'000);
+    t += 600;  // stall
+    c.at_ms(t);
+    const auto inflight = static_cast<uint32_t>(c.tunnel.send_window_used());
+    ASSERT_GT(inflight, 8u * 1024);
+    for (uint32_t acked = 0; acked + 4 * 1024 < inflight; acked += 4 * 1024) {
+        c.ack(std::min<uint32_t>(4 * 1024, inflight - 4 * 1024 - acked), test_tunnel_id);
+    }
+    c.send(24 * 1024);
+    for (int step = 0; step < 4; ++step) {
+        t += 25;
+        c.at_ms(t);
+        c.ack(4 * 1024, test_tunnel_id);
+        c.send(4 * 1024);
+    }
+    EXPECT_LT(c.tunnel.bandwidth_bps(), established + established / 4)
+        << "established " << established;
+}
+
+// A path with an RTT below the 20 ms sampling floor is still measured: the
+// sample's baseline survives the ACKs that come too soon, so the interval
+// grows until it is long enough. (Guards the anchor design: a baseline reset by
+// every ACK would never reach the floor here.)
+TEST_F(TunnelTest, BdpBandwidthIsMeasuredOnAPathFasterThanTheSamplingFloor) {
+    ClockedBdpTunnel c(io_ctx, test_tunnel_id, test_friend_number);
+    c.send(64 * 1024);
+    // An 8 KiB ACK every 5 ms (1.6 MB/s), each answered by another 8 KiB.
+    for (int step = 1; step <= 40; ++step) {
+        c.at_ms(step * 5);
+        c.ack(8 * 1024, test_tunnel_id);
+        c.send(8 * 1024);
+    }
+    EXPECT_GT(c.tunnel.bandwidth_bps(), 800'000);
+    EXPECT_LT(c.tunnel.bandwidth_bps(), 3'200'000);
+}
+
+// Application-limited samples (nothing queued, window room left) measure the
+// application, not the path: they may raise the estimate but never lower it.
+// 8 KiB stays unacknowledged throughout, so the window never drains (a drained
+// window restarted the old estimator's interval and hid the problem).
+TEST_F(TunnelTest, BdpAppLimitedSamplesDoNotDragTheEstimateDown) {
+    ClockedBdpTunnel c(io_ctx, test_tunnel_id, test_friend_number);
+    c.send(128 * 1024);
+    for (int step = 1; step <= 8; ++step) {  // 16 KiB / 10 ms = 1.6 MB/s
+        c.at_ms(step * 10);
+        c.ack(step < 8 ? 16 * 1024 : 8 * 1024, test_tunnel_id);
+    }
+    const std::int64_t established = c.tunnel.bandwidth_bps();
+    ASSERT_GT(established, 800'000);
+    // Now a trickle: one 1 KiB write every 100 ms, ACKed 50 ms later.
+    for (int i = 0; i < 40; ++i) {
+        c.at_ms(100 + i * 100);
+        c.send(1024);
+        c.at_ms(150 + i * 100);
+        c.ack(1024, test_tunnel_id);
+    }
+    // The trickle itself is ignored. The one bulk-phase sample still open
+    // (its bytes are among the 8 KiB held back) is measured meanwhile, which
+    // is genuinely slow delivery and may move the estimate a little; the
+    // old estimator fell to ~1% of it here.
+    EXPECT_GE(c.tunnel.bandwidth_bps(), established * 85 / 100)
+        << "app-limited samples must not shrink the path estimate";
+}
+
+// A sample left open when the window drained (its interval was still under the
+// floor) must not span the idle gap that follows: the next transfer starts a
+// fresh baseline, or the idle seconds would read as a crawl.
+TEST_F(TunnelTest, BdpBandwidthDoesNotMeasureAcrossAnIdleGap) {
+    ClockedBdpTunnel c(io_ctx, test_tunnel_id, test_friend_number);
+    c.send(64 * 1024);
+    c.at_ms(5);
+    c.ack(8 * 1024, test_tunnel_id);  // opens a baseline; 5 ms is too short
+    c.at_ms(10);
+    c.ack(56 * 1024, test_tunnel_id);  // drained; 10 ms is still too short
+    EXPECT_EQ(c.tunnel.send_window_used(), 0u);
+    // Two seconds idle, then 64 KiB delivered in 100 ms (~650 KB/s).
+    c.at_ms(2'010);
+    c.send(64 * 1024);
+    c.at_ms(2'110);
+    c.ack(64 * 1024, test_tunnel_id);
+    EXPECT_GT(c.tunnel.bandwidth_bps(), 300'000) << "the idle gap was measured as slow delivery";
+}
+
 // The sampler's leaf lock is never held across the send callback, so an ACK
 // that comes back synchronously from inside it (in-process loopback) neither
 // deadlocks nor loses credit.

@@ -628,9 +628,16 @@ flow_control:
   every 10 s for a round trip or two (a few percent of throughput); that dip in
   `toxtunnel_tunnel_send_window_bytes` is expected. The smoothed RTT of all
   samples is exported alongside.
-- **Bandwidth** is the EWMA of bytes acknowledged per interval between ACKs.
-  After the window drains completely the next interval starts afresh; a pause
-  that leaves bytes unacknowledged still costs one slow sample (1/8 weight).
+- **Bandwidth** is the EWMA (1/8 weight) of delivery-rate samples, as in BBR:
+  each RTT sample also records how much had been delivered when it was sent,
+  and a measurement is the bytes delivered since then over the time since the
+  delivery before it was sent -- at least max(20 ms, min RTT / 2). ACKs that
+  arrive bunched (toxcore batching, or a reverse path queueing them behind
+  data) therefore cannot read as a rate above what was really delivered. A
+  transfer that starts with nothing in flight starts a fresh measurement (idle
+  time is never counted as slow delivery), and a sample sent while the
+  application had nothing queued and the window had room may only raise the
+  estimate.
 
 The fixed 50 ms is a jitter / queue budget: on a fast path the RTT is mostly
 scheduling jitter and the minimum is a lucky sample, so without it the window

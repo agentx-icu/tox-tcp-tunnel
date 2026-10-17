@@ -1359,7 +1359,20 @@ void TunnelClient::start_pipe_mode() {
         request_stop();
     });
 
-    tunnel_mgr_->add_tunnel(tunnel_id, tunnel);
+    if (!tunnel_mgr_->add_tunnel(tunnel_id, tunnel)) {
+        util::Logger::error("Tunnel manager at capacity; cannot start pipe-mode tunnel");
+        tunnel_mgr_->release_tunnel_id(tunnel_id);
+        {
+            std::lock_guard<std::mutex> lock(pipe_mutex_);
+            pipe_bridge_.reset();
+        }
+        pipe_mode_started_ = false;
+        request_stop();
+        return;
+    }
+    if (abandon_tunnel_if_stopping(tunnel_id)) {
+        return;  // stop() is tearing the pipe down already
+    }
 
     if (!tunnel->open(target.remote_host, target.remote_port)) {
         util::Logger::error("Failed to open pipe-mode tunnel {} to {}:{}", tunnel_id,
@@ -1812,6 +1825,15 @@ void TunnelClient::close_held_connections() {
     }
 }
 
+bool TunnelClient::abandon_tunnel_if_stopping(uint16_t tunnel_id) {
+    if (!stop_started_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // remove_tunnel() force-closes a never-opened tunnel and releases its id.
+    tunnel_mgr_->remove_tunnel(tunnel_id);
+    return true;
+}
+
 void TunnelClient::open_tunnel_for_connection(std::shared_ptr<core::TcpConnection> conn,
                                               const ForwardRule& rule) {
     // Allocate a tunnel ID and create the tunnel. C-07: handle exhaustion
@@ -1948,6 +1970,10 @@ void TunnelClient::open_tunnel_for_connection(std::shared_ptr<core::TcpConnectio
         util::Logger::error("Tunnel manager at capacity; dropping connection on port {}",
                             rule.local_port);
         tunnel_mgr_->release_tunnel_id(tunnel_id);
+        conn->close();
+        return;
+    }
+    if (abandon_tunnel_if_stopping(tunnel_id)) {
         conn->close();
         return;
     }
@@ -2105,6 +2131,13 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     if (!tunnel_mgr_->add_tunnel(tunnel_id, tunnel)) {
         util::Logger::error("Tunnel manager at capacity; rejecting SOCKS5 {}:{}", host, port);
         tunnel_mgr_->release_tunnel_id(tunnel_id);
+        if (!reply_sent->exchange(true)) {
+            (*reply_cb)(TunnelOpenOutcome::Failed);
+        }
+        conn->close();
+        return;
+    }
+    if (abandon_tunnel_if_stopping(tunnel_id)) {
         if (!reply_sent->exchange(true)) {
             (*reply_cb)(TunnelOpenOutcome::Failed);
         }
