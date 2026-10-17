@@ -158,6 +158,19 @@ CTest tests. The packaging CI jobs invoke the appropriate script after `cpack`
 to validate that DEB/RPM/PKG/MSI artifacts lay their files down where each
 platform expects them.
 
+To get installers for an unreleased branch (e.g. to put an MSI on a Windows
+test machine), run the CI workflow by hand with packaging enabled. The packages
+are attached to the run as `installer-<platform>` artifacts; nothing is
+released:
+
+```bash
+gh workflow run ci.yml --ref <branch> -f packages=true -f package_version=0.5.0
+gh run download <run-id> -n installer-windows-aarch64
+```
+
+`package_version` must be a plain `x.y.z` (MSI and RPM reject anything else),
+and the packaged binary reports that same version.
+
 The DEB script runs locally — build a package with `cpack -G DEB` and point
 `verify_linux_deb_install.sh` at it inside a clean `ubuntu:24.04` container.
 The RPM script does **not**: it installs the package, and only a
