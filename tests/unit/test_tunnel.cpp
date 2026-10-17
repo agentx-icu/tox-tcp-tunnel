@@ -681,6 +681,34 @@ TEST_F(TunnelTest, BdpRttIsSampledPerByteRangeAndTheMinimumIgnoresTheQueue) {
     EXPECT_EQ(tunnel.send_window_used(), 0u);
 }
 
+// ACK compression: toxcore can deliver several ACKs a millisecond or two
+// apart. Measured ACK-to-ACK that read as a burst rate (16 KiB / 1.5 ms ~
+// 10 MB/s on an 80 KB/s path) and inflated the window to MiBs. A bandwidth
+// sample must span at least kMinBandwidthIntervalNs.
+TEST_F(TunnelTest, BdpBandwidthIsNotMeasuredAcrossBatchedAcks) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number);
+    tunnel.configure_coalesce(0, 1362);
+    tunnel.configure_flow_control(bdp_config());
+    tunnel.set_state(Tunnel::State::Connected);
+    tunnel.set_on_send_to_tox([](std::span<const uint8_t>) { return SendOutcome::Sent; });
+    const std::vector<uint8_t> chunk(64 * 1024, 0x11);
+    tunnel.on_tcp_data_received(chunk.data(), chunk.size());
+
+    // Back to back, as toxcore delivers a batch: well inside the 20 ms floor
+    // however the scheduler behaves.
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 16 * 1024));  // opens
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 16 * 1024));
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 16 * 1024));
+    EXPECT_EQ(tunnel.bandwidth_bps(), 0) << "batched ACKs must not produce a sample";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 16 * 1024));
+    // 48 KiB over >= 40 ms: under 2 MB/s, nowhere near the GB/s a
+    // back-to-back ACK-to-ACK sample would have claimed.
+    EXPECT_GT(tunnel.bandwidth_bps(), 0);
+    EXPECT_LT(tunnel.bandwidth_bps(), 2'000'000);
+}
+
 // The sampler's leaf lock is never held across the send callback, so an ACK
 // that comes back synchronously from inside it (in-process loopback) neither
 // deadlocks nor loses credit.

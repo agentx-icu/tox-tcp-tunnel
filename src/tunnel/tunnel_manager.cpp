@@ -1494,12 +1494,14 @@ bool frame_must_respect_outbound_barrier(FrameType type) noexcept {
     // frame that OPEN must wait behind is now one of the manager-owned control
     // types.)
     //
-    // TUNNEL_DATA is deliberately NOT here, and does not need to be. DATA only
+    // TUNNEL_DATA is not here because ordering does not need it: DATA only
     // flows once the tunnel is Connected, which on the client requires its OPEN
     // to have been sent and ACKed and on the server requires the OPEN_ACK to
     // have been sent — both of which are barriered — so DATA is already ordered
-    // behind them transitively. Adding DATA would instead stall a live stream
-    // behind an unrelated parked PING for up to a drain interval.
+    // behind them transitively. DATA does yield to parked frames, but for
+    // priority, not ordering: the sender (app/tunnel_senders.cpp) reports
+    // backpressure for DATA while anything is parked, or a bulk tunnel takes
+    // every freed toxcore slot and the parked control frame starves.
     //
     // CLOSE and ERROR are no longer here OR in the manager's retry queue:
     // since issue #24 slice 3 they are driver-owned (driver_owns_retry), so

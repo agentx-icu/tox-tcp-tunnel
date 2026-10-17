@@ -997,8 +997,9 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
 /// before being handed to toxcore on the direct per-tunnel path.
 ///
 /// Only TUNNEL_OPEN and TUNNEL_ACK — see the definition for why TUNNEL_DATA is
-/// covered transitively and why the still-parked control frames are not covered
-/// at all.
+/// covered transitively (for ordering; the senders still make DATA yield to
+/// parked frames, for priority) and why the still-parked control frames are not
+/// covered at all.
 [[nodiscard]] bool frame_must_respect_outbound_barrier(FrameType type) noexcept;
 
 }  // namespace toxtunnel::tunnel

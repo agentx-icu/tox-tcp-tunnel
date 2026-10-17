@@ -35,11 +35,13 @@ enum class BackpressureSite : std::uint32_t {
 
 /// Shared rate limiter for the Tox-backpressure retry logs.
 ///
-/// The coalesce retry timer re-arms at `tunnel.coalesce_max_delay_us` (200 us
-/// by default) with no backoff, so a stalled Tox link makes the backpressure
-/// site fire up to ~5 kHz. Measured: 5218 lines / 37 MB from a single
-/// disconnect, which rolled three 5 MiB log files in under a minute and
-/// discarded exactly the pre-failure history needed to diagnose it.
+/// The coalesce retry timer used to re-arm at `tunnel.coalesce_max_delay_us`
+/// (200 us by default) with no backoff, so a stalled Tox link made the
+/// backpressure site fire up to ~5 kHz. Measured: 5218 lines / 37 MB from a
+/// single disconnect, which rolled three 5 MiB log files in under a minute and
+/// discarded exactly the pre-failure history needed to diagnose it. The retry
+/// now waits at least kBackpressureRetryUs (5 ms), but a long stall still
+/// fires 200 times a second, so the throttle stays.
 ///
 /// KEY CHOICE — `(friend_number, site)`, NOT tunnel id:
 ///
@@ -2252,9 +2254,9 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
         //  - RTT from the newest send-time sample this ACK covers. ACKs are
         //    delta credits on the wire; acked_total is the cumulative, clamped
         //    offset they add up to, which is what the samples are keyed on.
-        //  - Bandwidth over the interval since the last sample. ACKs less
-        //    than 1 ms apart carry their bytes forward rather than losing
-        //    them (dropping them under-estimated fast links).
+        //  - Bandwidth over the interval since the last sample, which spans
+        //    at least max(20 ms, min RTT / 2); ACKs inside it carry their
+        //    bytes forward (see below).
         std::int64_t rtt_us = 0;
         std::int64_t trusted_rtt_us = 0;
         std::int64_t bps = 0;
@@ -2286,7 +2288,15 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
             } else {
                 bw_carry_bytes_ += acked;
                 const std::int64_t delta_ns = now_ns - last_ack_ns_;
-                if (delta_ns > 1'000'000) {  // > 1 ms
+                // Measure over at least max(20 ms, min RTT / 2), not ACK to
+                // ACK. toxcore hands over several ACKs in one iterate pass
+                // ("ACK compression"): two 16 KiB ACKs 1.5 ms apart read as
+                // 10 MB/s on an 80 KB/s path, which pumped the EWMA and
+                // inflated the window to MiBs -- the very queue the BDP
+                // window exists to bound (rig: 11-22 s head-of-line).
+                const std::int64_t min_interval_ns = std::max<std::int64_t>(
+                    kMinBandwidthIntervalNs, flow_control_.min_rtt_us() * 1000 / 2);
+                if (delta_ns >= min_interval_ns) {
                     // Saturate the inputs so the product stays inside int64
                     // (MSVC has no __int128), then cap the result: a hostile
                     // peer must not be able to pump the estimator.
@@ -3642,7 +3652,7 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
                     backpressure_log_throttle(friend_number_, BackpressureSite::CoalesceDrain),
                     "Tunnel {} Tox backpressured; holding {} bytes for retry", tunnel_id_,
                     frame_bytes);
-                coalesce_arm_timer_locked();
+                coalesce_arm_timer_locked(/*backpressured=*/true);
                 // Exit-protocol re-check, ERROR only: a terminal ERROR
                 // deposited while this DATA send was in flight seals + empties
                 // the FIFO, so it makes progress (top priority). A CLOSE
@@ -3838,13 +3848,26 @@ void TunnelImpl::recover_after_driver_unwind() noexcept {
     }
 }
 
-void TunnelImpl::coalesce_arm_timer_locked() {
-    if (coalesce_pending_locked() == 0 || coalesce_timer_armed_) {
+void TunnelImpl::coalesce_arm_timer_locked(bool backpressured) {
+    if (coalesce_pending_locked() == 0) {
         return;
+    }
+    const std::uint32_t delay_us = backpressured
+                                       ? std::max(coalesce_max_delay_us_, kBackpressureRetryUs)
+                                       : coalesce_max_delay_us_;
+    if (coalesce_timer_armed_) {
+        // A backpressured retry must not ride an already-armed short coalesce
+        // timer (the Batch path arms one before its first send): push it out
+        // to the backoff. expires_after() cancels the pending wait, whose
+        // handler then sees operation_aborted / a stale epoch and returns.
+        if (!backpressured || coalesce_timer_.expiry() >= std::chrono::steady_clock::now() +
+                                                              std::chrono::microseconds(delay_us)) {
+            return;
+        }
     }
     coalesce_timer_armed_ = true;
     const auto epoch = ++coalesce_timer_epoch_;
-    coalesce_timer_.expires_after(std::chrono::microseconds(coalesce_max_delay_us_));
+    coalesce_timer_.expires_after(std::chrono::microseconds(delay_us));
     // S17 / 2026-05-20 follow-up: capture weak_ptr instead of bare `this`.
     // steady_timer::cancel() is non-blocking; a handler already dispatched
     // to the io_context's worker queue will still run after this Tunnel

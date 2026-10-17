@@ -1274,7 +1274,13 @@ class TunnelImpl : public Tunnel {
 
     /// (Re)arm the flush timer if the buffer is non-empty and no timer is
     /// pending. The caller must hold `coalesce_mutex_`.
-    void coalesce_arm_timer_locked();
+    /// @p backpressured: re-arm after toxcore refused DATA (SENDQ full). The
+    /// wait is then at least kBackpressureRetryUs -- toxcore frees capacity
+    /// only from its iterate loop (<= 5 ms), so retrying at the coalesce delay
+    /// (200 us, 0 on Windows) just spun every congested tunnel at kHz rates
+    /// through the blocking Tox-thread bridge.
+    void coalesce_arm_timer_locked(bool backpressured = false);
+    static constexpr std::uint32_t kBackpressureRetryUs = 5000;
 
     /// Bytes still pending in the outbound cohort FIFO. The caller must hold
     /// `coalesce_mutex_`.
@@ -1624,8 +1630,9 @@ class TunnelImpl : public Tunnel {
     ///    trip, where the old "first byte of a burst until the window drained"
     ///    sample included the whole queue and was rare under sustained load.
     ///  - `last_ack_ns_` / `bw_carry_bytes_`: bandwidth = bytes acked over the
-    ///    interval since the last sample. ACKs closer together than 1 ms carry
-    ///    their bytes into the next sample instead of being dropped.
+    ///    interval since the last sample, which spans at least
+    ///    max(kMinBandwidthIntervalNs, min RTT / 2); ACKs inside it carry
+    ///    their bytes forward (batched ACKs must not read as a burst rate).
     struct RttSample {
         std::uint64_t end_offset;
         std::int64_t sent_ns;
@@ -1634,6 +1641,8 @@ class TunnelImpl : public Tunnel {
     // Whether a sample is trusted for the min-RTT filter is decided by
     // BdpFlowControl::is_trusted_inflight() (relative to the configured floor).
     static constexpr std::uint64_t kRttSampleSpacing = 8 * 1024;
+    /// Shortest interval a bandwidth sample may span (see the ACK handler).
+    static constexpr std::int64_t kMinBandwidthIntervalNs = 20'000'000;
     static constexpr std::size_t kMaxRttSamples = 64;
     std::mutex bdp_sample_mutex_;
     std::deque<RttSample> rtt_samples_;

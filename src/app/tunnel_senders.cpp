@@ -16,9 +16,11 @@ TunnelSenders make_tunnel_senders(TypedLosslessSendFn send_lossless,
     senders.span = [send_lossless, manager,
                     friend_number](std::span<const std::uint8_t> data) -> tunnel::SendOutcome {
         // FIFO barrier, consulted BEFORE toxcore rather than after a refusal.
-        // Frame type byte is at offset 0 of the unprefixed wire.
+        // Frame type byte is at offset 0 of the unprefixed wire. DATA also
+        // yields to parked manager frames, for priority (see the owned path).
         if (!data.empty() &&
-            tunnel::frame_must_respect_outbound_barrier(static_cast<tunnel::FrameType>(data[0])) &&
+            (tunnel::frame_must_respect_outbound_barrier(static_cast<tunnel::FrameType>(data[0])) ||
+             static_cast<tunnel::FrameType>(data[0]) == tunnel::FrameType::TUNNEL_DATA) &&
             manager->outbound_queue_busy()) {
             // Something older is still on its way to toxcore. Report
             // backpressure so the handshake driver retries after it, instead of
@@ -51,11 +53,23 @@ TunnelSenders make_tunnel_senders(TypedLosslessSendFn send_lossless,
     // Wave B zero-copy outbound: the OwnedFrameBuffer already carries the
     // lossless prefix plus the 5-byte tunnel header in its reserved prefix, so
     // `wire_view()` goes straight to toxcore with no further copies. This path
-    // carries TUNNEL_DATA only, which is why it needs no barrier check: DATA
-    // only flows on a Connected tunnel, and reaching Connected required a
-    // barriered OPEN (client) or OPEN_ACK (server).
+    // carries TUNNEL_DATA only. Ordering needs no barrier here (DATA only flows
+    // on a Connected tunnel, and reaching Connected required a barriered OPEN
+    // or OPEN_ACK), but priority does:
     senders.owned = [send_lossless, manager,
                      friend_number](tunnel::OwnedFrameBuffer buf) -> tunnel::SendOutcome {
+        // A manager-owned control frame (PING, PONG, INFO, ...) refused by
+        // toxcore is parked and retried on the manager's drain timer, while
+        // DATA is re-offered as soon as capacity frees, so under a bulk
+        // transfer DATA took every freed slot. While anything is parked, DATA
+        // reports backpressure and retries after it. Driver-owned frames
+        // (OPEN, OPEN_ACK, CLOSE, ERROR) are not parked here; they retry on
+        // their own timers and benefit from DATA's backpressure backoff
+        // (TunnelImpl::kBackpressureRetryUs). Strict priority for them needs
+        // a per-friend scheduler (#42).
+        if (manager->outbound_queue_busy()) {
+            return tunnel::SendOutcome::SendqFull;
+        }
         const auto wire = buf.wire_view();
         const auto outcome = send_lossless(friend_number, wire.data(), wire.size());
         if (outcome == tox::ToxAdapter::LosslessSendOutcome::Sent) {
