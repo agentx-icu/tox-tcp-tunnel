@@ -577,6 +577,12 @@ class TunnelImpl : public Tunnel {
     [[nodiscard]] std::int64_t min_rtt_us() const noexcept { return flow_control_.min_rtt_us(); }
 
     /// Current EWMA bandwidth estimate (bytes/sec).
+    /// Test seam: when non-zero, the BDP sampler (send-side samples and the
+    /// ACK handler) reads this instead of steady_clock, in nanoseconds. Lets
+    /// tests drive ACK timing deterministically; never set in production.
+    void set_clock_for_test(std::int64_t now_ns) noexcept {
+        test_now_ns_.store(now_ns, std::memory_order_relaxed);
+    }
     [[nodiscard]] std::int64_t bandwidth_bps() const noexcept {
         return flow_control_.bandwidth_bps();
     }
@@ -1629,14 +1635,26 @@ class TunnelImpl : public Tunnel {
     ///    a sample's offset yields RTT = now - its send time: a per-byte round
     ///    trip, where the old "first byte of a burst until the window drained"
     ///    sample included the whole queue and was rare under sustained load.
-    ///  - `last_ack_ns_` / `bw_carry_bytes_`: bandwidth = bytes acked over the
-    ///    interval since the last sample, which spans at least
-    ///    max(kMinBandwidthIntervalNs, min RTT / 2); ACKs inside it carry
-    ///    their bytes forward (batched ACKs must not read as a burst rate).
+    ///  - Bandwidth is a delivery rate (as in BBR): each sample also records
+    ///    how much had been delivered (acked) when it was sent and when that
+    ///    delivery happened. `bw_anchor_` is the first sample an ACK covered
+    ///    since the last measurement; once now - anchor.delivered_ns spans at
+    ///    least max(kMinBandwidthIntervalNs, min RTT / 2), bandwidth = bytes
+    ///    delivered since the anchor was sent / that interval. The interval
+    ///    starts before the anchor's own round trip, so ACKs that arrive in a
+    ///    burst (toxcore batching, or a reverse path queueing them behind
+    ///    data) cannot read as a rate higher than what was really delivered.
+    ///    Concurrent callers stay safe (one leaf lock, a monotonic delivered
+    ///    offset), but the estimate assumes what the daemon provides: one
+    ///    tunnel's frames arrive serialized (each daemon's inbound strand) and
+    ///    its TCP input comes from one read loop at a time.
     struct RttSample {
         std::uint64_t end_offset;
         std::int64_t sent_ns;
-        std::uint64_t inflight;  ///< bytes emitted but unacked when this was sent
+        std::uint64_t inflight;     ///< bytes emitted but unacked when this was sent
+        std::uint64_t delivered;    ///< total_bytes_acked_ when this was sent
+        std::int64_t delivered_ns;  ///< time of that delivery (or the send, after idle)
+        bool app_limited;           ///< sender had nothing more queued and window room
     };
     // Whether a sample is trusted for the min-RTT filter is decided by
     // BdpFlowControl::is_trusted_inflight() (relative to the configured floor).
@@ -1646,16 +1664,26 @@ class TunnelImpl : public Tunnel {
     static constexpr std::size_t kMaxRttSamples = 64;
     std::mutex bdp_sample_mutex_;
     std::deque<RttSample> rtt_samples_;
-    std::int64_t last_ack_ns_{0};
-    std::uint64_t bw_carry_bytes_{0};
-    /// The previous ACK left nothing outstanding: the sender may have gone
-    /// idle, so the next interval would count idle time as slow delivery and
-    /// shrink the window. It restarts the interval instead.
-    bool bw_window_drained_{false};
+    /// The sampler's own view of delivery: the cumulative acked offset and the
+    /// time of the ACK that reached it, published together under
+    /// bdp_sample_mutex_. total_bytes_acked_ moves earlier, outside the lock,
+    /// so pairing it with this timestamp could date a delivery too early.
+    std::uint64_t sampler_delivered_{0};
+    std::int64_t last_delivered_ns_{0};
+    /// Baseline of the bandwidth sample in progress; see rtt_samples_. Cleared
+    /// by a measurement, and by a send that finds nothing in flight (an idle
+    /// gap must not be measured as slow delivery).
+    std::optional<RttSample> bw_anchor_;
+    std::atomic<std::int64_t> test_now_ns_{0};
+    [[nodiscard]] std::int64_t sampler_now_ns() const noexcept;
 
     /// Emission-driver side of the RTT sampler; see rtt_samples_. Returns
-    /// whether a sample was recorded for @p end_offset.
-    bool note_rtt_sample_sent(std::uint64_t end_offset);
+    /// whether a sample was recorded for @p end_offset (the frame's end;
+    /// @p frame_bytes its size). @p more_queued: more DATA is queued behind
+    /// it; without that and with window room left the sample is marked
+    /// application-limited.
+    bool note_rtt_sample_sent(std::uint64_t end_offset, std::uint64_t frame_bytes,
+                              bool more_queued);
     /// Undo note_rtt_sample_sent() for a send that did not go out.
     void drop_rtt_sample(std::uint64_t end_offset);
 

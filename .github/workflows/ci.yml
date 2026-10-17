@@ -199,14 +199,16 @@ jobs:
         env:
           QA_PACKAGE_VERSION: ${{ inputs.package_version }}
         run: |
+          # Both sources are checked: the result is interpolated into later
+          # shell commands, so it must be digits and dots only.
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version="${RELEASE_VERSION#v}"
           else
             version="$QA_PACKAGE_VERSION"
-            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::package_version must be x.y.z, got '$version'"
-              exit 1
-            fi
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::package version must be x.y.z, got '$version'"
+            exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
