@@ -129,7 +129,13 @@ Report risk level: LOW / MEDIUM / HIGH.
   conclude "the network is down" from a failed ping, or "the network is fine"
   from a successful one. The signals that mean something:
   - `Connected to Tox DHT` / `Self connection status: connected (UDP|TCP)` in the log
-  - `toxtunnel inspect status --json | jq .friends_online`
+  - `toxtunnel inspect status --json | jq '.friends_online, .dht_connected'`
+    (`dht_connected` is v0.5.0+; so is `toxtunnel_dht_connected` in `/metrics`)
+  - `Bootstrap contacted 0 of N node(s): this daemon has NO DHT connectivity …`
+    (v0.5.0+, error level) — no node answered at all. The daemon then retries on a
+    10 s–5 min backoff (`Bootstrap retry N: contacted X/Y node(s)`). A host whose
+    only egress is an HTTP/SOCKS proxy never gets past this on its own: set
+    `tox.proxy` (v0.5.0+) and pin `bootstrap_nodes` by IP
   - `last_connection_type` in `known_servers.yaml` for the actual peer path
   - If `bootstrap_mode: lan`, no internet is required at all, but both machines
     must be on the same subnet and the network must pass multicast
@@ -233,10 +239,13 @@ These layers only apply when the corresponding feature is enabled.
 | Friend online but tunnel fails | Rules block the target or target service is down | Check `rules.yaml` and test target with `nc -zv host port` |
 | `Invalid public key length` | Wrong friend key format in `rules.yaml` | Friend public key must be exactly 64 hex chars, not the full 76-char Tox ID |
 | `Rules file not found` | Bad `server.rules_file` path | Use an absolute path and verify permissions |
-| Slow transfer speed (≈5–10 KB/s; a tiny request takes seconds while a bulk transfer runs) | Tox **TCP relay** instead of direct UDP — `toxtunnel servers list` / `known_servers.yaml` shows `last_connection_type: tcp`. toxcore's congestion control over relays tops out at a few packets/s; interactive SSH / DB queries are fine, bulk copies are not | Get the peers onto direct UDP: same LAN → `bootstrap_mode: lan` (that is what turns on toxcore local discovery — there is no separate `local_discovery_enabled` YAML key); otherwise make sure UDP 33445+ is reachable on at least one side. On a relay-only path keep payloads small (compress) and avoid concurrent bulk flows — every tunnel to one friend shares a single toxcore send queue, so one bulk copy starves the others |
+| Slow transfer speed (≈5–10 KB/s; a tiny request takes seconds while a bulk transfer runs) | Tox **TCP relay** instead of direct UDP — `toxtunnel servers list` / `known_servers.yaml` shows `last_connection_type: tcp`. toxcore's congestion control over relays tops out at a few packets/s; interactive SSH / DB queries are fine, bulk copies are not | Get the peers onto direct UDP: same LAN → `bootstrap_mode: lan` (that is what turns on toxcore local discovery — there is no separate `local_discovery_enabled` YAML key); otherwise make sure UDP 33445+ is reachable on at least one side. On a relay-only path keep payloads small (compress) and avoid concurrent bulk flows — every tunnel to one friend shares a single toxcore send queue, so one bulk copy starves the others (v0.5.0+ bounds the queue a bulk copy builds to about min RTT / 2 + 75 ms of data, or the 32 KiB floor's worth on paths slower than ~440 KB/s; before, on a relay path, it was tens of seconds) |
 | Periodic disconnects | Unstable Tox friend connectivity | Raise log level and check network stability |
+| `Tunnel N open timed out after 30s with no OPEN_ACK from the peer; closing` (v0.5.0+) | The server never answered the open: it went offline mid-handshake, or (pre-v0.5.0 server on a slow path) the OPEN_ACK sat behind a bulk transfer in the friend's queue. Booked as `tunnels_opened_total{result="failed"}` | Check the server is online and not saturated by a bulk flow to the same client; upgrade both ends to v0.5.0 (its window shrinks on slow paths). `tunnel.open_timeout_seconds` tunes the limit (0 = the old wait-forever) |
+| `TCP connection accepted on port P while the server is offline; holding it for up to 10s (N held)` then `Held connection on port P timed out after 10s waiting for the server; closing` (v0.5.0+) | The client's server was offline when the app connected; the connection was held but the server did not come back in time | Normal at start-up or across a brief link drop. If it times out, find out why the server is offline (layer 4). Raise `tunnel.offline_open_wait_seconds` to ride out longer gaps, e.g. past `failover.timeout_seconds` when a fallback should take over |
+| App sees `Connection reset by peer`; client log `Tunnel N received TUNNEL_ERROR: code=4, desc='target connection ended abnormally: …'` (server: `Tunnel N sent error: code=4, …`) | The **target** service reset or broke its connection after the tunnel was up; v0.5.0+ passes that through as a local reset (older releases turned it into a clean EOF, so truncated replies looked complete) | Investigate the target service (its logs, limits, crashes); the tunnel did its job |
 | Crashes on startup with `std::bad_alloc` (huge `mmap`) | A non-regular file — usually a **directory** — sits at `<data_dir>/tox_save.dat` (or it is corrupt), so the loader read a garbage size. The v0.4.8 Linux packaging bug created the directory case | **Do not `rm -rf` it — that destroys the Tox identity, which cannot be recovered.** Stop the daemon, then: if it is an **empty directory**, `rmdir` it (v0.4.9+ self-heals this on the next write anyway). If it is a **file**, move it aside rather than deleting: `mv <data_dir>/tox_save.dat <data_dir>/tox_save.dat.bak-$(date +%s)`. Only then restart, which mints a **new identity with a new public key** — so every server's `rules.yaml` needs the new key, and the peer's `known_servers.yaml` entry is stale. Get the user's explicit agreement to that before doing it. Hardened to fail gracefully in builds after v0.4.7 |
-| Both peers reach DHT but `friends_online` stays 0 **across different machines** | Tox friend-discovery (onion) blocked by the network — a local HTTP/SOCKS proxy or VPN in TUN mode (e.g. Clash) degrades onion routing; a corporate switch usually filters the multicast that `bootstrap_mode: lan` needs | Same LAN allowing multicast → `lan`. Else the path must pass Tox UDP/onion (don't proxy the daemon's traffic), or pin a mutually-reachable bootstrap node. Same-host loopback (`lan`) always works |
+| Both peers reach DHT but `friends_online` stays 0 **across different machines** | Tox friend-discovery (onion) blocked by the network — a local HTTP/SOCKS proxy or VPN in TUN mode (e.g. Clash) degrades onion routing; a corporate switch usually filters the multicast that `bootstrap_mode: lan` needs | Same LAN allowing multicast → `lan`. Else the path must pass Tox UDP/onion (don't let a TUN-mode VPN capture the daemon's traffic), or pin a mutually-reachable bootstrap node — on v0.5.0+ another daemon can be that node (`dht_public_key` / `tcp_relay_port` from its `inspect status`), and a proxy-only host can go through `tox.proxy` to that daemon's TCP relay. Same-host loopback (`lan`) always works |
 | `TcpListener: failed to bind <addr>:<port>: Address already in use` (Windows: `Only one usage of each socket address … is normally permitted`) | Local forward port taken (often a second toxtunnel) | At startup the client refuses to run: `Failed to initialize client: cannot listen on configured forward port(s): …` and exits 1. On reload it is per-forward: `Reload: not forwarding <addr>:<port> -> …` plus `reload applied with warnings: …`, everything else stays live. v0.4.13+ reports the bind address alongside the port; older builds print the port alone. Free the port (`ss -tlnp \| grep :N`) or pick another |
 | `failed to create Tox instance: could not bind Tox TCP relay port <N>` | Another toxtunnel (or anything else) holds that port. The Tox **UDP** port auto-walks to the next free one; the **TCP relay** port does not, and server mode will not accept `tcp_port: 0` | Give this daemon its own `tox.tcp_port` |
 | `data directory <dir> is already in use by toxtunnel pid <N>` | A second daemon tried to take a `data_dir` another one owns. Sharing it would mean sharing the Tox identity, the inspect socket and `known_servers.yaml`, so startup refuses with exit 1 — including under `--service`, so `Restart=on-failure` retries once the holder exits | Stop the other instance, or give this one its own `data_dir` |
@@ -308,9 +317,18 @@ Tox-thread watchdog fires when `tox_iterate` stalls past
 
 1. `journalctl -u toxtunnel | grep "tox_thread wedge"` — logged at **critical**
    level, verbatim:
-   `tox_thread wedge detected: lag_ms=<N> deadline_ms=<N> heartbeat_count=<N>`.
-   Those are the three values in the message text (there are no `delta_ms` or
-   `last_heartbeat_counter` fields).
+   v0.4.x: `tox_thread wedge detected: lag_ms=<N> deadline_ms=<N> heartbeat_count=<N>`;
+   v0.5.0+: `tox_thread wedge detected: lag_ms=<N> deadline_ms=<N>
+   heartbeat_count=<N> phase=<phase> (confirmed over 5 consecutive checks);
+   aborting so the service manager restarts the daemon`. `phase` names where
+   the Tox thread is stuck: `idle`, `tox_iterate`, `posted tasks`,
+   `application callbacks` or `maintenance`. There are no `delta_ms` or `last_heartbeat_counter`
+   fields. On v0.5.0+ it is preceded by warnings `tox_thread heartbeat stale for
+   <N> ms (deadline <N> ms, phase=…); confirming wedge (k/5)`.
+   **An abort right after the host woke from sleep, or after a VM pause, on
+   v0.4.x is that pause, not a wedge** — v0.4.x aborts on one stale check;
+   v0.5.0 requires 5 consecutive ones and discards checks taken across a process
+   suspend. Correlate with the host's sleep/wake log before chasing toxcore.
 2. `cat <data_dir>/abort_count` — **the only durable count.** Written at abort
    time; nothing reads it back at startup.
 3. `curl 127.0.0.1:9100/metrics | grep watchdog_aborts` —
@@ -418,8 +436,11 @@ the daemon refuse to start:
 `flow_control.mode` defaults to `bdp` since v0.4.1 — check the config has
 not pinned `mode: fixed`. In `bdp` mode the per-tunnel `BdpFlowControl`
 scales the window between `send_window_min_bytes` and
-`send_window_max_bytes` based on RTT × bandwidth EWMA. Inspect via the
-`toxtunnel_tunnel_send_window_bytes` summary. If the link is a TCP relay
+`send_window_max_bytes`: bandwidth × (minimum RTT of the last ~10 s + 50 ms) ×
+`safety_factor_x100`/100 on v0.5.0+ (an RTT × bandwidth EWMA before). Inspect via
+the `toxtunnel_tunnel_send_window_bytes` summary. On v0.5.0+ a dip to the 32 KiB
+floor about every 10 s during a long transfer is the periodic RTT re-measure,
+not a fault. If the link is a TCP relay
 the window is not the limiter — see "Slow transfer speed" above.
 
 ### Symptom: tunnels die across server restart
@@ -470,7 +491,9 @@ the service (`install-windows-service`), as a Scheduled Task, or via
 `Connecting`, while the server side shows the same IDs as `Connected`
 (or `Disconnecting`). Cause: a control frame (`TUNNEL_OPEN_ACK`,
 `TUNNEL_CLOSE`, `PING`, `PONG`) hit toxcore's lossless SENDQ while it
-was full and got silently dropped. Fixed in v0.4.5+:
+was full and got silently dropped. Fixed in v0.4.5+ (and since v0.5.0
+`tunnel.open_timeout_seconds`, default 30, closes any client tunnel still in
+`Connecting` after that long instead of letting it hang):
 
 - Control frames routed via `TunnelManager::send_frame` are parked in a
   bounded FIFO retry queue (cap 4096) and re-emitted every 20 ms until

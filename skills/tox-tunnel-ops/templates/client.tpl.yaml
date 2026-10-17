@@ -31,6 +31,13 @@ logging:
 tox:
   udp_enabled: true
   bootstrap_mode: {{BOOTSTRAP_MODE|auto}}
+  # Only egress is an HTTP CONNECT / SOCKS5 proxy (v0.5.0+)? Route Tox through it.
+  # toxcore then runs TCP-relay-only (no UDP), so pin bootstrap_nodes by IP; not
+  # allowed with bootstrap_mode: lan.
+  # proxy:
+  #   type: socks5                # none | http | socks5
+  #   host: 127.0.0.1
+  #   port: 7890
 
 # Prometheus /metrics endpoint (opt-in). Off by default.
 # The client exposes its own metric set (tunnels_active{role="client"},
@@ -49,6 +56,10 @@ tox:
 #   coalesce_max_delay_us: 200
 #   coalesce_max_bytes: 1362
 #   idle_timeout_seconds: 0       # 0 = disabled; set non-zero to reap idle tunnels
+#   open_timeout_seconds: 30      # v0.5.0+: close an open with no OPEN_ACK after this long
+#   offline_open_wait_seconds: 10 # v0.5.0+: hold forward connections made while the
+#                                 # server is offline; raise past failover.timeout_seconds
+#                                 # if they should wait for a fallback
 
 client:
   # Either paste the server's 76-character Tox ID here, or use an alias that

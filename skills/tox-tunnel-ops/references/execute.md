@@ -20,7 +20,7 @@ If not found, prefer package installation over source builds.
 The canonical, always-current install instructions are the "Installation"
 section of the repo's [`README.md`](https://github.com/agentx-icu/tox-tcp-tunnel#installation);
 if this file and the README ever disagree, the README wins. The newest release
-at the time of writing is **v0.4.12** — check the Releases page for the current
+at the time of writing is **v0.5.0** — check the Releases page for the current
 one rather than trusting this number.
 
 **When you are installing on an operator's machine, do not pipe a script from a
@@ -33,7 +33,7 @@ What changes is that the code executed is the released package, pinned to a
 version you chose, rather than whatever `master` holds at that moment:
 
 ```bash
-VER=0.4.12; ARCH=x86_64          # or aarch64
+VER=0.5.0; ARCH=x86_64           # or aarch64
 BASE="https://github.com/agentx-icu/tox-tcp-tunnel/releases/download/v${VER}"
 
 # Linux (DEB - Ubuntu/Debian)
@@ -51,7 +51,7 @@ sudo installer -pkg "/tmp/toxtunnel-${VER}.pkg" -target /
 
 ```powershell
 # Windows (Administrator PowerShell); ARM: toxtunnel-$VER-Windows-ARM64.msi
-$VER='0.4.12'
+$VER='0.5.0'
 irm "https://github.com/agentx-icu/tox-tcp-tunnel/releases/download/v$VER/toxtunnel-$VER-Windows-AMD64.msi" -OutFile "$env:TEMP\toxtunnel.msi"
 msiexec /i "$env:TEMP\toxtunnel.msi" /qn
 ```
@@ -77,7 +77,8 @@ install needs to be reproducible.
 
 The repo ships installer scripts that auto-detect arch, download the matching
 native package from GitHub Releases, install it, and seed `config.yaml`
-based on `--mode`. Client mode writes a config scaffold and leaves the system
+based on the mode (`--mode` for `install.sh`, `-Mode` or `TOXTUNNEL_MODE` for
+`install.ps1`). Client mode writes a config scaffold and leaves the system
 service idled (exit 0) until the user fills in `client.server_id` and sets
 `service.allow_client_daemon: true`.
 
@@ -86,9 +87,9 @@ let them read it, and only then run it.** `master` is mutable: the `| sudo sh`
 form executes whatever landed on that branch today, as root, unreviewed.
 
 ```bash
-# Download a pinned copy (tag URLs resolve; verified for v0.4.12)
+# Download a pinned copy (tag URLs resolve; verified for v0.5.0)
 curl -fsSL -o /tmp/toxtunnel-install.sh \
-  https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.4.12/scripts/install.sh
+  https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.0/scripts/install.sh
 less /tmp/toxtunnel-install.sh            # <- show the operator what will run as root
 sudo sh /tmp/toxtunnel-install.sh                        # server
 sudo sh /tmp/toxtunnel-install.sh --mode client          # client scaffold
@@ -96,7 +97,7 @@ sudo sh /tmp/toxtunnel-install.sh --mode client          # client scaffold
 
 ```powershell
 # Windows (Administrator PowerShell)
-irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.4.12/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
+irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.0/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
 Get-Content "$env:TEMP\install.ps1" | more     # review first
 $env:TOXTUNNEL_MODE='client'; & "$env:TEMP\install.ps1"
 ```
@@ -268,6 +269,12 @@ sc stop ToxTunnel
 > that failed for a transient reason — e.g. a restart racing the previous
 > instance for the data-directory lock — the way systemd's `Restart=on-failure`
 > and launchd's `KeepAlive` already do. Check it with `sc qfailure ToxTunnel`.
+>
+> From v0.5.0 the command is safe to re-run after an upgrade: an existing
+> registration is updated in place (binary path, auto-start, recovery policy)
+> instead of failing, and the daemon re-applies a missing recovery policy at
+> every service start, so a service registered by an older release repairs
+> itself.
 
 ### Manual source-build service templates
 
@@ -551,7 +558,7 @@ Verify failover behavior:
 journalctl -u toxtunnel -f | grep -E 'Failover|active server'
 
 # Or query the running daemon directly
-toxtunnel inspect status --json | jq '.friends_online, .peer_online_seconds'
+toxtunnel inspect status --json | jq '.friends_online, .dht_connected, .peer_online_seconds'
 # (there is no .active_server field — the active server appears only in the
 #  `Failover: switching active server …` log line)
 ```
@@ -730,7 +737,8 @@ everything. Only a reply from the real remote service proves the path.
 Operators with extra capacity / hardening needs can opt into the new
 v0.4 blocks. Defaults preserve v0.3.0 behaviour, with two deliberate
 exceptions: `flow_control.mode` is `bdp` (since v0.4.1), and `watchdog`
-is on.
+is on. v0.5.0 adds two default-on client timings, `open_timeout_seconds`
+and `offline_open_wait_seconds` (see "v0.5.0 additions" below).
 
 ### Watchdog (on by default)
 
@@ -765,8 +773,19 @@ Monitoring it — mind the two similarly named metrics:
 The fatal line is logged at **critical** level and reads:
 
 ```text
-tox_thread wedge detected: lag_ms=<N> deadline_ms=<N> heartbeat_count=<N>
+tox_thread wedge detected: lag_ms=<N> deadline_ms=<N> heartbeat_count=<N> phase=<phase> (confirmed over 5 consecutive checks); aborting so the service manager restarts the daemon
 ```
+
+Since v0.5.0 the abort is **confirmed**: the heartbeat counter must stay
+unchanged for 5 consecutive over-deadline checks, and a check that finds the
+observer itself was stalled past the deadline (host sleep, a paused VM) is
+discarded. Before that, every laptop lid-close or VM pause longer than the
+deadline aborted a perfectly healthy daemon on resume. The warnings leading up
+to it read `tox_thread heartbeat stale for <N> ms (deadline <N> ms,
+phase=<phase>); confirming wedge (<k>/5)`; `phase` (`idle`, `tox_iterate`,
+`posted tasks`, `application callbacks`, `maintenance`) says where the Tox
+thread is stuck. On v0.4.x the line
+has no `phase=` and a single over-deadline check aborts.
 
 ### Adaptive coalescing (opt-in)
 
@@ -781,11 +800,30 @@ tunnel:
 ```yaml
 flow_control:
   mode: bdp                    # default; `fixed` locks the v0.3.0 256 KiB window
-  send_window_min_bytes: 65536
+  send_window_min_bytes: 32768 # v0.5.0 default; never below 32 KiB (65536 before)
   send_window_max_bytes: 4194304
   safety_factor_x100: 150
   fixed_window_bytes: 262144
 ```
+
+From v0.5.0 each tunnel starts at `fixed_window_bytes` and sizes its window as
+`bandwidth × (min RTT + 50 ms) × safety_factor_x100 / 100`, clamped to
+`[min, max]`. RTT is measured per byte range (DATA handed to toxcore until the
+peer's ACK covers it) and the window uses the minimum of the last ~10 s, taken
+only from samples sent with little in flight. Consequences worth telling an
+operator:
+
+- The seed is no longer a floor: on a slow or relayed path the window shrinks
+  toward 32 KiB, so a bulk transfer stops parking tens of seconds of data in
+  toxcore's per-friend queue ahead of every other tunnel and control frame.
+  The queue it can build is about min RTT / 2 + 75 ms of data, or the 32 KiB
+  floor's worth on paths slower than ~440 KB/s.
+- `send_window_min_bytes` is clamped up to 32 KiB (the receiver ACKs every
+  16 KiB, so a smaller window would stall). A pre-v0.5.0 config that set 65536
+  explicitly still works; it just keeps a 64 KiB floor.
+- A sustained transfer dips to the floor for a round trip or two about every
+  10 s to re-measure the path (like BBR's ProbeRTT). That periodic dip in
+  `toxtunnel_tunnel_send_window_bytes` is expected, not a fault.
 
 ### Per-friend rate limiting (opt-in)
 
@@ -898,3 +936,97 @@ which is exactly why the feature cannot survive a process restart on either side
 only. If a user wants an SSH session to survive a server restart, no ToxTunnel
 setting delivers that; point them at `tmux`/`screen` or `mosh` instead.
 
+## v0.5.0 additions
+
+### Hosts whose only egress is a proxy (`tox.proxy`)
+
+```yaml
+tox:
+  udp_enabled: false           # optional: toxcore turns UDP off for a proxy anyway
+  proxy:
+    type: socks5               # none (default) | http | socks5
+    host: 127.0.0.1            # IP or DNS name (resolved locally)
+    port: 7890
+  bootstrap_nodes:             # pin them by IP (see below)
+    - address: 144.172.88.203
+      port: 33445
+      public_key: "2016A0F2797EE3A8B004BA623F11AAFC8146F1B8F45107232A1A1AECCE856674"
+```
+
+- The startup log confirms it: `Tox traffic goes through SOCKS5 proxy
+  127.0.0.1:7890 (TCP relays only; toxcore disables UDP for a proxied node)`.
+- **No UDP.** toxcore cannot proxy UDP, so a proxied node reaches peers only
+  through TCP relays: expect relay throughput (SSH / DB grade, not bulk).
+- **Pin `bootstrap_nodes` by IP.** The public node-list fetch in `bootstrap_mode:
+  auto` runs `curl` without the proxy, and node addresses resolve locally.
+- `bootstrap_mode: lan` with a proxy is rejected at startup. Not reloadable.
+
+### Bootstrapping from another ToxTunnel daemon (private networks)
+
+When one side cannot reach the public DHT but can reach another daemon directly
+(VPN, overlay, LAN segment — or a proxied node that can reach one), pin that
+daemon as a bootstrap node. Read its DHT identity:
+
+```bash
+toxtunnel inspect status --json -c <its config> | jq '{dht_public_key, udp_port, tcp_relay_port}'
+# udp_port / tcp_relay_port are omitted when zero (jq shows null): a proxied node
+# has no UDP port, and a client normally runs no TCP relay.
+# or its startup line:
+#   DHT node key: 6F2C…E1A0 (UDP port 34510, TCP relay port 34511; changes on every restart)
+```
+
+```yaml
+tox:
+  bootstrap_nodes:
+    - {address: 10.0.0.5, port: 34510, public_key: "6F2C…E1A0"}   # UDP DHT
+    - {address: 10.0.0.5, port: 34511, public_key: "6F2C…E1A0"}   # TCP relay (servers)
+```
+
+- `dht_public_key` is **not** the Tox ID, and it **changes every time that
+  daemon restarts** — after a restart, regenerate the pinned entries. Keep at
+  least one public node in the list as well.
+- Pin that daemon's ports with `tox.udp_port` (new in v0.5.0; `0` = toxcore's
+  33445..33545 walk) and `tox.tcp_port`, so only the key moves.
+
+### Client open timing: `open_timeout_seconds` and `offline_open_wait_seconds`
+
+```yaml
+tunnel:
+  open_timeout_seconds: 30         # default; 0 = wait forever (pre-v0.5.0)
+  offline_open_wait_seconds: 10    # default; 0 = close at once (pre-v0.5.0)
+```
+
+- **`open_timeout_seconds`** closes a tunnel whose TUNNEL_OPEN got no OPEN_ACK in
+  time (`Tunnel N open timed out after 30s with no OPEN_ACK from the peer;
+  closing`), booked as `tunnels_opened_total{result="failed"}`. Before v0.5.0
+  the application hung in `Connecting` indefinitely.
+- **`offline_open_wait_seconds`** holds a forward connection accepted while the
+  server is offline (start-up, a brief link drop) — unread, at most 64 — and
+  opens it when the server comes back (`TCP connection accepted on port P while the server is offline; holding it
+  for up to 10s (N held)` → `Server online; opening N held connection(s)`, or `Held
+  connection on port P timed out after 10s waiting for the server; closing`).
+  Forward rules only; SOCKS5 / HTTP CONNECT still fail at once. The default is
+  shorter than `failover.timeout_seconds` (60): with failover configured, raise
+  it past that if a connection made while the primary is down should wait for
+  the fallback.
+
+### Behaviour changes to know when upgrading to v0.5.0
+
+- **Abnormal ends are resets.** When the target resets the connection after the
+  tunnel is up, the client resets its local socket too (the application sees
+  ECONNRESET, not a clean EOF), and the client logs `Tunnel N received
+  TUNNEL_ERROR: code=4, desc='target connection ended abnormally: …'` (the
+  server: `Tunnel N sent error: code=4, …`). A declined resume ends the
+  tunnel the same way.
+- **Keepalive is less trigger-happy and recovers by itself.** With
+  `keepalive_interval_seconds` set, any inbound frame now counts as life (not
+  only a PONG, which can queue behind bulk data), probing continues after a dead
+  verdict, and the first sign of life restores the server. Before v0.5.0 a slow
+  link could get a peer declared dead mid-transfer, and a verdict over a link
+  that never dropped stayed permanent.
+- **Bootstrap retries.** While not DHT-connected the daemon re-contacts its node
+  list on a 10 s–5 min backoff (`Bootstrap retry N: contacted X/Y node(s)`) and
+  re-fetches the public list when it has none. `inspect status` reports
+  `dht_connected`; `/metrics` exports `toxtunnel_dht_connected`.
+- **`--version` on a source build** reports `git describe` (e.g.
+  `0.5.0-3-gabc1234`); packages report the plain release number.
