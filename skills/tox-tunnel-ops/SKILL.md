@@ -79,7 +79,12 @@ Binary framing over Tox lossless custom packets:
   (minimum RTT + 50 ms) × `safety_factor_x100`/100, clamped to 32 KiB–4 MiB, and it
   **shrinks below the seed on slow paths**; before v0.5.0
   the seed was also the floor, so on a TCP-relay path a bulk transfer queued tens of
-  seconds of data ahead of every other tunnel and control frame to that peer
+  seconds of data ahead of every other tunnel and control frame to that peer.
+  Since v0.5.1 the bandwidth is a BBR-style delivery rate, so ACKs that arrive bunched
+  (toxcore batching, a congested reverse path) no longer inflate the window. A send
+  that starts with nothing in flight begins a fresh measurement, so an idle gap is not
+  read as slow delivery, and a sample sent while the application had nothing queued
+  and the window still had room for another full frame may only raise the estimate
 - Toxcore carries **one ordered stream per friend**: every tunnel to the same peer shares
   it, so a bulk transfer adds latency to an interactive session on the same server.
   The queue a saturating transfer can build is about min RTT / 2 + 75 ms of data, or
@@ -607,7 +612,7 @@ Analyze the user's message and route to the appropriate mode:
 | "An SSH session shouldn't drop when I **restart** the server" | **Nothing does this. Say so.** | No ToxTunnel feature preserves a TCP session across a server process restart — the server's local socket to the target dies with the process, and there is no on-disk resume state (the resume hold is purely in-memory). Answer honestly, then offer what actually helps: run the session under `tmux`/`screen` on the far side, or `mosh` for SSH, so the *application* survives; or use failover to a second server so the *service* stays reachable (the session still redials). |
 | "The tunnel shouldn't drop when the **network** flaps", "fast reattach across a brief disconnect" | **Tunnel resume** (`tunnel.resume.enabled: true`) | v0.4 opt-in, **live-reconnect only — both processes must stay up.** The server holds the disconnected friend's in-memory tunnels (and their target TCP connections) for `resume.max_age_seconds`; the client re-sends `TUNNEL_RESUME_REQUEST` per surviving tunnel and reconciles byte offsets. There is no retransmit buffer, so a gap is handled per `resume.on_gap` (`close` / `passthrough`). Nothing is persisted to disk. |
 | "Bulk transfer is slow", "throughput-tune", "high BDP link" | **Adaptive coalescing** (`tunnel.coalesce_mode: adaptive`) + **BDP flow control** (`flow_control.mode: bdp`) | v0.4. `flow_control.mode: bdp` is the default since v0.4.1 — verify it isn't overridden to `fixed`. `tunnel.coalesce_mode` is still `fixed` by default; flip to `adaptive` on bulk-heavy deployments. |
-| "SSH lags / new connections time out while a big copy runs to the same server" | **Upgrade to v0.5.0+ first; then separate the traffic** | All tunnels to one peer share toxcore's single ordered stream, so bulk data queues ahead of keystrokes and of the OPEN_ACK a new connection waits for. Before v0.5.0 the BDP window could not shrink below 256 KiB — on a relay path that is tens of seconds of queue (opens hit `open_timeout_seconds`, keepalive could falsely declare the peer dead). v0.5.0 bounds it to about min RTT / 2 + 75 ms of data, or the 32 KiB floor's worth on paths slower than ~440 KB/s (median ≈1 s measured on a 100 KB/s, 320 ms-RTT path in the PR #48 soak). Beyond that: rate-limit the bulk friend, or give bulk transfers their own server identity |
+| "SSH lags / new connections time out while a big copy runs to the same server" | **Upgrade to v0.5.1+ first; then separate the traffic** | All tunnels to one peer share toxcore's single ordered stream, so bulk data queues ahead of keystrokes and of the OPEN_ACK a new connection waits for. Before v0.5.0 the BDP window could not shrink below 256 KiB — on a relay path that is tens of seconds of queue (opens hit `open_timeout_seconds`, keepalive could falsely declare the peer dead). v0.5.0 bounds it to about min RTT / 2 + 75 ms of data, or the 32 KiB floor's worth on paths slower than ~440 KB/s (median ≈1 s measured on a 100 KB/s, 320 ms-RTT path in the PR #48 soak). Beyond that: rate-limit the bulk friend, or give bulk transfers their own server identity |
 | "This host can only get out through a proxy", "corporate HTTP proxy", "behind Clash / a SOCKS5 client" | **`tox.proxy`** (v0.5.0+) | `type: http \| socks5`, `host`, `port`. UDP is off for a proxied node, so the friend link is a TCP relay: SSH/DB-grade throughput, not bulk. Pin `bootstrap_nodes` by IP — the public node-list fetch bypasses the proxy. Not with `bootstrap_mode: lan`. Restart to change |
 | "No internet on one side, but it can reach the other daemon over a VPN / overlay / LAN segment" | **Pin the other daemon as a bootstrap node** (v0.5.0+) | Read its `dht_public_key`, `udp_port`, `tcp_relay_port` from `toxtunnel inspect status --json` (or the `DHT node key:` startup line). The two port fields are omitted when zero: no `udp_port` on a proxied node (UDP is off), no `tcp_relay_port` on a client that runs no relay and add two `bootstrap_nodes` entries (UDP port, TCP relay port). That key is **not** the Tox ID and **changes on every restart** of that daemon — keep a public node too, and pin its ports with `tox.udp_port` / `tox.tcp_port` |
 | "Daemon went silent without exiting", "tunnels stop but RSS flat", "detect a wedge" | **Watchdog metrics** — alert on `toxtunnel_tox_iterate_lag_ms` | v0.4, on by default. Mind the two near-identical names: **`toxtunnel_tox_iterate_lag_ms`** is the live gauge — milliseconds since the last `tox_iterate()` *returned* — and is the one that rises during an actual wedge. **`toxtunnel_tox_iterate_lag_milliseconds_max`** is the maximum *completed* call duration since process start, so it latches on one old slow call and can never move while a call is hung; use it as a slow-toxcore trend, not a wedge alarm. `toxtunnel_watchdog_aborts_total` **resets to 0 on every restart** (it is not seeded from `<data_dir>/abort_count`) — alert on `increase()`, and read the file for the durable count. |
@@ -1073,7 +1078,7 @@ Read on demand:
 
    ```bash
    # Linux (DEB). Pin the version; check the Releases page for the current one.
-   VER=0.5.0; ARCH=x86_64       # or aarch64
+   VER=0.5.1; ARCH=x86_64       # or aarch64
    curl -fsSL -o "/tmp/toxtunnel-${VER}.deb" \
      "https://github.com/agentx-icu/tox-tcp-tunnel/releases/download/v${VER}/toxtunnel-${VER}-Linux-${ARCH}.deb"
    sudo apt-get install -y "/tmp/toxtunnel-${VER}.deb"     # or: sudo dpkg -i
@@ -1083,7 +1088,7 @@ Read on demand:
    ```
 
    **Upstream publishes no checksum or signature files** (verified against the
-   v0.5.0 release: only the package assets and their `-latest` aliases). GitHub
+   v0.5.1 release: only the package assets and their `-latest` aliases). GitHub
    still exposes a SHA-256 digest per release asset, so there is something to
    compare against — but it comes from the same party as the file, so it catches
    corruption, not a compromised release. Independent signature/provenance is
@@ -1094,8 +1099,8 @@ Read on demand:
    the user explicitly wants it, **pin it to a release tag rather than `master`**
    (tag URLs resolve; `master` is mutable and would execute whatever landed there
    today, as root):
-   - macOS/Linux: `curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.0/scripts/install.sh` — then **show the operator the script**, and only then `sudo sh /tmp/install.sh --mode {server|client}`
-   - Windows (Administrator PowerShell): `irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.0/scripts/install.ps1 -OutFile $env:TEMP\install.ps1` — review, then `$env:TOXTUNNEL_MODE='{server|client}'; & $env:TEMP\install.ps1`
+   - macOS/Linux: `curl -fsSL -o /tmp/install.sh https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.1/scripts/install.sh` — then **show the operator the script**, and only then `sudo sh /tmp/install.sh --mode {server|client}`
+   - Windows (Administrator PowerShell): `irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.1/scripts/install.ps1 -OutFile $env:TEMP\install.ps1` — review, then `$env:TOXTUNNEL_MODE='{server|client}'; & $env:TEMP\install.ps1`
 
    Never run the `| sudo sh` / `| iex` form yourself on the user's behalf. Only
    suggest building from source when no pre-built package exists for the target
