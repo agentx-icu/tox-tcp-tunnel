@@ -20,7 +20,7 @@ If not found, prefer package installation over source builds.
 The canonical, always-current install instructions are the "Installation"
 section of the repo's [`README.md`](https://github.com/agentx-icu/tox-tcp-tunnel#installation);
 if this file and the README ever disagree, the README wins. The newest release
-at the time of writing is **v0.5.0** — check the Releases page for the current
+at the time of writing is **v0.5.1** — check the Releases page for the current
 one rather than trusting this number.
 
 **When you are installing on an operator's machine, do not pipe a script from a
@@ -33,7 +33,7 @@ What changes is that the code executed is the released package, pinned to a
 version you chose, rather than whatever `master` holds at that moment:
 
 ```bash
-VER=0.5.0; ARCH=x86_64           # or aarch64
+VER=0.5.1; ARCH=x86_64           # or aarch64
 BASE="https://github.com/agentx-icu/tox-tcp-tunnel/releases/download/v${VER}"
 
 # Linux (DEB - Ubuntu/Debian)
@@ -51,7 +51,7 @@ sudo installer -pkg "/tmp/toxtunnel-${VER}.pkg" -target /
 
 ```powershell
 # Windows (Administrator PowerShell); ARM: toxtunnel-$VER-Windows-ARM64.msi
-$VER='0.5.0'
+$VER='0.5.1'
 irm "https://github.com/agentx-icu/tox-tcp-tunnel/releases/download/v$VER/toxtunnel-$VER-Windows-AMD64.msi" -OutFile "$env:TEMP\toxtunnel.msi"
 msiexec /i "$env:TEMP\toxtunnel.msi" /qn
 ```
@@ -87,9 +87,9 @@ let them read it, and only then run it.** `master` is mutable: the `| sudo sh`
 form executes whatever landed on that branch today, as root, unreviewed.
 
 ```bash
-# Download a pinned copy (tag URLs resolve; verified for v0.5.0)
+# Download a pinned copy (tag URLs resolve; verified for v0.5.1)
 curl -fsSL -o /tmp/toxtunnel-install.sh \
-  https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.0/scripts/install.sh
+  https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.1/scripts/install.sh
 less /tmp/toxtunnel-install.sh            # <- show the operator what will run as root
 sudo sh /tmp/toxtunnel-install.sh                        # server
 sudo sh /tmp/toxtunnel-install.sh --mode client          # client scaffold
@@ -97,7 +97,7 @@ sudo sh /tmp/toxtunnel-install.sh --mode client          # client scaffold
 
 ```powershell
 # Windows (Administrator PowerShell)
-irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.0/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
+irm https://raw.githubusercontent.com/agentx-icu/tox-tcp-tunnel/v0.5.1/scripts/install.ps1 -OutFile "$env:TEMP\install.ps1"
 Get-Content "$env:TEMP\install.ps1" | more     # review first
 $env:TOXTUNNEL_MODE='client'; & "$env:TEMP\install.ps1"
 ```
@@ -810,8 +810,14 @@ From v0.5.0 each tunnel starts at `fixed_window_bytes` and sizes its window as
 `bandwidth × (min RTT + 50 ms) × safety_factor_x100 / 100`, clamped to
 `[min, max]`. RTT is measured per byte range (DATA handed to toxcore until the
 peer's ACK covers it) and the window uses the minimum of the last ~10 s, taken
-only from samples sent with little in flight. Consequences worth telling an
-operator:
+only from samples sent with little in flight. Bandwidth (since v0.5.1) is a
+BBR-style delivery rate: bytes delivered since a sample was sent, over the time
+since the delivery before it, so bunched ACKs cannot read as a rate above what was
+really delivered. A send that starts with nothing in flight begins a fresh
+measurement (an idle gap is not counted as slow delivery), and a sample sent while
+the application had nothing queued and the window still had room for another full
+frame may only raise the estimate; with the window full, a quiet application's
+samples still count normally. Consequences worth telling an operator:
 
 - The seed is no longer a floor: on a slow or relayed path the window shrinks
   toward 32 KiB, so a bulk transfer stops parking tens of seconds of data in
@@ -1029,4 +1035,4 @@ tunnel:
   re-fetches the public list when it has none. `inspect status` reports
   `dht_connected`; `/metrics` exports `toxtunnel_dht_connected`.
 - **`--version` on a source build** reports `git describe` (e.g.
-  `0.5.0-3-gabc1234`); packages report the plain release number.
+  `0.5.1-3-gabc1234`); packages report the plain release number.
