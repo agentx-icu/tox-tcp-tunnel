@@ -1764,11 +1764,64 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
         manager_ptr, friend_number);
     server_tunnel->set_on_send_to_tox(std::move(senders.span));
     server_tunnel->set_on_send_to_tox_owned(std::move(senders.owned));
+
+    // The target connection and its resolver exist from here on, so the
+    // pre-wire teardown below can cancel them (issues #41, #44).
+    auto tcp_conn = std::make_shared<core::TcpConnection>(io_context_->get_io_context());
+    auto resolver = std::make_shared<asio::ip::tcp::resolver>(io_context_->get_io_context());
+    auto pending = std::make_shared<detail::PendingOpen>();
+    // Every async stage below resolves the manager through this weak_ptr, not
+    // through managers_: a friend that drops mid-open has its manager parked in
+    // held_managers_ (resume), where a managers_ lookup would miss it.
+    const std::weak_ptr<tunnel::TunnelManager> weak_manager = manager_ptr;
+    const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = server_tunnel;
+
+    // Pre-wire teardown. Fires when the tunnel ends before it is wired: a client
+    // TUNNEL_ERROR, a client TUNNEL_CLOSE while no socket is attached (its open
+    // deadline expired), or a manager teardown (friend offline / shutdown).
+    // Installed BEFORE add_tunnel(), so no frame can reach the tunnel first —
+    // and this runs on inbound_strand_, which also routes that friend's frames.
+    // wire_tcp_to_tunnel() replaces it once the open is handed over.
+    {
+        const std::weak_ptr<asio::ip::tcp::resolver> weak_resolver = resolver;
+        const std::weak_ptr<core::TcpConnection> weak_tcp = tcp_conn;
+        server_tunnel->set_on_close([weak_manager, weak_tunnel, weak_resolver, weak_tcp, pending,
+                                     tunnel_id, friend_number]() {
+            if (!pending->try_cancel()) {
+                return;  // Handed to wiring (it re-checks), or already resolved.
+            }
+            if (auto r = weak_resolver.lock()) {
+                r->cancel();
+            }
+            if (auto c = weak_tcp.lock()) {
+                // A no-op while the socket is still Disconnected; the resolver /
+                // connect continuation sees `Resolved` and closes it instead.
+                c->force_close();
+            }
+            if (pending->claim_failure_booking()) {
+                util::MetricsRegistry::instance().inc_tunnels_opened(
+                    util::MetricsRegistry::OpenResult::Failed);
+            }
+            util::Logger::info(
+                "Tunnel {} (friend {}) ended before its target connection was established; "
+                "cancelled the connect",
+                tunnel_id, friend_number);
+            // Inline, not posted: nothing calls notify_close_once() under a
+            // manager lock, and removing here frees the id before the next
+            // frame from this friend is dispatched on the strand.
+            auto mgr = weak_manager.lock();
+            auto self = weak_tunnel.lock();
+            if (mgr && self) {
+                (void)mgr->remove_tunnel_if(tunnel_id, self.get());
+            }
+        });
+    }
+
     // H-05: add_tunnel can fail (manager hit max_tunnels between
     // handle_incoming_open and here). On failure leave the guard uncommitted so
     // it releases the reserved id, tell the peer, and bail — otherwise the
     // TUNNEL_OPEN would be half-accepted with no registered tunnel.
-    if (!manager_ptr->add_tunnel(tunnel_id, std::move(server_tunnel))) {
+    if (!manager_ptr->add_tunnel(tunnel_id, server_tunnel)) {
         util::Logger::warn("TunnelManager full; could not add tunnel {} for friend {}", tunnel_id,
                            friend_number);
         util::MetricsRegistry::instance().inc_tunnels_opened(
@@ -1778,87 +1831,106 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
         auto error_frame =
             tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, 1, "Tunnel limit exceeded");
         manager_ptr->send_frame(error_frame);
+        // Never registered: stand the pre-wire teardown down so the tunnel's
+        // destruction cannot book a second outcome for this open.
+        (void)pending->try_cancel();
+        (void)pending->claim_failure_booking();
         return;
     }
     // add_tunnel re-set used_ids_[tunnel_id]; the guard's release would
     // now wrongly free it. Commit so the destructor skips the release.
     id_guard.committed = true;
 
-    // Create a TCP connection to the target host:port.
-    auto tcp_conn = std::make_shared<core::TcpConnection>(io_context_->get_io_context());
+    // A pre-wire resolve / connect failure: tell the peer and drop the tunnel —
+    // unless the pre-wire teardown already claimed this open, in which case the
+    // peer has moved on and must hear nothing more about this id.
+    auto fail_prewire = [weak_manager, weak_tunnel, pending, tunnel_id](std::uint8_t code,
+                                                                        std::string reason) {
+        if (!pending->try_cancel()) {
+            return;
+        }
+        if (pending->claim_failure_booking()) {
+            util::MetricsRegistry::instance().inc_tunnels_opened(
+                util::MetricsRegistry::OpenResult::Failed);
+        }
+        // Send error and close the tunnel (H-01: outside managers_mutex_ —
+        // removal re-enters the tunnel's close callbacks). Identity-checked:
+        // a lapsed tunnel or a recycled id means this open is not ours to end.
+        auto mgr = weak_manager.lock();
+        auto self = weak_tunnel.lock();
+        if (mgr && self && mgr->get_tunnel(tunnel_id).get() == self.get()) {
+            mgr->send_frame(tunnel::ProtocolFrame::make_tunnel_error(tunnel_id, code, reason));
+            (void)mgr->remove_tunnel_if(tunnel_id, self.get());
+        }
+    };
 
     // Resolve the target host and connect.
-    auto resolver = std::make_shared<asio::ip::tcp::resolver>(io_context_->get_io_context());
-
     resolver->async_resolve(
         target_host, std::to_string(target_port),
-        [this, resolver, tcp_conn, friend_number, tunnel_id, target_host, target_port](
-            const std::error_code& ec, asio::ip::tcp::resolver::results_type results) {
+        [this, resolver, tcp_conn, pending, weak_manager, weak_tunnel, fail_prewire, friend_number,
+         tunnel_id, target_host,
+         target_port](const std::error_code& ec, asio::ip::tcp::resolver::results_type results) {
+            if (pending->resolved()) {
+                return;  // Cancelled by the pre-wire teardown; nothing to report.
+            }
             if (ec) {
                 util::Logger::error("Failed to resolve {}:{} for tunnel {}: {}", target_host,
                                     target_port, tunnel_id, ec.message());
-                util::MetricsRegistry::instance().inc_tunnels_opened(
-                    util::MetricsRegistry::OpenResult::Failed);
-
-                // Send error and close the tunnel (H-01: do both outside
-                // managers_mutex_ — remove_tunnel() calls Tunnel::close(), whose
-                // callbacks re-enter managers_mutex_).
-                std::shared_ptr<tunnel::TunnelManager> mgr;
-                {
-                    std::lock_guard lock(managers_mutex_);
-                    auto it = managers_.find(friend_number);
-                    if (it != managers_.end()) {
-                        mgr = it->second;
-                    }
-                }
-                if (mgr) {
-                    auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
-                        tunnel_id, 2, "DNS resolution failed: " + ec.message());
-                    mgr->send_frame(error_frame);
-                    mgr->remove_tunnel(tunnel_id);
-                }
+                fail_prewire(2, "DNS resolution failed: " + ec.message());
                 return;
             }
+            if (!pending->advance(detail::PendingOpen::Phase::Resolving,
+                                  detail::PendingOpen::Phase::Connecting)) {
+                return;  // Cancelled between the check above and here.
+            }
 
-            // Connect to the first resolved endpoint.
+            // Connect to the first resolved endpoint. Initiated OUTSIDE the
+            // phase mutex (its misuse path calls back inline); a cancel landing
+            // in between is caught by the re-check right after.
             auto endpoint = results.begin()->endpoint();
-            tcp_conn->async_connect(endpoint, [this, tcp_conn, friend_number, tunnel_id,
-                                               target_host,
+            tcp_conn->async_connect(endpoint, [this, tcp_conn, pending, weak_manager, weak_tunnel,
+                                               fail_prewire, friend_number, tunnel_id, target_host,
                                                target_port](const std::error_code& connect_ec) {
+                if (pending->resolved()) {
+                    tcp_conn->force_close();  // Cancelled while connecting.
+                    return;
+                }
                 if (connect_ec) {
                     util::Logger::error("Failed to connect to {}:{} for tunnel {}: {}", target_host,
                                         target_port, tunnel_id, connect_ec.message());
-                    util::MetricsRegistry::instance().inc_tunnels_opened(
-                        util::MetricsRegistry::OpenResult::Failed);
-
-                    std::shared_ptr<tunnel::TunnelManager> mgr;
-                    {
-                        std::lock_guard lock(managers_mutex_);
-                        auto it = managers_.find(friend_number);
-                        if (it != managers_.end()) {
-                            mgr = it->second;
-                        }
-                    }
-                    if (mgr) {
-                        // Code 3 now means "actively refused" and nothing else;
-                        // every other connect failure is the general code 2.
-                        // Classified numerically — see
-                        // detail::open_failure_for_connect_error().
-                        const auto reason = detail::open_failure_for_connect_error(connect_ec);
-                        auto error_frame = tunnel::ProtocolFrame::make_tunnel_error(
-                            tunnel_id, reason.code, reason.description);
-                        mgr->send_frame(error_frame);
-                        mgr->remove_tunnel(tunnel_id);
-                    }
+                    // Code 3 now means "actively refused" and nothing else;
+                    // every other connect failure is the general code 2.
+                    // Classified numerically — see
+                    // detail::open_failure_for_connect_error().
+                    const auto reason = detail::open_failure_for_connect_error(connect_ec);
+                    fail_prewire(reason.code, reason.description);
+                    return;
+                }
+                if (!pending->advance(detail::PendingOpen::Phase::Connecting,
+                                      detail::PendingOpen::Phase::Handed)) {
+                    tcp_conn->force_close();  // Cancelled as the connect completed.
                     return;
                 }
 
                 util::Logger::info("TCP connected to {}:{} for tunnel {} (friend {})", target_host,
                                    target_port, tunnel_id, friend_number);
 
-                // Wire up the TCP connection to the tunnel.
-                wire_tcp_to_tunnel(friend_number, tunnel_id, tcp_conn);
+                // Wire up the TCP connection to the tunnel. A lapsed tunnel was
+                // destroyed with its manager; nothing is left to wire.
+                auto expected = weak_tunnel.lock();
+                if (!expected) {
+                    tcp_conn->force_close();
+                    return;
+                }
+                wire_tcp_to_tunnel(friend_number, tunnel_id, tcp_conn, expected, weak_manager,
+                                   pending);
             });
+            // A cancel that claimed `Resolved` after the advance above but
+            // before async_connect() moved the socket to Connecting found
+            // nothing to close; close it now that there is something.
+            if (pending->resolved()) {
+                tcp_conn->force_close();
+            }
         });
 }
 
@@ -2406,55 +2478,53 @@ void TunnelServer::handle_resume_request(uint32_t friend_number,
 }
 
 void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id,
-                                      std::shared_ptr<core::TcpConnection> tcp_conn) {
-    // Hold a shared_ptr to the TunnelImpl so its lifetime extends across the
-    // TCP strand's async callbacks, even if remove_tunnel() fires from the Tox
-    // strand mid-flight. Same shared_ptr discipline for the manager
-    // (M-1 in the 2026-05-20 review): the unlocked tail below calls
-    // manager_ptr->send_frame(ack) after the lock is released.
-    std::shared_ptr<tunnel::TunnelImpl> tunnel_impl;
-    std::shared_ptr<tunnel::TunnelManager> manager_ptr;
-
-    // Look up manager and tunnel under the lock, then release immediately.
-    {
-        std::lock_guard lock(managers_mutex_);
-        auto it = managers_.find(friend_number);
-        if (it == managers_.end()) {
-            util::Logger::warn("Cannot wire tunnel {}: no TunnelManager for friend {}", tunnel_id,
-                               friend_number);
-            tcp_conn->close();
-            return;
+                                      std::shared_ptr<core::TcpConnection> tcp_conn,
+                                      const std::shared_ptr<tunnel::TunnelImpl>& expected,
+                                      const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                                      const std::shared_ptr<detail::PendingOpen>& pending) {
+    // Hold shared_ptrs to the TunnelImpl and the manager so their lifetimes
+    // extend across the TCP strand's async callbacks, even if remove_tunnel()
+    // fires from the Tox strand mid-flight (M-1 in the 2026-05-20 review).
+    //
+    // Resolved through the weak manager captured at open time, not a managers_
+    // lookup (which misses a manager parked for resume), and identity-checked
+    // against the tunnel this connect was made for: an id-only lookup could
+    // wire this socket into a replacement that recycled the id. A refusal ends
+    // the open here — the pre-wire teardown stood down once the open was
+    // Handed, so nobody else will.
+    const std::shared_ptr<tunnel::TunnelImpl> tunnel_impl = expected;
+    const std::shared_ptr<tunnel::TunnelManager> manager_ptr = weak_manager.lock();
+    const auto refuse = [&](const char* why) {
+        util::Logger::warn("Cannot wire tunnel {} (friend {}): {}; closing its target connection",
+                           tunnel_id, friend_number, why);
+        tcp_conn->force_close();
+        if (manager_ptr) {
+            (void)manager_ptr->remove_tunnel_if(tunnel_id, tunnel_impl.get());
         }
-        manager_ptr = it->second;
-
-        auto tunnel = manager_ptr->get_tunnel(tunnel_id);
-        if (!tunnel) {
-            util::Logger::warn("Cannot wire: tunnel {} not found for friend {}", tunnel_id,
-                               friend_number);
-            tcp_conn->close();
-            return;
+        if (pending->claim_failure_booking()) {
+            util::MetricsRegistry::instance().inc_tunnels_opened(
+                util::MetricsRegistry::OpenResult::Failed);
         }
-
-        // Downcast to TunnelImpl for the extended API.
-        tunnel_impl = std::dynamic_pointer_cast<tunnel::TunnelImpl>(tunnel);
-        if (!tunnel_impl) {
-            util::Logger::error("Tunnel {} is not a TunnelImpl", tunnel_id);
-            tcp_conn->close();
-            return;
-        }
+    };
+    if (!manager_ptr) {
+        refuse("its TunnelManager is gone");
+        return;
+    }
+    if (manager_ptr->get_tunnel(tunnel_id).get() != tunnel_impl.get()) {
+        refuse("the tunnel was removed (or its id recycled) while connecting");
+        return;
     }
 
     // All wiring below happens WITHOUT holding managers_mutex_.
     // Use weak_ptr on the TcpConnection -> TunnelImpl callback edge so the
     // socket callbacks do not form a permanent ownership cycle with the tunnel.
     const std::weak_ptr<tunnel::TunnelImpl> weak_tunnel = tunnel_impl;
-    // Resolve the owning manager through a weak_ptr captured here rather than a
-    // friend-keyed managers_ lookup inside the callbacks. While a friend is
+    // The callbacks resolve the owning manager through `weak_manager` (the
+    // parameter) rather than a friend-keyed managers_ lookup. While a friend is
     // disconnected its manager is parked in held_managers_ (resume); the same
     // shared_ptr instance moves between managers_ and held_managers_ and back on
-    // resurrect, so this weak_ptr tracks it across every transition and only
+    // resurrect, so the weak_ptr tracks it across every transition and only
     // lapses once the resume hold expires and the manager is destroyed.
-    const std::weak_ptr<tunnel::TunnelManager> weak_manager = manager_ptr;
 
     // Associate the TCP connection with the tunnel.
     tunnel_impl->set_tcp_connection(tcp_conn);
@@ -2482,6 +2552,17 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // correct in both orders, which a bare "already decremented" flag is not:
     // an abandoned tunnel is never counted, so nothing may decrement for it.
     auto active_gauge = detail::make_active_gauge_latch();
+
+    // Why the target went away, when it died while the gate's commit callback
+    // was running: the disconnect handler records it BEFORE target_gone(), and
+    // the post-commit close below reads it after the gate has consumed that
+    // request, so a target reset in that window still reaches the client as
+    // TUNNEL_ERROR 4 instead of a clean close (issue #44).
+    struct TargetEnd {
+        std::mutex mutex;
+        std::string abnormal_reason;  // empty = clean end of stream
+    };
+    auto target_end = std::make_shared<TargetEnd>();
 
     auto ack_gate = std::make_shared<detail::OpenAckGate>(
         io_context_->get_io_context(),
@@ -2523,14 +2604,25 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
         // still running, so the gate could not truthfully tell the disconnect
         // handler "the tunnel is live, run your close". This is that close,
         // run once commit has finished. Identical to the ordinary path below.
-        [this, weak_manager, weak_tunnel, tunnel_id]() {
-            asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, tunnel_id]() {
+        [this, weak_manager, weak_tunnel, tunnel_id, target_end]() {
+            std::string abnormal_reason;
+            {
+                std::lock_guard<std::mutex> lock(target_end->mutex);
+                abnormal_reason = target_end->abnormal_reason;
+            }
+            asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, tunnel_id,
+                                                       abnormal_reason]() {
                 auto mgr = weak_manager.lock();
                 auto tunnel = weak_tunnel.lock();
                 if (!mgr || !tunnel) {
                     return;
                 }
-                // Identity-checked for the same reason as the ordinary path.
+                // Identity-checked for the same reason as the ordinary path,
+                // and the same abnormal-end rule.
+                if (!abnormal_reason.empty() && mgr->get_tunnel(tunnel_id).get() == tunnel.get()) {
+                    tunnel->send_error(4, abnormal_reason);
+                    return;
+                }
                 (void)mgr->close_tunnel_if(tunnel_id, tunnel.get());
             });
         });
@@ -2539,7 +2631,7 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // Uses asio::post to defer cleanup, avoiding re-entrance into managers_mutex_
     // if on_disconnect fires synchronously from tcp_conn->close().
     tcp_conn->set_on_disconnect([this, weak_manager, weak_tunnel, ack_gate, friend_number,
-                                 tunnel_id](const std::error_code& ec) {
+                                 tunnel_id, target_end](const std::error_code& ec) {
         // ec is default-constructed for a clean half-close / EOF teardown.
         // Calling ec.message() in that case renders the platform's "no
         // error" string ("Undefined error: 0" on macOS, "Success" on
@@ -2553,15 +2645,6 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
                                 friend_number);
         }
 
-        // The target can die while the OPEN_ACK is still backpressured. The
-        // tunnel was never published in that case, so the graceful close
-        // below is the wrong tool: with the client still in Connecting, a
-        // TUNNEL_CLOSE does not resolve it. The gate answers with a
-        // TUNNEL_ERROR instead.
-        if (ack_gate->target_gone()) {
-            return;
-        }
-
         // An abnormal end of the target connection — a reset, or any read /
         // write error that is not a clean end of stream — is reported to the
         // peer as such. `operation_aborted` is our own force_close() and an
@@ -2573,6 +2656,21 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
         const std::string abnormal_reason =
             abnormal ? std::string("target connection ended abnormally: ") + ec.message()
                      : std::string();
+        // Recorded before target_gone(): if the gate is mid-commit it defers
+        // this end to its post-commit close, which reads the reason here.
+        {
+            std::lock_guard<std::mutex> lock(target_end->mutex);
+            target_end->abnormal_reason = abnormal_reason;
+        }
+
+        // The target can die while the OPEN_ACK is still backpressured. The
+        // tunnel was never published in that case, so the graceful close
+        // below is the wrong tool: with the client still in Connecting, a
+        // TUNNEL_CLOSE does not resolve it. The gate answers with a
+        // TUNNEL_ERROR instead.
+        if (ack_gate->target_gone()) {
+            return;
+        }
 
         asio::post(io_context_->get_io_context(),
                    [weak_manager, weak_tunnel, tunnel_id, abnormal, abnormal_reason]() {
@@ -2647,7 +2745,18 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // terminal transition.
     detail::wire_active_gauge(
         *tunnel_impl, active_gauge, [this, weak_manager, weak_tunnel, tunnel_id, tcp_conn]() {
-            tcp_conn->close();
+            // A tunnel that ended in Error (a client TUNNEL_ERROR — its
+            // application reset, or it abandoned the session — or our own
+            // terminal error) did not complete: reset the target rather than
+            // drain queued writes into a clean FIN (issue #44). A lapsed
+            // weak_ptr (destructor-driven notification) keeps the graceful
+            // close.
+            const auto owner_now = weak_tunnel.lock();
+            if (owner_now && owner_now->state() == tunnel::Tunnel::State::Error) {
+                tcp_conn->abort();
+            } else {
+                tcp_conn->close();
+            }
             asio::post(io_context_->get_io_context(), [weak_manager, weak_tunnel, tunnel_id]() {
                 // Same rationale as on_disconnect: remove via the weak_ptr so a
                 // tunnel closed while its manager is held for resume is still
@@ -2665,6 +2774,31 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
                 }
             });
         });
+
+    // The pre-wire teardown stood down when this open was handed over, and the
+    // tunnel's single close notification may have been consumed by it in the
+    // window before the on_close above was installed. So look once more, now
+    // that every later end of this tunnel reaches the wired on_close: a tunnel
+    // that already ended gets no OPEN_ACK — its peer has dropped it.
+    if (const auto state = tunnel_impl->state();
+        state == tunnel::Tunnel::State::Closed || state == tunnel::Tunnel::State::Error) {
+        if (state == tunnel::Tunnel::State::Error) {
+            tcp_conn->abort();
+        } else {
+            tcp_conn->force_close();
+        }
+        (void)manager_ptr->remove_tunnel_if(tunnel_id, tunnel_impl.get());
+        detail::active_gauge_release(active_gauge);
+        if (pending->claim_failure_booking()) {
+            util::MetricsRegistry::instance().inc_tunnels_opened(
+                util::MetricsRegistry::OpenResult::Failed);
+        }
+        util::Logger::info(
+            "Tunnel {} (friend {}) ended while its target connection was being wired; "
+            "no OPEN_ACK sent",
+            tunnel_id, friend_number);
+        return;
+    }
 
     // Watch for the target dying before the read loop exists. `start_read()` is
     // held back until the OPEN_ACK is on the wire, and a socket with no

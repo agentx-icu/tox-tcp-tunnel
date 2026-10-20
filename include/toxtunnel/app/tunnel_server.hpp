@@ -345,6 +345,70 @@ bool active_gauge_count(const ActiveGaugeLatch& latch);
 /// call on a tunnel that was never published; safe to call repeatedly.
 void active_gauge_release(const ActiveGaugeLatch& latch);
 
+/// The not-yet-wired half of a server open: DNS resolution and the target
+/// connect that run between `add_tunnel()` and `wire_tcp_to_tunnel()`.
+///
+/// Before this existed, a client TUNNEL_CLOSE / TUNNEL_ERROR reaching a tunnel
+/// in that window (its open deadline expired, it abandoned the session) moved
+/// the tunnel to a terminal state with nobody listening: the resolver and the
+/// connect kept running, the id stayed reserved, and when the connect finally
+/// completed the tunnel was wired anyway and the client got an OPEN_ACK plus a
+/// TUNNEL_ERROR for a tunnel it had already dropped (issues #41, #44).
+///
+/// One phase word, under one mutex, decides who owns the teardown:
+///  * `Resolving` / `Connecting` — the pre-wire on_close may cancel: it claims
+///    `Resolved`, cancels the resolver, closes the socket and removes the
+///    tunnel. A resolver or connect completion that finds `Resolved` does
+///    nothing at all (no frame, no metric).
+///  * `Handed` — the connect succeeded and `wire_tcp_to_tunnel()` owns the
+///    tunnel; the pre-wire on_close stands down, and wiring re-checks the
+///    tunnel's state once its own on_close is installed.
+///  * `Resolved` — finished: cancelled, or failed (resolve / connect error).
+///
+/// `tunnels_opened_total{result="failed"}` for the pre-wire paths is booked
+/// through `claim_failure_booking()`, so a cancel racing an error path books it
+/// once.
+class PendingOpen {
+   public:
+    enum class Phase : std::uint8_t { Resolving, Connecting, Handed, Resolved };
+
+    /// Atomically move `from` -> `to`; false if the phase was anything else.
+    bool advance(Phase from, Phase to) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (phase != from) {
+            return false;
+        }
+        phase = to;
+        return true;
+    }
+
+    /// Claim the teardown of a not-yet-handed open: Resolving or Connecting ->
+    /// Resolved. False once the open was handed to wiring or already resolved.
+    bool try_cancel() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (phase != Phase::Resolving && phase != Phase::Connecting) {
+            return false;
+        }
+        phase = Phase::Resolved;
+        return true;
+    }
+
+    [[nodiscard]] bool resolved() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return phase == Phase::Resolved;
+    }
+
+    /// True for exactly one caller: the one that books the failed open.
+    bool claim_failure_booking() noexcept {
+        return !failure_booked.exchange(true, std::memory_order_acq_rel);
+    }
+
+   private:
+    mutable std::mutex mutex;
+    Phase phase{Phase::Resolving};
+    std::atomic<bool> failure_booked{false};
+};
+
 /// Install every hook that must settle a server tunnel's active-gauge count.
 ///
 /// There are two, and both are needed. A terminal transition covers the paths
@@ -809,8 +873,18 @@ class TunnelServer {
                          uint64_t server_send_offset, tunnel::TunnelResumeStatus status);
 
     /// Wire a TCP connection to a tunnel for bidirectional data flow.
+    ///
+    /// `expected` is the tunnel this connect was made for, and `weak_manager`
+    /// the manager it was added to (it may since have moved to the resume
+    /// hold). Wiring refuses — closes the socket, sends no OPEN_ACK — when the
+    /// manager no longer holds `expected` under `tunnel_id` (the id was
+    /// recycled) or `expected` already ended; `pending` is the open's phase
+    /// word (see detail::PendingOpen), already advanced to `Handed`.
     void wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id,
-                            std::shared_ptr<core::TcpConnection> tcp_conn);
+                            std::shared_ptr<core::TcpConnection> tcp_conn,
+                            const std::shared_ptr<tunnel::TunnelImpl>& expected,
+                            const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                            const std::shared_ptr<detail::PendingOpen>& pending);
 
     /// Get the hex public key string for a friend number.
     [[nodiscard]] std::string get_friend_pk_hex(uint32_t friend_number) const;

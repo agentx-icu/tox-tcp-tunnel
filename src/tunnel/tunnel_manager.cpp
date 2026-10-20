@@ -1084,7 +1084,7 @@ void TunnelManager::close_all_local() {
         doomed.size(), dropped);
 }
 
-void TunnelManager::close_all() {
+void TunnelManager::close_all(TeardownMode mode) {
     std::map<uint16_t, std::shared_ptr<Tunnel>> tunnels_to_close;
     TunnelClosedCallback closed_cb;
 
@@ -1129,10 +1129,29 @@ void TunnelManager::close_all() {
             // Per-tunnel isolation (see close_all_local): one throwing tunnel
             // must not skip the rest of the batch or the shutdown that follows.
             try {
-                if (impl != nullptr && impl->abort_teardown_required()) {
+                const auto established = [impl] {
+                    const auto s = impl->state();
+                    return s == Tunnel::State::Connected || s == Tunnel::State::Disconnecting;
+                };
+                if (mode == TeardownMode::Abandon && impl != nullptr && established()) {
+                    // Regardless of an Abort seal: a sealed-but-established
+                    // tunnel already has a terminal ERROR owner mid-flight, and
+                    // send_error() then suppresses itself — whereas
+                    // force_close() would claim Closed first and FIN the local
+                    // socket. ERROR after a CLOSE already sent is allowed;
+                    // ERROR-before-CLOSE is enforced by the driver.
+                    impl->send_error(4, "session abandoned by the client (failover / keepalive)");
+                } else if (impl != nullptr && impl->abort_teardown_required()) {
                     impl->force_close();
                 } else {
                     tunnel->close();
+                    // A handshake that completed while close() was deciding
+                    // left the tunnel established after all: end it the
+                    // abandon way rather than half-open.
+                    if (mode == TeardownMode::Abandon && impl != nullptr && established()) {
+                        impl->send_error(4,
+                                         "session abandoned by the client (failover / keepalive)");
+                    }
                 }
             } catch (const std::exception& e) {
                 util::Logger::warn("TunnelManager: tunnel {} threw during close_all: {}", id,

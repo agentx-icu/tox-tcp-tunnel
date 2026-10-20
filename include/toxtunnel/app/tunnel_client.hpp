@@ -83,6 +83,18 @@ using LosslessPacketSendFn = std::function<bool(uint32_t, const uint8_t*, std::s
 [[nodiscard]] tunnel::TunnelImpl::SendOwnedToToxCallback make_fixed_friend_lossless_owned_sender(
     LosslessPacketSendFn send_lossless, uint32_t friend_number);
 
+/// The local application's socket went away (forward and SOCKS5 tunnels'
+/// on_disconnect). A clean end (empty code / EOF) and our own teardown
+/// (`operation_aborted`) close the tunnel gracefully. Anything else — the
+/// application reset the connection, or a read / write failed — means the
+/// stream did not complete, so an established (Connected / Disconnecting)
+/// tunnel ends with TUNNEL_ERROR code 4 and the server aborts the target
+/// instead of handing it a clean FIN (issue #44). Tunnels still in the open
+/// handshake keep the graceful close: their read loop has not started, and an
+/// ERROR there could race the pending TUNNEL_OPEN (#41).
+void end_tunnel_for_local_disconnect(const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                                     const std::error_code& ec);
+
 }  // namespace detail
 
 /// Client-side application that listens on local TCP ports and forwards
