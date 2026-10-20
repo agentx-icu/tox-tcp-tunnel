@@ -157,9 +157,30 @@ void TcpConnection::async_connect(const asio::ip::tcp::endpoint& endpoint, Conne
                 return;
             }
 
+            // The connect can complete successfully after a close / force_close
+            // already ran on this strand (it was queued behind the completion
+            // being dispatched): the owner cancelled it. Report that as an
+            // abort rather than resurrecting a closed connection as Connected —
+            // and never touch the closed socket's endpoint, whose throwing
+            // accessor would escape into the worker's fatal boundary.
+            if (state_.load(std::memory_order_acquire) != ConnectionState::Connecting) {
+                util::Logger::debug(
+                    "TcpConnection: connect completed after the connection "
+                    "was closed; reporting it as aborted");
+                if (cb) {
+                    cb(asio::error::operation_aborted);
+                }
+                if (on_connect_) {
+                    on_connect_(asio::error::operation_aborted);
+                }
+                return;
+            }
+
+            std::error_code endpoint_ec;
+            const auto remote = socket_.remote_endpoint(endpoint_ec);
             util::Logger::debug("TcpConnection: connected to {}:{}",
-                                socket_.remote_endpoint().address().to_string(),
-                                socket_.remote_endpoint().port());
+                                endpoint_ec ? std::string("?") : remote.address().to_string(),
+                                endpoint_ec ? 0 : remote.port());
 
             // Disable Nagle on outbound sockets (see adopting-ctor for rationale).
             std::error_code nodelay_ec;

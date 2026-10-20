@@ -147,14 +147,17 @@ struct TunnelErrorPayload {
     ///       "Tunnel ID in use", "Tunnel not found", target lost before the
     ///       tunnel was established, half-close linger timeout.
     ///   3 — the target actively refused the TCP connection, and nothing else.
-    ///   4 — (v0.5.0+) the target's TCP connection ended abnormally AFTER the
-    ///       tunnel was established: a reset, or any read/write error that is
-    ///       not a clean end of stream. Post-open by definition, so no SOCKS5
-    ///       or HTTP CONNECT reply rides on it; the receiving client resets
-    ///       its local socket so the application sees ECONNRESET instead of a
-    ///       clean EOF (issue #35). A peer that predates this code treats it
-    ///       as a generic error and tears the tunnel down, which is the same
-    ///       outcome minus the reset.
+    ///   4 — (v0.5.0+) the sender's own TCP endpoint ended abnormally AFTER
+    ///       the tunnel was established: a reset, or any read/write error that
+    ///       is not a clean end of stream. Post-open by definition, so no SOCKS5
+    ///       or HTTP CONNECT reply rides on it. Sent by the server for its
+    ///       target (issue #35): the client resets its local socket so the
+    ///       application sees ECONNRESET instead of a clean EOF. Sent by the
+    ///       client (v0.5.2+) for its local application's socket, and when it
+    ///       abandons a session on failover / a keepalive dead verdict (issues
+    ///       #41, #44): the server aborts the target instead of closing it. A
+    ///       peer that predates this code treats it as a generic error and
+    ///       tears the tunnel down, which is the same outcome minus the reset.
     ///
     /// Up to v0.4.11 code 3 was a grab-bag covering policy denials, connect
     /// failures and teardowns alike. Full contract and the compatibility rules

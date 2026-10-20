@@ -382,8 +382,25 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// @return      The allocated tunnel ID, or 0 if nothing was sent.
     [[nodiscard]] uint16_t create_tunnel(const std::string& host, uint16_t port);
 
+    /// How close_all() ends the tunnels it detaches.
+    enum class TeardownMode {
+        /// Graceful TUNNEL_CLOSE per tunnel, waiting for the peer's reciprocal
+        /// close (shutdown, friend-offline teardown).
+        Graceful,
+        /// The session is being abandoned — a failover switch or a keepalive
+        /// dead verdict (issue #41). Nobody will deliver the peer's reciprocal
+        /// CLOSE to a detached tunnel, and the streams did not complete, so
+        /// every established tunnel (Connected or Disconnecting) ends with
+        /// TUNNEL_ERROR code 4 instead: the peer aborts its side, and the
+        /// terminal Error transition resets the local socket (ECONNRESET) and
+        /// settles the owner's bookkeeping. Tunnels still in the open handshake
+        /// keep the Graceful path, whose CloseObligation orders the CLOSE
+        /// behind an in-flight OPEN.
+        Abandon,
+    };
+
     /// Close all tunnels and clear the manager.
-    void close_all();
+    void close_all(TeardownMode mode = TeardownMode::Graceful);
 
     /// Abandon this manager's session locally: stop authorising sends, then
     /// release local state.

@@ -115,6 +115,27 @@ tunnel::TunnelImpl::SendOwnedToToxCallback make_fixed_friend_lossless_owned_send
     };
 }
 
+// See tunnel_client.hpp. no_buffer_space is our own write-cap drop, so the
+// description says so.
+void end_tunnel_for_local_disconnect(const std::weak_ptr<tunnel::TunnelImpl>& weak_tunnel,
+                                     const std::error_code& ec) {
+    auto tunnel = weak_tunnel.lock();
+    if (!tunnel) {
+        return;
+    }
+    const bool abnormal = ec && ec != asio::error::eof && ec != asio::error::operation_aborted;
+    const auto state = tunnel->state();
+    if (abnormal && (state == tunnel::Tunnel::State::Connected ||
+                     state == tunnel::Tunnel::State::Disconnecting)) {
+        tunnel->send_error(4,
+                           ec == asio::error::no_buffer_space
+                               ? std::string("local connection dropped: write queue cap exceeded")
+                               : "local connection ended abnormally: " + ec.message());
+        return;
+    }
+    tunnel->close();
+}
+
 }  // namespace detail
 
 // -------------------------------------------------------------------------
@@ -1144,7 +1165,9 @@ void TunnelClient::apply_keepalive_dead_verdict(uint32_t dead_friend) {
     util::Logger::warn(
         "Active server unresponsive (keepalive); marking offline and failing over "
         "(still probing it, so it is restored if it answers again)");
-    tunnel_mgr_->close_all();
+    // Abandon, not Graceful: waiting for the reciprocal CLOSE of a server just
+    // judged unresponsive is waiting for the thing that failed (issue #41).
+    tunnel_mgr_->close_all(tunnel::TunnelManager::TeardownMode::Abandon);
     info_request_sent_.store(false);
 }
 
@@ -1950,10 +1973,8 @@ void TunnelClient::open_tunnel_for_connection(std::shared_ptr<core::TcpConnectio
             tunnel->on_tcp_read_eof();
         }
     });
-    conn->set_on_disconnect([weak_tunnel](const std::error_code& /*ec*/) {
-        if (auto tunnel = weak_tunnel.lock()) {
-            tunnel->close();
-        }
+    conn->set_on_disconnect([weak_tunnel](const std::error_code& ec) {
+        detail::end_tunnel_for_local_disconnect(weak_tunnel, ec);
     });
     // C-03: flush a deferred ACK once the local TCP write queue drains.
     conn->set_on_writable([weak_tunnel]() -> bool {
@@ -2116,10 +2137,8 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
             tunnel->on_tcp_read_eof();
         }
     });
-    conn->set_on_disconnect([weak_tunnel](const std::error_code& /*ec*/) {
-        if (auto tunnel = weak_tunnel.lock()) {
-            tunnel->close();
-        }
+    conn->set_on_disconnect([weak_tunnel](const std::error_code& ec) {
+        detail::end_tunnel_for_local_disconnect(weak_tunnel, ec);
     });
     conn->set_on_writable([weak_tunnel]() -> bool {
         if (auto tunnel = weak_tunnel.lock()) {
@@ -2411,7 +2430,14 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
     // re-enter the client.
     info_request_sent_.store(false);
     if (tunnel_mgr_) {
-        tunnel_mgr_->close_all();
+        // Abandon, not Graceful (issue #41): the route repin queued above sends
+        // the old server's reciprocal CLOSE to the gate as non-active-friend
+        // traffic, and the detached tunnels are out of the half-close cap's
+        // reach, so a graceful close would leave every local socket half-open
+        // until the application gave up. Established tunnels end with
+        // TUNNEL_ERROR 4 to the OLD server (each tunnel's sender is bound to
+        // the friend it was opened on) and a local RST.
+        tunnel_mgr_->close_all(tunnel::TunnelManager::TeardownMode::Abandon);
         // Fresh keepalive baseline for the new server: the silence (or the
         // dead verdict) accrued while talking to the old one is not evidence
         // against its successor. Re-enabling also clears the dead latch, which

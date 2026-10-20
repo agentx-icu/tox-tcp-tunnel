@@ -558,6 +558,51 @@ TEST(KeepaliveVerdictOrderingTest, StaleClientVerdictAfterFailoverLeavesTheSucce
     quiesce(io_ctx, mgr);
 }
 
+// Issue #41: the verdict abandons the session. Waiting for the reciprocal
+// CLOSE of a server just judged unresponsive is waiting for the thing that
+// failed, so an established tunnel ends with TUNNEL_ERROR 4 — Error, which is
+// what resets the application's socket — instead of a graceful CLOSE that left
+// it half-open until the application gave up.
+TEST(KeepaliveVerdictOrderingTest, ClientVerdictAbandonsEstablishedTunnelsWithAnError) {
+    asio::io_context io_ctx;
+    app::TunnelClient client;
+    auto mgr = std::make_shared<TunnelManager>(io_ctx);
+    mgr->set_send_handler(
+        [](const std::vector<std::uint8_t>&) { return tunnel::SendOutcome::Sent; });
+    std::vector<ProtocolFrame> frames;
+    auto tunnel = std::make_shared<TunnelImpl>(io_ctx, 41, /*friend_number=*/0);
+    tunnel->set_on_send_to_tox([&frames](std::span<const std::uint8_t> data) {
+        if (auto f = ProtocolFrame::deserialize(data)) {
+            frames.push_back(f.value());
+        }
+        return tunnel::SendOutcome::Sent;
+    });
+    tunnel->set_state(Tunnel::State::Connecting);
+    tunnel->set_state(Tunnel::State::Connected);
+    ASSERT_TRUE(mgr->add_tunnel(41, tunnel));
+    Access::tunnel_mgr(client) = mgr;
+    app::ClientServerEndpoint ep;
+    ep.friend_number = 0;
+    ep.tox_id_hex = std::string(76, 'A');
+    ep.online = true;
+    ep.link_up = true;
+    Access::endpoints(client).push_back(ep);
+    Access::active_index(client) = 0;
+    Access::strand_route_friend(client) = 0;
+    Access::server_online(client).store(true);
+    drive_to_dead_verdict(io_ctx, mgr);
+
+    Access::apply_keepalive_dead_verdict(client, 0);
+
+    EXPECT_EQ(tunnel->state(), Tunnel::State::Error);
+    ASSERT_EQ(frames.size(), 1u);
+    EXPECT_EQ(frames[0].type(), tunnel::FrameType::TUNNEL_ERROR);
+    ASSERT_TRUE(frames[0].as_tunnel_error().has_value());
+    EXPECT_EQ(frames[0].as_tunnel_error()->error_code, 4);
+
+    quiesce(io_ctx, mgr);
+}
+
 TEST(KeepaliveVerdictOrderingTest, ClientVerdictOvertakenByRecoveryIsDropped) {
     asio::io_context io_ctx;
     app::TunnelClient client;

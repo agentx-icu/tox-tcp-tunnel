@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "toxtunnel/app/inspect_server.hpp"
@@ -345,6 +346,84 @@ bool active_gauge_count(const ActiveGaugeLatch& latch);
 /// call on a tunnel that was never published; safe to call repeatedly.
 void active_gauge_release(const ActiveGaugeLatch& latch);
 
+/// The not-yet-wired half of a server open: DNS resolution and the target
+/// connect that run between `add_tunnel()` and `wire_tcp_to_tunnel()`.
+///
+/// Before this existed, a client TUNNEL_CLOSE / TUNNEL_ERROR reaching a tunnel
+/// in that window (its open deadline expired, it abandoned the session) moved
+/// the tunnel to a terminal state with nobody listening: the resolver and the
+/// connect kept running, the id stayed reserved, and when the connect finally
+/// completed the tunnel was wired anyway and the client got an OPEN_ACK plus a
+/// TUNNEL_ERROR for a tunnel it had already dropped (issues #41, #44).
+///
+/// One phase word, under one mutex, decides who owns the teardown:
+///  * `Resolving` / `Connecting` — the pre-wire on_close may cancel: it claims
+///    `Resolved`, cancels the resolver, closes the socket and removes the
+///    tunnel. A resolver or connect completion that finds `Resolved` does
+///    nothing at all (no frame, no metric).
+///  * `Handed` — the connect succeeded and `wire_tcp_to_tunnel()` owns the
+///    tunnel; the pre-wire on_close stands down, and wiring re-checks the
+///    tunnel's state once its own on_close is installed.
+///  * `Resolved` — finished: cancelled, or failed (resolve / connect error).
+///
+/// `tunnels_opened_total{result="failed"}` for the pre-wire paths is booked
+/// through `claim_failure_booking()`, so a cancel racing an error path books it
+/// once.
+class PendingOpen {
+   public:
+    enum class Phase : std::uint8_t { Resolving, Connecting, Handed, Resolved };
+
+    /// Atomically move `from` -> `to`; false if the phase was anything else.
+    bool advance(Phase from, Phase to) {
+        return advance_and(from, to, [] {});
+    }
+
+    /// advance(), running `initiate` under the same lock once the move is
+    /// made. Used to start the target connect: a cancel then either precedes
+    /// the move (no connect at all) or follows the fully initiated connect
+    /// (its socket close aborts it) — never lands between TcpConnection's state
+    /// claim and the socket's creation, where the close would find nothing to
+    /// close and the connect would run to its OS timeout. `initiate` must not
+    /// call back into this object (TcpConnection::async_connect only completes
+    /// inline on its misuse path, unreachable for a fresh connection).
+    template <typename F>
+    bool advance_and(Phase from, Phase to, F&& initiate) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (phase != from) {
+            return false;
+        }
+        phase = to;
+        std::forward<F>(initiate)();
+        return true;
+    }
+
+    /// Claim the teardown of a not-yet-handed open: Resolving or Connecting ->
+    /// Resolved. False once the open was handed to wiring or already resolved.
+    bool try_cancel() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (phase != Phase::Resolving && phase != Phase::Connecting) {
+            return false;
+        }
+        phase = Phase::Resolved;
+        return true;
+    }
+
+    [[nodiscard]] bool resolved() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return phase == Phase::Resolved;
+    }
+
+    /// True for exactly one caller: the one that books the failed open.
+    bool claim_failure_booking() noexcept {
+        return !failure_booked.exchange(true, std::memory_order_acq_rel);
+    }
+
+   private:
+    mutable std::mutex mutex;
+    Phase phase{Phase::Resolving};
+    std::atomic<bool> failure_booked{false};
+};
+
 /// Install every hook that must settle a server tunnel's active-gauge count.
 ///
 /// There are two, and both are needed. A terminal transition covers the paths
@@ -356,8 +435,15 @@ void active_gauge_release(const ActiveGaugeLatch& latch);
 ///
 /// @param extra_on_close  The caller's own on_close work, run after the gauge
 ///                        is settled. May be null.
+/// @param on_error        Run on the transition to `Error`, after the gauge is
+///                        settled. That transition can precede on_close by a
+///                        long time — a terminal TUNNEL_ERROR held back by
+///                        SENDQ backpressure settles (and fires on_close) only
+///                        once toxcore takes it — so work that must not wait
+///                        for the wire, like resetting the target, goes here.
+///                        May be null.
 void wire_active_gauge(tunnel::TunnelImpl& tunnel, ActiveGaugeLatch gauge,
-                       std::function<void()> extra_on_close);
+                       std::function<void()> extra_on_close, std::function<void()> on_error = {});
 
 /// What `commit_open_ack()` did.
 enum class OpenAckCommit : std::uint8_t {
@@ -491,6 +577,14 @@ class OpenAckGate : public std::enable_shared_from_this<OpenAckGate> {
     /// caller must NOT run its ordinary `Tunnel::close()` path. Returns false
     /// once the tunnel is live, where the ordinary close is exactly right.
     bool target_gone();
+
+    /// Resolve the gate without a word to the peer: no OPEN_ACK, no abandon
+    /// TUNNEL_ERROR, no booking. For a tunnel that ended before the gate was
+    /// started — its peer has already dropped it, so a TUNNEL_ERROR would at
+    /// best be noise and at worst land on a replacement that recycled the id.
+    /// Returns false when the gate had already resolved (an abandon, a
+    /// commit), in which case that resolution owns the teardown.
+    bool disarm();
 
     /// True once the tunnel has been published. Test observability.
     [[nodiscard]] bool committed() const;
@@ -782,7 +876,14 @@ class TunnelServer {
     void setup_tunnel_manager(uint32_t friend_number, std::string_view pk_hex = {});
 
     /// Tear down the TunnelManager for a disconnected friend.
-    void teardown_tunnel_manager(uint32_t friend_number);
+    ///
+    /// `mode` applies when the manager is closed rather than held for resume:
+    /// a keepalive verdict passes Abandon (issue #41) — the peer was judged
+    /// unresponsive, so its streams did not complete and each target is reset
+    /// rather than handed a clean FIN.
+    void teardown_tunnel_manager(
+        uint32_t friend_number,
+        tunnel::TunnelManager::TeardownMode mode = tunnel::TunnelManager::TeardownMode::Graceful);
 
     /// Strand-side half of a keepalive death verdict: tear the friend's manager
     /// down only if @p verdict_manager is still its live manager and is still
@@ -809,8 +910,18 @@ class TunnelServer {
                          uint64_t server_send_offset, tunnel::TunnelResumeStatus status);
 
     /// Wire a TCP connection to a tunnel for bidirectional data flow.
+    ///
+    /// `expected` is the tunnel this connect was made for, and `weak_manager`
+    /// the manager it was added to (it may since have moved to the resume
+    /// hold). Wiring refuses — closes the socket, sends no OPEN_ACK — when the
+    /// manager no longer holds `expected` under `tunnel_id` (the id was
+    /// recycled) or `expected` already ended; `pending` is the open's phase
+    /// word (see detail::PendingOpen), already advanced to `Handed`.
     void wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id,
-                            std::shared_ptr<core::TcpConnection> tcp_conn);
+                            std::shared_ptr<core::TcpConnection> tcp_conn,
+                            const std::shared_ptr<tunnel::TunnelImpl>& expected,
+                            const std::weak_ptr<tunnel::TunnelManager>& weak_manager,
+                            const std::shared_ptr<detail::PendingOpen>& pending);
 
     /// Get the hex public key string for a friend number.
     [[nodiscard]] std::string get_friend_pk_hex(uint32_t friend_number) const;

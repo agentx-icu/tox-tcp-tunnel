@@ -37,6 +37,7 @@ add_executable(unit_tests
     unit/tunnel_reaper_test.cpp
     unit/tunnel_coalesce_test.cpp
     unit/client_failover_test.cpp
+    unit/session_abandon_test.cpp
     unit/zero_copy_read_test.cpp
     unit/socks5_listener_test.cpp
     unit/tunnel_error_classification_test.cpp
