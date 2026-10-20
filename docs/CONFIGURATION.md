@@ -726,6 +726,14 @@ the log shows a `warning` at half the deadline, the confirmation ticks, and
 the final `critical` line names the phase the Tox thread was in
 (`tox_iterate`, posted tasks, application callbacks).
 
+On macOS and Linux the heartbeat age is measured on a clock that stops while
+the host is asleep: `CLOCK_UPTIME_RAW` on macOS, `steady_clock` (Linux
+`CLOCK_MONOTONIC`) elsewhere. On macOS the standard `steady_clock` keeps counting through sleep,
+so before this every Power Nap / DarkWake maintenance wake after ~15 minutes
+asleep showed a ~900 s lag and could abort a healthy daemon. Consequently
+`toxtunnel_tox_iterate_lag_ms` on macOS also excludes sleep time. Windows still
+counts host sleep in the lag and relies on the confirmation logic above.
+
 ## Per-Friend Rate Limiting (`rules.yaml`)
 
 Anti-DoS layer. Default behaviour is "no limiting" (v0.3.0

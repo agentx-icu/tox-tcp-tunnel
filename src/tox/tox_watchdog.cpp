@@ -11,7 +11,22 @@
 #include "toxtunnel/util/metrics.hpp"
 #include "toxtunnel/util/systemd_notify.hpp"
 
+#if defined(__APPLE__)
+#include <time.h>
+#endif
+
 namespace toxtunnel::tox {
+
+std::int64_t ToxWatchdog::now_ns() noexcept {
+#if defined(__APPLE__)
+    // Excludes system sleep (unlike steady_clock == CLOCK_MONOTONIC_RAW).
+    return static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+#else
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+#endif
+}
 
 struct ToxWatchdog::ObserverState {
     std::mutex mutex;
@@ -68,8 +83,7 @@ void ToxWatchdog::start(asio::io_context& io_ctx) {
     timer_ = std::make_unique<asio::steady_timer>(io_ctx);
     // Seed the heartbeat so the very first observer tick doesn't fire on a
     // pristine state (last_heartbeat_ns == 0).
-    last_heartbeat_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                             std::memory_order_release);
+    last_heartbeat_ns_.store(now_ns(), std::memory_order_release);
     arm_timer_locked();
 }
 
@@ -93,8 +107,7 @@ void ToxWatchdog::stop() {
 
 void ToxWatchdog::heartbeat() noexcept {
     heartbeat_counter_.fetch_add(1, std::memory_order_relaxed);
-    last_heartbeat_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                             std::memory_order_release);
+    last_heartbeat_ns_.store(now_ns(), std::memory_order_release);
 }
 
 const char* ToxWatchdog::phase_name(Phase phase) noexcept {
@@ -114,13 +127,13 @@ const char* ToxWatchdog::phase_name(Phase phase) noexcept {
 }
 
 void ToxWatchdog::backdate_heartbeat_for_test(std::chrono::milliseconds age) noexcept {
-    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto now = now_ns();
     last_heartbeat_ns_.store(now - std::chrono::nanoseconds(age).count(),
                              std::memory_order_release);
 }
 
 void ToxWatchdog::backdate_last_check_for_test(std::chrono::milliseconds age) noexcept {
-    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto now = now_ns();
     last_check_ns_.store(now - std::chrono::nanoseconds(age).count(), std::memory_order_relaxed);
 }
 
@@ -142,11 +155,12 @@ std::int64_t ToxWatchdog::check_once() noexcept {
 
     // How long since this observer itself last ran. The observer is a 1 Hz
     // timer; a gap far beyond that means the observer was not running either —
-    // the process (or the whole machine) was suspended.
-    const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto prev_check_ns = last_check_ns_.exchange(now_ns, std::memory_order_relaxed);
+    // the process (or, on Windows, the whole machine) was suspended. On macOS
+    // and Linux host sleep never shows up here: now_ns() stops while asleep.
+    const auto check_ns = now_ns();
+    const auto prev_check_ns = last_check_ns_.exchange(check_ns, std::memory_order_relaxed);
     const std::int64_t observer_gap_ms =
-        prev_check_ns == 0 ? 0 : (now_ns - prev_check_ns) / 1'000'000;
+        prev_check_ns == 0 ? 0 : (check_ns - prev_check_ns) / 1'000'000;
 
     const std::uint64_t hb = heartbeat_count();
     const std::uint64_t seen = last_seen_heartbeat_.exchange(hb, std::memory_order_relaxed);

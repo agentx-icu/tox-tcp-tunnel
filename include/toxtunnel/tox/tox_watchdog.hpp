@@ -124,8 +124,21 @@ class ToxWatchdog {
         return last_heartbeat_ns_.load(std::memory_order_acquire);
     }
 
+    /// The clock every watchdog timestamp is taken on, in nanoseconds. It is
+    /// monotonic and, on macOS and Linux, does NOT advance while the host is
+    /// asleep, so a lag means awake time without Tox-thread progress (Windows
+    /// steady_clock still counts sleep; check_once()'s confirmation logic
+    /// covers that). On Apple this is
+    /// CLOCK_UPTIME_RAW: libc++'s steady_clock there is CLOCK_MONOTONIC_RAW,
+    /// which keeps counting through sleep, so every macOS maintenance wake
+    /// (DarkWake) after ~15 min asleep looked like a 15 min wedge and aborted
+    /// the daemon. Elsewhere it is steady_clock (Linux CLOCK_MONOTONIC already
+    /// stops during suspend). Process / VM pauses are still handled by the
+    /// observer-gap logic in check_once().
+    [[nodiscard]] static std::int64_t now_ns() noexcept;
+
     [[nodiscard]] std::int64_t lag_ms() const noexcept {
-        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        const auto now = now_ns();
         const auto last = last_heartbeat_ns_.load(std::memory_order_acquire);
         if (last == 0) {
             return 0;

@@ -14,8 +14,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <thread>
+
+#if defined(__APPLE__)
+#include <time.h>
+#endif
 
 #include "toxtunnel/core/io_context.hpp"
 #include "toxtunnel/util/metrics.hpp"
@@ -366,6 +371,44 @@ TEST(ToxWatchdogTest, ObserverStallIsForgivenOnlyOncePerUnchangedHeartbeat) {
         wd.check_once();
     }
     EXPECT_EQ(aborts.load(), 1) << "late observer ticks with a frozen heartbeat must still abort";
+}
+
+// ---------------------------------------------------------------------------
+// Host sleep must not age the heartbeat. On macOS libc++'s steady_clock is
+// CLOCK_MONOTONIC_RAW, which counts through sleep: every DarkWake after
+// ~15 min asleep showed lag_ms ~900000 and the watchdog aborted a healthy
+// daemon (17 crash reports on the Mac QA host). The watchdog clock must be
+// CLOCK_UPTIME_RAW there. Sleep itself cannot be simulated in a unit test,
+// so pin the clock source instead.
+// ---------------------------------------------------------------------------
+
+TEST(ToxWatchdogTest, WatchdogClockIsMonotonic) {
+    std::int64_t prev = tox::ToxWatchdog::now_ns();
+    for (int i = 0; i < 1000; ++i) {
+        const std::int64_t cur = tox::ToxWatchdog::now_ns();
+        ASSERT_GE(cur, prev);
+        prev = cur;
+    }
+}
+
+#if defined(__APPLE__)
+TEST(ToxWatchdogTest, WatchdogClockExcludesHostSleepOnApple) {
+    const auto before = static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    const std::int64_t wd = tox::ToxWatchdog::now_ns();
+    const auto after = static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    EXPECT_GE(wd, before) << "watchdog clock must be CLOCK_UPTIME_RAW, not steady_clock";
+    EXPECT_LE(wd, after) << "watchdog clock must be CLOCK_UPTIME_RAW, not steady_clock";
+}
+#endif
+
+TEST(ToxWatchdogTest, LagIsMeasuredOnTheWatchdogClock) {
+    tox::ToxWatchdog wd;
+    wd.configure(30s, /*enabled=*/true);
+    wd.heartbeat();
+    wd.backdate_heartbeat_for_test(10s);
+    const auto lag = wd.lag_ms();
+    EXPECT_GE(lag, 10'000);
+    EXPECT_LT(lag, 20'000);
 }
 
 }  // namespace toxtunnel
