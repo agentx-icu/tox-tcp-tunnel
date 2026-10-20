@@ -120,6 +120,8 @@ void MetricsRegistry::reset() {
     tox_iterate_lag_ms_.store(0, std::memory_order_relaxed);
     watchdog_aborts_.store(0, std::memory_order_relaxed);
     worker_aborts_.store(0, std::memory_order_relaxed);
+    log_sink_errors_.store(0, std::memory_order_relaxed);
+    log_records_dropped_.store(0, std::memory_order_relaxed);
     resume_attempts_.store(0, std::memory_order_relaxed);
     resume_successes_.store(0, std::memory_order_relaxed);
     resume_failures_.store(0, std::memory_order_relaxed);
@@ -299,6 +301,22 @@ void MetricsRegistry::inc_worker_aborts() {
 
 std::uint64_t MetricsRegistry::worker_aborts() const {
     return worker_aborts_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_log_sink_errors() {
+    log_sink_errors_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::log_sink_errors() const {
+    return log_sink_errors_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_log_records_dropped() {
+    log_records_dropped_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::log_records_dropped() const {
+    return log_records_dropped_.load(std::memory_order_relaxed);
 }
 
 void MetricsRegistry::inc_resume_attempts() {
@@ -507,6 +525,16 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_worker_aborts_total counter\n"
            "toxtunnel_worker_aborts_total "
         << worker_aborts() << "\n";
+    out << "# HELP toxtunnel_log_sink_errors_total Log sink failures observed since process "
+           "start (write / flush / reopen errors).\n"
+           "# TYPE toxtunnel_log_sink_errors_total counter\n"
+           "toxtunnel_log_sink_errors_total "
+        << log_sink_errors() << "\n";
+    out << "# HELP toxtunnel_log_records_dropped_total Log records that neither the log file "
+           "nor its fallback could take.\n"
+           "# TYPE toxtunnel_log_records_dropped_total counter\n"
+           "toxtunnel_log_records_dropped_total "
+        << log_records_dropped() << "\n";
     out << "# HELP toxtunnel_watchdog_aborts_total Cumulative tox-thread wedge aborts since "
            "process start.\n"
            "# TYPE toxtunnel_watchdog_aborts_total counter\n"

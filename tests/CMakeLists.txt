@@ -17,6 +17,7 @@ include(GoogleTest)
 add_executable(unit_tests
     unit/placeholder_test.cpp
     unit/log_throttle_test.cpp
+    unit/resilient_file_sink_test.cpp
     unit/test_bootstrap_source.cpp
     unit/test_expected.cpp
     unit/test_circular_buffer.cpp

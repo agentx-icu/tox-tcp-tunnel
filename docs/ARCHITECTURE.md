@@ -342,6 +342,8 @@ Exposed series (subject to growth — names are stable once shipped):
 | `toxtunnel_friends_online` | gauge | Tox friends currently online |
 | `toxtunnel_dht_connected` | gauge | 1 while this node is connected to the Tox DHT, 0 otherwise (a daemon that never bootstrapped shows 0 for its whole life) |
 | `toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max}` | summary | `tox_iterate()` elapsed-time samples |
+| `toxtunnel_log_sink_errors_total` | counter | Log sink failures observed (a write / flush that threw, a failed reopen, an error reported to the logger). Counts failures, not lost lines |
+| `toxtunnel_log_records_dropped_total` | counter | Log records that neither the log file nor its fallback (syslog on POSIX) could take |
 
 There is no remote-command channel; the daemon does not export per-frame
 counts or a self-connection-status gauge.

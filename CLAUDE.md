@@ -105,7 +105,7 @@ than expanding this section.
 | TCP I/O | `IoContext`, `TcpConnection`, `TcpListener`, `OwnedBuffer` |
 | Tox | `ToxAdapter` (owns the iterate thread), `ToxConnection`, `ToxWatchdog`. NOTE: `ToxAdapter` owns the **only** Tox event loop — wire all new tox-thread work into it. |
 | Tunnel | `Tunnel`, `TunnelManager`, `ProtocolFrame`, `OwnedFrameBuffer`, `WriteCoalescer`, `BdpFlowControl`, `TunnelIdAllocator` |
-| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger`, `atomic_write_file`, `PidFileGuard` |
+| Util | `QrCode`, `WindowsService`, `SystemdNotify`, `Config`, `config_reload`, `MetricsRegistry`, `MetricsServer`, `Logger` (file sink wrapped in `ResilientFileSink`, issue #47), `atomic_write_file`, `PidFileGuard` |
 
 `TunnelClient` owns a `FailoverConfig`-driven state machine that promotes/demotes
 between primary and fallback Tox IDs. `InspectServer` accepts local IPC

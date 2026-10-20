@@ -714,7 +714,7 @@ Administrators on its pipe — run `inspect` from an elevated prompt.
 | Form                                      | Description                                  |
 | ----------------------------------------- | -------------------------------------------- |
 | `toxtunnel inspect tunnels [--json]`      | List open tunnels (id, peer, idle, bytes)    |
-| `toxtunnel inspect status [--json]`       | Daemon status: `mode`, `version`, `friends_online`, `dht_connected`, `peer_online_seconds` (client), `tunnels_active`, `bytes_in`, `bytes_out` |
+| `toxtunnel inspect status [--json]`       | Daemon status: `mode`, `version`, `friends_online`, `dht_connected`, `peer_online_seconds` (client), `tunnels_active`, `bytes_in`, `bytes_out`; with `logging.file` set, `log_sink_state` (`ok` / `fallback` / `failed`), `log_sink_errors`, `log_records_dropped` |
 | `-d, --data-dir DIR` / `-c, --config F`   | Where to find the IPC socket / `toxtunnel.pid` |
 
 The IPC endpoint is enabled by default (`inspect.enabled: true`). Set it to

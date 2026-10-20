@@ -423,6 +423,7 @@ void TunnelServer::start() {
             return managers_.size();
         };
         providers.dht_connected = [this]() -> bool { return tox_adapter_->is_connected(); };
+        providers.log_sink = &current_log_sink_status;
         providers.dht_node = [this]() -> InspectProviders::DhtNode {
             const auto& info = tox_adapter_->dht_node_info();
             return {info.public_key_hex, info.udp_port, info.tcp_relay_port};

@@ -8,6 +8,8 @@
 #include <system_error>
 
 #include "toxtunnel/util/logger.hpp"
+#include "toxtunnel/util/metrics.hpp"
+#include "toxtunnel/util/resilient_file_sink.hpp"
 
 #ifdef _WIN32
 #include <aclapi.h>
@@ -459,6 +461,14 @@ std::string InspectServer::render_status_json(const InspectProviders& providers)
         out += "\"dht_connected\":";
         out += providers.dht_connected() ? "true" : "false";
     }
+    if (providers.log_sink) {
+        if (const auto sink = providers.log_sink()) {
+            append_kv_string(out, "log_sink_state", sink->state, first);
+            append_kv_num(out, "log_sink_errors", static_cast<std::size_t>(sink->errors), first);
+            append_kv_num(out, "log_records_dropped", static_cast<std::size_t>(sink->dropped),
+                          first);
+        }
+    }
     if (providers.dht_node) {
         const auto node = providers.dht_node();
         if (!node.public_key_hex.empty()) {
@@ -547,6 +557,16 @@ std::string InspectServer::render_error_json(std::string_view message) {
     out += json_escape(message);
     out += "\"}";
     return out;
+}
+
+std::optional<InspectProviders::LogSinkStatus> current_log_sink_status() {
+    const auto state = util::Logger::file_sink_state();
+    if (!state) {
+        return std::nullopt;
+    }
+    const auto& metrics = util::MetricsRegistry::instance();
+    return InspectProviders::LogSinkStatus{util::to_string(*state), metrics.log_sink_errors(),
+                                           metrics.log_records_dropped()};
 }
 
 }  // namespace toxtunnel::app
