@@ -435,8 +435,15 @@ class PendingOpen {
 ///
 /// @param extra_on_close  The caller's own on_close work, run after the gauge
 ///                        is settled. May be null.
+/// @param on_error        Run on the transition to `Error`, after the gauge is
+///                        settled. That transition can precede on_close by a
+///                        long time — a terminal TUNNEL_ERROR held back by
+///                        SENDQ backpressure settles (and fires on_close) only
+///                        once toxcore takes it — so work that must not wait
+///                        for the wire, like resetting the target, goes here.
+///                        May be null.
 void wire_active_gauge(tunnel::TunnelImpl& tunnel, ActiveGaugeLatch gauge,
-                       std::function<void()> extra_on_close);
+                       std::function<void()> extra_on_close, std::function<void()> on_error = {});
 
 /// What `commit_open_ack()` did.
 enum class OpenAckCommit : std::uint8_t {

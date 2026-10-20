@@ -1983,13 +1983,17 @@ void release_unpublished_resources(const std::shared_ptr<tunnel::TunnelImpl>& tu
 }  // namespace
 
 void wire_active_gauge(tunnel::TunnelImpl& tunnel, ActiveGaugeLatch gauge,
-                       std::function<void()> extra_on_close) {
-    tunnel.set_on_state_change([gauge](tunnel::Tunnel::State new_state) {
-        if (new_state == tunnel::Tunnel::State::Closed ||
-            new_state == tunnel::Tunnel::State::Error) {
-            active_gauge_release(gauge);
-        }
-    });
+                       std::function<void()> extra_on_close, std::function<void()> on_error) {
+    tunnel.set_on_state_change(
+        [gauge, on_error = std::move(on_error)](tunnel::Tunnel::State new_state) {
+            if (new_state == tunnel::Tunnel::State::Closed ||
+                new_state == tunnel::Tunnel::State::Error) {
+                active_gauge_release(gauge);
+            }
+            if (new_state == tunnel::Tunnel::State::Error && on_error) {
+                on_error();
+            }
+        });
     tunnel.set_on_close([gauge, extra = std::move(extra_on_close)]() {
         // Settled here as well as on the terminal transition: a graceful close
         // of a published tunnel never reaches one. The latch makes the overlap
@@ -2749,7 +2753,8 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // detail::wire_active_gauge() for why on_close_ is needed as well as the
     // terminal transition.
     detail::wire_active_gauge(
-        *tunnel_impl, active_gauge, [this, weak_manager, weak_tunnel, tunnel_id, tcp_conn]() {
+        *tunnel_impl, active_gauge,
+        [this, weak_manager, weak_tunnel, tunnel_id, tcp_conn]() {
             // A tunnel that ended in Error (a client TUNNEL_ERROR — its
             // application reset, or it abandoned the session — or our own
             // terminal error) did not complete: reset the target rather than
@@ -2778,7 +2783,13 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
                     (void)mgr->remove_tunnel_if(tunnel_id, owner.get());
                 }
             });
-        });
+        },
+        // Reset the target the moment the tunnel ends in Error, not when its
+        // terminal TUNNEL_ERROR finally clears SENDQ backpressure and on_close
+        // runs — an abandoned session's peer may be the reason the queue is
+        // full. The on_close abort above stays for the paths that reach it
+        // first; abort() is idempotent.
+        [tcp_conn]() { tcp_conn->abort(); });
 
     // The pre-wire teardown stood down when this open was handed over, and the
     // tunnel's single close notification may have been consumed by it in the

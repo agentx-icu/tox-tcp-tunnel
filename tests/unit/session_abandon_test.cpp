@@ -195,6 +195,38 @@ TEST(SessionAbandonTest, BackpressuredErrorStillReachesTheWireWithoutAnOwner) {
     EXPECT_TRUE(weak.expired()) << "the settled ERROR must release its retry ownership";
 }
 
+// Review finding: the server reset its target from on_close, which a terminal
+// ERROR held back by SENDQ backpressure fires only once toxcore takes it. The
+// reset hook rides the Error transition instead.
+TEST(SessionAbandonTest, ServerTargetResetDoesNotWaitForTheErrorToReachTheWire) {
+    asio::io_context io_ctx;
+    Wire wire;
+    auto t = make_tunnel(io_ctx, 8, wire, Tunnel::State::Connected);
+    int resets = 0;
+    int closes = 0;
+    app::detail::wire_active_gauge(
+        *t, app::detail::make_active_gauge_latch(), [&] { ++closes; }, [&] { ++resets; });
+    {
+        std::lock_guard<std::mutex> lock(wire.mutex);
+        wire.outcome = SendOutcome::SendqFull;
+    }
+
+    t->send_error(4, "session abandoned (peer failed over or judged unresponsive)");
+
+    EXPECT_EQ(t->state(), Tunnel::State::Error);
+    EXPECT_EQ(resets, 1) << "the target is reset on the Error transition";
+    EXPECT_EQ(closes, 0) << "on_close still waits for the ERROR to settle";
+
+    {
+        std::lock_guard<std::mutex> lock(wire.mutex);
+        wire.outcome = SendOutcome::Sent;
+    }
+    pump_until(io_ctx, [&] { return closes == 1; });
+    EXPECT_EQ(closes, 1);
+    EXPECT_EQ(resets, 1);
+    ASSERT_TRUE(wire.error().has_value());
+}
+
 // ---------------------------------------------------------------------------
 // detail::end_tunnel_for_local_disconnect  (#44, client side)
 // ---------------------------------------------------------------------------
