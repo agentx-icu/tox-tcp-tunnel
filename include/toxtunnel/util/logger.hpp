@@ -8,11 +8,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace toxtunnel::util {
+
+enum class LogSinkState : int;  // resilient_file_sink.hpp
 
 /// Log severity levels, mirroring spdlog levels.
 enum class LogLevel {
@@ -273,7 +276,9 @@ class Logger {
     /// @see https://github.com/gabime/spdlog/wiki/3.-Custom-formatting
     static void set_pattern(std::string_view pattern);
 
-    /// Add a rotating-file sink.
+    /// Add a rotating-file sink, wrapped in a ResilientFileSink so a file that
+    /// goes bad mid-run (revoked fd, EIO, ENOSPC) is reopened or routed to the
+    /// platform fallback instead of silently ending the log (issue #47).
     /// @param filename       Path to the log file.
     /// @param max_size_bytes Maximum size of a single file before rotation
     ///                       (default 5 MiB).
@@ -284,6 +289,10 @@ class Logger {
 
     /// Immediately flush all sinks.
     static void flush();
+
+    /// Health of the file sink added by add_file_sink(), or nullopt when no
+    /// file sink is configured (console-only logging).
+    static std::optional<LogSinkState> file_sink_state();
 
     // -----------------------------------------------------------------
     // Logging methods

@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -48,6 +49,16 @@ struct InspectProviders {
         uint16_t tcp_relay_port = 0;
     };
     std::function<DhtNode()> dht_node;
+
+    /// Optional: health of the daemon's log file (issue #47) — a daemon whose
+    /// log descriptor went bad used to keep running with a log that simply
+    /// stopped. nullopt (no file sink configured) omits the fields.
+    struct LogSinkStatus {
+        std::string state;  // "ok" | "fallback" | "failed"
+        std::uint64_t errors = 0;
+        std::uint64_t dropped = 0;
+    };
+    std::function<std::optional<LogSinkStatus>()> log_sink;
 
     /// Optional (client mode): seconds the active server has been continuously
     /// online, or 0 when offline. Lets `inspect status` answer "is the tunnel
@@ -139,5 +150,10 @@ class InspectServer {
 
     mutable std::mutex mutex_;
 };
+
+/// The log-sink status both daemons publish through InspectProviders::log_sink:
+/// Logger's file-sink state plus the MetricsRegistry counters (which exist even
+/// when the metrics listener is disabled). nullopt when no file sink is set up.
+[[nodiscard]] std::optional<InspectProviders::LogSinkStatus> current_log_sink_status();
 
 }  // namespace toxtunnel::app

@@ -234,6 +234,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/util/logger.cpp
     src/util/metrics.cpp
     src/util/qr_code.cpp
+    src/util/resilient_file_sink.cpp
     src/util/system_info.cpp
     src/util/systemd_notify.cpp
     src/util/pid_file.cpp

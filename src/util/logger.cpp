@@ -2,11 +2,20 @@
 
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#if !defined(_WIN32)
+#include <spdlog/sinks/syslog_sink.h>
+#include <syslog.h>
+#endif
 
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+
+#include "toxtunnel/util/metrics.hpp"
+#include "toxtunnel/util/resilient_file_sink.hpp"
 
 namespace toxtunnel::util {
 
@@ -25,6 +34,40 @@ std::shared_ptr<spdlog::logger> g_logger;
 /// Collect all sinks so we can rebuild the logger when sinks are added.
 std::vector<spdlog::sink_ptr> g_sinks;
 
+/// The file sink, for Logger::file_sink_state(). Guarded by g_mutex.
+std::weak_ptr<ResilientFileSink> g_file_sink;
+
+/// Next steady-clock tick (ns) at which the error handler may print to stderr.
+std::atomic<std::int64_t> g_next_stderr_report_ns{0};
+
+/// Replaces spdlog's default handler on every logger we build. That one prints
+/// to stderr once a second — which, for a daemon whose stderr is the same
+/// revoked descriptor as its log, is a second silent failure. This one counts
+/// every report (so /metrics and `inspect status` show it) and still prints,
+/// throttled to once a minute. It must never call Logger: it can run while
+/// shutdown() holds g_mutex, and from inside a sink.
+void on_logger_error(const std::string& msg) noexcept {
+    MetricsRegistry::instance().inc_log_sink_errors();
+    const auto now_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    auto next = g_next_stderr_report_ns.load(std::memory_order_relaxed);
+    if (now_ns() < next) {
+        return;
+    }
+    // Re-read the clock before claiming the slot, as LogThrottle does: a
+    // thread parked between the first read and here would otherwise publish a
+    // deadline already in the past and let the next report through at once.
+    const auto deadline = now_ns() + std::chrono::nanoseconds(std::chrono::minutes(1)).count();
+    if (!g_next_stderr_report_ns.compare_exchange_strong(next, deadline,
+                                                         std::memory_order_relaxed)) {
+        return;
+    }
+    std::fprintf(stderr, "[toxtunnel] log error: %s\n", msg.c_str());
+}
+
 /// (Re-)create the internal logger using the current set of sinks.
 /// Caller must hold g_mutex.
 void rebuild_logger_locked() {
@@ -39,6 +82,9 @@ void rebuild_logger_locked() {
 
     g_logger = std::make_shared<spdlog::logger>(g_logger_name, g_sinks.begin(), g_sinks.end());
     g_logger->set_level(level);
+    // Before publication, on every rebuild: add_file_sink() rebuilds the
+    // logger, and a fresh spdlog::logger starts with the default handler.
+    g_logger->set_error_handler(on_logger_error);
     // Without this, the rotating_file_sink's stdio buffer (BUFSIZ, 4-8 KB) holds
     // every line written below the threshold until it fills. Operators tailing
     // the log see stale state for minutes during quiet periods and lose the
@@ -135,6 +181,7 @@ void Logger::init(std::string_view name) {
 
     g_logger_name = std::string(name);
     g_sinks.clear();
+    g_file_sink.reset();
 
     // Default sink: coloured stderr so stdout can safely carry tunneled data.
     auto console_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
@@ -158,6 +205,7 @@ void Logger::shutdown() {
     spdlog::shutdown();
     g_logger.reset();
     g_sinks.clear();
+    g_file_sink.reset();
 }
 
 void Logger::set_level(LogLevel level) {
@@ -176,8 +224,25 @@ void Logger::add_file_sink(const std::string& filename, std::size_t max_size_byt
                            std::size_t max_files) {
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    auto file_sink =
-        std::make_shared<spdlog::sinks::rotating_file_sink_mt>(filename, max_size_bytes, max_files);
+    // The inner sinks are single-threaded on purpose: ResilientFileSink's own
+    // mutex serialises every access to them.
+    ResilientFileSink::SinkFactory fallback;
+#if !defined(_WIN32)
+    fallback = []() -> spdlog::sink_ptr {
+        // Formatted with the file sink's pattern, so the configured context
+        // (logger name, level, thread) survives the switch; syslog adds its
+        // own timestamp on top. On macOS syslog(3) lands in the unified log.
+        return std::make_shared<spdlog::sinks::syslog_sink_st>("toxtunnel", LOG_PID, LOG_DAEMON,
+                                                               /*enable_formatting=*/true);
+    };
+#endif
+    auto file_sink = std::make_shared<ResilientFileSink>(
+        [filename, max_size_bytes, max_files]() -> spdlog::sink_ptr {
+            return std::make_shared<spdlog::sinks::rotating_file_sink_st>(filename, max_size_bytes,
+                                                                          max_files);
+        },
+        std::move(fallback));
+    g_file_sink = file_sink;
     g_sinks.push_back(file_sink);
 
     rebuild_logger_locked();
@@ -185,6 +250,14 @@ void Logger::add_file_sink(const std::string& filename, std::size_t max_size_byt
 
 void Logger::flush() {
     get()->flush();
+}
+
+std::optional<LogSinkState> Logger::file_sink_state() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (auto sink = g_file_sink.lock()) {
+        return sink->state();
+    }
+    return std::nullopt;
 }
 
 // =========================================================================

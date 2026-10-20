@@ -176,6 +176,22 @@ class MetricsRegistry {
     [[nodiscard]] std::uint64_t worker_aborts() const;
 
     // -----------------------------------------------------------------
+    // Log sink health (issue #47)
+    // -----------------------------------------------------------------
+
+    /// Increment `toxtunnel_log_sink_errors_total`: one per OBSERVED log sink
+    /// failure (a write or flush that threw, a failed reopen, an error reported
+    /// to the logger's error handler). Not a count of lost records — a failed
+    /// flush can lose any number of buffered lines, or none.
+    void inc_log_sink_errors();
+    [[nodiscard]] std::uint64_t log_sink_errors() const;
+
+    /// Increment `toxtunnel_log_records_dropped_total`: a record that reached
+    /// the file sink while neither the file nor a fallback could take it.
+    void inc_log_records_dropped();
+    [[nodiscard]] std::uint64_t log_records_dropped() const;
+
+    // -----------------------------------------------------------------
     // Tunnel resume protocol
     // -----------------------------------------------------------------
 
@@ -255,6 +271,8 @@ class MetricsRegistry {
     std::atomic<std::int64_t> tox_iterate_lag_ms_{0};
     std::atomic<std::uint64_t> watchdog_aborts_{0};
     std::atomic<std::uint64_t> worker_aborts_{0};
+    std::atomic<std::uint64_t> log_sink_errors_{0};
+    std::atomic<std::uint64_t> log_records_dropped_{0};
 
     // Tunnel resume protocol.
     std::atomic<std::uint64_t> resume_attempts_{0};
