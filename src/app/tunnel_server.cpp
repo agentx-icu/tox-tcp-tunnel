@@ -1461,10 +1461,11 @@ void TunnelServer::teardown_after_keepalive_verdict(
     }
     util::Logger::warn("Friend {} unresponsive (keepalive); tearing down its tunnels",
                        friend_number);
-    teardown_tunnel_manager(friend_number);
+    teardown_tunnel_manager(friend_number, tunnel::TunnelManager::TeardownMode::Abandon);
 }
 
-void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {
+void TunnelServer::teardown_tunnel_manager(uint32_t friend_number,
+                                           tunnel::TunnelManager::TeardownMode mode) {
     // Drop the friend's throttle slot: cancel its retry timer and discard any
     // deferred packets. Those bytes belong to a session the peer has left, and
     // they were never acknowledged — so on a resume the client still counts
@@ -1570,7 +1571,7 @@ void TunnelServer::teardown_tunnel_manager(uint32_t friend_number) {
                 }
             }));
     } else {
-        mgr->close_all();
+        mgr->close_all(mode);
     }
 }
 
@@ -1879,18 +1880,13 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                 fail_prewire(2, "DNS resolution failed: " + ec.message());
                 return;
             }
-            if (!pending->advance(detail::PendingOpen::Phase::Resolving,
-                                  detail::PendingOpen::Phase::Connecting)) {
-                return;  // Cancelled between the check above and here.
-            }
-
-            // Connect to the first resolved endpoint. Initiated OUTSIDE the
-            // phase mutex (its misuse path calls back inline); a cancel landing
-            // in between is caught by the re-check right after.
+            // Connect to the first resolved endpoint, initiated under the phase
+            // lock (see PendingOpen::advance_and) so a cancel cannot slip in
+            // between the connect's state claim and its socket's creation.
             auto endpoint = results.begin()->endpoint();
-            tcp_conn->async_connect(endpoint, [this, tcp_conn, pending, weak_manager, weak_tunnel,
-                                               fail_prewire, friend_number, tunnel_id, target_host,
-                                               target_port](const std::error_code& connect_ec) {
+            auto on_connected = [this, tcp_conn, pending, weak_manager, weak_tunnel, fail_prewire,
+                                 friend_number, tunnel_id, target_host,
+                                 target_port](const std::error_code& connect_ec) {
                 if (pending->resolved()) {
                     tcp_conn->force_close();  // Cancelled while connecting.
                     return;
@@ -1924,13 +1920,11 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
                 }
                 wire_tcp_to_tunnel(friend_number, tunnel_id, tcp_conn, expected, weak_manager,
                                    pending);
-            });
-            // A cancel that claimed `Resolved` after the advance above but
-            // before async_connect() moved the socket to Connecting found
-            // nothing to close; close it now that there is something.
-            if (pending->resolved()) {
-                tcp_conn->force_close();
-            }
+            };
+            (void)pending->advance_and(
+                detail::PendingOpen::Phase::Resolving, detail::PendingOpen::Phase::Connecting,
+                [&] { tcp_conn->async_connect(endpoint, std::move(on_connected)); });
+            // false: cancelled after the check above; nothing was started.
         });
 }
 
@@ -2316,6 +2310,17 @@ bool OpenAckGate::target_gone() {
     if (run_abandon) {
         run_abandon();
     }
+    return true;
+}
+
+bool OpenAckGate::disarm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (phase_ != Phase::Pending) {
+        return false;
+    }
+    phase_ = Phase::Abandoned;
+    release_callbacks_locked();
+    post_commit_close_ = nullptr;
     return true;
 }
 
@@ -2782,6 +2787,13 @@ void TunnelServer::wire_tcp_to_tunnel(uint32_t friend_number, uint16_t tunnel_id
     // that already ended gets no OPEN_ACK — its peer has dropped it.
     if (const auto state = tunnel_impl->state();
         state == tunnel::Tunnel::State::Closed || state == tunnel::Tunnel::State::Error) {
+        // Silence the gate first: the socket close below reaches its disconnect
+        // handler, and a Pending gate would answer it with abandon_open_ack()
+        // (a TUNNEL_ERROR the peer does not need, and a second booking). If the
+        // gate already resolved, a racing end got there first and owns this.
+        if (!ack_gate->disarm()) {
+            return;
+        }
         if (state == tunnel::Tunnel::State::Error) {
             tcp_conn->abort();
         } else {

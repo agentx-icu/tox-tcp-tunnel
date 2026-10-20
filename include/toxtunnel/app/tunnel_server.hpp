@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "toxtunnel/app/inspect_server.hpp"
@@ -374,11 +375,25 @@ class PendingOpen {
 
     /// Atomically move `from` -> `to`; false if the phase was anything else.
     bool advance(Phase from, Phase to) {
+        return advance_and(from, to, [] {});
+    }
+
+    /// advance(), running `initiate` under the same lock once the move is
+    /// made. Used to start the target connect: a cancel then either precedes
+    /// the move (no connect at all) or follows the fully initiated connect
+    /// (its socket close aborts it) — never lands between TcpConnection's state
+    /// claim and the socket's creation, where the close would find nothing to
+    /// close and the connect would run to its OS timeout. `initiate` must not
+    /// call back into this object (TcpConnection::async_connect only completes
+    /// inline on its misuse path, unreachable for a fresh connection).
+    template <typename F>
+    bool advance_and(Phase from, Phase to, F&& initiate) {
         std::lock_guard<std::mutex> lock(mutex);
         if (phase != from) {
             return false;
         }
         phase = to;
+        std::forward<F>(initiate)();
         return true;
     }
 
@@ -555,6 +570,14 @@ class OpenAckGate : public std::enable_shared_from_this<OpenAckGate> {
     /// caller must NOT run its ordinary `Tunnel::close()` path. Returns false
     /// once the tunnel is live, where the ordinary close is exactly right.
     bool target_gone();
+
+    /// Resolve the gate without a word to the peer: no OPEN_ACK, no abandon
+    /// TUNNEL_ERROR, no booking. For a tunnel that ended before the gate was
+    /// started — its peer has already dropped it, so a TUNNEL_ERROR would at
+    /// best be noise and at worst land on a replacement that recycled the id.
+    /// Returns false when the gate had already resolved (an abandon, a
+    /// commit), in which case that resolution owns the teardown.
+    bool disarm();
 
     /// True once the tunnel has been published. Test observability.
     [[nodiscard]] bool committed() const;
@@ -846,7 +869,14 @@ class TunnelServer {
     void setup_tunnel_manager(uint32_t friend_number, std::string_view pk_hex = {});
 
     /// Tear down the TunnelManager for a disconnected friend.
-    void teardown_tunnel_manager(uint32_t friend_number);
+    ///
+    /// `mode` applies when the manager is closed rather than held for resume:
+    /// a keepalive verdict passes Abandon (issue #41) — the peer was judged
+    /// unresponsive, so its streams did not complete and each target is reset
+    /// rather than handed a clean FIN.
+    void teardown_tunnel_manager(
+        uint32_t friend_number,
+        tunnel::TunnelManager::TeardownMode mode = tunnel::TunnelManager::TeardownMode::Graceful);
 
     /// Strand-side half of a keepalive death verdict: tear the friend's manager
     /// down only if @p verdict_manager is still its live manager and is still

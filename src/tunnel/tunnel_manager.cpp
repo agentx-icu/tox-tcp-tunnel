@@ -1085,6 +1085,10 @@ void TunnelManager::close_all_local() {
 }
 
 void TunnelManager::close_all(TeardownMode mode) {
+    // Side-neutral: the client sends it on failover / a keepalive verdict about
+    // its server, the server on a keepalive verdict about its client.
+    static constexpr const char* kAbandonReason =
+        "session abandoned (peer failed over or judged unresponsive)";
     std::map<uint16_t, std::shared_ptr<Tunnel>> tunnels_to_close;
     TunnelClosedCallback closed_cb;
 
@@ -1140,7 +1144,7 @@ void TunnelManager::close_all(TeardownMode mode) {
                     // force_close() would claim Closed first and FIN the local
                     // socket. ERROR after a CLOSE already sent is allowed;
                     // ERROR-before-CLOSE is enforced by the driver.
-                    impl->send_error(4, "session abandoned by the client (failover / keepalive)");
+                    impl->send_error(4, kAbandonReason);
                 } else if (impl != nullptr && impl->abort_teardown_required()) {
                     impl->force_close();
                 } else {
@@ -1149,8 +1153,7 @@ void TunnelManager::close_all(TeardownMode mode) {
                     // left the tunnel established after all: end it the
                     // abandon way rather than half-open.
                     if (mode == TeardownMode::Abandon && impl != nullptr && established()) {
-                        impl->send_error(4,
-                                         "session abandoned by the client (failover / keepalive)");
+                        impl->send_error(4, kAbandonReason);
                     }
                 }
             } catch (const std::exception& e) {

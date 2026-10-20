@@ -192,6 +192,7 @@ TEST(SessionAbandonTest, BackpressuredErrorStillReachesTheWireWithoutAnOwner) {
         EXPECT_NE(type, FrameType::TUNNEL_DATA) << "abandoned DATA must not follow the ERROR";
     }
     pump_until(io_ctx, [&] { return weak.expired(); });
+    EXPECT_TRUE(weak.expired()) << "the settled ERROR must release its retry ownership";
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +280,54 @@ TEST(PendingOpenTest, HandedOpenBelongsToWiring) {
     ASSERT_TRUE(p.advance(Phase::Connecting, Phase::Handed));
     EXPECT_FALSE(p.try_cancel()) << "wiring re-checks the tunnel itself once handed";
     EXPECT_FALSE(p.resolved());
+}
+
+TEST(PendingOpenTest, InitiationRunsUnderTheMoveOrNotAtAll) {
+    app::detail::PendingOpen p;
+    int started = 0;
+    EXPECT_TRUE(p.advance_and(Phase::Resolving, Phase::Connecting, [&] { ++started; }));
+    EXPECT_EQ(started, 1);
+    app::detail::PendingOpen cancelled;
+    ASSERT_TRUE(cancelled.try_cancel());
+    EXPECT_FALSE(cancelled.advance_and(Phase::Resolving, Phase::Connecting, [&] { ++started; }));
+    EXPECT_EQ(started, 1) << "a cancelled open must not start a connect";
+}
+
+// The re-check in wire_tcp_to_tunnel() silences a not-yet-started gate before
+// tearing the socket down: the target end it then reports must not turn into
+// abandon_open_ack()'s TUNNEL_ERROR and second booking.
+TEST(OpenAckGateDisarmTest, DisarmedGateIgnoresTheTargetEndSilently) {
+    asio::io_context io_ctx;
+    int acks = 0;
+    int commits = 0;
+    int abandons = 0;
+    auto gate = std::make_shared<app::detail::OpenAckGate>(
+        io_ctx,
+        [&] {
+            ++acks;
+            return SendOutcome::Sent;
+        },
+        [&] {
+            ++commits;
+            return true;
+        },
+        [&] { ++abandons; }, [] {});
+    EXPECT_TRUE(gate->disarm());
+    EXPECT_TRUE(gate->target_gone()) << "still the gate's teardown, not the ordinary close";
+    EXPECT_FALSE(gate->disarm()) << "already resolved";
+    EXPECT_EQ(acks, 0);
+    EXPECT_EQ(commits, 0);
+    EXPECT_EQ(abandons, 0);
+}
+
+TEST(OpenAckGateDisarmTest, DisarmLosesToAnEarlierResolution) {
+    asio::io_context io_ctx;
+    int abandons = 0;
+    auto gate = std::make_shared<app::detail::OpenAckGate>(
+        io_ctx, [] { return SendOutcome::Sent; }, [] { return true; }, [&] { ++abandons; }, [] {});
+    EXPECT_TRUE(gate->target_gone());
+    EXPECT_EQ(abandons, 1);
+    EXPECT_FALSE(gate->disarm()) << "the abandon owns the teardown";
 }
 
 TEST(PendingOpenTest, FailureIsBookedOnce) {
