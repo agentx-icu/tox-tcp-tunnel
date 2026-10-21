@@ -20,14 +20,14 @@ needed), wires their identities and rules automatically, and runs:
 
 | Scenario | Checks |
 |---|---|
-| `echo` | data both ways; 32 MiB download (loopback throughput) |
-| `bulk_open_latency` | open + first echo of a new tunnel while a 256 MiB download runs on the same friend stays under `--bulk-open-bound-ms` (default 3000) |
-| `rst_target_to_app` | a target reset reaches the application as `ECONNRESET` (#35) |
-| `rst_app_to_target` | an application reset reaches the target as a reset (#44) |
-| `half_close` | a half-closed tunnel whose peer never closes is reaped by `tunnel.half_close_timeout_seconds`, not earlier |
-| `keepalive_recovery` | a frozen (`SIGSTOP`) server is judged dead, the application is reset promptly (#41), and the client recovers when the server answers again |
-| `failover` | two servers: the active one freezes → failover; it recovers → prefer-primary switches back (#43) |
-| `client_first` | the client starts before its server and connects once it appears |
+| `echo` | data both ways; a complete 32 MiB download (loopback throughput) |
+| `bulk_open_latency` | open + first echo of a new tunnel stays under `--bulk-open-bound-ms` (default 3000) while a download is shown to be moving on the same friend before and during every probe |
+| `rst_target_to_app` | the target resets *this* connection (correlated by a per-connection token) and the application sees `ECONNRESET` within seconds (#35) |
+| `rst_app_to_target` | an application resets an *established* connection and the target sees a reset on that same connection (#44) |
+| `half_close` | the specific tunnel the test half-closed (its target never closes back) goes `Disconnecting` and is removed no earlier than `tunnel.half_close_timeout_seconds`; the cap's log line is recorded when the build has it |
+| `keepalive_recovery` | with an established connection, a frozen (`SIGSTOP`) server is judged dead and that connection is reset promptly (#41); the client logs recovery when the server answers, and new tunnels work |
+| `failover` | two servers: with an established connection on A, A freezes → that connection is reset and the client switches to B (by Tox ID) and carries data; A recovers → the client switches back to A (#43) and carries data |
+| `client_first` | a connection accepted while the server is not up yet is held and carried, on the same socket, once the server appears (`tunnel.offline_open_wait_seconds`) |
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel
@@ -45,7 +45,9 @@ It exits non-zero when any selected scenario fails.
 
 The JSON document's `perf` section is the per-run baseline: idle open + echo
 latency, open + echo latency under bulk, loopback download throughput, the time
-a client-first start takes to carry data, and CPU seconds per daemon. CI keeps
+a client-first start takes to carry data, CPU seconds per daemon, and each
+daemon's RTT, send-window and bandwidth summaries (count / sum / max) scraped
+from `/metrics`. CI keeps
 it as the `live-smoke` artifact; for a release, save the tag's artifact next to
 the release notes so the next release can be compared against it. Loopback
 numbers measure ToxTunnel's own overhead, not a network — slow-path behaviour
@@ -63,7 +65,7 @@ directions. Each combination skips only what the older side cannot do:
 | v0.5.x client | `rst_app_to_target`, `keepalive_recovery`, `failover` | no client-side reset on an application RST / abandon (#41, #44), no standby probing (#43) |
 | v0.5.x server | `rst_app_to_target` | does not reset the target on a client `TUNNEL_ERROR` (#44) |
 | v0.4.x server | also `rst_target_to_app`, `keepalive_recovery`, `failover` | predates `TUNNEL_ERROR` code 4 (#35); stops answering a client once its own keepalive tore that client's manager down (#36) |
-| v0.4.x client | `rst_target_to_app`, plus the v0.5.x client list | does not reset on code 4 |
+| v0.4.x client | `rst_target_to_app`, `client_first`, plus the v0.5.x client list | does not reset on code 4; drops a connection accepted while offline (held since v0.5.0) |
 
 A scenario that starts failing for a combination it used to pass is a
 compatibility regression.

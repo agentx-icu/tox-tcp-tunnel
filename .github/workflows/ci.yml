@@ -524,7 +524,8 @@ jobs:
     # the client-side reset and abandon semantics of #41/#44 and standby
     # probing (#43); v0.4.x servers additionally stop answering a client once
     # their own keepalive has torn its manager down (fixed in v0.5.0, #36) and
-    # predate the TUNNEL_ERROR 4 reset (#35).
+    # predate the TUNNEL_ERROR 4 reset (#35); v0.4.x clients also drop a
+    # connection accepted while the server is offline (held since v0.5.0).
     name: Mixed versions (${{ matrix.peer }})
     runs-on: ubuntu-24.04
     strategy:
@@ -536,7 +537,7 @@ jobs:
             skip_old_client: rst_app_to_target,keepalive_recovery,failover
           - peer: "0.4.14"
             skip_new_client: rst_app_to_target,rst_target_to_app,keepalive_recovery,failover
-            skip_old_client: rst_app_to_target,rst_target_to_app,keepalive_recovery,failover
+            skip_old_client: rst_app_to_target,rst_target_to_app,keepalive_recovery,failover,client_first
     steps:
       - uses: actions/checkout@v7
         with:
@@ -576,6 +577,7 @@ jobs:
           path: |
             new-client.json
             old-client.json
+            /tmp/tt-live-*/**/*.log
           if-no-files-found: ignore
 
   source-archive:
@@ -624,6 +626,9 @@ jobs:
       - build-installers
       - code-style-check
       - build-debug
+      - live-smoke
+      - mixed-version
+      - source-archive
     runs-on: ubuntu-24.04
     permissions:
       contents: write
