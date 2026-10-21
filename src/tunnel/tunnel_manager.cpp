@@ -1862,9 +1862,11 @@ ManagerSnapshot TunnelManager::snapshot() const {
 // Internal helpers
 // ===========================================================================
 
-void TunnelManager::handle_ping_frame(const ProtocolFrame& /*frame*/) {
+void TunnelManager::handle_ping_frame(const ProtocolFrame& frame) {
     util::Logger::debug("TunnelManager: received PING, sending PONG");
-    ProtocolFrame pong = ProtocolFrame::make_pong();
+    // Echo a fence PING's payload so the peer's friend gate can correlate the
+    // reply with the PING it answers (issue #42).
+    ProtocolFrame pong = ProtocolFrame::make_pong_for(frame);
     send_frame(pong);
 }
 

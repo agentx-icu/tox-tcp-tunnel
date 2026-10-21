@@ -211,6 +211,7 @@ target_sources(toxtunnel_lib PRIVATE
     src/tunnel/tunnel_manager.cpp
     src/tunnel/write_coalescer.cpp
     src/tunnel/bdp_flow_control.cpp
+    src/tunnel/friend_send_gate.cpp
     src/tox/bootstrap_source.cpp
     src/tox/types.cpp
     src/tox/tox_ptr.cpp

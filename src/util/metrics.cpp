@@ -120,6 +120,11 @@ void MetricsRegistry::reset() {
     tox_iterate_lag_ms_.store(0, std::memory_order_relaxed);
     watchdog_aborts_.store(0, std::memory_order_relaxed);
     worker_aborts_.store(0, std::memory_order_relaxed);
+    friend_gate_refusals_.store(0, std::memory_order_relaxed);
+    friend_gate_legacy_.store(0, std::memory_order_relaxed);
+    open_latency_count_.store(0, std::memory_order_relaxed);
+    open_latency_sum_ms_.store(0.0, std::memory_order_relaxed);
+    open_latency_max_ms_.store(0.0, std::memory_order_relaxed);
     log_sink_errors_.store(0, std::memory_order_relaxed);
     log_records_dropped_.store(0, std::memory_order_relaxed);
     resume_attempts_.store(0, std::memory_order_relaxed);
@@ -301,6 +306,33 @@ void MetricsRegistry::inc_worker_aborts() {
 
 std::uint64_t MetricsRegistry::worker_aborts() const {
     return worker_aborts_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_friend_gate_refusals() {
+    friend_gate_refusals_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::friend_gate_refusals() const {
+    return friend_gate_refusals_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::inc_friend_gate_legacy() {
+    friend_gate_legacy_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MetricsRegistry::friend_gate_legacy() const {
+    return friend_gate_legacy_.load(std::memory_order_relaxed);
+}
+
+void MetricsRegistry::observe_tunnel_open_latency_ms(double ms) {
+    open_latency_count_.fetch_add(1, std::memory_order_relaxed);
+    double sum = open_latency_sum_ms_.load(std::memory_order_relaxed);
+    while (!open_latency_sum_ms_.compare_exchange_weak(sum, sum + ms, std::memory_order_relaxed)) {
+    }
+    double max = open_latency_max_ms_.load(std::memory_order_relaxed);
+    while (ms > max &&
+           !open_latency_max_ms_.compare_exchange_weak(max, ms, std::memory_order_relaxed)) {
+    }
 }
 
 void MetricsRegistry::inc_log_sink_errors() {
@@ -525,6 +557,27 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_worker_aborts_total counter\n"
            "toxtunnel_worker_aborts_total "
         << worker_aborts() << "\n";
+    out << "# HELP toxtunnel_friend_gate_refusals_total DATA frames held back by the per-friend "
+           "gate (retried, not lost).\n"
+           "# TYPE toxtunnel_friend_gate_refusals_total counter\n"
+           "toxtunnel_friend_gate_refusals_total "
+        << friend_gate_refusals() << "\n";
+    out << "# HELP toxtunnel_friend_gate_legacy_total Friends found not to echo fences (left "
+           "ungated).\n"
+           "# TYPE toxtunnel_friend_gate_legacy_total counter\n"
+           "toxtunnel_friend_gate_legacy_total "
+        << friend_gate_legacy() << "\n";
+    out << "# HELP toxtunnel_tunnel_open_latency_milliseconds Client open attempt to Connected.\n"
+           "# TYPE toxtunnel_tunnel_open_latency_milliseconds summary\n"
+           "toxtunnel_tunnel_open_latency_milliseconds_count "
+        << open_latency_count_.load(std::memory_order_relaxed) << "\n"
+        << "toxtunnel_tunnel_open_latency_milliseconds_sum "
+        << open_latency_sum_ms_.load(std::memory_order_relaxed) << "\n"
+        << "# HELP toxtunnel_tunnel_open_latency_milliseconds_max Largest open latency since "
+           "process start.\n"
+           "# TYPE toxtunnel_tunnel_open_latency_milliseconds_max gauge\n"
+           "toxtunnel_tunnel_open_latency_milliseconds_max "
+        << open_latency_max_ms_.load(std::memory_order_relaxed) << "\n";
     out << "# HELP toxtunnel_log_sink_errors_total Log sink failures observed since process "
            "start (write / flush / reopen errors).\n"
            "# TYPE toxtunnel_log_sink_errors_total counter\n"

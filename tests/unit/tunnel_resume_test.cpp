@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <asio.hpp>
 #include <atomic>
 #include <chrono>
@@ -23,6 +24,7 @@
 #include "toxtunnel/app/tunnel_client.hpp"
 #include "toxtunnel/app/tunnel_server.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
+#include "toxtunnel/tunnel/friend_send_gate.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/tunnel/tunnel_manager.hpp"
@@ -918,6 +920,20 @@ TEST(StandbyProbeTest, TheRealPacketPathCreditsPongsAndAnswersPings) {
     ASSERT_TRUE(pong.has_value());
     EXPECT_EQ(pong.value().type(), FrameType::PONG);
     EXPECT_TRUE(pong.value().payload().empty());
+
+    // A friend gate fence from a just-demoted server is echoed, not answered
+    // plainly (a plain PONG would mark that server's gate legacy).
+    f.sent.clear();
+    const auto fence = tunnel::FriendSendGate::make_fence_packet(7, 3);
+    Access::handle_non_active_packet(f.client, 0, fence);
+    ASSERT_EQ(f.sent.size(), 1u);
+    auto echo = ProtocolFrame::deserialize(
+        std::span<const std::uint8_t>(f.sent[0].second.data() + 1, f.sent[0].second.size() - 1));
+    ASSERT_TRUE(echo.has_value());
+    EXPECT_EQ(echo.value().type(), FrameType::PONG);
+    EXPECT_TRUE(std::equal(echo.value().payload().begin(), echo.value().payload().end(),
+                           fence.begin() + 6, fence.end()));
+    EXPECT_EQ(echo.value().payload().size(), fence.size() - 6);
 }
 
 TEST(StandbyProbeTest, MalformedOrForeignStandbyPacketsAreIgnored) {

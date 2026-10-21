@@ -87,8 +87,8 @@ Offset  Size  Field
 | `INFO_REPLY`    | 0x07  | Server → Client response (`tunnel_id` = 0, UTF-8 YAML map filtered by `server.disclose.*`). Empty payload = "policy is to disclose nothing"; client persists the result to `known_servers.yaml`. Old servers ignore `INFO_REQUEST` — client falls back to locally-observable metadata only. |
 | `TUNNEL_RESUME_REQUEST` | 0x08 | Client → Server: reattach a tunnel that survived a brief disconnect (the server held it for `resume.max_age_seconds`). Binary payload: `[version:1=0x01][prior_id:2][recv:8][send:8][host_len:1][host:N][port:2]`. Wire-inactive when `tunnel.resume.enabled: false` (the default). Old servers ignore unknown opcodes; the client falls back to `TUNNEL_OPEN` if the server declines or doesn't recognise the tunnel. |
 | `TUNNEL_RESUME_ACK`     | 0x09 | Server → Client: result of the resume attempt. Binary payload: `[version:1=0x01][new_id:2][server_recv:8][server_send:8][status:1]` where `status ∈ {0=Ok, 1=TargetUnreachable, 2=RulesDenied, 3=TooOld, 4=Unknown}`. |
-| `PING`          | 0x10  | Keep-alive ping                                   |
-| `PONG`          | 0x11  | Keep-alive response                               |
+| `PING`          | 0x10  | Keep-alive ping. Empty payload, or a 17-byte **fence** `[0x46][epoch:8][seq:8]` sent by the per-friend DATA gate (`flow_control.friend_gate`, issue #42). Every release ignores a PING payload. |
+| `PONG`          | 0x11  | Keep-alive response. Since v0.5.2 a PONG echoes a 1..32-byte PING payload (a fence echo); earlier releases always answer empty. |
 
 > Every frame is prepended with a single `kLosslessPacketByte` (0xA0) when
 > handed to toxcore's lossless custom packet API. ToxTunnel does **not**
@@ -344,6 +344,9 @@ Exposed series (subject to growth — names are stable once shipped):
 | `toxtunnel_tox_iterate_lag_milliseconds_{count,sum,max}` | summary | `tox_iterate()` elapsed-time samples |
 | `toxtunnel_log_sink_errors_total` | counter | Log sink failures observed (a write / flush that threw, a failed reopen, an error reported to the logger). Counts failures, not lost lines |
 | `toxtunnel_log_records_dropped_total` | counter | Log records that neither the log file nor its fallback (syslog on POSIX) could take |
+| `toxtunnel_friend_gate_refusals_total` | counter | DATA frames the per-friend gate held back (retried by their tunnel, never lost) |
+| `toxtunnel_friend_gate_legacy_total` | counter | Peers found not to echo fences, left ungated |
+| `toxtunnel_tunnel_open_latency_milliseconds_{count,sum}` / `_max` | summary / gauge | Client: open attempt → Connected (includes SENDQ retries, the network and the server's target connect) |
 
 There is no remote-command channel; the daemon does not export per-frame
 counts or a self-connection-status gauge.

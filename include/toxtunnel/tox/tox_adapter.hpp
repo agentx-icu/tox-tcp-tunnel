@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
+#include "toxtunnel/tox/lossless_send_gate.hpp"
 #include "toxtunnel/tox/tox_ptr.hpp"
 #include "toxtunnel/tox/types.hpp"
 #include "toxtunnel/util/expected.hpp"
@@ -392,6 +393,11 @@ class ToxAdapter {
     /// Register a callback for incoming lossless packets.
     void set_on_lossless_packet(FriendLosslessPacketCallback cb);
 
+    /// Install a gate at the lossless send/receive boundary (issue #42). Call
+    /// before start(); every gate method then runs under tox_mutex_ (see
+    /// LosslessSendGate). Null removes it.
+    void set_lossless_send_gate(std::shared_ptr<LosslessSendGate> gate);
+
     /// Register a callback for incoming lossy packets.
     void set_on_lossy_packet(FriendLossyPacketCallback cb);
 
@@ -627,6 +633,15 @@ class ToxAdapter {
     /// a relay-to-direct upgrade replays every reconnect side effect
     /// (resume requests, keepalive restart, a second pipe-mode start).
     std::unordered_map<uint32_t, TOX_CONNECTION> friend_transport_;
+
+    /// See set_lossless_send_gate(). Guarded by tox_mutex_, like the toxcore
+    /// calls it brackets; `gate_io_` is what the gate may ask of toxcore while
+    /// that lock is held.
+    std::shared_ptr<LosslessSendGate> send_gate_;
+    LosslessSendGate::Io gate_io_;
+    /// Raw view of send_gate_ for the lock-free fast_reject() check; set with
+    /// it (before start(), so it never dangles while senders run).
+    std::atomic<LosslessSendGate*> send_gate_hint_{nullptr};
 
     /// See dht_node_info(). Written once in initialize().
     DhtNodeInfo dht_node_info_;

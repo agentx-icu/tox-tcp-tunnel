@@ -196,6 +196,17 @@ ProtocolFrame ProtocolFrame::make_pong() {
     return ProtocolFrame(FrameType::PONG, 0);
 }
 
+ProtocolFrame ProtocolFrame::make_pong_for(const ProtocolFrame& ping) {
+    // Mirrors tunnel::kMaxPingEchoBytes (friend_send_gate.hpp).
+    constexpr std::size_t kMaxEcho = 32;
+    ProtocolFrame frame(FrameType::PONG, 0);
+    const auto payload = ping.payload();
+    if (!payload.empty() && payload.size() <= kMaxEcho) {
+        frame.payload_.assign(payload.begin(), payload.end());
+    }
+    return frame;
+}
+
 ProtocolFrame ProtocolFrame::make_info_request() {
     return ProtocolFrame(FrameType::INFO_REQUEST, 0);
 }

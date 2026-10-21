@@ -7,6 +7,7 @@
 
 #include "toxtunnel/app/tunnel_senders.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
+#include "toxtunnel/tunnel/friend_send_gate.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/util/asio_timer.hpp"
@@ -36,6 +37,9 @@ struct ClientOpenBook {
     bool connected{false};  ///< `Connected` was observed and booked (opened{ok}, active++).
     bool resolved{false};   ///< Terminal outcome booked; a later Connected is ignored.
     bool active{false};     ///< The active gauge currently counts this tunnel.
+    /// Built right before the tunnel's open attempt: the start of
+    /// toxtunnel_tunnel_open_latency_milliseconds.
+    std::chrono::steady_clock::time_point open_started{std::chrono::steady_clock::now()};
 };
 
 /// Book `Connected`. Returns false when the tunnel already ended (a terminal
@@ -49,6 +53,10 @@ bool book_connected(ClientOpenBook& book) {
     book.connected = true;
     book.resolved = true;
     book.active = true;
+    util::MetricsRegistry::instance().observe_tunnel_open_latency_ms(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                  book.open_started)
+            .count());
     util::MetricsRegistry::instance().inc_tunnels_opened(util::MetricsRegistry::OpenResult::Ok);
     util::MetricsRegistry::instance().inc_tunnels_active(util::MetricsRegistry::Role::Client);
     return true;
@@ -227,6 +235,12 @@ util::Expected<void, std::string> TunnelClient::initialize(const Config& config)
     if (!init_result) {
         return util::unexpected(std::string("Failed to initialize ToxAdapter: ") +
                                 init_result.error());
+    }
+    if (config_.flow_control.friend_gate) {
+        // Per-friend DATA gate at the toxcore boundary (issue #42). Installed
+        // before start(): every gate call then runs under the adapter's lock.
+        tox_adapter_->set_lossless_send_gate(std::make_shared<tunnel::FriendSendGate>());
+        util::Logger::info("Per-friend DATA gate enabled (flow_control.friend_gate)");
     }
 
     // Open the persistent known-servers registry alongside tox_save.dat.
@@ -2634,9 +2648,16 @@ void TunnelClient::handle_non_active_packet(uint32_t friend_number, const uint8_
             note_standby_alive(friend_number);
         }
     } else if (data[1] == static_cast<uint8_t>(tunnel::FrameType::PING)) {
-        // Answered so a standby never judges us dead. A plain PONG: a standby
-        // gets no traffic from us, so nothing of ours depends on its payload.
-        const auto wire = tunnel::ProtocolFrame::make_pong().serialize();
+        // Answered so a standby never judges us dead. Echoed like any other
+        // PING: a server that was active a moment ago may still have friend
+        // gate fences outstanding, and a plain PONG would read as a legacy
+        // peer to its gate (issue #42).
+        const auto ping =
+            tunnel::ProtocolFrame::deserialize(std::span<const uint8_t>(data + 1, length - 1));
+        if (!ping) {
+            return;
+        }
+        const auto wire = tunnel::ProtocolFrame::make_pong_for(ping.value()).serialize();
         std::vector<uint8_t> pong;
         pong.reserve(1 + wire.size());
         pong.push_back(tunnel::kLosslessPacketByte);
