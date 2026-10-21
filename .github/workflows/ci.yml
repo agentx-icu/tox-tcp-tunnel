@@ -484,6 +484,139 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
 
+  live-smoke:
+    # Real daemons on loopback (issue #46): the behaviours the qa5 rig found
+    # broken that no unit/integration test could see -- control-frame latency
+    # under bulk, RST in both directions, keepalive verdict + recovery,
+    # failover and prefer-primary return, the half-close cap, a client that
+    # starts first. The JSON it writes is also the per-run performance record.
+    name: Live smoke (two daemons)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libsodium-dev
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DTOXTUNNEL_BUILD_TESTS=OFF
+          cmake --build build --parallel
+      - name: Run the live smoke
+        run: |
+          python3 tests/live/live_smoke.py --server-bin build/toxtunnel \
+            --client-bin build/toxtunnel --out live-smoke.json
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-smoke
+          path: |
+            live-smoke.json
+            /tmp/tt-live-*/**/*.log
+          if-no-files-found: ignore
+
+  mixed-version:
+    # This build against released peers, both directions (issue #46). Each
+    # combination skips only what the older side cannot do: v0.5.x peers lack
+    # the client-side reset and abandon semantics of #41/#44 and standby
+    # probing (#43); v0.4.x servers additionally stop answering a client once
+    # their own keepalive has torn its manager down (fixed in v0.5.0, #36) and
+    # predate the TUNNEL_ERROR 4 reset (#35).
+    name: Mixed versions (${{ matrix.peer }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - peer: "0.5.1"
+            skip_new_client: rst_app_to_target
+            skip_old_client: rst_app_to_target,keepalive_recovery,failover
+          - peer: "0.4.14"
+            skip_new_client: rst_app_to_target,rst_target_to_app,keepalive_recovery,failover
+            skip_old_client: rst_app_to_target,rst_target_to_app,keepalive_recovery,failover
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libsodium-dev
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DTOXTUNNEL_BUILD_TESTS=OFF
+          cmake --build build --parallel
+      - name: Fetch the released peer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "v${{ matrix.peer }}" -R "${{ github.repository }}" \
+            -p "toxtunnel-${{ matrix.peer }}-Linux-x86_64.deb" -D peer
+          dpkg-deb -x peer/*.deb peer/root
+          peer/root/usr/bin/toxtunnel --version
+      - name: New client, released server
+        run: |
+          python3 tests/live/live_smoke.py --client-bin build/toxtunnel \
+            --server-bin peer/root/usr/bin/toxtunnel \
+            --skip "${{ matrix.skip_new_client }}" --out new-client.json
+      - name: Released client, new server
+        if: always()
+        run: |
+          python3 tests/live/live_smoke.py --client-bin peer/root/usr/bin/toxtunnel \
+            --server-bin build/toxtunnel \
+            --skip "${{ matrix.skip_old_client }}" --out old-client.json
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mixed-version-${{ matrix.peer }}
+          path: |
+            new-client.json
+            old-client.json
+          if-no-files-found: ignore
+
+  source-archive:
+    # A tree without .git (a release tarball, a distro build) has to report
+    # the same version as a git checkout: --version, the package file name
+    # and the package metadata must all agree with project() (issue #46).
+    name: Source archive build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libsodium-dev
+      - name: Export the tree without .git
+        run: |
+          git ls-files --recurse-submodules -z | tar --null -T - -cf "$RUNNER_TEMP/src.tar"
+          mkdir "$RUNNER_TEMP/src"
+          tar -xf "$RUNNER_TEMP/src.tar" -C "$RUNNER_TEMP/src"
+          test ! -e "$RUNNER_TEMP/src/.git"
+      - name: Build and package
+        working-directory: ${{ runner.temp }}/src
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DTOXTUNNEL_BUILD_TESTS=OFF
+          cmake --build build --parallel
+          (cd build && cpack -G DEB)
+      - name: Versions agree
+        working-directory: ${{ runner.temp }}/src
+        run: |
+          set -euo pipefail
+          want=$(sed -nE 's/^project\(toxtunnel VERSION ([0-9.]+).*/\1/p' CMakeLists.txt)
+          got=$(build/toxtunnel --version)
+          deb=$(ls build/toxtunnel-*.deb)
+          meta=$(dpkg-deb -f "$deb" Version)
+          echo "project=$want --version=$got deb=$deb metadata=$meta"
+          test "$got" = "$want"
+          test "$meta" = "$want"
+          case "$deb" in *"toxtunnel-$want-"*) ;; *) echo "package name lacks $want"; exit 1;; esac
+
   publish-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
