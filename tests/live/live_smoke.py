@@ -306,8 +306,12 @@ class Daemon:
             return None
 
     def tunnels(self):
+        """{id: tunnel} from a successful inspect, or None if inspect failed —
+        never an empty map that would read as "every tunnel is gone"."""
         doc = self.inspect("tunnels")
-        return {t["id"]: t for t in doc.get("tunnels", [])} if doc else {}
+        if not doc or "tunnels" not in doc:
+            return None
+        return {t["id"]: t for t in doc["tunnels"]}
 
     def reload(self):
         subprocess.run([self.binary, "reload", "-c", self.config], capture_output=True, timeout=10)
@@ -451,13 +455,28 @@ class Rig:
 """)
         for s in self.servers:
             s.reload()
-        if self.client.wait_log("Server friend 0 is now online", 120) is None:
-            raise RuntimeError("client never saw its primary online")
-        if len(self.servers) > 1:
-            # Let a multi-server client settle on the primary.
-            time.sleep(FAILOVER_GRACE_S + 2)
-        if not wait_echo(self, 30):
+        # Ready = data flows; which server got there first does not matter.
+        if not wait_echo(self, 120):
             raise RuntimeError("no echo through the tunnel after setup")
+        if len(self.servers) > 1:
+            # A multi-server client may have started on B (A connected later);
+            # prefer-primary then moves it to A after the grace. Scenarios
+            # assume A is active, so wait until the current route is A and
+            # has stayed A past the grace.
+            a = self.servers[0].id[:12]
+            deadline = time.time() + FAILOVER_GRACE_S + 60
+            settled_since = None
+            while time.time() < deadline:
+                switches = active_switches(self, "0")
+                on_a = not switches or switches[-1] == a
+                settled_since = (settled_since or time.time()) if on_a else None
+                if settled_since and time.time() - settled_since > FAILOVER_GRACE_S + 2:
+                    break
+                time.sleep(0.5)
+            else:
+                raise RuntimeError("multi-server client did not settle on the primary")
+            if not wait_echo(self, 30):
+                raise RuntimeError("no echo through the primary after settling")
 
     def down(self):
         for d in self.daemons():
@@ -654,14 +673,18 @@ def sc_rst_app_to_target(rig, perf):
 
 
 def sc_half_close(rig, perf):
-    before = set(rig.client.tunnels())
+    snap = rig.client.tunnels()
+    if snap is None:
+        return False, {"inspect": "failed"}
+    before = set(snap)
     token = new_token()
     s = connect(rig)
     s.sendall(f"SINK {token}\n".encode())
     if not rig.targets.wait(token, "accepted", 15):
         s.close()
         return False, {"target_accepted": False}
-    new_ids = set(rig.client.tunnels()) - before
+    snap = rig.client.tunnels()
+    new_ids = set(snap) - before if snap is not None else set()
     if len(new_ids) != 1:
         s.close()
         return False, {"new_tunnels": sorted(new_ids)}
@@ -672,7 +695,11 @@ def sc_half_close(rig, perf):
     state_after_fin = None
     reaped = None
     while time.time() - t0 < HALF_CLOSE_S + 15:
-        t = rig.client.tunnels().get(tid)
+        snap = rig.client.tunnels()
+        if snap is None:
+            time.sleep(0.25)  # a failed inspect proves nothing either way
+            continue
+        t = snap.get(tid)
         if t is None:
             reaped = round(time.time() - t0, 1)
             break
