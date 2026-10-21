@@ -2648,9 +2648,16 @@ void TunnelClient::handle_non_active_packet(uint32_t friend_number, const uint8_
             note_standby_alive(friend_number);
         }
     } else if (data[1] == static_cast<uint8_t>(tunnel::FrameType::PING)) {
-        // Answered so a standby never judges us dead. A plain PONG: a standby
-        // gets no traffic from us, so nothing of ours depends on its payload.
-        const auto wire = tunnel::ProtocolFrame::make_pong().serialize();
+        // Answered so a standby never judges us dead. Echoed like any other
+        // PING: a server that was active a moment ago may still have friend
+        // gate fences outstanding, and a plain PONG would read as a legacy
+        // peer to its gate (issue #42).
+        const auto ping =
+            tunnel::ProtocolFrame::deserialize(std::span<const uint8_t>(data + 1, length - 1));
+        if (!ping) {
+            return;
+        }
+        const auto wire = tunnel::ProtocolFrame::make_pong_for(ping.value()).serialize();
         std::vector<uint8_t> pong;
         pong.reserve(1 + wire.size());
         pong.push_back(tunnel::kLosslessPacketByte);
