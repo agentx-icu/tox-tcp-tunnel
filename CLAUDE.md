@@ -176,11 +176,13 @@ tests/integration/   # Integration tests
 tests/packaging/     # Package-layout verification scripts (run by packaging CI)
 tests/soak/          # Bounded smoke tests (bare ctest or ctest -L soak)
 tests/chaos/         # Bounded fault-injection smoke test (bare ctest or ctest -L chaos)
+tests/live/          # live_smoke.py: real daemons on loopback (CI live-smoke /
+                     # mixed-version jobs); see docs/TESTING.md
                      # Total test count: ~525 across all suites.
 third_party/c-toxcore/   # Git submodule — required for build
 cmake/Packaging.cmake    # CPack configuration
 packaging/{linux,macos,windows}/   # Service units, installer scripts, MSI/WIX fragments
-docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, scenario guides
+docs/                # ARCHITECTURE.md, CONFIGURATION.md, BUILDING.md, TESTING.md, scenario guides
 ```
 
 ## v0.3.0 Default Behavior (read before changing config defaults)
