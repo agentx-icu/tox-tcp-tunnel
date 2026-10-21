@@ -559,6 +559,91 @@ TEST(FriendSendGateTest, FastRejectMirrorsTheGateForDataOnly) {
     EXPECT_FALSE(h.gate.fast_reject(1, data_packet())) << "credit reopens the hint";
 }
 
+TEST(FriendSendGateTest, FastPathRefusalsStillCountAsDemand) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.deliver(echo_of(h.fences.back()));  // ACTIVE
+    h.fill();
+    h.tick();
+    const auto fences = h.fences.size();
+    // From now on the tunnel only ever hears the fast path.
+    for (int i = 0; i < 40; ++i) {
+        h.now += 250 * kMs;
+        ASSERT_TRUE(h.gate.fast_reject(1, data_packet()));
+        h.tick();
+    }
+    EXPECT_GT(h.fences.size(), fences) << "recovery fences keep going on fast-path demand";
+}
+
+TEST(FriendSendGateTest, ReArmedDetectionStartsOnFastPathDemand) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.deliver(lossless(ProtocolFrame::make_pong()));
+    ASSERT_EQ(h.view().phase, Gate::Phase::Legacy);
+    for (int i = 0; i < 20; ++i) {
+        h.offer_data();  // ungated: debt piles up
+    }
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    const auto fences = h.fences.size();
+    h.tick();  // closes the hint before any admit() refusal
+    ASSERT_TRUE(h.gate.fast_reject(1, data_packet()));
+    h.now += 10 * kMs;
+    h.tick();
+    EXPECT_GT(h.fences.size(), fences) << "the first fence of the re-armed detection goes out";
+    h.now += 11 * kSec;
+    h.tick();
+    EXPECT_EQ(h.view().phase, Gate::Phase::Legacy) << "and its timeout can run";
+}
+
+TEST(FriendSendGateTest, CompressedEchoesOfAConstantSerializerReadAsItsRate) {
+    // 6000 B/s serializer, 160 ms one way; echoes held back and released in
+    // bunches every 2 s (reverse-path compression).
+    Harness h;
+    double delivered_at = 0;  // when the serializer frees up
+    std::vector<std::pair<std::int64_t, std::vector<std::uint8_t>>> pending;
+    std::size_t seen = 0;
+    const auto stamp = [&] {
+        for (; seen < h.fences.size(); ++seen) {
+            // The fence is delivered once every byte before it has crossed.
+            pending.emplace_back(static_cast<std::int64_t>(delivered_at) + 160 * kMs,
+                                 echo_of(h.fences[seen]));
+        }
+    };
+    for (int ms = 0; ms < 60'000; ms += 10) {
+        h.now += 10 * kMs;
+        while (h.offer_data()) {
+            delivered_at = std::max(delivered_at, static_cast<double>(h.now)) +
+                           static_cast<double>(data_packet().size()) / 6000.0 * 1e9;
+            stamp();
+        }
+        h.tick();
+        stamp();
+        if (ms % 2000 == 0) {  // release every echo due by now, at once
+            std::vector<std::pair<std::int64_t, std::vector<std::uint8_t>>> keep;
+            for (auto& [due, pong] : pending) {
+                if (due + 160 * kMs <= h.now) {
+                    h.deliver(pong);
+                } else {
+                    keep.emplace_back(due, pong);
+                }
+            }
+            pending.swap(keep);
+        }
+    }
+    EXPECT_LT(h.view().rate_bps, 6000.0 * 1.25) << "bunched echoes must not read as a burst";
+}
+
+TEST(FriendSendGateTest, TheHintAdmitsASmallFrameThatFits) {
+    Harness h;
+    h.fill();  // leaves less than one full frame of room
+    const auto small = data_packet(100);
+    const bool admit_small = h.gate.admit(h.io, 1, small, h.now);
+    EXPECT_EQ(h.gate.fast_reject(1, small), !admit_small)
+        << "the hint must agree with admit() for the packet's real size";
+}
+
 TEST(PongEchoTest, PongEchoesSmallPingPayloadsOnly) {
     const auto fence = Gate::make_fence_packet(5, 6);
     auto ping = ProtocolFrame::deserialize(

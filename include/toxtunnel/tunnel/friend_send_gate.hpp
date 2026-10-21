@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -129,6 +130,13 @@ class FriendSendGate final : public tox::LosslessSendGate {
         std::uint64_t snapshot;
         std::int64_t lo_sent_ns;
         std::uint64_t lo_backlog;  ///< emitted - delivered when `lo` was sent
+        /// Delivery state when `lo` was sent, for the rate sample (BBR's
+        /// P.delivered / P.delivered_time / P.first_sent_time): the credited
+        /// bytes, when that credit arrived, and when the fence it came from
+        /// had been sent.
+        std::uint64_t delivered_at_send;
+        std::int64_t credit_ns_at_send;
+        std::int64_t credit_sent_ns_at_send;
     };
 
     struct Ledger {
@@ -151,6 +159,9 @@ class FriendSendGate final : public tox::LosslessSendGate {
         std::uint64_t empty_pongs_received = 0;
         // Demand.
         std::int64_t last_refused_ns = 0;
+        /// The last credit: when it arrived and when its fence had been sent.
+        std::int64_t last_credit_ns = 0;
+        std::int64_t last_credit_sent_ns = 0;
         /// Delivery rate: a windowed MAXIMUM (two 10 s buckets, expiring with
         /// them) of per-fence samples — the bytes outstanding when a fence was
         /// sent over that fence's send-to-echo time. Each sample spans a whole
@@ -200,9 +211,15 @@ class FriendSendGate final : public tox::LosslessSendGate {
     std::map<PublicKey, Ledger> ledgers_;
     std::unordered_map<std::uint32_t, PublicKey> number_to_key_;
     /// fast_reject()'s view, indexed by friend number (larger numbers simply
-    /// never get the fast path). Written under tox_mutex_, read lock-free.
+    /// never get the fast path): the DATA bytes admit() would accept right
+    /// now (kOpen = no limit). Written under tox_mutex_, read lock-free.
     static constexpr std::size_t kHintSlots = 4096;
-    std::array<std::atomic<std::uint8_t>, kHintSlots> closed_hint_{};
+    static constexpr std::int64_t kOpen = INT64_MAX;
+    std::array<std::atomic<std::int64_t>, kHintSlots> hint_room_{};
+    /// fast_reject() turned DATA away since the last tick: demand admit() never
+    /// saw, folded into the ledger by on_tick (recovery fences, ProbeRTT and
+    /// the first fence of a re-armed detection all key off demand).
+    mutable std::array<std::atomic<std::uint8_t>, kHintSlots> hint_refused_{};
 };
 
 }  // namespace toxtunnel::tunnel

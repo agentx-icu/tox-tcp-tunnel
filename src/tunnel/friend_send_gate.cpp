@@ -63,7 +63,11 @@ std::uint64_t random_epoch() {
 
 }  // namespace
 
-FriendSendGate::FriendSendGate(Config cfg, std::uint64_t epoch) : cfg_(cfg), epoch_(epoch) {}
+FriendSendGate::FriendSendGate(Config cfg, std::uint64_t epoch) : cfg_(cfg), epoch_(epoch) {
+    for (auto& room : hint_room_) {
+        room.store(kOpen, std::memory_order_relaxed);
+    }
+}
 
 FriendSendGate::FriendSendGate() : FriendSendGate(Config{}, random_epoch()) {}
 
@@ -232,18 +236,30 @@ void FriendSendGate::on_received(const Io& io, std::uint32_t friend_number,
 
 void FriendSendGate::credit(Ledger& l, const Range& matched, std::uint64_t seq,
                             std::int64_t now_ns) {
-    l.delivered = std::max(l.delivered, matched.snapshot);
-    if (now_ns > matched.lo_sent_ns) {
-        // The bytes outstanding when the range's first fence went out were all
-        // delivered by now: a rate over a whole round trip, so a bunch of late
-        // echoes cannot read as a burst. A later fence of the range only makes
-        // the interval longer (conservative). The max filter keeps the high
-        // samples; low, application-limited ones cannot lower it.
-        observe_rate(l,
-                     static_cast<double>(matched.lo_backlog) * 1e9 /
-                         static_cast<double>(now_ns - matched.lo_sent_ns),
-                     now_ns);
+    const std::uint64_t delivered = std::max(l.delivered, matched.snapshot);
+    if (matched.credit_ns_at_send > 0 && delivered > matched.delivered_at_send) {
+        // BBR's delivery-rate sample: the bytes credited since the credit that
+        // was current when this fence went out, over the longer of the echo-
+        // side interval (that credit -> now) and the send-side interval (its
+        // fence's send -> this fence's send). Both ends of each interval are
+        // the same kind of event, so bunched echoes shrink neither, and bytes
+        // delivered before the fence was sent are not counted as if they had
+        // crossed the path afterwards.
+        const std::int64_t ack_elapsed = now_ns - matched.credit_ns_at_send;
+        const std::int64_t send_elapsed = matched.lo_sent_ns - matched.credit_sent_ns_at_send;
+        const std::int64_t elapsed = std::max(ack_elapsed, send_elapsed);
+        if (elapsed > 0) {
+            observe_rate(l,
+                         static_cast<double>(delivered - matched.delivered_at_send) * 1e9 /
+                             static_cast<double>(elapsed),
+                         now_ns);
+        }
     }
+    if (delivered > l.delivered || l.last_credit_ns == 0) {
+        l.last_credit_ns = now_ns;
+        l.last_credit_sent_ns = matched.lo_sent_ns;
+    }
+    l.delivered = delivered;
     if (seq == matched.lo) {
         // The one fence of the range whose send time is exact.
         observe_rtt(l, (now_ns - matched.lo_sent_ns) / 1000,
@@ -295,12 +311,19 @@ void FriendSendGate::publish_hint(const Ledger& l) {
     if (l.friend_number >= kHintSlots) {
         return;
     }
-    // "A full frame would be refused now": what fast_reject() answers until
-    // the next republish (every tick, every credit, every refusal).
-    const std::uint64_t backlog = l.emitted - l.delivered;
-    const bool closed =
-        l.phase != Phase::Legacy && (l.probing || (backlog > 0 && backlog + 1400 > budget(l)));
-    closed_hint_[l.friend_number].store(closed ? 1 : 0, std::memory_order_release);
+    // What admit() would accept right now, for fast_reject() until the next
+    // republish (every tick, credit and refusal).
+    std::int64_t room = kOpen;
+    if (l.phase != Phase::Legacy) {
+        const std::uint64_t backlog = l.emitted - l.delivered;
+        const std::uint64_t b = budget(l);
+        if (l.probing) {
+            room = -1;
+        } else if (backlog > 0) {
+            room = backlog >= b ? 0 : static_cast<std::int64_t>(b - backlog);
+        }
+    }
+    hint_room_[l.friend_number].store(room, std::memory_order_release);
 }
 
 bool FriendSendGate::fast_reject(std::uint32_t friend_number,
@@ -309,7 +332,13 @@ bool FriendSendGate::fast_reject(std::uint32_t friend_number,
         packet[1] != static_cast<std::uint8_t>(FrameType::TUNNEL_DATA)) {
         return false;
     }
-    return closed_hint_[friend_number].load(std::memory_order_acquire) != 0;
+    const std::int64_t room = hint_room_[friend_number].load(std::memory_order_acquire);
+    if (static_cast<std::int64_t>(packet.size()) <= room) {
+        return false;
+    }
+    // Turned away without admit(): record the demand for the next tick.
+    hint_refused_[friend_number].store(1, std::memory_order_release);
+    return true;
 }
 
 void FriendSendGate::observe_rtt(Ledger& l, std::int64_t rtt_us, bool trusted,
@@ -341,7 +370,8 @@ void FriendSendGate::record_fence(Ledger& l, std::uint64_t seq, std::int64_t now
     if (!l.entries.empty() && l.entries.back().snapshot == l.emitted) {
         l.entries.back().hi = seq;
     } else {
-        l.entries.push_back(Range{seq, seq, l.emitted, now_ns, l.emitted - l.delivered});
+        l.entries.push_back(Range{seq, seq, l.emitted, now_ns, l.emitted - l.delivered, l.delivered,
+                                  l.last_credit_ns, l.last_credit_sent_ns});
     }
     if (l.entries.size() > cfg_.max_ledger_entries) {
         // Thin the middle, never the ends: the oldest entry is the next echo
@@ -418,6 +448,10 @@ void FriendSendGate::on_tick(const Io& io, std::int64_t now_ns) {
         }
         const bool blocked = l.last_refused_ns > 0 && now_ns - l.last_refused_ns < kBlockedWindowNs;
         age_rate(l, now_ns);
+        if (l.friend_number < kHintSlots &&
+            hint_refused_[l.friend_number].exchange(0, std::memory_order_acq_rel) != 0) {
+            l.last_refused_ns = now_ns;
+        }
         // No trusted sample and no completed probe for probe_after_ns.
         const std::int64_t trusted_ref = std::max(
             l.last_trusted_ns > 0 ? l.last_trusted_ns : l.activated_ns, l.last_probe_done_ns);
@@ -463,7 +497,8 @@ void FriendSendGate::on_tick(const Io& io, std::int64_t now_ns) {
 void FriendSendGate::forget_friend_number(std::uint32_t friend_number) {
     number_to_key_.erase(friend_number);
     if (friend_number < kHintSlots) {
-        closed_hint_[friend_number].store(0, std::memory_order_release);
+        hint_room_[friend_number].store(kOpen, std::memory_order_release);
+        hint_refused_[friend_number].store(0, std::memory_order_release);
     }
 }
 
