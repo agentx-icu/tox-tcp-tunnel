@@ -14,6 +14,11 @@ namespace {
 constexpr std::int64_t kMinRttBucketNs = 10'000'000'000;
 /// DATA refused within this window counts as "blocked" (demand exists).
 constexpr std::int64_t kBlockedWindowNs = 1'000'000'000;
+/// A peer that echoed before a reconnect is judged legacy without positive
+/// evidence (a plain PONG) only after this many legacy timeouts: its echoes
+/// may come late behind a backlog, and Legacy drops the fences that could
+/// prove it otherwise.
+constexpr std::int64_t kRearmedTimeoutFactor = 6;
 /// Progress fences: a quarter budget apart, never closer than two frames.
 /// Several fences per budget keep credit flowing while DATA is admitted; a
 /// single fence per budget would turn the gate into stop-and-wait at
@@ -63,7 +68,7 @@ std::uint64_t random_epoch() {
 
 }  // namespace
 
-FriendSendGate::FriendSendGate(Config cfg, std::uint64_t epoch) : cfg_(cfg), epoch_(epoch) {
+FriendSendGate::FriendSendGate(const Config& cfg, std::uint64_t epoch) : cfg_(cfg), epoch_(epoch) {
     for (auto& room : hint_room_) {
         room.store(kOpen, std::memory_order_relaxed);
     }
@@ -272,6 +277,7 @@ void FriendSendGate::credit(Ledger& l, const Range& matched, std::uint64_t seq,
     }
     if (l.phase == Phase::Bootstrap) {
         l.phase = Phase::Active;
+        l.rearmed_active = false;
         l.activated_ns = now_ns;
         util::Logger::debug("Friend gate: friend {} echoes fences; gating its DATA",
                             l.friend_number);
@@ -421,11 +427,21 @@ void FriendSendGate::on_connection_status(const Io& io, std::uint32_t friend_num
     if (!connected) {
         return;  // accounting survives: NONE does not prove the stream is gone
     }
-    if (Ledger* l = ledger_for(io, friend_number); l != nullptr && l->phase == Phase::Legacy) {
-        // A reconnect may be an upgraded peer: detect again, from fresh
-        // evidence — the surplus of plain PONGs that made it Legacy must not
-        // condemn it again; keepalive PINGs still outstanding stay counted.
+    if (Ledger* l = ledger_for(io, friend_number); l != nullptr && l->phase != Phase::Bootstrap) {
+        // A reconnect may be a different build behind the same identity: an
+        // upgraded peer (was Legacy) or one restarted on an older release
+        // (was Active, whose plain PONGs only Bootstrap detection can see —
+        // left Active, its unanswerable debt would stall DATA for good).
+        // Detect again, from fresh evidence — the surplus of plain PONGs that
+        // made it Legacy must not condemn it again; keepalive PINGs still
+        // outstanding stay counted. The byte accounting is kept: the next
+        // echo's snapshot covers anything sent before the disconnect.
+        l->rearmed_active = l->phase == Phase::Active;
         l->phase = Phase::Bootstrap;
+        // The first fence goes out as soon as DATA is blocked, not after the
+        // backoff the old connection had reached.
+        l->recovery_interval_ns = 0;
+        l->next_recovery_ns = 0;
         l->first_fence_ns = 0;
         l->empty_pongs_received = std::min(l->empty_pongs_received, l->empty_pings_sent);
     }
@@ -441,8 +457,11 @@ void FriendSendGate::on_tick(const Io& io, std::int64_t now_ns) {
         if (it == number_to_key_.end() || it->second != key) {
             continue;
         }
+        const std::int64_t legacy_after = l.rearmed_active
+                                              ? kRearmedTimeoutFactor * cfg_.legacy_timeout_ns
+                                              : cfg_.legacy_timeout_ns;
         if (l.phase == Phase::Bootstrap && l.first_fence_ns > 0 &&
-            now_ns - l.first_fence_ns > cfg_.legacy_timeout_ns) {
+            now_ns - l.first_fence_ns > legacy_after) {
             enter_legacy(l, "no fence echo");
             continue;
         }

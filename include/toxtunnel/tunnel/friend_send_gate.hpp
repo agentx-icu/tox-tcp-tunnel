@@ -96,7 +96,7 @@ class FriendSendGate final : public tox::LosslessSendGate {
         std::uint64_t epoch;
     };
 
-    explicit FriendSendGate(Config cfg, std::uint64_t epoch);
+    explicit FriendSendGate(const Config& cfg, std::uint64_t epoch);
     /// Random per-process epoch.
     FriendSendGate();
 
@@ -153,6 +153,9 @@ class FriendSendGate final : public tox::LosslessSendGate {
         std::deque<Range> entries;
         Phase phase = Phase::Bootstrap;
         std::int64_t first_fence_ns = 0;
+        /// Back in Bootstrap after a reconnect from Active: only a plain PONG
+        /// makes it Legacy promptly; silence takes kRearmedTimeoutFactor longer.
+        bool rearmed_active = false;
         // Legacy detection: an empty PONG beyond the empty PINGs we sent
         // answered a fence.
         std::uint64_t empty_pings_sent = 0;

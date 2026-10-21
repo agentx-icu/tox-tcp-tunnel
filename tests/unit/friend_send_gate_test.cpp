@@ -72,7 +72,7 @@ struct Harness {
     std::int64_t now = 1 * kSec;
     tox::LosslessSendGate::Io io;
 
-    explicit Harness(Gate::Config cfg = {}) : gate(cfg, /*epoch=*/0x1122334455667788ULL) {
+    explicit Harness(const Gate::Config& cfg = {}) : gate(cfg, /*epoch=*/0x1122334455667788ULL) {
         io.public_key = [this](std::uint32_t n) -> std::optional<Key> {
             auto it = keys.find(n);
             if (it == keys.end()) {
@@ -546,6 +546,88 @@ TEST(FriendSendGateTest, RearmedLegacyDetectionStartsFromFreshEvidence) {
     EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap) << "that PONG answered the keepalive";
     h.deliver(echo_of(h.fences.back()));
     EXPECT_EQ(h.view().phase, Gate::Phase::Active);
+}
+
+TEST(FriendSendGateTest, AnActivePeerRestartedOnAnOlderReleaseIsDetectedAgain) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 300 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    ASSERT_EQ(h.view().phase, Gate::Phase::Active);
+    // More DATA, then the peer goes away with it unanswered.
+    h.fill();
+    h.tick();
+    const auto debt = h.view().emitted - h.view().delivered;
+    ASSERT_GT(debt, 0u);
+    h.gate.on_connection_status(h.io, 1, false, h.now);
+    h.now += 2 * kSec;
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap);
+    EXPECT_EQ(h.view().emitted - h.view().delivered, debt) << "the accounting survives";
+    // Back on an older release: it answers our fences plainly. The first
+    // fence goes out on the next blocked tick, not after the old backoff.
+    ASSERT_FALSE(h.offer_data()) << "the debt exceeds the bootstrap floor";
+    const auto before = h.fences.size();
+    h.now += 1 * kMs;
+    h.tick();
+    ASSERT_GT(h.fences.size(), before) << "a post-reconnect fence was sent";
+    h.deliver(lossless(ProtocolFrame::make_pong()));
+    EXPECT_EQ(h.view().phase, Gate::Phase::Legacy);
+    EXPECT_TRUE(h.offer_data()) << "an ungated peer is never stalled by debt it cannot answer";
+}
+
+TEST(FriendSendGateTest, AnActivePeerThatStillEchoesReactivatesWithItsDebtCovered) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 300 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    h.fill();
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    ASSERT_EQ(h.view().phase, Gate::Phase::Bootstrap);
+    h.now += 600 * kMs;
+    h.tick();
+    ASSERT_FALSE(h.fences.empty());
+    h.now += 300 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    const auto v = h.view();
+    EXPECT_EQ(v.phase, Gate::Phase::Active);
+    EXPECT_EQ(v.delivered, v.emitted);
+}
+
+TEST(FriendSendGateTest, ARearmedPeerWhoseEchoIsSlowIsNotCondemnedByTheShortTimeout) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 300 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    h.fill();
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    (void)h.offer_data();
+    h.now += 1 * kMs;
+    h.tick();
+    ASSERT_FALSE(h.fences.empty());
+    const auto fence = h.fences.back();
+    // Eleven seconds of silence behind a backlog: past the first-contact
+    // timeout, well inside the re-armed one.
+    for (int i = 0; i < 110; ++i) {
+        h.now += 100 * kMs;
+        (void)h.offer_data();
+        h.tick();
+    }
+    EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap);
+    h.deliver(echo_of(fence));
+    EXPECT_EQ(h.view().phase, Gate::Phase::Active);
+    // Silence does still end it eventually.
+    h.fill();
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    for (int i = 0; i < 700 && h.view().phase != Gate::Phase::Legacy; ++i) {
+        h.now += 100 * kMs;
+        (void)h.offer_data();
+        h.tick();
+    }
+    EXPECT_EQ(h.view().phase, Gate::Phase::Legacy);
 }
 
 TEST(FriendSendGateTest, FastRejectMirrorsTheGateForDataOnly) {

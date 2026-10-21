@@ -679,7 +679,9 @@ is retried, nothing is dropped.
   a plain PONG, is detected (or, failing that, after 10 s without an echo), and
   runs ungated as before. Until a peer is recognised, DATA to it is capped at the
   floor — an older peer sees up to ~10 s of slow start per connection while
-  this is on.
+  this is on. Detection runs again on every reconnect, since the peer may
+  have been upgraded or restarted on an older release; a peer that echoed
+  before is then judged older on a plain PONG, or only after 60 s of silence.
 - Only an exact echo of a fence this process sent is ever credited, so lost,
   late or misrouted replies cannot release DATA early.
 - Like the per-tunnel window, the gate drains briefly (ProbeRTT) when it has had
