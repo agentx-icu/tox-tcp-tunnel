@@ -1227,6 +1227,7 @@ Node convert<toxtunnel::FlowControlConfig>::encode(const toxtunnel::FlowControlC
     node["send_window_max_bytes"] = rhs.send_window_max_bytes;
     node["safety_factor_x100"] = rhs.safety_factor_x100;
     node["fixed_window_bytes"] = rhs.fixed_window_bytes;
+    node["friend_gate"] = rhs.friend_gate;
     return node;
 }
 
@@ -1246,6 +1247,9 @@ bool convert<toxtunnel::FlowControlConfig>::decode(const Node& node,
     }
     if (node["safety_factor_x100"]) {
         rhs.safety_factor_x100 = node["safety_factor_x100"].as<uint32_t>();
+    }
+    if (node["friend_gate"]) {
+        rhs.friend_gate = node["friend_gate"].as<bool>();
     }
     if (node["fixed_window_bytes"]) {
         rhs.fixed_window_bytes = node["fixed_window_bytes"].as<uint32_t>();

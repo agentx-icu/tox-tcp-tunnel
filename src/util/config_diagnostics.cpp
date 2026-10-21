@@ -68,8 +68,12 @@ const KeySet& tunnel_keys() {
     return k;
 }
 const KeySet& flow_control_keys() {
-    static const KeySet k{"mode", "send_window_min_bytes", "send_window_max_bytes",
-                          "safety_factor_x100", "fixed_window_bytes"};
+    static const KeySet k{"mode",
+                          "send_window_min_bytes",
+                          "send_window_max_bytes",
+                          "safety_factor_x100",
+                          "fixed_window_bytes",
+                          "friend_gate"};
     return k;
 }
 const KeySet& watchdog_keys() {

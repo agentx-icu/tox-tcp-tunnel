@@ -176,6 +176,26 @@ class MetricsRegistry {
     [[nodiscard]] std::uint64_t worker_aborts() const;
 
     // -----------------------------------------------------------------
+    // Friend DATA gate (issue #42)
+    // -----------------------------------------------------------------
+
+    /// `toxtunnel_friend_gate_refusals_total`: DATA frames the friend gate held
+    /// back (each is retried by its tunnel; this counts deferrals, not loss).
+    void inc_friend_gate_refusals();
+    [[nodiscard]] std::uint64_t friend_gate_refusals() const;
+
+    /// `toxtunnel_friend_gate_legacy_total`: friends found not to echo fences,
+    /// left ungated.
+    void inc_friend_gate_legacy();
+    [[nodiscard]] std::uint64_t friend_gate_legacy() const;
+
+    /// Client: one open attempt -> Connected interval, in ms. Includes SENDQ
+    /// retries, the network and the server's target connect — what an
+    /// application waits for before its first byte can flow. Failed opens are
+    /// counted in tunnels_opened_total{result="failed"}, not here.
+    void observe_tunnel_open_latency_ms(double ms);
+
+    // -----------------------------------------------------------------
     // Log sink health (issue #47)
     // -----------------------------------------------------------------
 
@@ -271,6 +291,11 @@ class MetricsRegistry {
     std::atomic<std::int64_t> tox_iterate_lag_ms_{0};
     std::atomic<std::uint64_t> watchdog_aborts_{0};
     std::atomic<std::uint64_t> worker_aborts_{0};
+    std::atomic<std::uint64_t> friend_gate_refusals_{0};
+    std::atomic<std::uint64_t> friend_gate_legacy_{0};
+    std::atomic<std::uint64_t> open_latency_count_{0};
+    std::atomic<double> open_latency_sum_ms_{0.0};
+    std::atomic<double> open_latency_max_ms_{0.0};
     std::atomic<std::uint64_t> log_sink_errors_{0};
     std::atomic<std::uint64_t> log_records_dropped_{0};
 

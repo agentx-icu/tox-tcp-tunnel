@@ -1,0 +1,424 @@
+// Unit tests for tunnel::FriendSendGate (issue #42): the per-friend DATA gate
+// at the toxcore boundary, driven with a scripted clock, key resolver and
+// fence transport. The long-outage cases are the schedules the design review
+// used to find wedges in earlier drafts.
+
+#include "toxtunnel/tunnel/friend_send_gate.hpp"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <asio.hpp>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <map>
+#include <optional>
+#include <span>
+#include <vector>
+
+#include "toxtunnel/tunnel/protocol.hpp"
+#include "toxtunnel/tunnel/tunnel_manager.hpp"
+
+namespace toxtunnel::tunnel {
+namespace {
+
+using Gate = FriendSendGate;
+using Key = tox::LosslessSendGate::PublicKey;
+
+constexpr std::int64_t kMs = 1'000'000;
+constexpr std::int64_t kSec = 1'000 * kMs;
+
+Key key_of(std::uint8_t b) {
+    Key k{};
+    k.fill(b);
+    return k;
+}
+
+std::vector<std::uint8_t> lossless(const ProtocolFrame& f) {
+    const auto wire = f.serialize();
+    std::vector<std::uint8_t> p;
+    p.push_back(kLosslessPacketByte);
+    p.insert(p.end(), wire.begin(), wire.end());
+    return p;
+}
+
+std::vector<std::uint8_t> data_packet(std::size_t payload = 1300) {
+    return lossless(ProtocolFrame::make_tunnel_data(7, std::vector<std::uint8_t>(payload, 0x5a)));
+}
+
+std::uint64_t seq_of(const std::vector<std::uint8_t>& fence) {
+    std::uint64_t v = 0;
+    for (int i = 15; i < 23; ++i) {
+        v = (v << 8) | fence[static_cast<std::size_t>(i)];
+    }
+    return v;
+}
+
+/// The PONG a current peer sends for a fence packet.
+std::vector<std::uint8_t> echo_of(const std::vector<std::uint8_t>& fence_packet) {
+    auto ping = ProtocolFrame::deserialize(
+        std::span<const std::uint8_t>(fence_packet.data() + 1, fence_packet.size() - 1));
+    EXPECT_TRUE(ping.has_value());
+    return lossless(ProtocolFrame::make_pong_for(ping.value()));
+}
+
+/// Scripted toxcore around one gate.
+struct Harness {
+    Gate gate{Gate::Config{}, /*epoch=*/0x1122334455667788ULL};
+    std::map<std::uint32_t, Key> keys{{1, key_of(1)}};
+    std::vector<std::vector<std::uint8_t>> fences;  // fence packets toxcore accepted
+    bool send_ok = true;
+    std::int64_t now = 1 * kSec;
+    tox::LosslessSendGate::Io io;
+
+    Harness() {
+        io.public_key = [this](std::uint32_t n) -> std::optional<Key> {
+            auto it = keys.find(n);
+            if (it == keys.end()) {
+                return std::nullopt;
+            }
+            return it->second;
+        };
+        io.send = [this](std::uint32_t, std::span<const std::uint8_t> p) {
+            if (!send_ok) {
+                return false;
+            }
+            fences.emplace_back(p.begin(), p.end());
+            return true;
+        };
+    }
+
+    /// Offer one DATA frame like ToxAdapter does: admit, then account.
+    bool offer_data(std::uint32_t fn = 1, std::size_t payload = 1300) {
+        const auto p = data_packet(payload);
+        if (!gate.admit(io, fn, p, now)) {
+            return false;
+        }
+        gate.on_accepted(io, fn, p, now);
+        return true;
+    }
+    int fill(std::uint32_t fn = 1, int max = 10000) {
+        int n = 0;
+        while (n < max && offer_data(fn)) {
+            ++n;
+        }
+        return n;
+    }
+    void tick() { gate.on_tick(io, now); }
+    void deliver(const std::vector<std::uint8_t>& pong, std::uint32_t fn = 1) {
+        gate.on_received(io, fn, pong, now);
+    }
+    Gate::View view(std::uint8_t k = 1) { return gate.view(key_of(k)).value(); }
+};
+
+TEST(FriendSendGateTest, ControlFramesAreNeverHeldBack) {
+    Harness h;
+    h.fill();
+    ASSERT_FALSE(h.offer_data()) << "DATA is gated at the bootstrap floor";
+    for (const auto& f :
+         {ProtocolFrame::make_ping(), ProtocolFrame::make_pong(),
+          ProtocolFrame::make_tunnel_ack(3, 100), ProtocolFrame::make_tunnel_close(3),
+          ProtocolFrame::make_tunnel_error(3, 4, "x")}) {
+        EXPECT_TRUE(h.gate.admit(h.io, 1, lossless(f), h.now)) << to_string(f.type());
+    }
+}
+
+TEST(FriendSendGateTest, BootstrapStopsAtTheFloorAndSendsAFenceWhenBlocked) {
+    Harness h;
+    const int admitted = h.fill();
+    EXPECT_GT(admitted, 0);
+    EXPECT_LE(h.view().emitted, Gate::Config{}.floor_bytes + data_packet().size());
+    h.tick();
+    ASSERT_FALSE(h.fences.empty());
+    const auto fences_after_block = h.fences.size();
+    h.tick();
+    EXPECT_EQ(h.fences.size(), fences_after_block) << "the debt is covered; no fence storm";
+    EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap);
+}
+
+TEST(FriendSendGateTest, AnEchoActivatesTheGateAndCreditsEverythingBeforeIt) {
+    Harness h;
+    h.fill();
+    h.tick();
+    ASSERT_FALSE(h.fences.empty());
+    h.now += 300 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    const auto v = h.view();
+    EXPECT_EQ(v.phase, Gate::Phase::Active);
+    EXPECT_EQ(v.delivered, v.emitted);
+    EXPECT_EQ(v.entries, 0u);
+    EXPECT_TRUE(h.offer_data()) << "credit reopens the gate";
+}
+
+TEST(FriendSendGateTest, OnlyAnExactEchoOfThisProcessCredits) {
+    Harness h;
+    h.fill();
+    h.tick();
+    ASSERT_FALSE(h.fences.empty());
+    // Another process's fence (other epoch), an unknown seq, a plain PONG.
+    h.deliver(echo_of(Gate::make_fence_packet(0x99, seq_of(h.fences.back()))));
+    h.deliver(echo_of(Gate::make_fence_packet(h.gate.epoch(), 424242)));
+    EXPECT_EQ(h.view().delivered, 0u);
+    EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap);
+}
+
+TEST(FriendSendGateTest, APlainPongAnsweringAFenceMeansALegacyPeer) {
+    Harness h;
+    // A keepalive PING and its plain PONG are not evidence.
+    const auto ka = lossless(ProtocolFrame::make_ping());
+    h.gate.on_accepted(h.io, 1, ka, h.now);
+    h.fill();
+    h.tick();
+    h.deliver(lossless(ProtocolFrame::make_pong()));
+    EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap) << "that PONG answered the keepalive";
+    h.deliver(lossless(ProtocolFrame::make_pong()));
+    EXPECT_EQ(h.view().phase, Gate::Phase::Legacy) << "this one answered the fence";
+    EXPECT_TRUE(h.offer_data()) << "legacy peers run ungated";
+}
+
+TEST(FriendSendGateTest, NoEchoWithinTheTimeoutMeansALegacyPeer) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 11 * kSec;
+    h.tick();
+    EXPECT_EQ(h.view().phase, Gate::Phase::Legacy);
+    EXPECT_TRUE(h.offer_data());
+}
+
+TEST(FriendSendGateTest, ReconnectReArmsDetectionForALegacyPeer) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 11 * kSec;
+    h.tick();
+    ASSERT_EQ(h.view().phase, Gate::Phase::Legacy);
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap);
+}
+
+TEST(FriendSendGateTest, OfflineDoesNotWriteOffDebt) {
+    Harness h;
+    h.fill();
+    const auto before = h.view();
+    h.gate.on_connection_status(h.io, 1, false, h.now);
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    const auto after = h.view();
+    EXPECT_EQ(after.emitted, before.emitted);
+    EXPECT_EQ(after.delivered, before.delivered);
+    EXPECT_FALSE(h.offer_data()) << "the stream may have survived; the debt still stands";
+}
+
+TEST(FriendSendGateTest, RecoveryFencesOfAnOutageShareOneEntry) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.deliver(echo_of(h.fences.back()));  // ACTIVE; then the peer goes silent
+    h.fill();
+    h.tick();
+    const std::size_t entries_at_outage = h.view().entries;
+    for (int i = 0; i < 2000; ++i) {
+        h.now += 1 * kSec;
+        h.offer_data();  // keep demand alive
+        h.tick();
+    }
+    EXPECT_GT(h.fences.size(), 10u);
+    EXPECT_EQ(h.view().entries, entries_at_outage)
+        << "blocked: every recovery fence extends the newest entry";
+}
+
+TEST(FriendSendGateTest, NoEchoesEverStaysBoundedAndBlocked) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.deliver(echo_of(h.fences.back()));  // ACTIVE
+    for (int round = 0; round < 3000; ++round) {
+        h.now += 60 * kSec;  // 50 simulated hours
+        h.fill();
+        h.tick();
+        ASSERT_LE(h.view().entries, Gate::Config{}.max_ledger_entries);
+    }
+    EXPECT_FALSE(h.offer_data()) << "a peer that answers nothing keeps the gate closed";
+    EXPECT_EQ(h.view().phase, Gate::Phase::Active);
+}
+
+/// A lost oldest echo, then every later echo delivered after `latency`.
+void run_lost_oldest_then_latency(std::int64_t latency, std::int64_t horizon) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 200 * kMs;
+    h.deliver(echo_of(h.fences.back()));  // ACTIVE, and a backoff reset
+    h.fill();
+    h.tick();
+    ASSERT_FALSE(h.offer_data());
+    const std::size_t lost = h.fences.size() - 1;  // the oldest fence of the outage
+    std::deque<std::pair<std::int64_t, std::vector<std::uint8_t>>> in_flight;
+    std::size_t seen = lost + 1;
+    bool resumed = false;
+    for (std::int64_t t = 0; t < horizon && !resumed; t += 1 * kSec) {
+        h.now += 1 * kSec;
+        h.offer_data();
+        h.tick();
+        for (; seen < h.fences.size(); ++seen) {
+            in_flight.emplace_back(h.now + latency, echo_of(h.fences[seen]));
+        }
+        while (!in_flight.empty() && in_flight.front().first <= h.now) {
+            h.deliver(in_flight.front().second);
+            in_flight.pop_front();
+        }
+        ASSERT_LE(h.view().entries, Gate::Config{}.max_ledger_entries);
+        resumed = h.view().delivered == h.view().emitted;
+    }
+    (void)lost;
+    EXPECT_TRUE(resumed) << "a single lost echo must not wedge the gate";
+}
+
+TEST(FriendSendGateTest, LostOldestEchoThenFourHourLatencyRecovers) {
+    run_lost_oldest_then_latency(4 * 3600 * kSec, 5 * 3600 * kSec);
+}
+
+TEST(FriendSendGateTest, LostOldestEchoThenTwoMinuteLatencyRecovers) {
+    run_lost_oldest_then_latency(120 * kSec, 600 * kSec);
+}
+
+TEST(FriendSendGateTest, BudgetGrowsWithTheMeasuredPath) {
+    // 100 kB/s path, 100 ms RTT: echoes return 100 ms after the fence plus the
+    // time its backlog takes to drain.
+    Harness h;
+    double backlog_bytes = 0;
+    std::deque<std::pair<std::int64_t, std::vector<std::uint8_t>>> in_flight;
+    std::size_t seen = 0;
+    // Each fence's echo leaves after the bytes queued ahead of it drain at
+    // 100 kB/s, then crosses the 100 ms path.
+    const auto stamp_new_fences = [&] {
+        for (; seen < h.fences.size(); ++seen) {
+            const auto drain = static_cast<std::int64_t>(backlog_bytes / 100'000.0 * 1e9);
+            in_flight.emplace_back(h.now + 100 * kMs + drain, echo_of(h.fences[seen]));
+        }
+    };
+    for (int ms = 0; ms < 20'000; ms += 10) {
+        h.now += 10 * kMs;
+        backlog_bytes = std::max(0.0, backlog_bytes - 1000.0);  // 100 kB/s
+        while (h.offer_data()) {
+            backlog_bytes += static_cast<double>(data_packet().size());
+            stamp_new_fences();
+        }
+        h.tick();
+        stamp_new_fences();
+        std::sort(in_flight.begin(), in_flight.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        while (!in_flight.empty() && in_flight.front().first <= h.now) {
+            h.deliver(in_flight.front().second);
+            in_flight.pop_front();
+        }
+    }
+    const auto v = h.view();
+    EXPECT_EQ(v.phase, Gate::Phase::Active);
+    EXPECT_GT(v.rate_bps, 50'000.0);
+    EXPECT_GT(v.budget, Gate::Config{}.floor_bytes) << "the budget follows the measured BDP";
+    EXPECT_LT(v.budget, 200'000u) << "~ rate x (RTT + 50 ms) x 1.5, not unbounded";
+}
+
+TEST(FriendSendGateTest, ProbeRttEndsOnAZeroBacklogEchoEvenWithoutAnExactSample) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 100 * kMs;
+    h.deliver(echo_of(h.fences.back()));  // trusted sample, ACTIVE
+    // Keep it backlogged — every fence goes out with a queue, so no sample is
+    // trusted — until the probe starts.
+    for (int i = 0; i < 200 && !h.view().probing; ++i) {
+        h.now += 100 * kMs;
+        h.fill();
+        h.tick();
+        if (!h.view().probing) {
+            h.deliver(echo_of(h.fences.back()));
+        }
+    }
+    ASSERT_TRUE(h.view().probing) << "no trusted sample for 10 s while backlogged";
+    EXPECT_FALSE(h.offer_data()) << "the probe refuses DATA so the friend drains";
+    // Drain: echo the newest fence (covers all debt).
+    h.deliver(echo_of(h.fences.back()));
+    ASSERT_EQ(h.view().delivered, h.view().emitted);
+    // Alternating loss: the range's first fence (the exact sample) is lost, a
+    // later fence of the same range is echoed.
+    std::size_t before = h.fences.size();
+    h.now += 10 * kMs;
+    h.tick();  // zero-backlog fence (lo)
+    ASSERT_EQ(h.fences.size(), before + 1);
+    h.now += 600 * kMs;
+    h.tick();  // recovery fence, same range
+    ASSERT_GE(h.fences.size(), before + 2);
+    h.deliver(echo_of(h.fences.back()));  // not lo: credit, no exact sample
+    h.tick();
+    EXPECT_FALSE(h.view().probing) << "a zero-backlog echo ends the probe";
+    EXPECT_TRUE(h.offer_data());
+}
+
+TEST(FriendSendGateTest, FriendNumberReuseNeverCarriesAcrossKeys) {
+    Harness h;
+    h.fill();
+    ASSERT_FALSE(h.offer_data());
+    // Friend 1 deleted; the number is handed to a different key.
+    h.gate.forget_friend_number(1);
+    h.keys[1] = key_of(2);
+    EXPECT_TRUE(h.offer_data()) << "the new friend starts with its own ledger";
+    // The old key re-added under another number keeps its debt.
+    h.keys[5] = key_of(1);
+    EXPECT_FALSE(h.offer_data(5));
+}
+
+TEST(FriendSendGateTest, RestoredFriendIsResolvedLazily) {
+    Harness h;  // friend 1 was never "added" in this process
+    EXPECT_TRUE(h.offer_data());
+    EXPECT_TRUE(h.gate.view(key_of(1)).has_value());
+}
+
+TEST(FriendSendGateTest, UnknownFriendIsNotGated) {
+    Harness h;
+    EXPECT_TRUE(h.offer_data(/*fn=*/77));
+}
+
+TEST(PongEchoTest, PongEchoesSmallPingPayloadsOnly) {
+    const auto fence = Gate::make_fence_packet(5, 6);
+    auto ping = ProtocolFrame::deserialize(
+        std::span<const std::uint8_t>(fence.data() + 1, fence.size() - 1));
+    ASSERT_TRUE(ping.has_value());
+    const auto pong = ProtocolFrame::make_pong_for(ping.value());
+    EXPECT_EQ(pong.type(), FrameType::PONG);
+    ASSERT_EQ(pong.payload().size(), kFencePayloadSize);
+    EXPECT_TRUE(std::equal(pong.payload().begin(), pong.payload().end(), fence.begin() + 6));
+
+    EXPECT_TRUE(ProtocolFrame::make_pong_for(ProtocolFrame::make_ping()).payload().empty());
+}
+
+TEST(PongEchoTest, TheManagerEchoesAFenceAndAnswersAPlainPingPlainly) {
+    asio::io_context io_ctx;
+    TunnelManager mgr(io_ctx);
+    std::vector<std::vector<std::uint8_t>> sent;
+    mgr.set_send_handler([&sent](const std::vector<std::uint8_t>& wire) {
+        sent.push_back(wire);
+        return SendOutcome::Sent;
+    });
+    const auto fence = Gate::make_fence_packet(9, 10);
+    auto ping = ProtocolFrame::deserialize(
+        std::span<const std::uint8_t>(fence.data() + 1, fence.size() - 1));
+    ASSERT_TRUE(ping.has_value());
+    mgr.route_frame(ping.value());
+    mgr.route_frame(ProtocolFrame::make_ping());
+    ASSERT_EQ(sent.size(), 2u);
+    auto echo = ProtocolFrame::deserialize(sent[0]);
+    ASSERT_TRUE(echo.has_value());
+    EXPECT_EQ(echo.value().type(), FrameType::PONG);
+    ASSERT_EQ(echo.value().payload().size(), kFencePayloadSize);
+    EXPECT_TRUE(std::equal(echo.value().payload().begin(), echo.value().payload().end(),
+                           fence.begin() + 6));
+    auto plain = ProtocolFrame::deserialize(sent[1]);
+    ASSERT_TRUE(plain.has_value());
+    EXPECT_TRUE(plain.value().payload().empty());
+}
+
+}  // namespace
+}  // namespace toxtunnel::tunnel

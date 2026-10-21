@@ -11,6 +11,7 @@
 #include "toxtunnel/app/rate_limiter.hpp"
 #include "toxtunnel/app/tunnel_senders.hpp"
 #include "toxtunnel/core/tcp_connection.hpp"
+#include "toxtunnel/tunnel/friend_send_gate.hpp"
 #include "toxtunnel/tunnel/protocol.hpp"
 #include "toxtunnel/tunnel/tunnel.hpp"
 #include "toxtunnel/util/asio_timer.hpp"
@@ -319,6 +320,12 @@ util::Expected<void, std::string> TunnelServer::initialize(const Config& config)
     if (!init_result) {
         return util::unexpected(std::string("Failed to initialize ToxAdapter: ") +
                                 init_result.error());
+    }
+    if (config_.flow_control.friend_gate) {
+        // Per-friend DATA gate at the toxcore boundary (issue #42). Installed
+        // before start(): every gate call then runs under the adapter's lock.
+        tox_adapter_->set_lossless_send_gate(std::make_shared<tunnel::FriendSendGate>());
+        util::Logger::info("Per-friend DATA gate enabled (flow_control.friend_gate)");
     }
 
     // Wire up callbacks.
@@ -884,7 +891,7 @@ void TunnelServer::dispatch_inbound_frame(uint32_t friend_number,
         // would stay apart until the link itself flapped. Its next TUNNEL_OPEN
         // rebuilds the manager (handle_tunnel_open -> setup_tunnel_manager).
         if (frame.type() == tunnel::FrameType::PING && frame.tunnel_id() == 0) {
-            const auto wire = tunnel::ProtocolFrame::make_pong().serialize();
+            const auto wire = tunnel::ProtocolFrame::make_pong_for(frame).serialize();
             std::vector<uint8_t> packet;
             packet.reserve(1 + wire.size());
             packet.push_back(kLosslessPacketByte);

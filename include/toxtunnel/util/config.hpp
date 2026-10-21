@@ -298,6 +298,12 @@ struct FlowControlConfig {
     uint32_t safety_factor_x100 = 150;                 ///< 1.5× BDP headroom
     uint32_t fixed_window_bytes = 262144;  ///< 256 KiB — used in fixed mode and as the initial BDP
                                            ///< window before any RTT samples are observed.
+    /// Per-friend DATA gate (issue #42): bound the DATA queued inside toxcore
+    /// per friend so control frames (OPEN_ACK, ACK, PONG, ...) are not stuck
+    /// behind bulk transfers. Needs a peer that echoes fences (this version or
+    /// later); other peers are detected and left ungated. Experimental, off by
+    /// default; non-reloadable.
+    bool friend_gate = false;
 
     bool operator==(const FlowControlConfig& other) const = default;
 };

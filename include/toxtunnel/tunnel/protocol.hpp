@@ -271,6 +271,12 @@ class ProtocolFrame {
     /// Create a PONG frame (tunnel_id is 0).
     [[nodiscard]] static ProtocolFrame make_pong();
 
+    /// The PONG answering `ping`: echoes the PING's payload when it is 1..32
+    /// bytes (a correlated fence, issue #42), else the plain empty PONG. Every
+    /// earlier release ignores a PING payload and answers with an empty PONG,
+    /// so an echo is only ever produced for a peer that asked for one.
+    [[nodiscard]] static ProtocolFrame make_pong_for(const ProtocolFrame& ping);
+
     /// Create an INFO_REQUEST frame (tunnel_id is 0, empty payload).
     [[nodiscard]] static ProtocolFrame make_info_request();
 

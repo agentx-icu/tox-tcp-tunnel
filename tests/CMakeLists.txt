@@ -34,6 +34,7 @@ add_executable(unit_tests
     unit/test_tox_adapter.cpp
     unit/test_tunnel.cpp
     unit/test_tunnel_manager.cpp
+    unit/friend_send_gate_test.cpp
     unit/tunnel_reaper_test.cpp
     unit/tunnel_coalesce_test.cpp
     unit/client_failover_test.cpp

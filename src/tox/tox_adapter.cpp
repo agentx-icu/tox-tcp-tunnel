@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <optional>
+#include <span>
 #include <thread>
 
 #include "toxtunnel/tox/bootstrap_source.hpp"
@@ -712,6 +714,11 @@ util::Expected<uint32_t, std::string> ToxAdapter::add_friend(const ToxId& tox_id
                                     friend_add_error_string(err));
         }
 
+        // A reused number names a new friend now.
+        if (send_gate_) {
+            send_gate_->forget_friend_number(friend_number);
+        }
+
         // Persist the updated friend list. write_save_data_locked() assumes
         // the caller already holds tox_mutex_ (we do) and is on the Tox
         // thread (we are).
@@ -740,6 +747,9 @@ util::Expected<uint32_t, std::string> ToxAdapter::add_friend_norequest(
                                     friend_add_error_string(err));
         }
 
+        if (send_gate_) {
+            send_gate_->forget_friend_number(friend_number);
+        }
         (void)write_save_data_locked();
 
         util::Logger::info("Friend added (norequest): number={}", friend_number);
@@ -763,6 +773,9 @@ bool ToxAdapter::remove_friend(uint32_t friend_number) {
             // deleted friend: forget its status so a later friend given the
             // same number gets its first "connected" delivered.
             friend_transport_.erase(friend_number);
+            if (send_gate_) {
+                send_gate_->forget_friend_number(friend_number);
+            }
             (void)write_save_data_locked();
             util::Logger::info("Friend removed: number={}", friend_number);
             return true;
@@ -912,11 +925,24 @@ ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(uint32_t 
     // closure across to the Tox thread and block on a future; that round-trip
     // is the unavoidable cost of toxcore's single-thread requirement.
     return run_on_tox_thread([&]() -> LosslessSendOutcome {
-        TOX_ERR_FRIEND_CUSTOM_PACKET err;
-        bool ok;
+        TOX_ERR_FRIEND_CUSTOM_PACKET err = TOX_ERR_FRIEND_CUSTOM_PACKET_OK;
+        bool ok = false;
         {
+            // Admission, the enqueue and its bookkeeping in ONE critical
+            // section, so the gate sees packets in toxcore's stream order.
             std::lock_guard<std::mutex> lock(tox_mutex_);
+            const std::span<const uint8_t> packet(data, length);
+            const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (send_gate_ && !send_gate_->admit(gate_io_, friend_number, packet, now_ns)) {
+                // Held back by the friend's DATA gate: plain backpressure to the
+                // caller, which retains and retries the frame. Not a toxcore
+                // failure, so not logged as one.
+                return LosslessSendOutcome::SendqFull;
+            }
             ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
+            if (ok && err == TOX_ERR_FRIEND_CUSTOM_PACKET_OK && send_gate_) {
+                send_gate_->on_accepted(gate_io_, friend_number, packet, now_ns);
+            }
         }
 
         if (ok && err == TOX_ERR_FRIEND_CUSTOM_PACKET_OK) {
@@ -1058,6 +1084,34 @@ void ToxAdapter::set_on_friend_connection(FriendConnectionCallback cb) {
     on_friend_connection_ = std::move(cb);
 }
 
+void ToxAdapter::set_lossless_send_gate(std::shared_ptr<LosslessSendGate> gate) {
+    std::lock_guard<std::mutex> lock(tox_mutex_);
+    send_gate_ = std::move(gate);
+    // Both run with tox_mutex_ already held by the caller (the gate is only
+    // ever invoked under it), so neither takes it.
+    gate_io_.public_key = [this](uint32_t friend_number) -> std::optional<PublicKeyArray> {
+        if (!tox_) {
+            return std::nullopt;
+        }
+        PublicKeyArray key{};
+        TOX_ERR_FRIEND_GET_PUBLIC_KEY err;
+        if (!tox_friend_get_public_key(tox_.get(), friend_number, key.data(), &err) ||
+            err != TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
+            return std::nullopt;
+        }
+        return key;
+    };
+    gate_io_.send = [this](uint32_t friend_number, std::span<const uint8_t> packet) {
+        if (!tox_) {
+            return false;
+        }
+        TOX_ERR_FRIEND_CUSTOM_PACKET err;
+        return tox_friend_send_lossless_packet(tox_.get(), friend_number, packet.data(),
+                                               packet.size(), &err) &&
+               err == TOX_ERR_FRIEND_CUSTOM_PACKET_OK;
+    };
+}
+
 void ToxAdapter::set_on_lossless_packet(FriendLosslessPacketCallback cb) {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     on_lossless_packet_ = std::move(cb);
@@ -1164,6 +1218,12 @@ void ToxAdapter::run_loop() {
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                           iterate_start)
                     .count());
+            // The gate's own deadlines and fence sends (issue #42), still
+            // under tox_mutex_ like every other gate entry point.
+            if (send_gate_) {
+                send_gate_->on_tick(gate_io_,
+                                    std::chrono::steady_clock::now().time_since_epoch().count());
+            }
             interval = tox_iteration_interval(tox_.get());
         }
 
@@ -1474,6 +1534,12 @@ void ToxAdapter::on_friend_connection_status_cb(Tox* /*tox*/, uint32_t friend_nu
         return c == TOX_CONNECTION_UDP ? "UDP" : c == TOX_CONNECTION_TCP ? "TCP" : "none";
     };
 
+    if (self->send_gate_) {
+        self->send_gate_->on_connection_status(
+            self->gate_io_, friend_number, connected,
+            std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+
     // A value-initialised entry is TOX_CONNECTION_NONE, i.e. "never connected".
     TOX_CONNECTION& last = self->friend_transport_[friend_number];
     const TOX_CONNECTION previous = last;
@@ -1505,6 +1571,13 @@ void ToxAdapter::on_friend_lossless_packet_cb(Tox* /*tox*/, uint32_t friend_numb
     auto* self = static_cast<ToxAdapter*>(user_data);
 
     util::Logger::trace("Lossless packet from friend {}: {} bytes", friend_number, length);
+    // Inside tox_iterate, so under tox_mutex_ — in stream order with the
+    // gate's view of what was sent.
+    if (self->send_gate_) {
+        self->send_gate_->on_received(self->gate_io_, friend_number,
+                                      std::span<const uint8_t>(data, length),
+                                      std::chrono::steady_clock::now().time_since_epoch().count());
+    }
     self->enqueue_event(
         FriendLosslessPacketEvent{friend_number, std::vector<uint8_t>(data, data + length)});
 }

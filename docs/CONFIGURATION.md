@@ -610,6 +610,7 @@ flow_control:
   send_window_max_bytes: 4194304         # 4 MiB clamp ceiling (bdp mode)
   safety_factor_x100: 150                # 1.5× BDP headroom
   fixed_window_bytes: 262144             # 256 KiB — used in fixed mode
+  friend_gate: false                     # experimental per-friend DATA gate (see below)
 ```
 
 `mode: bdp` is the default since v0.4.1. Each tunnel starts at
@@ -654,6 +655,39 @@ stall waiting for an ACK.
 
 `mode: fixed` opts out and pins the window at `fixed_window_bytes` (the v0.3.0
 256 KiB by default). Non-reloadable.
+
+#### Per-friend DATA gate (`flow_control.friend_gate`) — experimental, off by default
+
+Every frame for a peer — all tunnels' DATA and every control frame (OPEN_ACK,
+ACK, CLOSE, ERROR, PING/PONG) — shares toxcore's single ordered stream, and
+toxcore's own congestion control lets that stream hold up to 64 packets (~88 KB)
+before it reacts. On a slow path that is many seconds of DATA in front of every
+control frame: opening a second tunnel during a bulk transfer could take tens of
+seconds (issue #42). Per-tunnel windows cannot help — a frame toxcore has
+accepted cannot be overtaken.
+
+`friend_gate: true` bounds, per peer, the DATA toxcore holds that is not yet
+known to be delivered. Delivery is learned from **fences**: PINGs carrying an
+id, which a peer running this version echoes in its PONG. Packets are delivered
+in order, so an echo proves everything sent before that PING arrived. The bound
+is `rate × (min fence RTT + 50 ms) × 1.5` (at least ~11 KB), with the delivery
+rate as a windowed maximum, as in BBR; control frames are never held back, so
+they wait behind at most that much DATA. Held-back DATA stays in its tunnel and
+is retried, nothing is dropped.
+
+- Both peers must run a version that echoes fences; an older peer answers with
+  a plain PONG, is detected (or, failing that, after 10 s without an echo), and
+  runs ungated as before. Until a peer is recognised, DATA to it is capped at the
+  floor — an older peer sees up to ~10 s of slow start per connection while
+  this is on.
+- Only an exact echo of a fence this process sent is ever credited, so lost,
+  late or misrouted replies cannot release DATA early.
+- Like the per-tunnel window, the gate drains briefly (ProbeRTT) when it has had
+  no clean RTT sample for 10 s under load.
+- Metrics: `toxtunnel_friend_gate_refusals_total` (DATA sends deferred, not lost)
+  and `toxtunnel_friend_gate_legacy_total` (peers left ungated).
+
+Non-reloadable.
 
 ### Tunnel-resume protocol (`tunnel.resume:`) — opt-in
 
