@@ -352,7 +352,14 @@ inspect:
 """
 
 
-def server_yaml(d, udp, tcp, metrics, rules):
+def node_yaml(nodes):
+    if not nodes:
+        return ""
+    return "  bootstrap_nodes:\n" + "\n".join(
+        f'    - {{address: "127.0.0.1", port: {p}, public_key: "{k}"}}' for p, k in nodes) + "\n"
+
+
+def server_yaml(d, udp, tcp, metrics, rules, nodes=()):
     return f"""mode: server
 data_dir: {d.dir}/data
 logging:
@@ -363,7 +370,7 @@ tox:
   udp_port: {udp}
   tcp_port: {tcp}
   bootstrap_mode: lan
-server:
+{node_yaml(nodes)}server:
   rules_file: {rules}
 metrics:
   enabled: true
@@ -373,10 +380,7 @@ metrics:
 
 def client_yaml(d, udp, metrics, servers, nodes, forward_port, target_port):
     ids = ", ".join(f'"{s}"' for s in servers)
-    node_block = ""
-    if nodes:
-        node_block = "  bootstrap_nodes:\n" + "\n".join(
-            f'    - {{address: "127.0.0.1", port: {p}, public_key: "{k}"}}' for p, k in nodes) + "\n"
+    node_block = node_yaml(nodes)
     return f"""mode: client
 data_dir: {d.dir}/data
 logging:
@@ -772,6 +776,20 @@ def sc_client_first(rig, perf):
     rig.client.start()
     if rig.client.wait_log("Tox ID:", 30, since) is None:
         return False, {"client_started": False}
+    # A restarted server has a fresh DHT key, so the client's pinned nodes
+    # are stale and LAN discovery is not reliable on CI runners: pin the
+    # servers to the client's (current) DHT key instead.
+    key = None
+    deadline = time.time() + 10
+    while key is None and time.time() < deadline:
+        st = rig.client.inspect()
+        key = st.get("dht_public_key") if st else None
+        if key is None:
+            time.sleep(0.3)
+    if key:
+        for srv in rig.servers:
+            srv.write(server_yaml(srv, srv.udp, srv.tcp, srv.metrics_port, rig.rules,
+                                  [(rig.client.udp, key)]))
     time.sleep(2)
     # Accepted while no server is up: the client must hold it, not drop it.
     token = new_token()
@@ -788,7 +806,8 @@ def sc_client_first(rig, perf):
     took = round(time.time() - t0, 1)
     s.close()
     perf["client_first_echo_s"] = took
-    return carried, {"held_connection_carried": carried, "after_server_start_s": took}
+    return carried, {"held_connection_carried": carried, "after_server_start_s": took,
+                     "servers_pinned_to_client": bool(key)}
 
 
 # ---------------------------------------------------------------------------
