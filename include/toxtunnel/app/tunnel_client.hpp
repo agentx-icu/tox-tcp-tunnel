@@ -391,6 +391,10 @@ class TunnelClient {
     /// switch decision (expire_standbys_locked). Keepalive off: none of this.
     void send_standby_probes(std::chrono::steady_clock::time_point now);
     void note_standby_alive(uint32_t friend_number);
+    /// A lossless packet from a friend that is not the active server: a
+    /// configured standby's PONG / PING is handled, everything else dropped.
+    /// Called outside endpoints_mutex_.
+    void handle_non_active_packet(uint32_t friend_number, const uint8_t* data, std::size_t length);
     /// Caller holds endpoints_mutex_. Returns the friends just marked unusable.
     std::vector<uint32_t> expire_standbys_locked(std::chrono::steady_clock::time_point now);
     /// The strand half of a failover tick: expire standbys, then decide and

@@ -243,6 +243,12 @@ class TunnelResumeTestAccess {
         std::lock_guard<std::mutex> lock(c.endpoints_mutex_);
         return c.expire_standbys_locked(now);
     }
+    static void handle_non_active_packet(TunnelClient& c, std::uint32_t fn,
+                                         const std::vector<std::uint8_t>& p) {
+        c.handle_non_active_packet(fn, p.data(), p.size());
+    }
+    static void apply_failover_on_strand(TunnelClient& c) { c.apply_failover_on_strand(); }
+    static std::atomic<bool>& running(TunnelClient& c) { return c.running_; }
     static std::function<void(std::uint32_t, const std::vector<std::uint8_t>&)>&
     standby_packet_sender(TunnelClient& c) {
         return c.standby_packet_sender_;
@@ -888,6 +894,64 @@ TEST(StandbyProbeTest, NoProbesOrVerdictsWithKeepaliveOff) {
     EXPECT_TRUE(f.sent.empty());
     f.ep(0).online = true;
     EXPECT_TRUE(Access::expire_standbys(f.client, f.now + std::chrono::hours(1)).empty());
+}
+
+std::vector<std::uint8_t> lossless_packet(const ProtocolFrame& f) {
+    const auto wire = f.serialize();
+    std::vector<std::uint8_t> p{tunnel::kLosslessPacketByte};
+    p.insert(p.end(), wire.begin(), wire.end());
+    return p;
+}
+
+TEST(StandbyProbeTest, TheRealPacketPathCreditsPongsAndAnswersPings) {
+    StandbyFixture f;
+    // A PONG from the demoted primary restores it.
+    Access::handle_non_active_packet(f.client, 0, lossless_packet(ProtocolFrame::make_pong()));
+    EXPECT_TRUE(f.ep(0).online);
+    // Its PING gets a plain PONG back, to that friend.
+    f.sent.clear();
+    Access::handle_non_active_packet(f.client, 0, lossless_packet(ProtocolFrame::make_ping()));
+    ASSERT_EQ(f.sent.size(), 1u);
+    EXPECT_EQ(f.sent[0].first, 0u);
+    auto pong = ProtocolFrame::deserialize(
+        std::span<const std::uint8_t>(f.sent[0].second.data() + 1, f.sent[0].second.size() - 1));
+    ASSERT_TRUE(pong.has_value());
+    EXPECT_EQ(pong.value().type(), FrameType::PONG);
+    EXPECT_TRUE(pong.value().payload().empty());
+}
+
+TEST(StandbyProbeTest, MalformedOrForeignStandbyPacketsAreIgnored) {
+    StandbyFixture f;
+    // Declares a one-byte payload it does not carry.
+    Access::handle_non_active_packet(f.client, 0, {tunnel::kLosslessPacketByte, 0x11, 0, 0, 0, 1});
+    EXPECT_FALSE(f.ep(0).online);
+    // DATA from a standby is not ours to process; nothing is sent either.
+    Access::handle_non_active_packet(
+        f.client, 0,
+        lossless_packet(ProtocolFrame::make_tunnel_data(3, std::vector<std::uint8_t>{1, 2, 3})));
+    EXPECT_TRUE(f.sent.empty());
+    // An unconfigured friend's PONG.
+    Access::handle_non_active_packet(f.client, 9, lossless_packet(ProtocolFrame::make_pong()));
+    EXPECT_FALSE(f.ep(0).online);
+}
+
+TEST(StandbyProbeTest, ExpiryIsAppliedBeforeTheSwitchIsDecided) {
+    StandbyFixture f;
+    Access::running(f.client).store(true);
+    Access::config(f.client).client = ClientConfig{};
+    Access::config(f.client).client->failover.timeout_seconds = 5;
+    // The active fallback has been offline for a minute; the primary looks
+    // usable but has been silent past the limit.
+    f.ep(1).online = false;
+    f.ep(1).link_up = false;
+    f.ep(1).offline_since = f.now - std::chrono::minutes(1);
+    f.ep(0).online = true;
+    f.ep(0).probe_baseline = f.now - std::chrono::minutes(1);
+    Access::apply_failover_on_strand(f.client);
+    EXPECT_EQ(Access::active_index(f.client), 1u)
+        << "a silent standby must not be promoted by the same tick that expires it";
+    EXPECT_FALSE(f.ep(0).online);
+    Access::running(f.client).store(false);
 }
 
 }  // namespace
