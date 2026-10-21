@@ -861,6 +861,10 @@ void TunnelClient::on_friend_connection(uint32_t friend_number, bool connected) 
         if (connected && !ep.online) {
             ep.online_since = now;
         }
+        if (connected && !ep.link_up) {
+            // A fresh link: standby silence is counted from here (issue #43).
+            ep.probe_baseline = now;
+        }
         if (!connected && ep.online) {
             ep.offline_since = now;
         }
@@ -959,22 +963,26 @@ void TunnelClient::setup_tox_callbacks() {
             // server's record.
             std::string sender_tox_id;
             std::uint64_t captured_generation = 0;
+            bool non_active = false;
             {
                 std::lock_guard<std::mutex> lock(endpoints_mutex_);
                 if (active_index_ >= endpoints_.size() ||
                     endpoints_[active_index_].friend_number != friend_number) {
-                    // Stale packet from a freshly-demoted fallback, or an
-                    // unexpected friend. Either way, ignore.
-                    util::Logger::debug(
-                        "Received lossless packet from non-active friend {} (active idx {})",
-                        friend_number, active_index_);
-                    return;
+                    // Not the active server: a configured standby's control
+                    // plane is handled below, outside the lock (issue #43);
+                    // anything else is dropped there.
+                    non_active = true;
+                } else {
+                    sender_tox_id = endpoints_[active_index_].tox_id_hex;
+                    // Capture the resume-session generation atomically with the
+                    // active-friend check (issue #28): a RESUME_ACK dispatched
+                    // from the strand after a later switch/reconnect bump is stale.
+                    captured_generation = resume_session_generation_;
                 }
-                sender_tox_id = endpoints_[active_index_].tox_id_hex;
-                // Capture the resume-session generation atomically with the
-                // active-friend check (issue #28): a RESUME_ACK dispatched from
-                // the strand after a later switch/reconnect bump is stale.
-                captured_generation = resume_session_generation_;
+            }
+            if (non_active) {
+                handle_non_active_packet(friend_number, data, length);
+                return;
             }
             if (length < 2) {
                 util::Logger::warn("Lossless packet too short ({} bytes)", length);
@@ -1075,6 +1083,10 @@ void TunnelClient::setup_tunnel_manager() {
     // serialized RESUME_REQUEST through toxcore; a test installs a capture via
     // TunnelResumeTestAccess to drive send_resume_requests() without toxcore.
     resume_request_sender_ = [this](std::uint32_t fn, const std::vector<std::uint8_t>& packet) {
+        (void)tox_adapter_->send_lossless_packet(fn, packet.data(), packet.size());
+    };
+    // Standby PING / PONG seam (issue #43), same shape.
+    standby_packet_sender_ = [this](std::uint32_t fn, const std::vector<std::uint8_t>& packet) {
         (void)tox_adapter_->send_lossless_packet(fn, packet.data(), packet.size());
     };
 
@@ -2375,6 +2387,9 @@ void TunnelClient::switch_active_endpoint(std::size_t new_index) {
             return;
         }
         old_id_prefix = endpoints_[active_index_].tox_id_hex.substr(0, 12);
+        // The demoted server is a standby from now on: its silence is
+        // counted from here, not from whenever it last answered (issue #43).
+        endpoints_[active_index_].probe_baseline = std::chrono::steady_clock::now();
         active_index_ = new_index;
         // A switch reuses tunnel ids under a new session; invalidate any
         // outstanding RESUME_ACK captured before this point (issue #28).
@@ -2468,38 +2483,202 @@ void TunnelClient::run_failover_tick() {
     const auto& failover_cfg = config_.client->failover;
     const auto now = std::chrono::steady_clock::now();
 
+    send_standby_probes(now);
+
     std::optional<std::size_t> switch_to;
+    bool standby_due = false;
     {
         std::lock_guard<std::mutex> lock(endpoints_mutex_);
         switch_to = decide_failover_switch(endpoints_, active_index_, failover_cfg, now);
+        if (config_.tunnel.keepalive_enabled()) {
+            const auto limit = 3 * std::chrono::seconds(config_.tunnel.keepalive_interval_seconds);
+            for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+                const auto& ep = endpoints_[i];
+                if (i != active_index_ && ep.link_up && ep.online &&
+                    now - std::max(ep.last_pong, ep.probe_baseline) > limit) {
+                    standby_due = true;
+                }
+            }
+        }
     }
 
-    if (!switch_to.has_value()) {
+    if (!switch_to.has_value() && !standby_due) {
         return;
     }
     if (!inbound_strand_) {
-        switch_active_endpoint(*switch_to);
+        apply_failover_on_strand();
         return;
     }
-    // Apply the switch on the inbound strand, where keepalive verdicts are
-    // applied too (apply_keepalive_dead_verdict): a verdict about the old
-    // server can then never interleave with the switch and close the
-    // successor's fresh tunnels. Re-decide there, since endpoint state may
-    // have moved since this timer tick looked.
-    asio::post(*inbound_strand_, [this]() {
-        if (!running_.load(std::memory_order_acquire) || !config_.client.has_value()) {
-            return;
+    // Apply on the inbound strand, where keepalive verdicts and standby PONGs
+    // are applied too: a verdict about the old server can then never
+    // interleave with the switch and close the successor's fresh tunnels, and
+    // a standby expiry is re-validated against PONGs, reconnects and promotions
+    // that landed after this tick looked.
+    asio::post(*inbound_strand_, [this]() { apply_failover_on_strand(); });
+}
+
+void TunnelClient::apply_failover_on_strand() {
+    if (!running_.load(std::memory_order_acquire) || !config_.client.has_value()) {
+        return;
+    }
+    std::optional<std::size_t> again;
+    std::vector<uint32_t> expired;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        // Standby health first, so the decision below cannot promote a
+        // standby that has just been found unusable.
+        expired = expire_standbys_locked(now);
+        again = decide_failover_switch(endpoints_, active_index_, config_.client->failover, now);
+    }
+    for (const auto friend_number : expired) {
+        util::Logger::warn(
+            "Standby server friend {} unresponsive (no PONG for 3 keepalive intervals); not "
+            "usable for failover until it answers",
+            friend_number);
+    }
+    if (again.has_value()) {
+        switch_active_endpoint(*again);
+    }
+}
+
+std::vector<uint32_t> TunnelClient::expire_standbys_locked(
+    std::chrono::steady_clock::time_point now) {
+    std::vector<uint32_t> expired;
+    if (!config_.tunnel.keepalive_enabled()) {
+        return expired;
+    }
+    const auto limit = 3 * std::chrono::seconds(config_.tunnel.keepalive_interval_seconds);
+    for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+        auto& ep = endpoints_[i];
+        // Re-validated here, at application time: role, link and the latest
+        // PONG / baseline are read now, not when the tick looked.
+        if (i == active_index_ || !ep.link_up || !ep.online) {
+            continue;
         }
-        std::optional<std::size_t> again;
-        {
-            std::lock_guard<std::mutex> lock(endpoints_mutex_);
-            again = decide_failover_switch(endpoints_, active_index_, config_.client->failover,
-                                           std::chrono::steady_clock::now());
+        if (now - std::max(ep.last_pong, ep.probe_baseline) > limit) {
+            ep.online = false;
+            ep.offline_since = now;
+            expired.push_back(ep.friend_number);
         }
-        if (again.has_value()) {
-            switch_active_endpoint(*again);
+    }
+    return expired;
+}
+
+void TunnelClient::send_standby_probes(std::chrono::steady_clock::time_point now) {
+    if (!config_.tunnel.keepalive_enabled() || !standby_packet_sender_) {
+        return;
+    }
+    const auto interval = std::chrono::seconds(config_.tunnel.keepalive_interval_seconds);
+    if (last_standby_probe_ != std::chrono::steady_clock::time_point{} &&
+        now - last_standby_probe_ < interval) {
+        return;
+    }
+    last_standby_probe_ = now;
+    std::vector<uint32_t> targets;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+            if (i != active_index_ && endpoints_[i].link_up) {
+                targets.push_back(endpoints_[i].friend_number);
+            }
         }
-    });
+    }
+    if (targets.empty()) {
+        return;
+    }
+    // Outside endpoints_mutex_: the send blocks on the Tox thread.
+    const auto wire = tunnel::ProtocolFrame::make_ping().serialize();
+    std::vector<uint8_t> ping;
+    ping.reserve(1 + wire.size());
+    ping.push_back(tunnel::kLosslessPacketByte);
+    ping.insert(ping.end(), wire.begin(), wire.end());
+    for (const auto friend_number : targets) {
+        standby_packet_sender_(friend_number, ping);
+    }
+}
+
+void TunnelClient::handle_non_active_packet(uint32_t friend_number, const uint8_t* data,
+                                            std::size_t length) {
+    // Only a well-formed tunnel-0 frame from a configured server that is not
+    // the active one: the structural check the active path gets from
+    // deserialize(), done by hand to keep this off the strand.
+    const bool control =
+        length >= 1 + tunnel::kFrameHeaderSize && data[0] == tunnel::kLosslessPacketByte &&
+        data[2] == 0 && data[3] == 0 &&
+        1 + tunnel::kFrameHeaderSize + ((static_cast<std::size_t>(data[4]) << 8) | data[5]) <=
+            length;
+    bool standby = false;
+    if (control) {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+            if (endpoints_[i].friend_number == friend_number) {
+                standby = i != active_index_;
+                break;
+            }
+        }
+    }
+    if (!standby) {
+        // A stale packet from a freshly-demoted fallback, or an unexpected
+        // friend: ignored, as before.
+        util::Logger::debug("Received lossless packet from non-active friend {}", friend_number);
+        return;
+    }
+    if (data[1] == static_cast<uint8_t>(tunnel::FrameType::PONG)) {
+        // Health evidence, applied on the strand with every other endpoint
+        // transition (which re-checks that it is still a standby).
+        if (inbound_strand_) {
+            asio::post(*inbound_strand_,
+                       [this, friend_number]() { note_standby_alive(friend_number); });
+        } else {
+            note_standby_alive(friend_number);
+        }
+    } else if (data[1] == static_cast<uint8_t>(tunnel::FrameType::PING)) {
+        // Answered so a standby never judges us dead. A plain PONG: a standby
+        // gets no traffic from us, so nothing of ours depends on its payload.
+        const auto wire = tunnel::ProtocolFrame::make_pong().serialize();
+        std::vector<uint8_t> pong;
+        pong.reserve(1 + wire.size());
+        pong.push_back(tunnel::kLosslessPacketByte);
+        pong.insert(pong.end(), wire.begin(), wire.end());
+        if (standby_packet_sender_) {
+            standby_packet_sender_(friend_number, pong);
+        }
+    }
+    // Nothing from a standby ever reaches the active manager.
+}
+
+void TunnelClient::note_standby_alive(uint32_t friend_number) {
+    bool restored = false;
+    {
+        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        for (std::size_t i = 0; i < endpoints_.size(); ++i) {
+            auto& ep = endpoints_[i];
+            if (ep.friend_number != friend_number) {
+                continue;
+            }
+            // A PONG queued before this endpoint was promoted belongs to the
+            // standby path no more: the active server's health is the
+            // manager keepalive's business.
+            if (i == active_index_) {
+                return;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            ep.last_pong = now;
+            if (ep.link_up && !ep.online) {
+                ep.online = true;
+                ep.online_since = now;
+                restored = true;
+            }
+            break;
+        }
+    }
+    if (restored) {
+        util::Logger::info(
+            "Standby server friend {} answering again; usable for failover (prefer-primary "
+            "switches back after failover.prefer_primary_grace_seconds)",
+            friend_number);
+    }
 }
 
 void TunnelClient::schedule_failover_tick() {
