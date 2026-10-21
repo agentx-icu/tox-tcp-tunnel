@@ -232,6 +232,21 @@ class TunnelResumeTestAccess {
     static void apply_keepalive_dead_verdict(TunnelClient& c, std::uint32_t dead_friend) {
         c.apply_keepalive_dead_verdict(dead_friend);
     }
+    static void send_standby_probes(TunnelClient& c, std::chrono::steady_clock::time_point now) {
+        c.send_standby_probes(now);
+    }
+    static void note_standby_alive(TunnelClient& c, std::uint32_t friend_number) {
+        c.note_standby_alive(friend_number);
+    }
+    static std::vector<std::uint32_t> expire_standbys(TunnelClient& c,
+                                                      std::chrono::steady_clock::time_point now) {
+        std::lock_guard<std::mutex> lock(c.endpoints_mutex_);
+        return c.expire_standbys_locked(now);
+    }
+    static std::function<void(std::uint32_t, const std::vector<std::uint8_t>&)>&
+    standby_packet_sender(TunnelClient& c) {
+        return c.standby_packet_sender_;
+    }
     static void accept_forward_connection(TunnelClient& c,
                                           std::shared_ptr<core::TcpConnection> conn,
                                           const ForwardRule& rule) {
@@ -777,6 +792,102 @@ TEST(KeepaliveVerdictOrderingTest, ServerVerdictSparesARevivedOrReplacedManager)
     ServerAccess::managers(server).clear();
     quiesce(io_ctx, judged);
     quiesce(io_ctx, successor);
+}
+
+// ---------------------------------------------------------------------------
+// Standby probing (issue #43)
+// ---------------------------------------------------------------------------
+
+struct StandbyFixture {
+    app::TunnelClient client;
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint8_t>>> sent;
+    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+    explicit StandbyFixture(std::uint32_t keepalive_s = 2) {
+        Access::config(client).tunnel.keepalive_interval_seconds = keepalive_s;
+        Access::standby_packet_sender(client) = [this](std::uint32_t fn,
+                                                       const std::vector<std::uint8_t>& p) {
+            sent.emplace_back(fn, p);
+        };
+        // Primary (friend 0) judged dead over a live link and demoted;
+        // the fallback (friend 1) is active.
+        for (std::uint32_t fn : {0u, 1u}) {
+            app::ClientServerEndpoint ep;
+            ep.friend_number = fn;
+            ep.tox_id_hex = std::string(76, fn == 0 ? 'A' : 'B');
+            ep.link_up = true;
+            ep.online = fn == 1;
+            ep.online_since = now - std::chrono::hours(1);
+            ep.probe_baseline = now;
+            Access::endpoints(client).push_back(ep);
+        }
+        Access::active_index(client) = 1;
+    }
+    app::ClientServerEndpoint& ep(std::size_t i) { return Access::endpoints(client)[i]; }
+};
+
+TEST(StandbyProbeTest, ADemotedPrimaryIsProbedAndRestoredByItsPong) {
+    StandbyFixture f;
+    Access::send_standby_probes(f.client, f.now);
+    ASSERT_EQ(f.sent.size(), 1u) << "only the standby with a live link is probed";
+    EXPECT_EQ(f.sent[0].first, 0u);
+    auto ping = ProtocolFrame::deserialize(
+        std::span<const std::uint8_t>(f.sent[0].second.data() + 1, f.sent[0].second.size() - 1));
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_EQ(ping.value().type(), FrameType::PING);
+
+    Access::send_standby_probes(f.client, f.now + std::chrono::milliseconds(500));
+    EXPECT_EQ(f.sent.size(), 1u) << "once per keepalive interval";
+
+    Access::note_standby_alive(f.client, 0);
+    EXPECT_TRUE(f.ep(0).online) << "a PONG makes the standby usable again";
+
+    FailoverConfig fc;
+    fc.prefer_primary_grace_seconds = 30;
+    const auto t = f.ep(0).online_since;
+    EXPECT_FALSE(app::decide_failover_switch(Access::endpoints(f.client), 1, fc,
+                                             t + std::chrono::seconds(10))
+                     .has_value())
+        << "not before the grace";
+    EXPECT_EQ(app::decide_failover_switch(Access::endpoints(f.client), 1, fc,
+                                          t + std::chrono::seconds(31)),
+              std::optional<std::size_t>(0))
+        << "prefer-primary brings the client back";
+}
+
+TEST(StandbyProbeTest, ASilentStandbyIsNotUsableAfterThreeIntervals) {
+    StandbyFixture f;
+    f.ep(0).online = true;  // a healthy-looking standby that has gone quiet
+    EXPECT_TRUE(Access::expire_standbys(f.client, f.now + std::chrono::seconds(5)).empty());
+    const auto expired = Access::expire_standbys(f.client, f.now + std::chrono::seconds(7));
+    ASSERT_EQ(expired.size(), 1u);
+    EXPECT_EQ(expired[0], 0u);
+    EXPECT_FALSE(f.ep(0).online);
+    EXPECT_TRUE(f.ep(1).online) << "the active server is the manager keepalive's business";
+}
+
+TEST(StandbyProbeTest, AFreshPongOvertakesAPendingExpiry) {
+    StandbyFixture f;
+    f.ep(0).online = true;
+    f.ep(0).probe_baseline = f.now - std::chrono::seconds(10);
+    Access::note_standby_alive(f.client, 0);  // lands before the strand applies the expiry
+    EXPECT_TRUE(Access::expire_standbys(f.client, std::chrono::steady_clock::now()).empty());
+    EXPECT_TRUE(f.ep(0).online);
+}
+
+TEST(StandbyProbeTest, APongFromThePromotedServerIsNotStandbyEvidence) {
+    StandbyFixture f;
+    const auto before = f.ep(1).last_pong;
+    Access::note_standby_alive(f.client, 1);  // friend 1 is the active server
+    EXPECT_EQ(f.ep(1).last_pong, before);
+}
+
+TEST(StandbyProbeTest, NoProbesOrVerdictsWithKeepaliveOff) {
+    StandbyFixture f(/*keepalive_s=*/0);
+    Access::send_standby_probes(f.client, f.now);
+    EXPECT_TRUE(f.sent.empty());
+    f.ep(0).online = true;
+    EXPECT_TRUE(Access::expire_standbys(f.client, f.now + std::chrono::hours(1)).empty());
 }
 
 }  // namespace

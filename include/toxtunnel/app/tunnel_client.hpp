@@ -48,6 +48,13 @@ struct ClientServerEndpoint {
     /// Timestamp (steady_clock) of the most recent offline->online transition.
     /// Used by the primary-prefer switchback grace window.
     std::chrono::steady_clock::time_point online_since{};
+    /// Standby health (issue #43): the last PONG this endpoint sent while it
+    /// was not the active server, and when probing it as a standby began (it
+    /// became standby, or its link came up). A standby that has not answered
+    /// for 3 keepalive intervals since the later of the two is not usable; a
+    /// standby judged unusable is usable again on its next PONG.
+    std::chrono::steady_clock::time_point last_pong{};
+    std::chrono::steady_clock::time_point probe_baseline{};
 };
 
 /// Pure decision function for the failover state machine. Returns the index
@@ -373,6 +380,25 @@ class TunnelClient {
     /// strand: a no-op unless that friend is still the active, routed server
     /// and the manager is still latched dead.
     void apply_keepalive_dead_verdict(uint32_t dead_friend);
+
+    /// Standby probing (issue #43). The keepalive covers only the ACTIVE
+    /// server, so a primary judged unresponsive and then demoted was never
+    /// heard from again and prefer-primary could not bring the client back.
+    /// The 1 Hz failover tick PINGs every standby whose link is up once per
+    /// keepalive interval (send_standby_probes); a PONG from a standby restores
+    /// it (note_standby_alive, strand); a standby silent for 3 intervals is
+    /// marked unusable, re-validated and applied on the strand right before the
+    /// switch decision (expire_standbys_locked). Keepalive off: none of this.
+    void send_standby_probes(std::chrono::steady_clock::time_point now);
+    void note_standby_alive(uint32_t friend_number);
+    /// Caller holds endpoints_mutex_. Returns the friends just marked unusable.
+    std::vector<uint32_t> expire_standbys_locked(std::chrono::steady_clock::time_point now);
+    /// The strand half of a failover tick: expire standbys, then decide and
+    /// apply a switch with the resulting health.
+    void apply_failover_on_strand();
+    std::chrono::steady_clock::time_point last_standby_probe_{};
+    /// Seam for the standby PING (tests): friend number, prefixed packet.
+    std::function<void(std::uint32_t, const std::vector<std::uint8_t>&)> standby_packet_sender_;
 
     /// The friend the inbound routing path is currently pinned to (issue #30).
     /// Touched ONLY on `inbound_strand_`: the switch repins it together with
