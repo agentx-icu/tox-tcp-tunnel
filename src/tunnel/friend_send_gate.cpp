@@ -94,9 +94,22 @@ FriendSendGate::Ledger* FriendSendGate::ledger_for(const Io& io, std::uint32_t f
         }
         it = number_to_key_.emplace(friend_number, *key).first;
     }
-    Ledger& l = ledgers_[it->second];
+    auto [lit, inserted] = ledgers_.try_emplace(it->second);
+    Ledger& l = lit->second;
+    if (inserted) {
+        l.epoch = next_ledger_epoch();
+    }
     l.friend_number = friend_number;
     return &l;
+}
+
+std::uint64_t FriendSendGate::next_ledger_epoch() {
+    // splitmix64 of the process seed and a counter: distinct per ledger,
+    // unpredictable across processes.
+    std::uint64_t z = epoch_ + 0x9E3779B97F4A7C15ULL * ++ledgers_created_;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
 }
 
 std::int64_t FriendSendGate::base_rtt_us(const Ledger& l) const noexcept {
@@ -111,10 +124,9 @@ std::uint64_t FriendSendGate::budget(const Ledger& l) const noexcept {
     if (l.phase != Phase::Active) {
         return cfg_.floor_bytes;
     }
-    std::int64_t rtt = base_rtt_us(l);
-    if (rtt <= 0) {
-        rtt = l.srtt_us;
-    }
+    // Until a trusted sample exists the only RTT we have carried a queue:
+    // learning it would size the budget by the backlog it is meant to bound.
+    const std::int64_t rtt = base_rtt_us(l);
     if (rtt <= 0 || l.rate_bps <= 0.0) {
         return cfg_.floor_bytes;
     }
@@ -147,8 +159,8 @@ bool FriendSendGate::admit(const Io& io, std::uint32_t friend_number,
     }
     if (!ok) {
         l->last_refused_ns = now_ns;
-        l->refused_since_credit = true;
         util::MetricsRegistry::instance().inc_friend_gate_refusals();
+        publish_hint(*l);
     }
     return ok;
 }
@@ -200,8 +212,8 @@ void FriendSendGate::on_received(const Io& io, std::uint32_t friend_number,
         return;
     }
     if (pk->payload.size() != kFencePayloadSize || pk->payload[0] != kFencePingKind ||
-        read_u64_be(&pk->payload[1]) != epoch_) {
-        return;  // not ours: another process's fence, or a stranger's payload
+        read_u64_be(&pk->payload[1]) != l->epoch) {
+        return;  // not this peer's fence: another ledger, process, or a stranger
     }
     const std::uint64_t seq = read_u64_be(&pk->payload[9]);
     for (std::size_t i = 0; i < l->entries.size(); ++i) {
@@ -220,21 +232,17 @@ void FriendSendGate::on_received(const Io& io, std::uint32_t friend_number,
 
 void FriendSendGate::credit(Ledger& l, const Range& matched, std::uint64_t seq,
                             std::int64_t now_ns) {
-    const std::uint64_t delivered = std::max(l.delivered, matched.snapshot);
-    if (delivered > l.delivered) {
-        // A delivery-rate sample only when the gate held demand back in the
-        // interval; an application-limited interval measures the application.
-        if (l.refused_since_credit && l.last_credit_ns > 0 && now_ns > l.last_credit_ns) {
-            observe_rate(l,
-                         static_cast<double>(delivered - l.delivered) * 1e9 /
-                             static_cast<double>(now_ns - l.last_credit_ns),
-                         now_ns);
-        }
-        l.delivered = delivered;
-        l.last_credit_ns = now_ns;
-        l.refused_since_credit = false;
-    } else if (l.last_credit_ns == 0) {
-        l.last_credit_ns = now_ns;
+    l.delivered = std::max(l.delivered, matched.snapshot);
+    if (now_ns > matched.lo_sent_ns) {
+        // The bytes outstanding when the range's first fence went out were all
+        // delivered by now: a rate over a whole round trip, so a bunch of late
+        // echoes cannot read as a burst. A later fence of the range only makes
+        // the interval longer (conservative). The max filter keeps the high
+        // samples; low, application-limited ones cannot lower it.
+        observe_rate(l,
+                     static_cast<double>(matched.lo_backlog) * 1e9 /
+                         static_cast<double>(now_ns - matched.lo_sent_ns),
+                     now_ns);
     }
     if (seq == matched.lo) {
         // The one fence of the range whose send time is exact.
@@ -254,6 +262,7 @@ void FriendSendGate::credit(Ledger& l, const Range& matched, std::uint64_t seq,
     }
     l.recovery_interval_ns = 0;
     l.next_recovery_ns = 0;
+    publish_hint(l);
 }
 
 void FriendSendGate::observe_rate(Ledger& l, double bps, std::int64_t now_ns) {
@@ -268,8 +277,39 @@ void FriendSendGate::observe_rate(Ledger& l, double bps, std::int64_t now_ns) {
     l.rate_bps = std::max(l.rate_cur_max, l.rate_prev_max);
 }
 
+void FriendSendGate::age_rate(Ledger& l, std::int64_t now_ns) {
+    // No sample for two whole buckets: the estimate describes an old path.
+    if (l.rate_bucket_start_ns != 0 && now_ns - l.rate_bucket_start_ns >= 2 * kMinRttBucketNs) {
+        l.rate_cur_max = 0.0;
+        l.rate_prev_max = 0.0;
+        l.rate_bps = 0.0;
+        l.rate_bucket_start_ns = 0;
+    }
+}
+
 std::uint64_t FriendSendGate::fence_interval(const Ledger& l) const noexcept {
     return std::max(kMinFenceIntervalBytes, budget(l) / kFencesPerBudget);
+}
+
+void FriendSendGate::publish_hint(const Ledger& l) {
+    if (l.friend_number >= kHintSlots) {
+        return;
+    }
+    // "A full frame would be refused now": what fast_reject() answers until
+    // the next republish (every tick, every credit, every refusal).
+    const std::uint64_t backlog = l.emitted - l.delivered;
+    const bool closed =
+        l.phase != Phase::Legacy && (l.probing || (backlog > 0 && backlog + 1400 > budget(l)));
+    closed_hint_[l.friend_number].store(closed ? 1 : 0, std::memory_order_release);
+}
+
+bool FriendSendGate::fast_reject(std::uint32_t friend_number,
+                                 std::span<const std::uint8_t> packet) const noexcept {
+    if (friend_number >= kHintSlots || packet.size() < 2 || packet[0] != kLosslessPacketByte ||
+        packet[1] != static_cast<std::uint8_t>(FrameType::TUNNEL_DATA)) {
+        return false;
+    }
+    return closed_hint_[friend_number].load(std::memory_order_acquire) != 0;
 }
 
 void FriendSendGate::observe_rtt(Ledger& l, std::int64_t rtt_us, bool trusted,
@@ -327,11 +367,12 @@ bool FriendSendGate::send_fence(const Io& io, Ledger& l, std::int64_t now_ns) {
     if (!io.send) {
         return false;
     }
-    const std::uint64_t seq = next_seq_++;
-    const auto packet = make_fence_packet(epoch_, seq);
+    const std::uint64_t seq = l.next_seq;
+    const auto packet = make_fence_packet(l.epoch, seq);
     if (!io.send(l.friend_number, packet)) {
-        return false;  // SENDQ or offline: the next tick tries again
+        return false;  // SENDQ or offline: the seq stays unused; the next tick tries again
     }
+    ++l.next_seq;
     record_fence(l, seq, now_ns);
     return true;
 }
@@ -340,6 +381,7 @@ void FriendSendGate::enter_legacy(Ledger& l, const char* why) {
     l.phase = Phase::Legacy;
     l.entries.clear();
     l.probing = false;
+    publish_hint(l);
     util::MetricsRegistry::instance().inc_friend_gate_legacy();
     util::Logger::info("Friend gate: friend {} is not gated ({})", l.friend_number, why);
 }
@@ -350,9 +392,12 @@ void FriendSendGate::on_connection_status(const Io& io, std::uint32_t friend_num
         return;  // accounting survives: NONE does not prove the stream is gone
     }
     if (Ledger* l = ledger_for(io, friend_number); l != nullptr && l->phase == Phase::Legacy) {
-        // A reconnect may be an upgraded peer: detect again.
+        // A reconnect may be an upgraded peer: detect again, from fresh
+        // evidence — the surplus of plain PONGs that made it Legacy must not
+        // condemn it again; keepalive PINGs still outstanding stay counted.
         l->phase = Phase::Bootstrap;
         l->first_fence_ns = 0;
+        l->empty_pongs_received = std::min(l->empty_pongs_received, l->empty_pings_sent);
     }
 }
 
@@ -372,7 +417,10 @@ void FriendSendGate::on_tick(const Io& io, std::int64_t now_ns) {
             continue;
         }
         const bool blocked = l.last_refused_ns > 0 && now_ns - l.last_refused_ns < kBlockedWindowNs;
-        const std::int64_t trusted_ref = l.last_trusted_ns > 0 ? l.last_trusted_ns : l.activated_ns;
+        age_rate(l, now_ns);
+        // No trusted sample and no completed probe for probe_after_ns.
+        const std::int64_t trusted_ref = std::max(
+            l.last_trusted_ns > 0 ? l.last_trusted_ns : l.activated_ns, l.last_probe_done_ns);
         if (l.phase == Phase::Active && !l.probing && blocked && trusted_ref > 0 &&
             now_ns - trusted_ref > cfg_.probe_after_ns) {
             // Every recent sample carried a queue: drain and measure again.
@@ -381,7 +429,9 @@ void FriendSendGate::on_tick(const Io& io, std::int64_t now_ns) {
         }
         if (l.probing && l.probe_released && l.delivered == l.emitted) {
             l.probing = false;
+            l.last_probe_done_ns = now_ns;
         }
+        publish_hint(l);
 
         bool want = false;
         bool recovery = false;
@@ -412,6 +462,9 @@ void FriendSendGate::on_tick(const Io& io, std::int64_t now_ns) {
 
 void FriendSendGate::forget_friend_number(std::uint32_t friend_number) {
     number_to_key_.erase(friend_number);
+    if (friend_number < kHintSlots) {
+        closed_hint_[friend_number].store(0, std::memory_order_release);
+    }
 }
 
 std::optional<FriendSendGate::View> FriendSendGate::view(const PublicKey& key) const {
@@ -420,8 +473,8 @@ std::optional<FriendSendGate::View> FriendSendGate::view(const PublicKey& key) c
         return std::nullopt;
     }
     const Ledger& l = it->second;
-    return View{l.phase,          l.emitted, l.delivered,    budget(l),
-                l.entries.size(), l.probing, base_rtt_us(l), l.rate_bps};
+    return View{l.phase,   l.emitted,      l.delivered, budget(l), l.entries.size(),
+                l.probing, base_rtt_us(l), l.rate_bps,  l.epoch};
 }
 
 }  // namespace toxtunnel::tunnel

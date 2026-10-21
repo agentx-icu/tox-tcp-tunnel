@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -61,9 +62,13 @@ class FriendSendGate final : public tox::LosslessSendGate {
         std::uint64_t floor_bytes = 8 * 1372;
         std::uint64_t max_bytes = 4 * 1024 * 1024;
         std::int64_t queue_budget_us = 50'000;
-        std::int64_t safety_factor_x100 = 150;
-        /// A fence sent with at most this much backlog measures the path.
-        std::uint64_t trusted_backlog_bytes = 2 * 1372;
+        /// 2x, as BBR's window gain: the rate samples see the pipe through the
+        /// gate's own backlog, and below 2x the budget settles short of a full
+        /// pipe on a long path.
+        std::int64_t safety_factor_x100 = 200;
+        /// A fence sent with at most this much backlog measures the path (the
+        /// first progress fence goes out two frames in, so it qualifies).
+        std::uint64_t trusted_backlog_bytes = 3 * 1372;
         std::size_t max_ledger_entries = 64;
         std::int64_t legacy_timeout_ns = 10'000'000'000;
         std::int64_t probe_after_ns = 10'000'000'000;
@@ -87,6 +92,7 @@ class FriendSendGate final : public tox::LosslessSendGate {
         bool probing;
         std::int64_t base_rtt_us;
         double rate_bps;
+        std::uint64_t epoch;
     };
 
     explicit FriendSendGate(Config cfg, std::uint64_t epoch);
@@ -103,6 +109,8 @@ class FriendSendGate final : public tox::LosslessSendGate {
                               std::int64_t now_ns) override;
     void on_tick(const Io& io, std::int64_t now_ns) override;
     void forget_friend_number(std::uint32_t friend_number) override;
+    [[nodiscard]] bool fast_reject(std::uint32_t friend_number,
+                                   std::span<const std::uint8_t> packet) const noexcept override;
 
     [[nodiscard]] std::optional<View> view(const PublicKey& key) const;
     [[nodiscard]] std::uint64_t epoch() const noexcept { return epoch_; }
@@ -120,11 +128,17 @@ class FriendSendGate final : public tox::LosslessSendGate {
         std::uint64_t hi;
         std::uint64_t snapshot;
         std::int64_t lo_sent_ns;
-        std::uint64_t lo_backlog;
+        std::uint64_t lo_backlog;  ///< emitted - delivered when `lo` was sent
     };
 
     struct Ledger {
         std::uint32_t friend_number = 0;
+        /// Fences are correlated per ledger: its own random epoch and a seq
+        /// that only advances when toxcore accepted a fence, so a range is
+        /// exactly the fences this peer was sent, and no other peer's echo
+        /// (nor one of an unsent seq) can ever match it.
+        std::uint64_t epoch = 0;
+        std::uint64_t next_seq = 1;
         std::uint64_t emitted = 0;
         std::uint64_t delivered = 0;
         std::uint64_t last_fenced = 0;
@@ -135,13 +149,12 @@ class FriendSendGate final : public tox::LosslessSendGate {
         // answered a fence.
         std::uint64_t empty_pings_sent = 0;
         std::uint64_t empty_pongs_received = 0;
-        // Demand / rate.
+        // Demand.
         std::int64_t last_refused_ns = 0;
-        bool refused_since_credit = false;
-        std::int64_t last_credit_ns = 0;
-        /// Delivery rate: a windowed MAXIMUM of credit-to-credit samples (two
-        /// 10 s buckets), as BBR does. An average would include the time the
-        /// gate itself kept the pipe short and converge well below capacity.
+        /// Delivery rate: a windowed MAXIMUM (two 10 s buckets, expiring with
+        /// them) of per-fence samples — the bytes outstanding when a fence was
+        /// sent over that fence's send-to-echo time. Each sample spans a whole
+        /// round trip, so echoes arriving bunched cannot read as a burst rate.
         double rate_bps = 0.0;
         double rate_cur_max = 0.0;
         double rate_prev_max = 0.0;
@@ -162,6 +175,9 @@ class FriendSendGate final : public tox::LosslessSendGate {
         // ProbeRTT.
         bool probing = false;
         bool probe_released = false;
+        /// When the last probe ended: the next one is due probe_after_ns later,
+        /// even if it ended on an echo that carried no exact RTT sample.
+        std::int64_t last_probe_done_ns = 0;
     };
 
     Ledger* ledger_for(const Io& io, std::uint32_t friend_number);
@@ -170,16 +186,23 @@ class FriendSendGate final : public tox::LosslessSendGate {
     void credit(Ledger& l, const Range& matched, std::uint64_t seq, std::int64_t now_ns);
     void observe_rtt(Ledger& l, std::int64_t rtt_us, bool trusted, std::int64_t now_ns);
     void observe_rate(Ledger& l, double bps, std::int64_t now_ns);
+    void age_rate(Ledger& l, std::int64_t now_ns);
     [[nodiscard]] std::uint64_t fence_interval(const Ledger& l) const noexcept;
+    void publish_hint(const Ledger& l);
+    [[nodiscard]] std::uint64_t next_ledger_epoch();
     void record_fence(Ledger& l, std::uint64_t seq, std::int64_t now_ns);
     bool send_fence(const Io& io, Ledger& l, std::int64_t now_ns);
     void enter_legacy(Ledger& l, const char* why);
 
     Config cfg_;
-    std::uint64_t epoch_;
-    std::uint64_t next_seq_ = 1;
+    std::uint64_t epoch_;  ///< per-process seed for the ledgers' epochs
+    std::uint64_t ledgers_created_ = 0;
     std::map<PublicKey, Ledger> ledgers_;
     std::unordered_map<std::uint32_t, PublicKey> number_to_key_;
+    /// fast_reject()'s view, indexed by friend number (larger numbers simply
+    /// never get the fast path). Written under tox_mutex_, read lock-free.
+    static constexpr std::size_t kHintSlots = 4096;
+    std::array<std::atomic<std::uint8_t>, kHintSlots> closed_hint_{};
 };
 
 }  // namespace toxtunnel::tunnel

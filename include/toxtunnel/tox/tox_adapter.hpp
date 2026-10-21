@@ -639,6 +639,9 @@ class ToxAdapter {
     /// that lock is held.
     std::shared_ptr<LosslessSendGate> send_gate_;
     LosslessSendGate::Io gate_io_;
+    /// Raw view of send_gate_ for the lock-free fast_reject() check; set with
+    /// it (before start(), so it never dangles while senders run).
+    std::atomic<LosslessSendGate*> send_gate_hint_{nullptr};
 
     /// See dht_node_info(). Written once in initialize().
     DhtNodeInfo dht_node_info_;

@@ -65,14 +65,14 @@ std::vector<std::uint8_t> echo_of(const std::vector<std::uint8_t>& fence_packet)
 
 /// Scripted toxcore around one gate.
 struct Harness {
-    Gate gate{Gate::Config{}, /*epoch=*/0x1122334455667788ULL};
+    Gate gate;
     std::map<std::uint32_t, Key> keys{{1, key_of(1)}};
     std::vector<std::vector<std::uint8_t>> fences;  // fence packets toxcore accepted
     bool send_ok = true;
     std::int64_t now = 1 * kSec;
     tox::LosslessSendGate::Io io;
 
-    Harness() {
+    explicit Harness(Gate::Config cfg = {}) : gate(cfg, /*epoch=*/0x1122334455667788ULL) {
         io.public_key = [this](std::uint32_t n) -> std::optional<Key> {
             auto it = keys.find(n);
             if (it == keys.end()) {
@@ -158,7 +158,7 @@ TEST(FriendSendGateTest, OnlyAnExactEchoOfThisProcessCredits) {
     ASSERT_FALSE(h.fences.empty());
     // Another process's fence (other epoch), an unknown seq, a plain PONG.
     h.deliver(echo_of(Gate::make_fence_packet(0x99, seq_of(h.fences.back()))));
-    h.deliver(echo_of(Gate::make_fence_packet(h.gate.epoch(), 424242)));
+    h.deliver(echo_of(Gate::make_fence_packet(h.view().epoch, 424242)));
     EXPECT_EQ(h.view().delivered, 0u);
     EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap);
 }
@@ -379,6 +379,184 @@ TEST(FriendSendGateTest, RestoredFriendIsResolvedLazily) {
 TEST(FriendSendGateTest, UnknownFriendIsNotGated) {
     Harness h;
     EXPECT_TRUE(h.offer_data(/*fn=*/77));
+}
+
+// --- Implementation-review regressions -------------------------------------
+
+TEST(FriendSendGateTest, BunchedLateEchoesCannotReadAsABurstRate) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 200 * kMs;
+    h.deliver(echo_of(h.fences.back()));  // ACTIVE
+    // Two fences, each sent with a backlog, echoed 5 s later 5 ms apart.
+    h.fill();
+    h.tick();
+    const auto backlog1 = h.view().emitted - h.view().delivered;
+    const auto f1 = h.fences.back();
+    h.now += 50 * kMs;
+    h.deliver(echo_of(f1));
+    h.fill();
+    h.tick();
+    const auto f2 = h.fences.back();
+    h.now += 5 * kSec;
+    h.deliver(echo_of(f2));
+    h.now += 5 * kMs;
+    // Whatever arrives bunched, no sample may exceed bytes-outstanding over
+    // that fence's own round trip.
+    EXPECT_LE(h.view().rate_bps, static_cast<double>(backlog1) / 0.05 * 1.01);
+    EXPECT_LT(h.view().rate_bps, 400'000.0);
+}
+
+TEST(FriendSendGateTest, RateEstimateExpiresWhenIdle) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 100 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    h.fill();
+    h.tick();
+    h.now += 100 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    ASSERT_GT(h.view().rate_bps, 0.0);
+    h.now += 30 * kSec;
+    h.tick();
+    EXPECT_EQ(h.view().rate_bps, 0.0) << "two silent buckets: back to the floor";
+    EXPECT_EQ(h.view().budget, Gate::Config{}.floor_bytes);
+}
+
+TEST(FriendSendGateTest, UntrustedSamplesNeverGrowTheBudget) {
+    Harness h;
+    // Bootstrap fence goes out with a full floor of backlog (untrusted).
+    for (int i = 0; i < 20; ++i) {
+        h.fill();
+        h.now += 10 * kMs;
+        h.tick();
+        h.now += 300 * kMs;
+        if (!h.fences.empty()) {
+            // Echo only the newest (high backlog) fences; lo samples untrusted.
+            h.deliver(echo_of(h.fences.back()));
+        }
+    }
+    if (h.view().base_rtt_us == 0) {
+        EXPECT_EQ(h.view().budget, Gate::Config{}.floor_bytes);
+    }
+}
+
+TEST(FriendSendGateTest, AnotherPeersEchoNeverCreditsThisPeer) {
+    Harness h;
+    h.keys[2] = key_of(2);
+    h.fill(1);
+    h.tick();
+    const auto a_fence = h.fences.back();
+    h.fill(2);
+    h.tick();
+    const auto b_fence = h.fences.back();
+    ASSERT_NE(a_fence, b_fence);
+    h.deliver(echo_of(b_fence), /*fn=*/1);  // B's echo arriving as A's
+    EXPECT_EQ(h.view(1).delivered, 0u);
+    h.deliver(echo_of(a_fence), /*fn=*/1);
+    EXPECT_GT(h.view(1).delivered, 0u);
+}
+
+TEST(FriendSendGateTest, AFailedFenceSendConsumesNoSequence) {
+    Harness h;
+    h.fill();
+    h.send_ok = false;
+    h.tick();
+    h.send_ok = true;
+    h.tick();
+    ASSERT_FALSE(h.fences.empty());
+    EXPECT_EQ(seq_of(h.fences.front()), 1u) << "only accepted fences take a seq";
+}
+
+TEST(FriendSendGateTest, ThinningKeepsTheOldestAndNewestEntries) {
+    Gate::Config cfg;
+    // Distinct snapshots only arise while DATA is admitted (about four per
+    // budget), so a small cap is what exercises the thinning.
+    cfg.max_ledger_entries = 3;
+    Harness h(cfg);
+    h.fill();
+    h.tick();
+    h.deliver(echo_of(h.fences.back()));  // ACTIVE
+    const std::size_t first = h.fences.size();
+    for (int i = 0; i < 40; ++i) {
+        h.offer_data();  // one new snapshot per fence: distinct entries
+        h.now += 10 * kMs;
+        h.tick();
+        if (h.fences.size() == first) {
+            continue;
+        }
+        ASSERT_LE(h.view().entries, cfg.max_ledger_entries);
+    }
+    ASSERT_GT(h.fences.size(), first + cfg.max_ledger_entries);
+    // The oldest retained entry is the first fence after activation; its echo
+    // still credits.
+    const auto before = h.view().delivered;
+    h.deliver(echo_of(h.fences[first]));
+    EXPECT_GT(h.view().delivered, before);
+}
+
+TEST(FriendSendGateTest, ProbeDoesNotReenterRightAfterANonExactExit) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.now += 100 * kMs;
+    h.deliver(echo_of(h.fences.back()));
+    for (int i = 0; i < 200 && !h.view().probing; ++i) {
+        h.now += 100 * kMs;
+        h.fill();
+        h.tick();
+        if (!h.view().probing) {
+            h.deliver(echo_of(h.fences.back()));
+        }
+    }
+    ASSERT_TRUE(h.view().probing);
+    h.deliver(echo_of(h.fences.back()));
+    h.now += 10 * kMs;
+    h.tick();  // zero-backlog lo, lost
+    h.now += 600 * kMs;
+    h.tick();  // same range
+    h.deliver(echo_of(h.fences.back()));
+    h.tick();
+    ASSERT_FALSE(h.view().probing);
+    // Backlogged again, all fences untrusted, for 5 s: no new probe yet.
+    for (int i = 0; i < 50; ++i) {
+        h.now += 100 * kMs;
+        h.fill();
+        h.tick();
+        EXPECT_FALSE(h.view().probing) << "at most one probe per probe_after_ns";
+        h.deliver(echo_of(h.fences.back()));
+    }
+}
+
+TEST(FriendSendGateTest, RearmedLegacyDetectionStartsFromFreshEvidence) {
+    Harness h;
+    h.fill();
+    h.tick();
+    h.deliver(lossless(ProtocolFrame::make_pong()));  // answered a fence plainly
+    ASSERT_EQ(h.view().phase, Gate::Phase::Legacy);
+    h.gate.on_connection_status(h.io, 1, true, h.now);
+    // The upgraded peer: a keepalive PING goes out, then fences; the
+    // keepalive's plain PONG returns first.
+    h.gate.on_accepted(h.io, 1, lossless(ProtocolFrame::make_ping()), h.now);
+    h.fill();
+    h.tick();
+    h.deliver(lossless(ProtocolFrame::make_pong()));
+    EXPECT_EQ(h.view().phase, Gate::Phase::Bootstrap) << "that PONG answered the keepalive";
+    h.deliver(echo_of(h.fences.back()));
+    EXPECT_EQ(h.view().phase, Gate::Phase::Active);
+}
+
+TEST(FriendSendGateTest, FastRejectMirrorsTheGateForDataOnly) {
+    Harness h;
+    EXPECT_FALSE(h.gate.fast_reject(1, data_packet()));
+    h.fill();
+    EXPECT_TRUE(h.gate.fast_reject(1, data_packet()));
+    EXPECT_FALSE(h.gate.fast_reject(1, lossless(ProtocolFrame::make_tunnel_ack(3, 1))));
+    h.tick();
+    h.deliver(echo_of(h.fences.back()));
+    EXPECT_FALSE(h.gate.fast_reject(1, data_packet())) << "credit reopens the hint";
 }
 
 TEST(PongEchoTest, PongEchoesSmallPingPayloadsOnly) {

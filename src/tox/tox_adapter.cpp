@@ -924,6 +924,16 @@ ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(uint32_t 
     // promise/future, no allocation. TCP I/O-thread callers marshal a single
     // closure across to the Tox thread and block on a future; that round-trip
     // is the unavoidable cost of toxcore's single-thread requirement.
+    // The friend gate's lock-free hint: a blocked tunnel's 5 ms retries would
+    // otherwise each pay a Tox-thread round trip just to be refused. The
+    // authoritative decision is still admit() below; the hint is republished
+    // by the gate every iterate, so a stale "closed" lasts one tick at most.
+    if (const auto gate = send_gate_hint_.load(std::memory_order_acquire);
+        gate != nullptr &&
+        gate->fast_reject(friend_number, std::span<const uint8_t>(data, length))) {
+        return LosslessSendOutcome::SendqFull;
+    }
+
     return run_on_tox_thread([&]() -> LosslessSendOutcome {
         TOX_ERR_FRIEND_CUSTOM_PACKET err = TOX_ERR_FRIEND_CUSTOM_PACKET_OK;
         bool ok = false;
@@ -1087,6 +1097,7 @@ void ToxAdapter::set_on_friend_connection(FriendConnectionCallback cb) {
 void ToxAdapter::set_lossless_send_gate(std::shared_ptr<LosslessSendGate> gate) {
     std::lock_guard<std::mutex> lock(tox_mutex_);
     send_gate_ = std::move(gate);
+    send_gate_hint_.store(send_gate_.get(), std::memory_order_release);
     // Both run with tox_mutex_ already held by the caller (the gate is only
     // ever invoked under it), so neither takes it.
     gate_io_.public_key = [this](uint32_t friend_number) -> std::optional<PublicKeyArray> {
@@ -1534,12 +1545,6 @@ void ToxAdapter::on_friend_connection_status_cb(Tox* /*tox*/, uint32_t friend_nu
         return c == TOX_CONNECTION_UDP ? "UDP" : c == TOX_CONNECTION_TCP ? "TCP" : "none";
     };
 
-    if (self->send_gate_) {
-        self->send_gate_->on_connection_status(
-            self->gate_io_, friend_number, connected,
-            std::chrono::steady_clock::now().time_since_epoch().count());
-    }
-
     // A value-initialised entry is TOX_CONNECTION_NONE, i.e. "never connected".
     TOX_CONNECTION& last = self->friend_transport_[friend_number];
     const TOX_CONNECTION previous = last;
@@ -1555,6 +1560,13 @@ void ToxAdapter::on_friend_connection_status_cb(Tox* /*tox*/, uint32_t friend_nu
                                transport_name(previous), transport_name(connection_status));
         }
         return;
+    }
+
+    // Connection edges only (a transport change is not a reconnect).
+    if (self->send_gate_) {
+        self->send_gate_->on_connection_status(
+            self->gate_io_, friend_number, connected,
+            std::chrono::steady_clock::now().time_since_epoch().count());
     }
 
     if (connected) {

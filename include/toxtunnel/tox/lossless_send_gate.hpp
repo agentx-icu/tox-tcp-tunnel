@@ -56,6 +56,17 @@ class LosslessSendGate {
     /// Called after every tox_iterate: the gate's own deadlines and sends.
     virtual void on_tick(const Io& io, std::int64_t now_ns) = 0;
 
+    /// Lock-free, from any thread, WITHOUT tox_mutex_: true when this packet
+    /// would certainly be refused right now, so the caller can skip the trip
+    /// to the Tox thread. A false positive only delays the packet to the next
+    /// retry; admit() stays the authoritative check.
+    [[nodiscard]] virtual bool fast_reject(std::uint32_t friend_number,
+                                           std::span<const std::uint8_t> packet) const noexcept {
+        (void)friend_number;
+        (void)packet;
+        return false;
+    }
+
     /// The friend number was deleted, or handed out again by an add: whatever
     /// the gate cached for that NUMBER no longer describes the same friend.
     virtual void forget_friend_number(std::uint32_t friend_number) = 0;
