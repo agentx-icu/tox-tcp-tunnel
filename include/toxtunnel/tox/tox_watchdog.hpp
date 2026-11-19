@@ -75,10 +75,8 @@ class ToxWatchdog {
     /// Force a check now (test hook + main-thread shutdown path).
     /// Returns the observed lag in milliseconds.
     ///
-    /// Suspend immunity (issue #38): a stale heartbeat alone does not abort.
-    /// A host that sleeps, or a hypervisor that pauses the guest, leaves the
-    /// heartbeat hours old on resume while the Tox thread is perfectly fine —
-    /// that was every watchdog abort on the Windows QA rig. So the observer
+    /// Suspend immunity (issue #38): a hypervisor pause can age the guest's
+    /// heartbeat even when the Tox thread is healthy. So the observer
     /// (a) ignores a tick after which it can see it was itself stalled for
     /// longer than the deadline (the whole process was suspended), and
     /// (b) requires the heartbeat COUNTER to stay unchanged for
@@ -125,16 +123,9 @@ class ToxWatchdog {
     }
 
     /// The clock every watchdog timestamp is taken on, in nanoseconds. It is
-    /// monotonic and, on macOS and Linux, does NOT advance while the host is
-    /// asleep, so a lag means awake time without Tox-thread progress (Windows
-    /// steady_clock still counts sleep; check_once()'s confirmation logic
-    /// covers that). On Apple this is
-    /// CLOCK_UPTIME_RAW: libc++'s steady_clock there is CLOCK_MONOTONIC_RAW,
-    /// which keeps counting through sleep, so every macOS maintenance wake
-    /// (DarkWake) after ~15 min asleep looked like a 15 min wedge and aborted
-    /// the daemon. Elsewhere it is steady_clock (Linux CLOCK_MONOTONIC already
-    /// stops during suspend). Process / VM pauses are still handled by the
-    /// observer-gap logic in check_once().
+    /// monotonic and excludes OS sleep on macOS (CLOCK_UPTIME_RAW), Windows
+    /// (unbiased interrupt time) and Linux (steady_clock/CLOCK_MONOTONIC).
+    /// Process and VM pauses are handled by the observer in check_once().
     [[nodiscard]] static std::int64_t now_ns() noexcept;
 
     [[nodiscard]] std::int64_t lag_ms() const noexcept {

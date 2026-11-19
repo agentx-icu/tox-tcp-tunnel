@@ -92,6 +92,9 @@ class MetricsRegistry {
     /// Record a single tox_iterate elapsed-time observation (ms).
     void observe_iterate_lag_ms(double ms);
 
+    /// Record how long a cross-thread packet send waited to run (ms).
+    void observe_send_bridge_wait_ms(double ms) noexcept;
+
     // -----------------------------------------------------------------
     // Outbound zero-copy counters (Wave B)
     // -----------------------------------------------------------------
@@ -265,6 +268,9 @@ class MetricsRegistry {
     std::atomic<std::uint64_t> iterate_lag_count_{0};
     std::atomic<double> iterate_lag_sum_ms_{0.0};
     std::atomic<double> iterate_lag_max_ms_{0.0};
+    std::atomic<std::uint64_t> send_bridge_wait_count_{0};
+    std::atomic<double> send_bridge_wait_sum_ms_{0.0};
+    std::atomic<double> send_bridge_wait_max_ms_{0.0};
 
     // Outbound zero-copy counters (Wave B).
     std::atomic<std::uint64_t> outbound_buffer_allocs_{0};

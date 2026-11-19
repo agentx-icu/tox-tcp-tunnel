@@ -20,6 +20,8 @@
 
 #if defined(__APPLE__)
 #include <time.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 #include "toxtunnel/core/io_context.hpp"
@@ -398,6 +400,17 @@ TEST(ToxWatchdogTest, WatchdogClockExcludesHostSleepOnApple) {
     const auto after = static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     EXPECT_GE(wd, before) << "watchdog clock must be CLOCK_UPTIME_RAW, not steady_clock";
     EXPECT_LE(wd, after) << "watchdog clock must be CLOCK_UPTIME_RAW, not steady_clock";
+}
+#elif defined(_WIN32)
+TEST(ToxWatchdogTest, WatchdogClockMatchesWindowsAwakeTime) {
+    ULONGLONG before = 0;
+    ULONGLONG after = 0;
+    ASSERT_TRUE(QueryUnbiasedInterruptTime(&before));
+    const auto now = tox::ToxWatchdog::now_ns();
+    ASSERT_TRUE(QueryUnbiasedInterruptTime(&after));
+    EXPECT_GE(now, static_cast<std::int64_t>(before * 100));
+    EXPECT_LE(now, static_cast<std::int64_t>(after * 100));
+    EXPECT_EQ(now % 100, 0);
 }
 #endif
 

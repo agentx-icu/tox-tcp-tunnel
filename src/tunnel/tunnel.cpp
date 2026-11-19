@@ -1245,8 +1245,13 @@ bool TunnelImpl::control_obligation_eligible_locked() {
 
 bool TunnelImpl::claim_terminal_error(std::vector<std::uint8_t> wire,
                                       bool* transport_settled_immediately) {
-    *transport_settled_immediately = false;
     std::lock_guard<std::mutex> lock(coalesce_mutex_);
+    return claim_terminal_error_locked(std::move(wire), transport_settled_immediately);
+}
+
+bool TunnelImpl::claim_terminal_error_locked(std::vector<std::uint8_t> wire,
+                                             bool* transport_settled_immediately) {
+    *transport_settled_immediately = false;
     publish_abort_locked();
     if (terminal_error_claimed_.load(std::memory_order_relaxed)) {
         return false;  // Duplicate suppressed; the first claim owns everything.
@@ -1488,39 +1493,15 @@ void TunnelImpl::close() {
         return;
     }
 
-    // Drain pending coalesced data before signalling close so the peer
-    // observes every byte we accepted. The decision is made under
-    // `coalesce_mutex_` FIRST: if anything is still pending — or an emitter is
-    // mid-drain, whose deferred result must never be read as "drained" (see
-    // EmitOutcome) — the TUNNEL_CLOSE is deferred and whichever driver
-    // completes the drain emits it. Emitting it now would let it overtake
-    // in-flight DATA, and the peer drops post-close frames as "unknown
-    // tunnel" (the close-before-drain truncation bug).
-    bool defer = false;
     {
         std::lock_guard<std::mutex> lock(coalesce_mutex_);
-        if (coalesce_pending_locked() > 0 || driver_active_) {
-            close_pending_ = true;
-            close_pending_full_ = true;
-            // close() is about to RETURN with the CLOSE still owed — the
-            // driver that finishes the drain emits it. The id stays reserved
-            // until then; releasing it on this return is what let a
-            // replacement take an id the deferred CLOSE was still going to
-            // name. Recorded inside this critical section, so no emit can
-            // slip between the decision and the record.
-            note_close_owed();
-            defer = true;
+        if (!claim_graceful_close_locked()) {
+            return;
         }
     }
-    if (defer) {
-        // Kick a drain in case no emitter is active any more; harmlessly
-        // deferred if one is, and the retry timer takes over on backpressure.
-        (void)run_emission_driver(DrainPolicy::FlushAll);
-        util::Logger::debug("Tunnel {} close deferred until coalesce buffer drains", tunnel_id_);
-        return;
-    }
 
-    emit_close_and_transition();
+    flush_pending_tcp_input();
+    (void)run_emission_driver(DrainPolicy::FlushAll);
 }
 
 void TunnelImpl::notify_teardown_fallback() noexcept {
@@ -1605,78 +1586,126 @@ util::MetricsRegistry::CloseReason TunnelImpl::local_close_reason() const noexce
                : util::MetricsRegistry::CloseReason::Local;
 }
 
-void TunnelImpl::close_for_timeout() {
-    timeout_close_.store(true, std::memory_order_release);
+bool TunnelImpl::claim_graceful_close_locked() {
+    if (state() != State::Connected ||
+        local_terminal_intent_ >= LocalTerminalIntent::GracefulClose) {
+        return false;
+    }
+    local_terminal_intent_ = LocalTerminalIntent::GracefulClose;
+    close_pending_ = true;
+    close_pending_full_ = true;
+    note_close_owed();
+    return true;
+}
 
-    if (state() == State::Disconnecting) {
-        // The peer abandoned its side of the close handshake. Tell it plainly:
-        // TUNNEL_ERROR drives the peer's tunnel to Error and through its normal
-        // teardown (see handle_tunnel_error_frame), releasing its target fd.
-        // Code 2, not 3. Its post-open timing means no SOCKS5 reply is riding on
-        // it, but code 3 now means "the target refused the connection" and this
-        // is a local linger timeout — leaving it at 3 would contradict the wire
-        // contract even though nothing observable would break today.
-        //
-        // Slice-3 completion (issue #24): this ERROR competes for the SAME
-        // one-shot terminal claim as send_error() and is emitted only by the
-        // driver — one slot cannot linearize two payload owners. A losing
-        // producer emits nothing: the winner's retained ERROR reaches the
-        // peer (or permanently fails), and one terminal frame suffices. All
-        // timeout-specific bookkeeping (Timeout metric, Closed state) stays
-        // producer-local, exactly as before.
-        std::vector<std::uint8_t> wire;
+void TunnelImpl::close_for_timeout() {
+    if (state() == State::Connecting) {
+        timeout_close_.store(true, std::memory_order_release);
+        close();
+    } else if (const auto claim = claim_timeout_close(0, 0)) {
+        finish_timeout_close(*claim);
+    }
+}
+
+std::optional<TunnelImpl::TimeoutClose> TunnelImpl::claim_timeout_close(
+    int64_t idle_timeout_ns, int64_t half_close_timeout_ns) {
+    std::lock_guard<std::mutex> lock(coalesce_mutex_);
+    const auto current = state();
+    const bool unconditional = idle_timeout_ns == 0 && half_close_timeout_ns == 0;
+    const auto idle_ns = IdleNanos();
+    if (!unconditional && !(idle_timeout_ns > 0 && idle_ns >= idle_timeout_ns) &&
+        !(current == State::Disconnecting && half_close_timeout_ns > 0 &&
+          idle_ns >= half_close_timeout_ns)) {
+        return std::nullopt;
+    }
+    if (current == State::Connected && claim_graceful_close_locked()) {
+        timeout_close_.store(true, std::memory_order_release);
+        return TimeoutClose::Graceful;
+    }
+    if (current == State::None && claim_terminal(State::None).claimed) {
+        publish_abort_locked();
+        timeout_close_.store(true, std::memory_order_release);
+        return TimeoutClose::Unpublished;
+    }
+    if (current == State::Closed || current == State::Error) {
+        return TimeoutClose::Cleanup;
+    }
+
+    const bool linger = current == State::Disconnecting;
+    const bool graceful_stalled =
+        current == State::Connected && local_terminal_intent_ == LocalTerminalIntent::GracefulClose;
+    if ((!linger && !graceful_stalled) || local_terminal_intent_ == LocalTerminalIntent::Abort) {
+        return std::nullopt;
+    }
+
+    // An existing close already used its time to drain. The shared terminal
+    // ERROR slot pins this id until the driver settles delivery.
+    std::vector<std::uint8_t> wire;
+    try {
+        wire = ProtocolFrame::make_tunnel_error(
+                   tunnel_id_, 2,
+                   linger ? "half-close linger timeout" : "graceful close drain timeout")
+                   .serialize();
+    } catch (...) {
+        // An allocation failure can't leave the timed-out tunnel open.
+    }
+    bool transport_settled = false;
+    if (!claim_terminal_error_locked(std::move(wire), &transport_settled)) {
+        return std::nullopt;
+    }
+    timeout_close_.store(true, std::memory_order_release);
+    return transport_settled ? TimeoutClose::ErrorWithoutTransport : TimeoutClose::Error;
+}
+
+void TunnelImpl::finish_timeout_close(TimeoutClose claim) {
+    if (claim == TimeoutClose::Graceful) {
+        flush_pending_tcp_input();
+        (void)run_emission_driver(DrainPolicy::FlushAll);
+        return;
+    }
+    if (claim == TimeoutClose::Cleanup) {
+        return;
+    }
+    if (claim == TimeoutClose::Unpublished) {
+        book_close_once(util::MetricsRegistry::CloseReason::Timeout);
         try {
-            wire = ProtocolFrame::make_tunnel_error(tunnel_id_, 2, "half-close linger timeout")
-                       .serialize();
+            notify_state_change(State::Closed);
         } catch (...) {
-            util::Logger::warn(
-                "Tunnel {} linger-timeout error frame failed to serialize; closing locally",
-                tunnel_id_);
+            notify_teardown_fallback();
+            throw;
         }
-        bool transport_settled = false;
-        if (claim_terminal_error(std::move(wire), &transport_settled)) {
-            struct ProducerSettleGuard {
-                TunnelImpl* self;
-                ~ProducerSettleGuard() {
-                    try {
-                        self->arrive_terminal_error_party(ErrorSettleParty::Producer);
-                    } catch (...) {
-                    }
-                }
-            } producer_guard{this};
-            if (transport_settled) {
-                arrive_terminal_error_party(ErrorSettleParty::Transport);
-            } else {
-                try {
-                    (void)run_emission_driver(DrainPolicy::FlushAll);
-                } catch (const std::exception& e) {
-                    util::Logger::warn("Tunnel {} linger-timeout error kick threw: {}", tunnel_id_,
-                                       e.what());
-                } catch (...) {
-                    util::Logger::warn("Tunnel {} linger-timeout error kick threw", tunnel_id_);
-                }
-            }
-            book_close_once(util::MetricsRegistry::CloseReason::Timeout);
-            transition_state(State::Closed);
-            util::Logger::info(
-                "Tunnel {} force-closed after half-close linger timeout; peer notified",
-                tunnel_id_);
-            notify_close_once();
-        } else {
-            // A real send_error() beat us to the claim: the tunnel is already
-            // being torn down with a terminal ERROR on the way, which
-            // supersedes the linger notification. Emit nothing; the winner
-            // owns the state and the close notification.
-            util::Logger::debug(
-                "Tunnel {} linger timeout superseded by an in-flight terminal error", tunnel_id_);
-        }
+        notify_close_once();
         return;
     }
 
-    // Any other reapable state: the ordinary close path is correct (it emits
-    // TUNNEL_CLOSE and drains buffered data first); only the accounting
-    // differs, which timeout_close_ takes care of.
-    close();
+    struct ProducerSettleGuard {
+        TunnelImpl* self;
+        ~ProducerSettleGuard() {
+            try {
+                self->arrive_terminal_error_party(ErrorSettleParty::Producer);
+            } catch (...) {
+            }
+        }
+    } producer_guard{this};
+    if (claim == TimeoutClose::ErrorWithoutTransport) {
+        arrive_terminal_error_party(ErrorSettleParty::Transport);
+    } else {
+        try {
+            (void)run_emission_driver(DrainPolicy::FlushAll);
+        } catch (const std::exception& e) {
+            util::Logger::warn("Tunnel {} linger-timeout error kick threw: {}", tunnel_id_,
+                               e.what());
+        } catch (...) {
+            util::Logger::warn("Tunnel {} linger-timeout error kick threw", tunnel_id_);
+        }
+    }
+    book_close_once(util::MetricsRegistry::CloseReason::Timeout);
+    if (transition_state_if(State::Disconnecting, State::Closed)) {
+        util::Logger::info("Tunnel {} force-closed after half-close linger timeout", tunnel_id_);
+    } else if (transition_state_if(State::Connected, State::Closed)) {
+        util::Logger::info("Tunnel {} force-closed after graceful close drain timeout", tunnel_id_);
+    }
+    notify_close_once();
 }
 
 void TunnelImpl::emit_local_close_only() {
@@ -1692,51 +1721,22 @@ void TunnelImpl::emit_local_close_only() {
     util::Logger::info("Tunnel {} sent local half-close", tunnel_id_);
 }
 
-bool TunnelImpl::flush_pending_tcp_input() {
-    for (;;) {
-        std::vector<std::uint8_t> chunk;
-        {
-            std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
-            const std::size_t pending = pending_tcp_pending_locked();
-            if (pending == 0) {
-                return true;
-            }
-
-            // Same admission rule as send_data_to_tox(): once flow control
-            // is configured the BDP target alone governs (in fixed mode it
-            // is the fixed window). Taking max(seed, target) here let the
-            // backlog drain above the target.
-            std::size_t effective_window = send_window_size_;
-            if (flow_control_configured_.load(std::memory_order_acquire)) {
-                effective_window = static_cast<std::size_t>(flow_control_.target_window_bytes());
-            }
-
-            const std::size_t used = send_window_used_.load(std::memory_order_relaxed);
-            if (used >= effective_window) {
-                return false;
-            }
-
-            const std::size_t send_budget = effective_window - used;
-            const std::size_t to_send = std::min(send_budget, pending);
-            const auto first =
-                pending_tcp_input_.begin() + static_cast<std::ptrdiff_t>(pending_tcp_consumed_);
-            chunk.assign(first, first + static_cast<std::ptrdiff_t>(to_send));
-        }
-
-        if (!send_data_to_tox(std::span<const std::uint8_t>(chunk.data(), chunk.size()))) {
-            return false;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
-            // Advance the read cursor instead of erasing from the front each
-            // iteration (which shifted every surviving byte — O(n) per chunk,
-            // O(n^2) to drain a large backlog). Compact lazily: clear once fully
-            // drained, otherwise erase the consumed prefix when it reaches at
-            // least half the buffer, keeping the amortised cost O(1). Mirrors
-            // the outbound cohorts' consumed-cursor scheme.
-            pending_tcp_consumed_ += chunk.size();
-            if (pending_tcp_consumed_ >= pending_tcp_input_.size()) {
+void TunnelImpl::flush_pending_tcp_input() {
+    const auto conn = tcp_connection();
+    bool admitted = false;
+    {
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        const std::size_t count =
+            std::min(send_window_available_locked(), pending_tcp_pending_locked());
+        const auto current = state();
+        if (count > 0 && (current == State::Connected || current == State::Disconnecting) &&
+            local_terminal_intent_ != LocalTerminalIntent::Abort) {
+            // This is the only admission that can move bytes after EOF or
+            // graceful close. It already owns the bytes in the pending FIFO.
+            const std::span<const uint8_t> data(pending_tcp_input_);
+            (void)admit_data_locked(data.subspan(pending_tcp_consumed_, count));
+            pending_tcp_consumed_ += count;
+            if (pending_tcp_pending_locked() == 0) {
                 pending_tcp_input_.clear();
                 pending_tcp_consumed_ = 0;
             } else if (pending_tcp_consumed_ >= pending_tcp_pending_locked()) {
@@ -1745,22 +1745,19 @@ bool TunnelImpl::flush_pending_tcp_input() {
                                              static_cast<std::ptrdiff_t>(pending_tcp_consumed_));
                 pending_tcp_consumed_ = 0;
             }
+            admitted = true;
+        }
+        if (conn && current == State::Connected &&
+            local_terminal_intent_ == LocalTerminalIntent::None &&
+            pending_tcp_pending_locked() == 0 && send_window_available_locked() > 0 &&
+            outbound_pending_locked() <= outbound_capacity_locked()) {
+            // pause_read() and resume_read() only update the connection's
+            // pause bit and post work. They don't invoke a callback inline.
+            conn->resume_read();
         }
     }
-}
-
-void TunnelImpl::maybe_finish_pending_tcp_eof() {
-    bool should_finish = false;
-    {
-        std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
-        if (pending_tcp_eof_ && pending_tcp_pending_locked() == 0) {
-            pending_tcp_eof_ = false;
-            should_finish = true;
-        }
-    }
-
-    if (should_finish) {
-        on_tcp_read_eof();
+    if (admitted) {
+        (void)run_emission_driver(DrainPolicy::FlushAll);
     }
 }
 
@@ -1880,6 +1877,11 @@ void TunnelImpl::force_close_impl(ResourceRelease release, std::optional<State> 
 
     if (owns_resources && !outbound_gate_closed()) {
         try {
+            {
+                std::lock_guard<std::mutex> lock(coalesce_mutex_);
+                pending_tcp_input_.clear();
+                pending_tcp_consumed_ = 0;
+            }
             flush_pending_writes();
         } catch (...) {
             note_ex();
@@ -2154,7 +2156,7 @@ void TunnelImpl::handle_tunnel_close_frame(const ProtocolFrame& /*frame*/) {
             // close notifications. Record the peer's close and stop — a
             // finalize here would transition an Error tunnel to Closed and
             // double-book the close metric.
-        } else if (coalesce_pending_locked() > 0 || driver_active_) {
+        } else if (outbound_pending_locked() > 0 || driver_active_) {
             // Outbound DATA accepted from local TCP is still draining (or an
             // emitter is mid-frame). Keep the tunnel alive until it is on the
             // wire; the driver that finishes the drain finalizes.
@@ -2342,26 +2344,9 @@ void TunnelImpl::handle_tunnel_ack_frame(const ProtocolFrame& frame) {
     util::Logger::debug("Tunnel {} received ACK for {} bytes (window now {})", tunnel_id_, acked,
                         new_window);
 
-    // C-S-1 + H-S-1 (2026-05-20 fix-storm review):
-    // (1) C-S-1: snapshot `tcp_conn_` under `mutex_` before deref —
-    //     `force_close()` resets it under the same lock from any thread.
-    // (2) H-S-1: the earlier `new_window < current_window` predicate
-    //     silently broke after S29's saturating-CAS refund: a refund
-    //     could drive send_window_used_ to 0 *before* this ACK landed,
-    //     so by the time we read it both values are 0 and the resume is
-    //     skipped — TCP read stays paused forever. Trigger resume on any
-    //     ACK that carried bytes; resume_read is idempotent so it's a
-    //     no-op when the loop wasn't paused.
-    std::shared_ptr<core::TcpConnection> conn;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        conn = tcp_conn_;
+    if (acked > 0) {
+        flush_pending_tcp_input();
     }
-    const bool drained_pending_tcp = flush_pending_tcp_input();
-    if (conn && acked > 0 && drained_pending_tcp) {
-        conn->resume_read();
-    }
-    maybe_finish_pending_tcp_eof();
 }
 
 void TunnelImpl::handle_tunnel_error_frame(const ProtocolFrame& frame) {
@@ -2441,172 +2426,106 @@ void TunnelImpl::handle_pong_frame(const ProtocolFrame& /*frame*/) {
 // ===========================================================================
 
 void TunnelImpl::on_tcp_data_received(const uint8_t* data, std::size_t length) {
-    if (!is_connected()) {
+    if (length == 0) {
         return;
     }
-
+    const auto conn = tcp_connection();
+    const std::span<const uint8_t> bytes(data, length);
+    std::optional<CoalescePolicy> admitted;
+    bool overflow = false;
     {
-        std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
-        if (pending_tcp_pending_locked() != 0) {
-            pending_tcp_input_.insert(pending_tcp_input_.end(), data, data + length);
-            std::shared_ptr<core::TcpConnection> conn;
-            {
-                std::lock_guard<std::mutex> conn_lock(mutex_);
-                conn = tcp_conn_;
-            }
-            if (conn) {
-                conn->pause_read();
-            }
+        std::lock_guard<std::mutex> lock(coalesce_mutex_);
+        if (state() != State::Connected || local_terminal_intent_ != LocalTerminalIntent::None) {
             return;
         }
-    }
-
-    // Forward to Tox; if the send window is full, propagate the backpressure
-    // upstream by pausing TCP reads — otherwise the data would be silently
-    // dropped (C-18 in the 2026-05-20 review). handle_tunnel_ack_frame
-    // calls resume_read once the window drains.
-    // L-S-1 (2026-05-20 fix-storm review): snapshot tcp_conn_ under
-    // mutex_ before deref — force_close() resets it from any thread.
-    const bool accepted = send_data_to_tox(std::span<const uint8_t>(data, length));
-    if (!accepted) {
-        {
-            std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
-            pending_tcp_input_.insert(pending_tcp_input_.end(), data, data + length);
+        const auto base = outbound_capacity_locked();
+        const auto reserve =
+            conn ? conn->read_buffer_size() : core::TcpConnection::kDefaultReadBufferSize;
+        const auto pending = outbound_pending_locked();
+        // The sole outstanding TCP read may use its reservation beyond the
+        // ordinary limit. Manual producers cannot consume that reservation.
+        const auto headroom = base - std::min(base, pending);
+        const auto reserved_used = pending > base ? pending - base : 0;
+        if (length > headroom && length - headroom > reserve - std::min(reserve, reserved_used)) {
+            overflow = true;
+        } else if (pending_tcp_pending_locked() == 0 && length <= send_window_available_locked()) {
+            admitted = admit_data_locked(bytes);
+            if (*admitted == CoalescePolicy::Batch) {
+                coalesce_arm_timer_locked();
+            }
+        } else {
+            pending_tcp_input_.insert(pending_tcp_input_.end(), bytes.begin(), bytes.end());
         }
-        std::shared_ptr<core::TcpConnection> conn;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            conn = tcp_conn_;
-        }
-        if (conn) {
+        if (conn && (pending_tcp_pending_locked() != 0 || send_window_available_locked() == 0 ||
+                     outbound_pending_locked() > base)) {
             conn->pause_read();
         }
+    }
+    if (overflow) {
+        // A producer violated the read reservation. An explicit stream
+        // failure is safer than silently dropping bytes or growing without bound.
+        send_error(2, "outbound TCP buffer limit exceeded");
+    } else if (admitted) {
+        drive_admitted_data(*admitted);
+    } else {
+        // There may already be partial window credit, even with no future ACK
+        // pending (a read larger than an empty window, for example).
+        flush_pending_tcp_input();
     }
 }
 
 void TunnelImpl::on_tcp_read_eof() {
-    util::Logger::debug("Tunnel {} TCP read EOF (accepted total {}, emitted total {})", tunnel_id_,
-                        total_bytes_sent_.load(std::memory_order_relaxed),
-                        total_bytes_emitted_.load(std::memory_order_relaxed));
-    // See close(): after a terminal Abort the half-close CLOSE must not reach
-    // the wire behind the terminal ERROR.
-    if (outbound_abort_published_.load(std::memory_order_acquire)) {
-        util::Logger::debug("Tunnel {} TCP EOF ignored: outbound already aborted", tunnel_id_);
-        return;
-    }
-
-    State current = state_.load(std::memory_order_acquire);
-    if (current == State::Connecting) {
+    if (state() == State::Connecting) {
         close();
         return;
     }
-    if (current != State::Connected && current != State::Disconnecting) {
-        util::Logger::debug("Tunnel {} TCP EOF ignored: state {}", tunnel_id_, to_string(current));
-        return;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(tcp_backpressure_mutex_);
-        if (pending_tcp_pending_locked() != 0) {
-            pending_tcp_eof_ = true;
-            util::Logger::debug("Tunnel {} TCP EOF deferred until pending TCP backlog flushes",
-                                tunnel_id_);
-            return;
-        }
-    }
-
-    bool defer = false;
-    bool emit_close = false;
-    bool finalize_now = false;
     {
         std::lock_guard<std::mutex> lock(coalesce_mutex_);
-        if (coalesce_pending_locked() > 0 || driver_active_) {
-            // Deferred: the driver that completes the drain emits the
-            // directional CLOSE (a mid-drain emitter's result must never be
-            // read as "drained" — see EmitOutcome).
-            close_pending_ = true;
-            defer = true;
-        } else {
-            if (!local_close_sent_) {
-                local_close_sent_ = true;
-                local_stream_done_ = true;
-                emit_close = true;
-            }
-            finalize_now = remote_close_received_;
+        const auto current = state();
+        if ((current != State::Connected && current != State::Disconnecting) ||
+            local_terminal_intent_ != LocalTerminalIntent::None) {
+            return;
         }
+        local_terminal_intent_ = LocalTerminalIntent::Eof;
+        close_pending_ = true;
+        note_close_owed();
     }
-    if (defer) {
-        (void)run_emission_driver(DrainPolicy::FlushAll);
-        util::Logger::debug("Tunnel {} TCP EOF deferred until coalesce buffer drains", tunnel_id_);
-        return;
-    }
-
-    if (emit_close) {
-        emit_local_close_only();
-    }
-    if (finalize_now) {
-        finalize_remote_close();
-    }
+    flush_pending_tcp_input();
+    (void)run_emission_driver(DrainPolicy::FlushAll);
 }
 
 // ===========================================================================
 // Data sending
 // ===========================================================================
 
-bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
-    if (!is_connected()) {
-        return false;
-    }
-    // Fast reject once the terminal Abort seal is published (send_error /
-    // close_outbound_gate / force_close teardown): admission is closed, and
-    // accepting bytes that could never drain would only grow a FIFO the
-    // abandonment already emptied. The lock-free load can race a concurrent
-    // seal; the authoritative re-check happens under `coalesce_mutex_` below,
-    // before any append.
-    if (outbound_abort_published_.load(std::memory_order_acquire)) {
-        return false;
-    }
+std::size_t TunnelImpl::send_window_available_locked() const noexcept {
+    const auto window = flow_control_configured_.load(std::memory_order_acquire)
+                            ? static_cast<std::size_t>(flow_control_.target_window_bytes())
+                            : send_window_size_;
+    return window - std::min(window, send_window_used_.load(std::memory_order_relaxed));
+}
 
-    // Check window. When `configure_flow_control` has been called, prefer
-    // the BDP-driven target over the constructor-time `send_window_size_`:
-    // in `fixed` mode they match, in `bdp` mode the estimator resizes the
-    // window in place. Otherwise stick with the legacy v0.3.0 behaviour so
-    // existing tests and pre-v0.4 callers see unchanged semantics.
-    const std::size_t data_size = data.size();
-    std::size_t effective_window = send_window_size_;
+std::size_t TunnelImpl::outbound_capacity_locked() const noexcept {
     if (flow_control_configured_.load(std::memory_order_acquire)) {
-        effective_window = static_cast<std::size_t>(flow_control_.target_window_bytes());
+        const auto& config = flow_control_.config();
+        return static_cast<std::size_t>(config.mode == FlowControlMode::Fixed
+                                            ? config.fixed_window_bytes
+                                            : config.max_window_bytes);
     }
-    // Atomically check-and-reserve the window. A plain load-then-fetch_add
-    // races: on_tcp_data_received (I/O thread) and flush_pending_tcp_input —
-    // reached via handle_tunnel_ack_frame on the Tox thread — can both pass the
-    // guard and then both fetch_add, overcommitting the BDP window by a chunk.
-    // The CAS reserves the bytes only if they still fit under the window value
-    // observed at compare time.
-    std::size_t current = send_window_used_.load(std::memory_order_relaxed);
-    for (;;) {
-        if (current + data_size > effective_window) {
-            util::Logger::debug("Tunnel {} send window full ({} + {} > {})", tunnel_id_, current,
-                                data_size, effective_window);
-            return false;
-        }
-        if (send_window_used_.compare_exchange_weak(current, current + data_size,
-                                                    std::memory_order_relaxed)) {
-            break;
-        }
-        // CAS failed: `current` was refreshed with the latest value; re-check.
-    }
-    // On a successful CAS `current` still holds the pre-reservation usage.
+    return send_window_size_;
+}
 
-    BumpActivity();
+std::size_t TunnelImpl::outbound_pending_locked() const noexcept {
+    // The driver's selected DATA remains charged to the cohort until the
+    // callback accepts it, including during synchronous/reentrant ACKs.
+    return coalesce_pending_locked() + pending_tcp_pending_locked();
+}
 
-    // ---- Adaptive coalescer decision ------------------------------------
-    // Update EWMA + select the active policy. The decision applies to this
-    // push only; the policy may change on every call.
+CoalescePolicy TunnelImpl::admit_data_locked(std::span<const uint8_t> data) {
     const auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto prev_ns = last_push_ns_.exchange(now_ns, std::memory_order_relaxed);
     const std::int64_t gap_us = prev_ns == 0 ? 0 : (now_ns - prev_ns) / 1000;
-    coalescer_.observe(data_size, gap_us);
+    coalescer_.observe(data.size(), gap_us);
     const auto decision = coalescer_.decide();
     if (decision.transitioned) {
         util::MetricsRegistry::instance().inc_coalesce_policy_transitions();
@@ -2614,75 +2533,60 @@ bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
                             to_string(decision.previous), to_string(decision.policy));
     }
 
-    // Finding-1 (user-reported, 2026-05-21) + close-before-drain fix
-    // (2026-05-25) lineage, now enforced by the emission driver: a Tox
-    // SENDQ-full on the emit path is transient backpressure, not a fatal
-    // error. The driver retains unsent bytes in their cohort and retries them
-    // on the flush timer, keeping the lossless guarantee intact — and no send
-    // callback ever runs under `coalesce_mutex_` (slice 2, issue #24).
-    bool emit_immediate = false;
+    const auto policy = coalesce_max_delay_us_ == 0 ? CoalescePolicy::Bypass : decision.policy;
+    const auto cap = policy == CoalescePolicy::Bypass
+                         ? kMaxTcpPayloadPerToxFrame
+                         : static_cast<std::size_t>(coalesce_max_bytes_);
+    fifo_append_locked(data, cap);
+    send_window_used_.fetch_add(data.size(), std::memory_order_relaxed);
+    BumpActivity();
+    total_bytes_sent_.fetch_add(data.size(), std::memory_order_relaxed);
+    util::MetricsRegistry::instance().add_bytes_out(data.size());
+    return policy;
+}
+
+void TunnelImpl::drive_admitted_data(CoalescePolicy policy) {
+    if (policy == CoalescePolicy::Bypass) {
+        (void)run_emission_driver(DrainPolicy::FlushAll);
+    } else {
+        (void)run_emission_driver(DrainPolicy::FullFramesOnly,
+                                  /*arm_timer_on_remainder=*/policy != CoalescePolicy::Drain);
+    }
+}
+
+bool TunnelImpl::send_data_to_tox(std::span<const uint8_t> data) {
+    std::optional<CoalescePolicy> admitted;
     {
         std::lock_guard<std::mutex> lock(coalesce_mutex_);
-        // Authoritative admission check, atomic with the append: a seal
-        // published between the lock-free fast check above and this lock
-        // means the FIFO has been abandoned — appending now would strand
-        // bytes admission promised to deliver. Refuse and refund the window
-        // reservation taken above.
-        if (outbound_abort_published_.load(std::memory_order_relaxed)) {
-            // Saturating refund, mirroring the ACK release loop: a concurrent
-            // reset_statistics() may have zeroed the counter between the CAS
-            // reservation above and this refusal, and an unconditional
-            // fetch_sub would underflow the unsigned counter and wedge
-            // admission at "window full" forever.
-            std::size_t used = send_window_used_.load(std::memory_order_relaxed);
-            while (used > 0 &&
-                   !send_window_used_.compare_exchange_weak(
-                       used, used > data_size ? used - data_size : 0, std::memory_order_relaxed)) {
-            }
+        if (state() != State::Connected || local_terminal_intent_ != LocalTerminalIntent::None) {
             return false;
         }
-        // `Bypass` policy and the legacy `max_delay_us == 0` path both want
-        // each write on the wire immediately.
-        emit_immediate = coalesce_max_delay_us_ == 0 || decision.policy == CoalescePolicy::Bypass;
-        // Admission cap is a property of the WRITE, carried by its cohort:
-        // bypass admits under the wire ceiling (one frame per unobstructed
-        // write), batch/drain under the configured coalesce cap. Behind an
-        // existing backlog the bytes simply queue in FIFO order — a bypass
-        // write must not overtake a buffered remainder, and its cohort keeps
-        // the bypass framing rather than inheriting the buffered cap.
-        fifo_append_locked(data, emit_immediate ? kMaxTcpPayloadPerToxFrame
-                                                : static_cast<std::size_t>(coalesce_max_bytes_));
-        if (!emit_immediate && decision.policy != CoalescePolicy::Drain) {
-            // Batch: the timer bounds how long a sub-cap remainder is held.
-            // Armed at admission (as always) so the bound holds even when the
-            // drive below is deferred to an emitter running another policy.
-            coalesce_arm_timer_locked();
+        if (data.empty()) {
+            return true;
+        }
+        const auto cap = outbound_capacity_locked();
+        const auto room = cap - std::min(cap, outbound_pending_locked());
+        if (data.size() > room) {
+            return false;
+        }
+        if (pending_tcp_pending_locked() != 0) {
+            pending_tcp_input_.insert(pending_tcp_input_.end(), data.begin(), data.end());
+        } else {
+            if (data.size() > send_window_available_locked()) {
+                return false;
+            }
+            admitted = admit_data_locked(data);
+            // An active Drain driver may leave a partial batch behind.
+            if (*admitted == CoalescePolicy::Batch) {
+                coalesce_arm_timer_locked();
+            }
         }
     }
-
-    // Statistics count ACCEPTED bytes only, so they come after the
-    // authoritative admission check above.
-    total_bytes_sent_.fetch_add(data_size, std::memory_order_relaxed);
-    util::MetricsRegistry::instance().add_bytes_out(data_size);
-
-    if (emit_immediate) {
-        // Bypass keeps its latency by running the driver synchronously on
-        // this thread when it is idle, and FlushAll puts a sub-MTU write on
-        // the wire before this call returns. A write arriving mid-send queues
-        // behind the active emitter — the FIFO serialization we want, no
-        // worse than blocking on the old in-lock send.
-        (void)run_emission_driver(DrainPolicy::FlushAll);
-    } else if (decision.policy == CoalescePolicy::Drain) {
-        // Drain: emit full frames on overflow only; the remainder waits for
-        // overflow or an explicit flush, never the timer.
-        (void)run_emission_driver(DrainPolicy::FullFramesOnly,
-                                  /*arm_timer_on_remainder=*/false);
+    if (admitted) {
+        drive_admitted_data(*admitted);
     } else {
-        // Batch: emit whatever already amounts to full frames; the remainder
-        // rides the timer armed above.
-        (void)run_emission_driver(DrainPolicy::FullFramesOnly);
+        flush_pending_tcp_input();
     }
-
     return true;
 }
 
@@ -3332,7 +3236,10 @@ void TunnelImpl::flush_pending_writes() {
 }
 
 void TunnelImpl::publish_abort_locked() {
+    local_terminal_intent_ = LocalTerminalIntent::Abort;
     outbound_abort_published_.store(true, std::memory_order_release);
+    pending_tcp_input_.clear();
+    pending_tcp_consumed_ = 0;
     // Abort abandons undelivered DATA. The emission driver tolerates this
     // happening while one of its frames is in flight: the commit step finds
     // an empty FIFO and consumes nothing.
@@ -3483,9 +3390,16 @@ EmitOutcome TunnelImpl::run_emission_driver(DrainPolicy policy, bool arm_timer_o
                             span_frame.emplace(
                                 ProtocolFrame::make_tunnel_data(tunnel_id_, payload));
                         }
-                        more_data_queued = outbound_fifo_pending_ > frame_bytes;
+                        more_data_queued = outbound_pending_locked() > frame_bytes;
                         current_sel = Sel::Data;
                     } else {
+                        if (pending_tcp_pending_locked() != 0) {
+                            // Only an ACK can make the pending input eligible.
+                            // A graceful close cannot overtake it.
+                            driver_flush_all_requested_ = false;
+                            driver_active_ = false;
+                            break;
+                        }
                         // FIFO empty. (3) A requested CLOSE, selection-is-
                         // authorization (the old pre-transport recheck is
                         // gone). The ERROR->CLOSE fence is

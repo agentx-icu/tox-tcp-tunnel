@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <asio/io_context.hpp>
+#include <asio/ip/tcp.hpp>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -23,6 +25,28 @@ namespace toxtunnel::tox {
 // ===========================================================================
 
 namespace {
+
+std::optional<std::string> numeric_bootstrap_address(const std::string& address) {
+    asio::error_code ec;
+    const auto ip = asio::ip::make_address(address, ec);
+    if (ec || (ip.is_v6() && ip.to_v6().scope_id() != 0)) {
+        return std::nullopt;
+    }
+    return ip.to_string();
+}
+
+std::vector<std::string> lookup_bootstrap_hostname(const std::string& hostname) {
+    asio::io_context context;
+    asio::ip::tcp::resolver resolver(context);
+    asio::error_code ec;
+    const auto results =
+        resolver.resolve(hostname, "0", asio::ip::tcp::resolver::numeric_service, ec);
+    std::vector<std::string> addresses;
+    for (const auto& result : results) {
+        addresses.push_back(result.endpoint().address().to_string());
+    }
+    return addresses;
+}
 
 /// Map a TOX_CONNECTION value to our FriendState enum.
 FriendState connection_to_state(TOX_CONNECTION conn) {
@@ -394,6 +418,10 @@ std::size_t ToxAdapter::bootstrap() {
         util::Logger::error("Cannot bootstrap: ToxAdapter not initialized");
         return 0;
     }
+    if (on_tox_thread()) {
+        util::Logger::error("Bootstrap must be called outside the Tox iteration thread");
+        return 0;
+    }
 
     std::vector<BootstrapNode> bootstrap_nodes;
     auto resolved = resolve_bootstrap_nodes_for_config(config_, config_.bootstrap_fetcher);
@@ -418,9 +446,10 @@ std::size_t ToxAdapter::bootstrap() {
                            resolved.error());
     }
 
-    std::size_t success_count = run_on_tox_thread([&]() -> std::size_t {
+    auto resolved_nodes = resolve_bootstrap_addresses(bootstrap_nodes);
+    const auto success_count = run_on_tox_thread([&]() {
         std::lock_guard<std::mutex> lock(tox_mutex_);
-        return contact_bootstrap_nodes_locked(bootstrap_nodes);
+        return contact_bootstrap_nodes_locked(resolved_nodes);
     });
 
     // Arm the lifetime retry (issue #34). LAN mode deliberately has no public
@@ -428,8 +457,12 @@ std::size_t ToxAdapter::bootstrap() {
     if (config_.bootstrap_mode != BootstrapMode::Lan &&
         config_.bootstrap_retry_initial_delay.count() > 0) {
         std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+        if (bootstrap_retry_.worker_stop) {
+            bootstrap_retry_.worker_stop->store(true, std::memory_order_release);
+        }
         bootstrap_retry_.armed = true;
-        bootstrap_retry_.nodes = bootstrap_nodes;
+        bootstrap_retry_.nodes = std::move(resolved_nodes);
+        bootstrap_retry_.refreshed.reset();
         bootstrap_retry_.attempts = 0;
         bootstrap_retry_.delay = config_.bootstrap_retry_initial_delay;
         bootstrap_retry_.next_attempt = std::chrono::steady_clock::now() + bootstrap_retry_.delay;
@@ -456,30 +489,80 @@ std::size_t ToxAdapter::bootstrap() {
     return success_count;
 }
 
-std::size_t ToxAdapter::contact_bootstrap_nodes_locked(const std::vector<BootstrapNode>& nodes) {
-    std::size_t count = 0;
+std::vector<ToxAdapter::ResolvedBootstrapNode> ToxAdapter::resolve_bootstrap_addresses(
+    const std::vector<BootstrapNode>& nodes, const std::atomic<bool>* stop) const {
+    std::vector<ResolvedBootstrapNode> result;
+    result.reserve(nodes.size());
     for (const auto& node : nodes) {
-        TOX_ERR_BOOTSTRAP err;
-        bool ok =
-            tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
-
-        if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
-            ++count;
-            util::Logger::debug("Bootstrap success: {}:{}", node.ip, node.port);
+        if (auto address = numeric_bootstrap_address(node.ip)) {
+            result.push_back({node, {std::move(*address)}, false});
         } else {
-            util::Logger::warn("Bootstrap failed for {}:{} (error {})", node.ip, node.port,
-                               static_cast<int>(err));
+            result.push_back({node, {}, true});
         }
+    }
+    refresh_bootstrap_dns(result, stop);
+    return result;
+}
 
-        // Also add as TCP relay for TCP-only connections.
-        TOX_ERR_BOOTSTRAP relay_err;
-        tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
-                          &relay_err);
-
-        if (relay_err != TOX_ERR_BOOTSTRAP_OK) {
-            util::Logger::debug("TCP relay add failed for {}:{} (error {})", node.ip, node.port,
-                                static_cast<int>(relay_err));
+bool ToxAdapter::refresh_bootstrap_dns(std::vector<ResolvedBootstrapNode>& nodes,
+                                       const std::atomic<bool>* stop) const {
+    bool changed = false;
+    for (auto& entry : nodes) {
+        if (stop && stop->load(std::memory_order_acquire)) {
+            return false;
         }
+        if (!entry.needs_dns) {
+            continue;
+        }
+        const auto& hostname = entry.node.ip;
+        const auto ips = config_.bootstrap_dns_resolver ? config_.bootstrap_dns_resolver(hostname)
+                                                        : lookup_bootstrap_hostname(hostname);
+        std::vector<std::string> addresses;
+        for (const auto& ip : ips) {
+            if (auto numeric = numeric_bootstrap_address(ip);
+                numeric && std::ranges::find(addresses, *numeric) == addresses.end()) {
+                addresses.push_back(std::move(*numeric));
+            }
+        }
+        if (addresses.empty()) {
+            util::Logger::debug("Bootstrap DNS lookup failed for {}; cached addresses: {}",
+                                hostname, entry.addresses.size());
+        } else if (addresses != entry.addresses) {
+            entry.addresses = std::move(addresses);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+std::size_t ToxAdapter::contact_bootstrap_nodes_locked(
+    const std::vector<ResolvedBootstrapNode>& nodes, bool relay_on_failure) {
+    std::size_t count = 0;
+    for (const auto& entry : nodes) {
+        const auto& node = entry.node;
+        bool contacted = false;
+        for (const auto& address : entry.addresses) {
+            TOX_ERR_BOOTSTRAP err;
+            const bool ok =
+                tox_bootstrap(tox_.get(), address.c_str(), node.port, node.public_key.data(), &err);
+            if (ok) {
+                contacted = true;
+                util::Logger::debug("Bootstrap success: {}:{}", address, node.port);
+            } else {
+                util::Logger::warn("Bootstrap failed for {}:{} (error {})", address, node.port,
+                                   static_cast<int>(err));
+            }
+            if (ok || relay_on_failure) {
+                TOX_ERR_BOOTSTRAP relay_err;
+                tox_add_tcp_relay(tox_.get(), address.c_str(), node.port, node.public_key.data(),
+                                  &relay_err);
+                if (relay_err != TOX_ERR_BOOTSTRAP_OK) {
+                    util::Logger::debug("TCP relay add failed for {}:{} (error {})", address,
+                                        node.port, static_cast<int>(relay_err));
+                }
+            }
+        }
+        count += contacted;
     }
     return count;
 }
@@ -496,10 +579,9 @@ std::size_t ToxAdapter::bootstrap_node_count() const {
 
 void ToxAdapter::bootstrap_retry_tick() {
     // Runs on the Tox thread once per iteration. Everything below is a few
-    // loads and one mutex when armed; the expensive part (the fetch) lives on
-    // the worker.
+    // loads and one mutex when armed; node-list fetches and DNS run on the worker.
     const auto now = std::chrono::steady_clock::now();
-    std::vector<BootstrapNode> to_contact;
+    std::vector<ResolvedBootstrapNode> to_contact;
     bool log_status = false;
     bool spawn_fetch = false;
     unsigned attempt = 0;
@@ -514,7 +596,7 @@ void ToxAdapter::bootstrap_retry_tick() {
             return;
         }
         // Reap a finished worker so a later spawn never blocks on join().
-        if (!r.fetch_in_flight && r.worker.joinable()) {
+        if (!r.worker_in_flight && r.worker.joinable()) {
             r.worker.join();
         }
         if (connected_.load(std::memory_order_acquire)) {
@@ -528,13 +610,12 @@ void ToxAdapter::bootstrap_retry_tick() {
             r.last_status_log = now;
             return;
         }
-        if (r.has_fetched) {
-            // The worker deposited a fresh list: contact it right away, on this
-            // (the Tox) thread — the worker itself never touches tox_.
-            r.nodes = std::move(r.fetched);
-            r.fetched.clear();
-            r.has_fetched = false;
+        if (r.refreshed) {
+            // Contact a new list or changed addresses right away.
+            r.nodes = std::move(*r.refreshed);
+            r.refreshed.reset();
             to_contact = r.nodes;
+            attempt = r.attempts;
         }
         known_nodes = r.nodes.size();
         disconnected_for =
@@ -544,15 +625,36 @@ void ToxAdapter::bootstrap_retry_tick() {
             attempt = r.attempts;
             r.delay = std::min(r.delay * 2, config_.bootstrap_retry_max_delay);
             r.next_attempt = now + r.delay;
-            if (r.nodes.empty()) {
-                // Nothing to contact: the startup fetch failed with no cache.
-                // Fetch again — on the worker, which may block for curl's
-                // full timeout — unless a fetch is still running.
-                if (!r.fetch_in_flight) {
-                    spawn_fetch = true;
-                }
-            } else {
-                to_contact = r.nodes;
+            // Contact last-known addresses even while the resolver is stalled.
+            to_contact = r.nodes;
+            spawn_fetch = r.nodes.empty() && !r.worker_in_flight;
+            const bool refresh_dns =
+                !r.worker_in_flight &&
+                std::ranges::any_of(r.nodes, &ResolvedBootstrapNode::needs_dns);
+            if (spawn_fetch || refresh_dns) {
+                r.worker_in_flight = true;
+                r.worker_stop = std::make_shared<std::atomic<bool>>(false);
+                r.worker = std::thread([this, stop = r.worker_stop, nodes = r.nodes]() mutable {
+                    bool refreshed = false;
+                    if (nodes.empty()) {
+                        auto result = BootstrapSource::fetch_and_cache_default_nodes(
+                            config_.data_dir, config_.bootstrap_fetcher);
+                        if (result) {
+                            nodes = resolve_bootstrap_addresses(result.value(), stop.get());
+                            refreshed = true;
+                        } else {
+                            util::Logger::warn("Bootstrap node list fetch retry failed: {}",
+                                               result.error());
+                        }
+                    } else {
+                        refreshed = refresh_bootstrap_dns(nodes, stop.get());
+                    }
+                    std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
+                    if (refreshed && !stop->load(std::memory_order_acquire)) {
+                        bootstrap_retry_.refreshed = std::move(nodes);
+                    }
+                    bootstrap_retry_.worker_in_flight = false;
+                });
             }
         }
         next_in = std::chrono::duration_cast<std::chrono::seconds>(r.next_attempt - now);
@@ -566,28 +668,6 @@ void ToxAdapter::bootstrap_retry_tick() {
             log_status = true;
         }
         attempts_so_far = r.attempts;
-        if (spawn_fetch) {
-            r.fetch_in_flight = true;
-            r.worker_stop = std::make_shared<std::atomic<bool>>(false);
-            auto stop = r.worker_stop;
-            auto fetcher = config_.bootstrap_fetcher;
-            auto data_dir = config_.data_dir;
-            r.worker = std::thread([this, stop, fetcher, data_dir]() mutable {
-                auto result = BootstrapSource::fetch_and_cache_default_nodes(data_dir, fetcher);
-                std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
-                bootstrap_retry_.fetch_in_flight = false;
-                if (stop->load(std::memory_order_acquire)) {
-                    return;  // stop() won; the adapter is going away.
-                }
-                if (result) {
-                    bootstrap_retry_.fetched = std::move(result.value());
-                    bootstrap_retry_.has_fetched = true;
-                } else {
-                    util::Logger::warn("Bootstrap node list fetch retry failed: {}",
-                                       result.error());
-                }
-            });
-        }
     }
 
     if (!to_contact.empty()) {
@@ -613,20 +693,18 @@ void ToxAdapter::bootstrap_retry_tick() {
 
 void ToxAdapter::stop_bootstrap_retry_worker() {
     std::thread worker;
-    std::shared_ptr<std::atomic<bool>> stop;
     {
         std::lock_guard<std::mutex> lock(bootstrap_retry_.mutex);
         bootstrap_retry_.armed = false;
-        bootstrap_retry_.has_fetched = false;
-        bootstrap_retry_.fetched.clear();
+        bootstrap_retry_.refreshed.reset();
+        if (bootstrap_retry_.worker_stop) {
+            bootstrap_retry_.worker_stop->store(true, std::memory_order_release);
+            bootstrap_retry_.worker_stop.reset();
+        }
         worker = std::move(bootstrap_retry_.worker);
-        stop = std::move(bootstrap_retry_.worker_stop);
-    }
-    if (stop) {
-        stop->store(true, std::memory_order_release);
     }
     if (worker.joinable()) {
-        // Bounded by the fetcher's own timeout (curl --max-time 8).
+        // Wait for the OS resolver or the node-list fetch to return.
         worker.join();
     }
 }
@@ -636,22 +714,16 @@ bool ToxAdapter::add_bootstrap_node(const BootstrapNode& node) {
         return false;
     }
 
-    return run_on_tox_thread([&]() -> bool {
-        std::lock_guard<std::mutex> lock(tox_mutex_);
-
-        TOX_ERR_BOOTSTRAP err;
-        bool ok =
-            tox_bootstrap(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(), &err);
-
-        if (ok && err == TOX_ERR_BOOTSTRAP_OK) {
-            // Also add as TCP relay.
-            TOX_ERR_BOOTSTRAP relay_err;
-            tox_add_tcp_relay(tox_.get(), node.ip.c_str(), node.port, node.public_key.data(),
-                              &relay_err);
-            return true;
-        }
-
+    if (on_tox_thread() && !numeric_bootstrap_address(node.ip)) {
+        util::Logger::error(
+            "Bootstrap hostname must be submitted outside the Tox iteration thread");
         return false;
+    }
+
+    const auto nodes = resolve_bootstrap_addresses({node});
+    return run_on_tox_thread([&]() {
+        std::lock_guard<std::mutex> lock(tox_mutex_);
+        return contact_bootstrap_nodes_locked(nodes, /*relay_on_failure=*/false) != 0;
     });
 }
 
@@ -911,9 +983,16 @@ std::vector<FriendInfo> ToxAdapter::get_friend_info_list() const {
 // Data transfer
 // ===========================================================================
 
-ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(uint32_t friend_number,
-                                                                       const uint8_t* data,
-                                                                       std::size_t length) {
+void ToxAdapter::observe_send_bridge_wait(
+    std::chrono::steady_clock::time_point queued_at) noexcept {
+    const auto elapsed = std::chrono::steady_clock::now() - queued_at;
+    util::MetricsRegistry::instance().observe_send_bridge_wait_ms(
+        std::chrono::duration<double, std::milli>(elapsed).count());
+}
+
+ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(
+    uint32_t friend_number, const uint8_t* data, std::size_t length,
+    util::OutboundSession* session) {
     if (!initialized_.load() || !data || length == 0) {
         return LosslessSendOutcome::PermanentFail;
     }
@@ -934,7 +1013,7 @@ ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(uint32_t 
         return LosslessSendOutcome::SendqFull;
     }
 
-    return run_on_tox_thread([&]() -> LosslessSendOutcome {
+    return run_on_tox_thread</*MeasureSendWait=*/true>([&]() -> LosslessSendOutcome {
         TOX_ERR_FRIEND_CUSTOM_PACKET err = TOX_ERR_FRIEND_CUSTOM_PACKET_OK;
         bool ok = false;
         {
@@ -949,7 +1028,19 @@ ToxAdapter::LosslessSendOutcome ToxAdapter::send_lossless_packet_typed(uint32_t 
                 // failure, so not logged as one.
                 return LosslessSendOutcome::SendqFull;
             }
-            ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
+            {
+                // Acquire after the marshal and only around native enqueue.
+                // In particular, neither virtual friend-gate hook can run
+                // with the session permit held.
+                std::unique_lock<std::mutex> permit;
+                if (session) {
+                    permit = session->acquire();
+                    if (!permit) {
+                        return LosslessSendOutcome::PermanentFail;
+                    }
+                }
+                ok = tox_friend_send_lossless_packet(tox_.get(), friend_number, data, length, &err);
+            }
             if (ok && err == TOX_ERR_FRIEND_CUSTOM_PACKET_OK && send_gate_) {
                 send_gate_->on_accepted(gate_io_, friend_number, packet, now_ns);
             }
@@ -1015,7 +1106,7 @@ bool ToxAdapter::send_lossy_packet(uint32_t friend_number, const uint8_t* data,
         return false;
     }
 
-    return run_on_tox_thread([&]() -> bool {
+    return run_on_tox_thread</*MeasureSendWait=*/true>([&]() -> bool {
         std::lock_guard<std::mutex> lock(tox_mutex_);
 
         TOX_ERR_FRIEND_CUSTOM_PACKET err;

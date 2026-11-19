@@ -30,6 +30,24 @@ using tunnel::TunnelImpl;
 using tunnel::TunnelManager;
 using TeardownMode = TunnelManager::TeardownMode;
 
+TEST(SessionAbandonTest, ReentrantAbandonRevokesPreviouslyCopiedSendAtEnqueue) {
+    asio::io_context io_ctx;
+    auto manager = std::make_shared<TunnelManager>(io_ctx);
+    const auto session = manager->outbound_session();
+    bool enqueued = false;
+    manager->set_send_handler([&](const std::vector<uint8_t>&) {
+        // This handler was copied before the manager abandoned its session.
+        // The enqueue, like ToxAdapter's native call, has a separate permit.
+        manager->close_all_local();
+        auto permit = session->acquire();
+        enqueued = static_cast<bool>(permit);
+        return enqueued ? SendOutcome::Sent : SendOutcome::PermanentFail;
+    });
+
+    EXPECT_EQ(manager->send_frame_typed(ProtocolFrame::make_ping()), SendOutcome::PermanentFail);
+    EXPECT_FALSE(enqueued);
+}
+
 /// Every frame a tunnel hands to "toxcore", decoded. `outcome` scripts the
 /// transport's answer.
 struct Wire {

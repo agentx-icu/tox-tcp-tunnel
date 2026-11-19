@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -9,6 +10,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -23,6 +25,7 @@
 #include "toxtunnel/tox/tox_ptr.hpp"
 #include "toxtunnel/tox/types.hpp"
 #include "toxtunnel/util/expected.hpp"
+#include "toxtunnel/util/outbound_session.hpp"
 
 namespace toxtunnel::tox {
 
@@ -121,6 +124,10 @@ struct ToxAdapterConfig {
     /// means the default (`curl https://nodes.tox.chat/json`); tests inject a
     /// fake so the retry path can be driven without a network.
     BootstrapSource::Fetcher bootstrap_fetcher;
+
+    /// Optional bootstrap DNS resolver. An empty result means lookup failed.
+    /// Calls run outside the Tox thread and return numeric IP addresses.
+    std::function<std::vector<std::string>(const std::string&)> bootstrap_dns_resolver;
 
     /// First delay before the DHT-bootstrap retry (issue #34); doubles on
     /// every failed attempt up to `bootstrap_retry_max_delay`. Tests shorten
@@ -248,7 +255,8 @@ class ToxAdapter {
     /// startup fetch of the public node list failed and no cache existed —
     /// fetches it again on a worker thread that never touches toxcore. A
     /// transient network failure at startup is therefore no longer permanent
-    /// for the life of the process. Not armed in LAN mode.
+    /// for the life of the process. Not armed in LAN mode. Initial DNS lookup
+    /// runs on the caller; call this from outside the Tox iteration thread.
     ///
     /// @return The number of nodes that were successfully contacted.
     [[nodiscard]] std::size_t bootstrap();
@@ -264,6 +272,7 @@ class ToxAdapter {
                                        BootstrapSource::Fetcher fetcher = {});
 
     /// Add a single bootstrap node at runtime and attempt to connect.
+    /// Hostnames must be passed from outside the Tox iteration thread.
     ///
     /// @return true if the bootstrap attempt succeeded, false otherwise.
     [[nodiscard]] bool add_bootstrap_node(const BootstrapNode& node);
@@ -349,9 +358,9 @@ class ToxAdapter {
     /// backpressure from permanent failure. Prefer this for control-frame
     /// paths that may want to queue-and-retry the SENDQ-full case but bail
     /// out (and surface the failure to the caller) for permanent errors.
-    [[nodiscard]] LosslessSendOutcome send_lossless_packet_typed(uint32_t friend_number,
-                                                                 const uint8_t* data,
-                                                                 std::size_t length);
+    [[nodiscard]] LosslessSendOutcome send_lossless_packet_typed(
+        uint32_t friend_number, const uint8_t* data, std::size_t length,
+        util::OutboundSession* session = nullptr);
 
     /// Send a custom lossless packet to a friend.
     ///
@@ -474,8 +483,10 @@ class ToxAdapter {
     ///     still serialises against any in-flight iterate.
     ///   * Otherwise @p fn is posted to the Tox thread and the caller
     ///     blocks on a future until it has executed.
-    template <typename Fn>
+    template <bool MeasureSendWait = false, typename Fn>
     std::invoke_result_t<Fn> run_on_tox_thread(Fn&& fn);
+
+    static void observe_send_bridge_wait(std::chrono::steady_clock::time_point queued_at) noexcept;
 
     /// True if the calling thread is the dedicated Tox iterate thread.
     [[nodiscard]] bool on_tox_thread() const noexcept;
@@ -487,16 +498,27 @@ class ToxAdapter {
     /// The tox_iterate loop executed on the dedicated thread.
     void run_loop();
 
-    /// Contact every node in @p nodes (tox_bootstrap + tox_add_tcp_relay).
-    /// Must run on the Tox thread with `tox_mutex_` held. Returns how many
-    /// tox_bootstrap calls succeeded.
-    std::size_t contact_bootstrap_nodes_locked(const std::vector<BootstrapNode>& nodes);
+    struct ResolvedBootstrapNode {
+        BootstrapNode node;
+        std::vector<std::string> addresses;  ///< last good numeric addresses
+        bool needs_dns{false};
+    };
+
+    std::vector<ResolvedBootstrapNode> resolve_bootstrap_addresses(
+        const std::vector<BootstrapNode>& nodes, const std::atomic<bool>* stop = nullptr) const;
+    bool refresh_bootstrap_dns(std::vector<ResolvedBootstrapNode>& nodes,
+                               const std::atomic<bool>* stop = nullptr) const;
+
+    /// Contact numeric addresses only, with `tox_mutex_` held. Count each
+    /// logical node once even if more than one of its addresses succeeds.
+    std::size_t contact_bootstrap_nodes_locked(const std::vector<ResolvedBootstrapNode>& nodes,
+                                               bool relay_on_failure = true);
 
     /// One step of the DHT-bootstrap retry, run by the iterate loop after
     /// every iteration (cheap when nothing is due). Adapter-owned state, so a
     /// stop()/start() cycle or a second adapter can never observe another's
     /// worker result. Only the Tox thread consumes a fetched list and calls
-    /// toxcore; the fetch worker only fetches, parses, caches and deposits.
+    /// toxcore; the worker handles node-list fetching and DNS.
     void bootstrap_retry_tick();
 
     /// Ask the fetch worker (if any) to stop and join it. Called from stop().
@@ -612,11 +634,10 @@ class ToxAdapter {
     /// worker thread is owned here, never process-global.
     struct BootstrapRetry {
         mutable std::mutex mutex;
-        bool armed{false};                   ///< set by bootstrap(), cleared by stop()
-        std::vector<BootstrapNode> nodes;    ///< last known list (may be empty)
-        std::vector<BootstrapNode> fetched;  ///< deposited by the worker, consumed by the tick
-        bool has_fetched{false};
-        bool fetch_in_flight{false};
+        bool armed{false};  ///< set by bootstrap(), cleared by stop()
+        std::vector<ResolvedBootstrapNode> nodes;
+        std::optional<std::vector<ResolvedBootstrapNode>> refreshed;
+        bool worker_in_flight{false};
         std::thread worker;
         std::shared_ptr<std::atomic<bool>> worker_stop;
         std::chrono::steady_clock::time_point next_attempt{};
@@ -698,7 +719,7 @@ void ToxAdapter::enqueue_event(Event&& event) {
     pending_events_.emplace_back(std::forward<Event>(event));
 }
 
-template <typename Fn>
+template <bool MeasureSendWait, typename Fn>
 std::invoke_result_t<Fn> ToxAdapter::run_on_tox_thread(Fn&& fn) {
     using Result = std::invoke_result_t<Fn>;
 
@@ -724,7 +745,7 @@ std::invoke_result_t<Fn> ToxAdapter::run_on_tox_thread(Fn&& fn) {
             // the lambda move-only and fail to compile).
             auto promise = std::make_shared<std::promise<Result>>();
             std::future<Result> future = promise->get_future();
-            tox_tasks_.emplace_back([fn = std::forward<Fn>(fn), promise]() mutable {
+            auto task = [fn = std::forward<Fn>(fn), promise]() mutable {
                 try {
                     if constexpr (std::is_void_v<Result>) {
                         fn();
@@ -735,7 +756,16 @@ std::invoke_result_t<Fn> ToxAdapter::run_on_tox_thread(Fn&& fn) {
                 } catch (...) {
                     promise->set_exception(std::current_exception());
                 }
-            });
+            };
+            if constexpr (MeasureSendWait) {
+                const auto queued_at = std::chrono::steady_clock::now();
+                tox_tasks_.emplace_back([task = std::move(task), queued_at]() mutable {
+                    observe_send_bridge_wait(queued_at);
+                    task();
+                });
+            } else {
+                tox_tasks_.emplace_back(std::move(task));
+            }
             lock.unlock();
             // Wake the iterate loop so the task is picked up without waiting
             // for the next idle tick.

@@ -327,6 +327,7 @@ class Daemon:
             return {}
         keep = ("toxtunnel_tunnel_rtt_microseconds", "toxtunnel_tunnel_send_window_bytes",
                 "toxtunnel_tunnel_bandwidth_bytes_per_second", "toxtunnel_tox_iterate_lag",
+                "toxtunnel_tox_send_bridge_wait_milliseconds",
                 "toxtunnel_bytes_in_total", "toxtunnel_bytes_out_total")
         out = {}
         for line in body.splitlines():
