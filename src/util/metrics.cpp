@@ -102,6 +102,9 @@ void MetricsRegistry::reset() {
     iterate_lag_count_.store(0, std::memory_order_relaxed);
     iterate_lag_sum_ms_.store(0.0, std::memory_order_relaxed);
     iterate_lag_max_ms_.store(0.0, std::memory_order_relaxed);
+    send_bridge_wait_count_.store(0, std::memory_order_relaxed);
+    send_bridge_wait_sum_ms_.store(0.0, std::memory_order_relaxed);
+    send_bridge_wait_max_ms_.store(0.0, std::memory_order_relaxed);
     outbound_buffer_allocs_.store(0, std::memory_order_relaxed);
     outbound_buffer_reuse_.store(0, std::memory_order_relaxed);
     outbound_buffer_overflow_.store(0, std::memory_order_relaxed);
@@ -191,6 +194,15 @@ void MetricsRegistry::observe_iterate_lag_ms(double ms) {
     iterate_lag_count_.fetch_add(1, std::memory_order_relaxed);
     atomic_add_double(iterate_lag_sum_ms_, ms);
     atomic_max_double(iterate_lag_max_ms_, ms);
+}
+
+void MetricsRegistry::observe_send_bridge_wait_ms(double ms) noexcept {
+    if (ms < 0.0 || std::isnan(ms)) {
+        return;
+    }
+    send_bridge_wait_count_.fetch_add(1, std::memory_order_relaxed);
+    atomic_add_double(send_bridge_wait_sum_ms_, ms);
+    atomic_max_double(send_bridge_wait_max_ms_, ms);
 }
 
 void MetricsRegistry::inc_outbound_buffer_allocs() {
@@ -470,6 +482,18 @@ std::string MetricsRegistry::render() const {
            "# TYPE toxtunnel_tox_iterate_lag_milliseconds_max gauge\n"
            "toxtunnel_tox_iterate_lag_milliseconds_max "
         << format_double(max) << "\n";
+
+    out << "# HELP toxtunnel_tox_send_bridge_wait_milliseconds Time from posting a packet send "
+           "until its task starts.\n"
+           "# TYPE toxtunnel_tox_send_bridge_wait_milliseconds summary\n"
+           "toxtunnel_tox_send_bridge_wait_milliseconds_count "
+        << send_bridge_wait_count_.load(std::memory_order_relaxed) << "\n"
+        << "toxtunnel_tox_send_bridge_wait_milliseconds_sum "
+        << format_double(send_bridge_wait_sum_ms_.load(std::memory_order_relaxed)) << "\n"
+        << "# HELP toxtunnel_tox_send_bridge_wait_milliseconds_max Maximum observed send wait.\n"
+           "# TYPE toxtunnel_tox_send_bridge_wait_milliseconds_max gauge\n"
+           "toxtunnel_tox_send_bridge_wait_milliseconds_max "
+        << format_double(send_bridge_wait_max_ms_.load(std::memory_order_relaxed)) << "\n";
 
     // Outbound zero-copy counters (Wave B).
     out << "# HELP toxtunnel_outbound_buffer_allocs_total OwnedFrameBuffer allocations for "

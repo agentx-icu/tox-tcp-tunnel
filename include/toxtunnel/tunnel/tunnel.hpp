@@ -374,6 +374,16 @@ class TunnelImpl : public Tunnel {
     void close_for_timeout();
 
    private:
+    friend class TunnelManager;
+
+    // The manager holds the reaper generation and the map entry stable
+    // through this claim. Running the resulting driver work is separate.
+    enum class TimeoutClose { Graceful, Unpublished, Cleanup, Error, ErrorWithoutTransport };
+    [[nodiscard]] std::optional<TimeoutClose> claim_timeout_close(int64_t idle_timeout_ns,
+                                                                  int64_t half_close_timeout_ns);
+    void finish_timeout_close(TimeoutClose claim);
+    [[nodiscard]] bool claim_graceful_close_locked();
+
     /// Local (we-initiated) closes are booked as Local, unless a maintenance
     /// timer is the one closing us — see close_for_timeout().
     [[nodiscard]] util::MetricsRegistry::CloseReason local_close_reason() const noexcept;
@@ -1118,6 +1128,8 @@ class TunnelImpl : public Tunnel {
     /// must treat the transport as settled — signalled via
     /// `*transport_settled_immediately`.
     bool claim_terminal_error(std::vector<std::uint8_t> wire, bool* transport_settled_immediately);
+    [[nodiscard]] bool claim_terminal_error_locked(std::vector<std::uint8_t> wire,
+                                                   bool* transport_settled_immediately);
 
     /// Publish-then-arm for the ERROR SENDQ retry timer. Ownership
     /// (`error_retry_armed_` + epoch + attempt) must already be published in
@@ -1215,22 +1227,7 @@ class TunnelImpl : public Tunnel {
     /// `coalesce_mutex_`. Never emits — emission belongs to the driver.
     void fifo_append_locked(std::span<const uint8_t> data, std::size_t cap);
 
-    /// Publish the terminal `Abort` intent (slice 3 of the outbound-send
-    /// driver design, issue #24): seal ordinary DATA admission and abandon
-    /// everything undelivered — the cohort FIFO and any deferred-close
-    /// bookkeeping riding on its drain. The caller must hold
-    /// `coalesce_mutex_`, which is what makes the seal atomic with the
-    /// abandonment: an admission racing this either lands before (and is
-    /// abandoned) or re-checks the seal after and is refused.
-    ///
-    /// In the design's `LocalTerminalIntent` ladder (None < LocalEof <
-    /// GracefulClose < Abort) only `Abort` is materialized so far — the two
-    /// graceful levels still live in the flags that predate the ladder
-    /// (`pending_tcp_eof_` / `close_pending_`), because enforcing them on
-    /// ordinary admission requires the slice-4 privileged capability that
-    /// drains the sealed pending-TCP backlog. No graceful operation may ever
-    /// route through here: Abort abandons bytes, and `close()` / TCP EOF owe
-    /// theirs to the peer.
+    /// Seal DATA admission and discard all queued DATA under coalesce_mutex_.
     void publish_abort_locked();
 
     /// THE single outbound emission driver for TUNNEL_DATA (slice 2 of the
@@ -1266,13 +1263,15 @@ class TunnelImpl : public Tunnel {
     /// TCP half-close: the peer may still send data until its own close.
     void emit_local_close_only();
 
-    /// Flush TCP bytes already read locally but still buffered behind the
-    /// tunnel send window. Returns true when the backlog is now empty.
-    bool flush_pending_tcp_input();
+    /// Hand pending input to the same FIFO as ordinary DATA. The cursor
+    /// advances under the admission lock, before a transport callback can run.
+    void flush_pending_tcp_input();
 
-    /// Local TCP EOF can arrive while `pending_tcp_input_` still holds bytes
-    /// waiting for an ACK-driven retry. Finish the half-close once they drain.
-    void maybe_finish_pending_tcp_eof();
+    [[nodiscard]] std::size_t send_window_available_locked() const noexcept;
+    [[nodiscard]] std::size_t outbound_capacity_locked() const noexcept;
+    [[nodiscard]] std::size_t outbound_pending_locked() const noexcept;
+    [[nodiscard]] CoalescePolicy admit_data_locked(std::span<const uint8_t> data);
+    void drive_admitted_data(CoalescePolicy policy);
 
     /// Complete a peer-initiated close after any outbound buffered DATA has
     /// drained. Must be called WITHOUT `coalesce_mutex_` held.
@@ -1295,7 +1294,7 @@ class TunnelImpl : public Tunnel {
     }
 
     /// Live bytes still queued in `pending_tcp_input_` (total minus the
-    /// already-sent prefix). The caller must hold `tcp_backpressure_mutex_`.
+    /// handed-off prefix). The caller must hold `coalesce_mutex_`.
     [[nodiscard]] std::size_t pending_tcp_pending_locked() const noexcept {
         return pending_tcp_input_.size() - pending_tcp_consumed_;
     }
@@ -1602,17 +1601,14 @@ class TunnelImpl : public Tunnel {
     // handed to Tox; otherwise full-duplex streams such as SSH stdout truncate
     // when the peer closes first.
     bool remote_close_pending_{false};
-    // Bytes already read from the local TCP socket but not yet admitted into
-    // the tunnel send window. Retried when ACKs reopen space. Consumed via the
-    // `pending_tcp_consumed_` read cursor and compacted lazily (see
-    // flush_pending_tcp_input) so draining a large backlog stays O(n), not the
-    // O(n^2) that erase-from-front per chunk produced.
+    // Both queues and the local terminal intent share coalesce_mutex_. The
+    // pending queue holds bytes already accepted from TCP but still waiting
+    // for a send-window reservation. Only flush_pending_tcp_input can move
+    // those bytes into a cohort after local admission has sealed.
+    enum class LocalTerminalIntent { None, Eof, GracefulClose, Abort };
+    LocalTerminalIntent local_terminal_intent_{LocalTerminalIntent::None};
     std::vector<std::uint8_t> pending_tcp_input_;
     std::size_t pending_tcp_consumed_{0};
-    // Local TCP EOF arrived while `pending_tcp_input_` was non-empty; defer the
-    // directional TUNNEL_CLOSE until those bytes flush.
-    bool pending_tcp_eof_{false};
-    mutable std::mutex tcp_backpressure_mutex_;
 
     // Adaptive coalescer + BDP flow control. Updated on the data path.
     WriteCoalescer coalescer_;

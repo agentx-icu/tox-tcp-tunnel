@@ -1,6 +1,6 @@
 # Outbound send driver — approved design
 
-Status: **approved, slices 1-3 implemented.** Slice 1 (typed seam + handshake)
+Status: **slices 1–5 implemented.** Slice 1 (typed seam + handshake)
 shipped in v0.4.13. Slice 2 (cohort FIFO + the single emission driver for DATA)
 is implemented on master: no Tox send callback runs under `coalesce_mutex_` on
 any DATA path any more, and the deferred-close bookkeeping moved from the flush
@@ -21,9 +21,12 @@ line. The full R-numbered review history and the completion plan live in
 separately: resume stale-ACK identity (#28), pre-existing exception-safety
 debt in stop/destructor/completion handlers (#29), manager pending-queue
 session provenance (#30), and the resume-abort integration regressions (#31).
-Slices 4-5 (pending-backlog seal, privileged capability, aggregate cap, the
-strong `close_all_local()` fence) remain open and are tracked as
-https://github.com/agentx-icu/tox-tcp-tunnel/issues/24.
+The pending TCP queue, cohort FIFO and local terminal intent now share one
+admission lock. Session abandonment closes a permit at the native enqueue.
+See the implementation notes below for [#24][issue24] and [#25][issue25].
+
+[issue24]: https://github.com/agentx-icu/tox-tcp-tunnel/issues/24
+[issue25]: https://github.com/agentx-icu/tox-tcp-tunnel/issues/25
 
 This document exists because the design took nine rounds of independent review
 to converge, and eight of those rounds were rejections that each found a real
@@ -39,17 +42,16 @@ callback **while holding `coalesce_mutex_`**: the buffered drain
 (snapshot under the lock, call outside it), and `OutboundSnapshot`'s own
 documentation already promised callbacks run with no lock held. Slice 2
 replaced both with `run_emission_driver` + the cohort FIFO; the CLOSE/ERROR
-paths (slice 3) and the pending-backlog seal (slice 4) remain.
+paths and the pending-backlog seal are described below.
 
-It is not a tidiness problem. The coupling has produced a series of real bugs —
-truncation, reordering, and teardown failures — because the mutex is invisible
-at the callback end: nothing there hints that a close re-enters a lock the
-caller already holds. Concretely it forced two compromises:
+It is not a tidiness problem. The coupling caused truncation, reordering and teardown failures because a
+callback could close a tunnel while the caller still held its admission lock.
+The earlier implementation had two compromises:
 
-- `force_close()` cannot flush once re-entered from inside a send, so it takes a
-  local-abandon path guarded by the outbound gate.
-- `close_all_local()` cannot wait for in-flight sends, so its documented
-  residual is that a send authorised just before the gate closed may still land.
+- A reentrant `force_close()` could not flush safely and used the local-abandon
+  path when the outbound gate was closed.
+- A previously copied callback could enqueue a packet after
+  `close_all_local()` returned.
 
 ## The shape of the fix
 
@@ -103,44 +105,17 @@ it closes the gate: one authority, not two.
 
 ### Two queues, one model
 
-`pending_tcp_input_` is a second admission queue under a *different* mutex
-(`tcp_backpressure_mutex_`). Three paths reach it without consulting the
-coalesce gate, so a bare atomic flag leaves a check-then-append race.
+The pending input and cohort FIFO share `coalesce_mutex_`. Ordinary admission
+queues behind a pending remainder. Pending handoff computes the window credit,
+appends to the cohort FIFO and commits the pending cursor in the same critical
+section. Another ACK can observe the old owner or the new owner, never both.
+It always checks the current queues again after crediting the window.
 
-The terminal claim therefore **seals** the backlog: publish the intent, then take
-`tcp_backpressure_mutex_` once and mark it sealed. Because every append holds
-that same mutex, the seal is a clean cut — every append is unambiguously before
-or after it.
-
-The seal alone is not enough. The ACK-driven drain selects a chunk, drops the
-mutex to send, and a claim can seal while the cursor still covers that chunk —
-sending the same bytes twice. So ownership spans
-`select chunk -> common admission -> cursor commit`, single-flight under
-`tcp_backpressure_mutex_`, and:
-
-- the pending cursor is committed when the **cohort FIFO accepts ownership**, not
-  when the transport callback succeeds. Bytes must never exist in a cohort and
-  the backlog simultaneously.
-- ordinary admission **queues behind any unhandled pending remainder**. Otherwise
-  a callback-reentrant `send_data_to_tox(C)` during the handoff of `A1` with
-  remainder `A2` produces `A1, C, A2`.
-- an ACK that finds an existing owner **records a kick/generation**; otherwise it
-  can reopen the window exactly as the owner parks and the only wakeup is lost.
-  The owner re-reads the kick before releasing ownership.
-- the owner re-loops only when the kick changed **and progress is possible** — a
-  kick with the window still closed must not spin.
-
-Draining the sealed backlog needs a **privileged capability**: ordinary
-`send_data_to_tox()` must reject once a terminal intent is published, so it
-cannot also be the thing that drains pre-claim bytes. The capability is
-non-copyable, generation-bound to the pending owner, kept off the public
-signature, and converges with ordinary admission **before** window accounting,
-metrics, activity, cohort tagging and retry. It may bypass `LocalEof` /
-`GracefulClose`; never `Abort`, never the session outbound gate.
-
-Pre-claim bytes: `LocalEof` and `GracefulClose` **drain** the sealed backlog
-before CLOSE — they are bytes already read off the local socket and owed to the
-peer. `Abort` abandons them, deliberately.
+EOF and graceful close seal ordinary admission. The private pending handoff can
+still move bytes it already owns into cohorts. It uses the same accounting and
+coalescing logic as ordinary admission, and both reject an Abort. The driver
+waits for both queues before emitting a graceful CLOSE. Abort clears both
+queues, including the deferred-close bookkeeping.
 
 ### Fragmentation cohorts
 
@@ -205,23 +180,13 @@ additive.
 
 ### Bounds
 
-One aggregate cap over pending backlog + cohort FIFO + in-flight owner bytes,
-not per-queue. It must reserve capacity for one maximum TCP read:
-`TcpConnection` hands out a borrowed buffer valid only during the callback, so
-refusing ownership near the cap either drops those bytes or blows the cap by
-copying them anyway. Pause at `cap - read_buffer_size` with an explicit
-outstanding-read reservation, require `cap >= maximum_read_size`, and release the
-reservation on success, EOF, error and cancellation.
-
-TCP read admission must be centralized. `TcpConnection` exposes a single pause
-bit while the ACK path can call `resume_read()` directly; the aggregate-cap
-reservation and send-window backpressure have to compose as pause *reasons*, and
-neither may resume reads while the other is still active.
-
-Internal admission returns `{accepted, should_pause}`. The public boolean keeps
-its meaning ("ownership accepted") — `on_tcp_data_received()` currently pauses
-only when admission returns false, so "accepted but queued behind the barrier"
-would otherwise fail to pause and let the backlog grow.
+The configured maximum send window bounds the sum of pending input, cohort
+bytes and the selected frame. The selected frame stays charged to its cohort
+until its send verdict is committed. Ordinary producers cannot borrow the
+extra capacity reserved for the TCP connection's one outstanding read. The
+TCP callback pauses further reads while input remains pending, the send window
+is full, or that extra capacity is still in use. An ACK checks all three
+conditions before resuming reads.
 
 ### `send_error()` ordering
 
@@ -242,33 +207,23 @@ state/error callback, because those callbacks can re-enter admission.
    no lock held), cohorts tagged with their admission cap, `EmitOutcome` with
    `DeferredToActiveEmitter` distinct from satisfied, and the deferred-close
    bookkeeping executed by whichever emitter completes the drain.
-3. **Partially implemented: terminal Abort ordering.** Landed: `send_error()`
-   reordering (seal admission + abandon DATA + claim the one terminal ERROR
-   atomically, callbacks outside the mutex; the seal also fences the CLOSE
-   obligation via `cancel_close_retry`, covering Owed and InFlight),
-   `close_outbound_gate()` publishing `Abort` in the gate's own critical
-   section, `force_close()` flushing best-effort BEFORE its CLOSE
-   announcement and abandoning the rest, the graceful close/EOF/remote-close
-   paths and the driver's pre-callback check consulting the seal, and the
-   driver tolerating a mid-flight abandonment. CLOSE retention/retry on the
-   SENDQ cadence predates this slice (`CloseFrameState` + `sendq_retry`), and
-   DATA-before-CLOSE ordering is the slice-2 drain-complete bookkeeping.
-   **Still open:** routing the CLOSE/ERROR emissions themselves through
-   `run_emission_driver`, so that literally no second path invokes a send
-   callback. **Documented residual (closed by that same open work, not by
-   slice 5):** a CLOSE that claims InFlight and then stalls before its
-   transport call can still land after a concurrent terminal ERROR — the
-   pre-transport recheck in `emit_close_frame_once` narrows that window to
-   the same allowance granted an already-authorised DATA callback, and the
-   single serialized owner for CLOSE/ERROR eliminates it outright (an ERROR
-   queues behind an already-authorised CLOSE, or cancels one not yet
-   selected). A `terminal_error_in_flight_` fence keeps the id from being
-   recycled while the ERROR's own transport attempt is outstanding.
-4. Pending-backlog seal, handoff ownership, privileged capability, aggregate cap.
-5. Only then: revisit the strong `close_all_local()` fence and whether the
-   `force_close()` local-abandon guard can be removed. Removing the mutex hold is
-   **necessary but not sufficient** for the fence — an in-flight wait still needs
-   an explicit answer for teardown invoked from inside the send being waited on.
+3. **Terminal ordering.** The driver owns terminal CLOSE and ERROR selection.
+   Abort shuts admission before a pending ERROR is driven. The close obligation
+   and ERROR settle latch hold the tunnel id until their terminal sends settle.
+4. **Pending input.** EOF and graceful close seal admission, and pending handoff
+   moves the already-owned bytes to the driver before calling transport. Both
+   queues share the capacity limit and one TCP read reservation.
+5. **Session abandonment.** Production packet callbacks take a per-manager
+   permit on the Tox thread immediately before native enqueue.
+   `close_all_local()` revokes that permit before local teardown. This settles
+   already-started native enqueues without waiting for reentrant callbacks or
+   I/O threads blocked on the Tox thread. Toxcore owns packets that were already
+   accepted. `force_close()` still skips flushing an abandoned session.
+
+The reaper captures exact tunnel instances and atomically claims a timeout
+under the matching manager epoch and tunnel admission lock. It dispatches
+transport and user callbacks after releasing both the generation and map
+locks. A stale scan cannot claim a replacement with the same numeric id.
 
 ## Mistakes this design already made, so they are not made again
 

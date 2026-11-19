@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "toxtunnel/tunnel/tunnel.hpp"
+#include "toxtunnel/util/outbound_session.hpp"
 
 namespace toxtunnel::tunnel {
 
@@ -402,76 +403,22 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// Close all tunnels and clear the manager.
     void close_all(TeardownMode mode = TeardownMode::Graceful);
 
-    /// Abandon this manager's session locally: stop authorising sends, then
-    /// release local state.
+    /// Permanently abandon this session and release its local sockets and ids.
     ///
-    /// For a manager whose peer has already moved on to a new session — a held
-    /// manager that lost a race to a freshly created one — `close_all()` is
-    /// actively harmful: tunnel ids are per-friend and recycled, so the
-    /// TUNNEL_CLOSE frames this session would emit can close the *winner's*
-    /// identically-numbered tunnels on the peer. This suppresses those frames
-    /// and only releases local state (target TCP sockets, tunnel ids).
-    ///
-    /// The mute is a **manager-level, one-way latch** (`outbound_muted()`), not
-    /// a per-tunnel callback swap: every outbound path — `send_frame()`,
-    /// `create_tunnel()`, `queue_outbound_for_retry()` and the
-    /// `pending_outbound_` drain, including a drain already running that still
-    /// holds a copy of the old send handler — checks it and discards. The
-    /// manager's own timers (keepalive PING, maintenance reaper) are stopped
-    /// first so they cannot generate new traffic mid-teardown. Once latched, no
-    /// outbound path will authorise another frame; the manager exists only to
-    /// be destroyed.
-    ///
-    /// The gate is raised in the SAME critical section that hands out
-    /// `SendSnapshot`s and copies the callback. That closes the check-to-call
-    /// seam: no caller can *acquire* a callback snapshot after the relevant
-    /// gate closes. Note "after the gate closes", not "after this call begins" —
-    /// the manager gate is raised in step 3 and the per-tunnel gates in step 4,
-    /// so a snapshot taken in the interim is still valid.
-    ///
-    /// Be precise about what that buys, because it is less than it sounds.
-    /// The gate stops new callback **snapshots**, not new callback
-    /// **invocations**. A sender that took its snapshot microseconds before the
-    /// latch can be descheduled between the snapshot and the call, and run its
-    /// send after this function has returned. So the post-condition is:
-    ///
-    /// > **After the gate closes, no new callback snapshot can be acquired;
-    /// > sends already authorised by a pre-gate snapshot may still start and
-    /// > land.**
-    ///
-    /// That admits several concurrent sends, and `TUNNEL_DATA` among them —
-    /// not merely a CLOSE/ERROR callback already entered.
-    ///
-    /// What this deliberately does NOT do is wait for those sends. An earlier
-    /// version blocked until every pre-gate snapshot was released, aiming for
-    /// "nothing of this session is on the wire when we return". That was
-    /// unreachable from here: a send callback that tears its own tunnel down
-    /// re-enters `force_close()` → `flush_pending_writes()` → the emission
-    /// driver, which cannot *wait* for the in-flight send it was called from
-    /// (the driver no longer holds `coalesce_mutex_` across a send since slice
-    /// 2, so this is no longer a deadlock — but the wait is still meaningless).
-    /// Because this
-    /// runs on the strand that also carries inbound frames, the cure was worse
-    /// than the disease: an indefinite data stall traded for one stale frame on
-    /// an opt-in code path. (That re-entrant route is separately defused —
-    /// `force_close()` skips the flush once the gate is closed — but the wait
-    /// remains the wrong tool.)
-    ///
-    /// The send path no longer holds a lock across the Tox call (slice 2
-    /// removed that), so the old deadlock is gone; the residual that remains is
-    /// a *pre-gate snapshot* one — a sender that copied the callback
-    /// microseconds before the gate closed can still land its frame. The
-    /// consequence is a stale frame from an abandoned session, which the peer
-    /// may map onto a recycled tunnel id. This is reachable only on the
-    /// default-off resume path's loser-manager race, and closing it needs the
-    /// session-generation machinery tracked separately (issue #30), not a
-    /// patch here.
+    /// Close the native enqueue gate before clearing local state. A send
+    /// callback copied earlier can still run, but its production Tox enqueue
+    /// must obtain the same permit after it reaches the Tox thread. Teardown
+    /// waits only for an already-started native enqueue, never for a callback
+    /// or an I/O worker waiting on the Tox thread. Already queued packets
+    /// are owned by toxcore and cannot be withdrawn.
     void close_all_local();
 
-    /// True once `close_all_local()` has abandoned this manager. Frames handed
-    /// to an outbound path after that point are discarded rather than sent. A
-    /// frame already authorised by a pre-gate snapshot is not covered — see
-    /// `close_all_local()`.
+    /// Native enqueue fence shared by all send callbacks for this manager.
+    [[nodiscard]] const std::shared_ptr<util::OutboundSession>& outbound_session() const noexcept {
+        return outbound_session_;
+    }
+
+    /// True once this manager has latched local abandonment.
     [[nodiscard]] bool outbound_muted() const noexcept;
 
     // -----------------------------------------------------------------
@@ -667,23 +614,9 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     // Outbound send-handler snapshot — see close_all_local()
     // -----------------------------------------------------------------
 
-    /// An authorisation to call `send_handler_`, plus the handler copy itself.
-    ///
-    /// This tracks nothing and owns no resource. Nothing can enumerate the
-    /// outstanding ones, and nothing can wait on them — that capability was
-    /// removed along with the teardown drain (see close_all_local()). It was
-    /// once called `SendLease`, and the name kept inviting the withdrawn
-    /// "in-flight / drain / RAII" reading back into the docs.
-    ///
-    /// Construction takes `handler_mutex_` once and atomically tests the
-    /// outbound gate and copies the handler. The handler itself is then called
-    /// with NO lock held (it re-enters ToxAdapter and, on a permanent failure,
-    /// the owning server — H-01 forbids doing that under one of this class's
-    /// locks). Testing and copying together is the only thing this promises: it
-    /// removes the check-to-call seam, so no caller can *acquire* a handler copy
-    /// after the gate closed. A caller that acquired one microseconds BEFORE the
-    /// gate closed still holds it and may still call it — see close_all_local()
-    /// for that residual and for why waiting on it deadlocks.
+    /// Test the callback gate and copy the handler under handler_mutex_.
+    /// Invoke the copy unlocked. Production handlers take an independent
+    /// native-enqueue permit on the Tox thread.
     class SendSnapshot {
        public:
         explicit SendSnapshot(TunnelManager& manager);
@@ -826,6 +759,8 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     /// after `close_all_local()` has closed the gate. Snapshots taken *before*
     /// it are unaffected and may still call their copy.
     bool send_gate_closed_{false};
+    const std::shared_ptr<util::OutboundSession> outbound_session_ =
+        std::make_shared<util::OutboundSession>();
 
     /// Serialises every state transition of `reaper_timer_` and
     /// `keepalive_timer_`.
@@ -843,11 +778,9 @@ class TunnelManager : public std::enable_shared_from_this<TunnelManager> {
     ///     `cancel` / `async_wait` on the same object. This mutex is the only
     ///     thing serialising them.
     ///
-    /// Discipline: it is a LEAF. Nothing that can re-enter this class (a send,
-    /// a reap, an application callback) may run while it is held; the tick
-    /// handler therefore does its work unlocked and only takes it for the entry
-    /// check and the re-arm. `steady_timer::cancel()` never invokes handlers
-    /// inline (asio posts them), so cancelling under it is safe.
+    /// No callback runs with this lock held. Reaper authorization takes the
+    /// manager map lock, this timer lock and the tunnel admission lock in that
+    /// order. Only the callback-free timeout claim runs under all three.
     mutable std::mutex timer_mutex_;
 
     /// Callback when a tunnel is created.

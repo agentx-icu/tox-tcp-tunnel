@@ -2,11 +2,14 @@
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "toxtunnel/tox/tox_adapter.hpp"
+#include "toxtunnel/tox/tox_watchdog.hpp"
+#include "toxtunnel/util/metrics.hpp"
 
 namespace toxtunnel::tox {
 namespace {
@@ -275,6 +278,88 @@ TEST(ToxAdapterTest, BootstrapRetryIsNotArmedInLanMode) {
     EXPECT_EQ(adapter.bootstrap_retry_attempts(), 0u);
 
     adapter.stop();
+    std::filesystem::remove_all(test_dir);
+}
+
+TEST(ToxAdapterTest, BootstrapDnsRetryDoesNotStallWatchdogHeartbeat) {
+    using namespace std::chrono_literals;
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto test_dir = std::filesystem::temp_directory_path() /
+                          ("toxtunnel_bootstrap_dns_" + std::to_string(unique));
+
+    std::atomic<int> lookups{0};
+    std::promise<void> resolving;
+    auto resolver_started = resolving.get_future();
+    std::promise<void> unblock;
+    auto unblock_resolver = unblock.get_future();
+
+    ToxAdapterConfig config;
+    config.data_dir = test_dir;
+    config.udp_enabled = false;
+    config.local_discovery_enabled = false;
+    config.bootstrap_retry_initial_delay = 25ms;
+    config.bootstrap_retry_max_delay = 1s;
+    config.bootstrap_nodes.push_back({"bootstrap.invalid", 33445, {}});
+    config.bootstrap_dns_resolver = [&](const std::string& host) -> std::vector<std::string> {
+        EXPECT_EQ(host, "bootstrap.invalid");
+        const auto lookup = ++lookups;
+        if (lookup == 1) {
+            return {"127.0.0.1"};
+        }
+        if (lookup == 2) {
+            resolving.set_value();
+            unblock_resolver.wait();
+        }
+        return {};
+    };
+
+    ToxWatchdog watchdog;
+    watchdog.configure(5s, true);
+    ToxAdapter adapter;
+    ASSERT_TRUE(adapter.initialize(config).has_value());
+    adapter.set_watchdog(&watchdog);
+    ASSERT_TRUE(adapter.start());
+    EXPECT_EQ(adapter.bootstrap(), 1u);
+
+    const auto started = resolver_started.wait_for(2s);
+    EXPECT_EQ(started, std::future_status::ready);
+    if (started == std::future_status::ready) {
+        const auto before = watchdog.heartbeat_count();
+        std::this_thread::sleep_for(5100ms);
+        EXPECT_GT(watchdog.heartbeat_count(), before);
+        EXPECT_LT(watchdog.lag_ms(), 5000);
+    }
+    unblock.set_value();
+    adapter.stop();
+    std::filesystem::remove_all(test_dir);
+}
+
+TEST(ToxAdapterTest, OnlyMarshaledSendsContributeToBridgeWait) {
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto test_dir =
+        std::filesystem::temp_directory_path() / ("toxtunnel_send_wait_" + std::to_string(unique));
+    auto& metrics = util::MetricsRegistry::instance();
+    metrics.reset();
+    ToxAdapterConfig config;
+    config.data_dir = test_dir;
+    config.udp_enabled = false;
+    config.local_discovery_enabled = false;
+    ToxAdapter adapter;
+    ASSERT_TRUE(adapter.initialize(config).has_value());
+
+    const uint8_t packet[] = {160, 0};
+    EXPECT_FALSE(adapter.send_lossless_packet(0, packet, sizeof(packet)));
+    EXPECT_NE(metrics.render().find("toxtunnel_tox_send_bridge_wait_milliseconds_count 0\n"),
+              std::string::npos);
+
+    ASSERT_TRUE(adapter.start());
+    (void)adapter.get_address();  // A marshaled operation other than a send.
+    EXPECT_FALSE(adapter.send_lossless_packet(0, packet, sizeof(packet)));
+    EXPECT_NE(metrics.render().find("toxtunnel_tox_send_bridge_wait_milliseconds_count 1\n"),
+              std::string::npos);
+
+    adapter.stop();
+    metrics.reset();
     std::filesystem::remove_all(test_dir);
 }
 

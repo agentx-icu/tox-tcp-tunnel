@@ -13,6 +13,8 @@
 
 #if defined(__APPLE__)
 #include <time.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 namespace toxtunnel::tox {
@@ -21,6 +23,12 @@ std::int64_t ToxWatchdog::now_ns() noexcept {
 #if defined(__APPLE__)
     // Excludes system sleep (unlike steady_clock == CLOCK_MONOTONIC_RAW).
     return static_cast<std::int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+#elif defined(_WIN32)
+    // This excludes sleep and hibernation and is available on Windows 7.
+    // Its system-tick precision is enough for a watchdog that checks at 1 Hz.
+    ULONGLONG awake_100ns = 0;
+    QueryUnbiasedInterruptTime(&awake_100ns);
+    return static_cast<std::int64_t>(awake_100ns * 100);
 #else
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -154,9 +162,8 @@ std::int64_t ToxWatchdog::check_once() noexcept {
     }
 
     // How long since this observer itself last ran. The observer is a 1 Hz
-    // timer; a gap far beyond that means the observer was not running either —
-    // the process (or, on Windows, the whole machine) was suspended. On macOS
-    // and Linux host sleep never shows up here: now_ns() stops while asleep.
+    // timer; a much larger gap means the observer was also stalled, as when
+    // the process or VM is paused. The watchdog clock excludes OS sleep.
     const auto check_ns = now_ns();
     const auto prev_check_ns = last_check_ns_.exchange(check_ns, std::memory_order_relaxed);
     const std::int64_t observer_gap_ms =

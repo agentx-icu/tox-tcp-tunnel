@@ -240,6 +240,63 @@ TEST_F(ReaperTest, ZeroTimeoutDisablesReaping) {
     EXPECT_TRUE(manager->has_tunnel(400));
 }
 
+TEST_F(ReaperTest, ScanCannotReapATunnelThatReplacedAnIdleCandidate) {
+    constexpr uint16_t first_id = 510;
+    constexpr uint16_t second_id = 511;
+    uint16_t replacement_id = 0;
+    for (const auto id : {first_id, second_id}) {
+        auto tunnel = MakeConnectedTunnel(io_ctx, id);
+        tunnel->set_on_send_to_tox([&, id](std::span<const uint8_t> wire) {
+            const auto frame = ProtocolFrame::deserialize(wire);
+            if (replacement_id == 0 && frame && frame.value().type() == FrameType::TUNNEL_CLOSE) {
+                replacement_id = id == first_id ? second_id : first_id;
+                manager->remove_tunnel(replacement_id);
+                auto replacement = MakeConnectedTunnel(io_ctx, replacement_id);
+                EXPECT_TRUE(manager->add_tunnel(replacement_id, std::move(replacement)));
+            }
+            return SendOutcome::Sent;
+        });
+        ASSERT_TRUE(manager->add_tunnel(id, std::move(tunnel)));
+    }
+
+    manager->enable_reaper(/*idle_timeout_seconds=*/1, /*tick_seconds=*/3600);
+    std::this_thread::sleep_for(1100ms);
+    EXPECT_EQ(manager->reap_idle_tunnels_once(manager->reaper_epoch()), 1u);
+    ASSERT_NE(replacement_id, 0);
+    EXPECT_TRUE(manager->has_tunnel(replacement_id));
+
+    // The send handlers above capture test locals.
+    manager->close_all_local();
+}
+
+TEST_F(ReaperTest, IdleTimeoutAbortsGracefulCloseStillWaitingForWindowCredit) {
+    constexpr uint16_t id = 520;
+    auto frames = std::make_shared<std::vector<FrameType>>();
+    auto tunnel = std::make_shared<TunnelImpl>(io_ctx, id, /*friend_number=*/1, /*send_window=*/8);
+    tunnel->configure_coalesce(0, 1362);
+    tunnel->set_state(Tunnel::State::Connected);
+    tunnel->set_on_send_to_tox([frames](std::span<const uint8_t> wire) {
+        if (const auto frame = ProtocolFrame::deserialize(wire)) {
+            frames->push_back(frame.value().type());
+        }
+        return SendOutcome::Sent;
+    });
+    ASSERT_TRUE(manager->add_tunnel(id, tunnel));
+
+    const std::array<uint8_t, 8> first{};
+    const std::array<uint8_t, 1> waiting{};
+    tunnel->on_tcp_data_received(first.data(), first.size());
+    tunnel->on_tcp_data_received(waiting.data(), waiting.size());
+    tunnel->close();
+    EXPECT_EQ(*frames, (std::vector{FrameType::TUNNEL_DATA}));
+
+    manager->enable_reaper(/*idle_timeout_seconds=*/1, /*tick_seconds=*/3600);
+    std::this_thread::sleep_for(1100ms);
+    EXPECT_EQ(manager->reap_idle_tunnels_once(manager->reaper_epoch()), 1u);
+    EXPECT_FALSE(manager->has_tunnel(id));
+    EXPECT_EQ(*frames, (std::vector{FrameType::TUNNEL_DATA, FrameType::TUNNEL_ERROR}));
+}
+
 TEST_F(ReaperTest, TimerFiresPeriodically) {
     auto idle = MakeConnectedTunnel(io_ctx, /*tunnel_id=*/500);
     manager->add_tunnel(500, std::move(idle));

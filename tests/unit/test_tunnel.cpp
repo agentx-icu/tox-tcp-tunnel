@@ -943,6 +943,73 @@ TEST_F(TunnelTest, TcpReadEofWaitsForBufferedChunkToFlushBeforeClose) {
     EXPECT_EQ(frame_types[2], FrameType::TUNNEL_CLOSE);
 }
 
+TEST_F(TunnelTest, GracefulCloseSealsAndDrainsTcpBacklog) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 8);
+    tunnel.configure_coalesce(0, 1362);
+    tunnel.set_state(Tunnel::State::Connected);
+
+    std::vector<FrameType> sent;
+    std::vector<uint8_t> delivered;
+    tunnel.set_on_send_to_tox([&](std::span<const uint8_t> wire) {
+        const auto frame = ProtocolFrame::deserialize(wire);
+        if (frame) {
+            sent.push_back(frame.value().type());
+            const auto body = frame.value().as_tunnel_data();
+            if (frame.value().type() == FrameType::TUNNEL_DATA) {
+                delivered.insert(delivered.end(), body.begin(), body.end());
+            }
+        }
+        return SendOutcome::Sent;
+    });
+
+    const std::vector<uint8_t> first(8, 'a');
+    const std::vector<uint8_t> waiting(4, 'b');
+    tunnel.on_tcp_data_received(first.data(), first.size());
+    tunnel.on_tcp_data_received(waiting.data(), waiting.size());
+    tunnel.close();
+    EXPECT_EQ(sent, (std::vector{FrameType::TUNNEL_DATA}));
+    EXPECT_FALSE(tunnel.send_data_to_tox(std::vector<uint8_t>{'c'}));
+
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 8));
+    auto expected = first;
+    expected.insert(expected.end(), waiting.begin(), waiting.end());
+    EXPECT_EQ(delivered, expected);
+    EXPECT_EQ(sent, (std::vector{FrameType::TUNNEL_DATA, FrameType::TUNNEL_DATA,
+                                 FrameType::TUNNEL_CLOSE}));
+}
+
+TEST_F(TunnelTest, ReentrantAckCannotAdmitTheSameTcpBacklogTwice) {
+    TunnelImpl tunnel(io_ctx, test_tunnel_id, test_friend_number, 8);
+    tunnel.configure_coalesce(0, 1362);
+    tunnel.set_state(Tunnel::State::Connected);
+
+    std::vector<uint8_t> delivered;
+    bool acked_reentrantly = false;
+    tunnel.set_on_send_to_tox([&](std::span<const uint8_t> wire) {
+        const auto frame = ProtocolFrame::deserialize(wire);
+        if (frame && frame.value().type() == FrameType::TUNNEL_DATA) {
+            const auto body = frame.value().as_tunnel_data();
+            delivered.insert(delivered.end(), body.begin(), body.end());
+            if (body.front() == 'b' && !acked_reentrantly) {
+                acked_reentrantly = true;
+                tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 8));
+            }
+        }
+        return SendOutcome::Sent;
+    });
+
+    const std::vector<uint8_t> first(8, 'a');
+    const std::vector<uint8_t> waiting(12, 'b');
+    tunnel.on_tcp_data_received(first.data(), first.size());
+    tunnel.on_tcp_data_received(waiting.data(), waiting.size());
+    tunnel.handle_frame(ProtocolFrame::make_tunnel_ack(test_tunnel_id, 8));
+
+    auto expected = first;
+    expected.insert(expected.end(), waiting.begin(), waiting.end());
+    EXPECT_TRUE(acked_reentrantly);
+    EXPECT_EQ(delivered, expected);
+}
+
 // ============================================================================
 // 10. ErrorHandling - error scenarios
 // ============================================================================

@@ -1315,8 +1315,10 @@ void TunnelClient::start_pipe_mode() {
     // `tunnel_mgr_` in tunnel_client.hpp explicitly warns against it.
     auto manager_ref = tunnel_mgr_;
     auto senders = detail::make_tunnel_senders(
-        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
-            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        [this, session = manager_ref->outbound_session()](
+            std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length,
+                                                            session.get());
         },
         manager_ref, tunnel_friend_number);
     tunnel->set_on_send_to_tox(std::move(senders.span));
@@ -1463,7 +1465,8 @@ void TunnelClient::install_manager_send_handler(std::uint32_t friend_number) {
         return;
     }
     tunnel_mgr_->set_send_handler(
-        [this, friend_number](const std::vector<uint8_t>& frame_data) -> tunnel::SendOutcome {
+        [this, friend_number, session = tunnel_mgr_->outbound_session()](
+            const std::vector<uint8_t>& frame_data) -> tunnel::SendOutcome {
             std::vector<uint8_t> packet;
             packet.reserve(1 + frame_data.size());
             packet.push_back(tunnel::kLosslessPacketByte);
@@ -1473,7 +1476,7 @@ void TunnelClient::install_manager_send_handler(std::uint32_t friend_number) {
             // snapshotted this handler sends to the friend it was queued for,
             // not whatever endpoint is now active.
             const auto outcome = tox_adapter_->send_lossless_packet_typed(
-                friend_number, packet.data(), packet.size());
+                friend_number, packet.data(), packet.size(), session.get());
             switch (outcome) {
                 case tox::ToxAdapter::LosslessSendOutcome::Sent:
                     return tunnel::SendOutcome::Sent;
@@ -1925,8 +1928,10 @@ void TunnelClient::open_tunnel_for_connection(std::shared_ptr<core::TcpConnectio
     // called out in tunnel_client.hpp:215-223 (H-S-2/H-S-4).
     auto manager_ref = tunnel_mgr_;
     auto senders = detail::make_tunnel_senders(
-        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
-            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        [this, session = manager_ref->outbound_session()](
+            std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length,
+                                                            session.get());
         },
         manager_ref, tunnel_friend_number);
     tunnel->set_on_send_to_tox(std::move(senders.span));
@@ -2073,8 +2078,10 @@ void TunnelClient::open_socks5_tunnel(std::shared_ptr<core::TcpConnection> conn,
     // (see comment on `tunnel_mgr_` in tunnel_client.hpp:215-223).
     auto manager_ref = tunnel_mgr_;
     auto senders = detail::make_tunnel_senders(
-        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
-            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        [this, session = manager_ref->outbound_session()](
+            std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length,
+                                                            session.get());
         },
         manager_ref, tunnel_friend_number);
     tunnel->set_on_send_to_tox(std::move(senders.span));

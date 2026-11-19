@@ -1359,10 +1359,8 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view
                 // paths re-enter it). Its tunnel ids belong to a session the peer
                 // has abandoned, and ids are recycled per friend, so a
                 // TUNNEL_CLOSE from here could close the winner's
-                // identically-numbered tunnel instead. close_all_local() emits no
-                // teardown frame of its own and authorises no further send; it
-                // does not retract a send some other thread authorised just
-                // before the gate closed (see TunnelManager::close_all_local()).
+                // identically-numbered tunnel instead. The manager closes its
+                // native enqueue gate before dropping local state.
                 resurrected->close_all_local();
             }
             return;
@@ -1380,26 +1378,26 @@ void TunnelServer::setup_tunnel_manager(uint32_t friend_number, std::string_view
 
     // Set up the send handler: serialize frame, prepend lossless packet byte,
     // send via ToxAdapter.
-    manager->set_send_handler(
-        [this, friend_number](const std::vector<uint8_t>& frame_data) -> tunnel::SendOutcome {
-            // Prepend the lossless packet prefix byte.
-            std::vector<uint8_t> packet;
-            packet.reserve(1 + frame_data.size());
-            packet.push_back(kLosslessPacketByte);
-            packet.insert(packet.end(), frame_data.begin(), frame_data.end());
+    manager->set_send_handler([this, friend_number, session = manager->outbound_session()](
+                                  const std::vector<uint8_t>& frame_data) -> tunnel::SendOutcome {
+        // Prepend the lossless packet prefix byte.
+        std::vector<uint8_t> packet;
+        packet.reserve(1 + frame_data.size());
+        packet.push_back(kLosslessPacketByte);
+        packet.insert(packet.end(), frame_data.begin(), frame_data.end());
 
-            const auto outcome = tox_adapter_->send_lossless_packet_typed(
-                friend_number, packet.data(), packet.size());
-            switch (outcome) {
-                case tox::ToxAdapter::LosslessSendOutcome::Sent:
-                    return tunnel::SendOutcome::Sent;
-                case tox::ToxAdapter::LosslessSendOutcome::SendqFull:
-                    return tunnel::SendOutcome::SendqFull;
-                case tox::ToxAdapter::LosslessSendOutcome::PermanentFail:
-                    return tunnel::SendOutcome::PermanentFail;
-            }
-            return tunnel::SendOutcome::PermanentFail;
-        });
+        const auto outcome = tox_adapter_->send_lossless_packet_typed(friend_number, packet.data(),
+                                                                      packet.size(), session.get());
+        switch (outcome) {
+            case tox::ToxAdapter::LosslessSendOutcome::Sent:
+                return tunnel::SendOutcome::Sent;
+            case tox::ToxAdapter::LosslessSendOutcome::SendqFull:
+                return tunnel::SendOutcome::SendqFull;
+            case tox::ToxAdapter::LosslessSendOutcome::PermanentFail:
+                return tunnel::SendOutcome::PermanentFail;
+        }
+        return tunnel::SendOutcome::PermanentFail;
+    });
 
     // Set up tunnel created callback for logging.
     manager->set_on_tunnel_created([friend_number](uint16_t tunnel_id) {
@@ -1767,8 +1765,10 @@ void TunnelServer::handle_tunnel_open(uint32_t friend_number, const tunnel::Prot
     // which would force a deserialize + re-serialize round trip and a redundant
     // byte copy.
     auto senders = detail::make_tunnel_senders(
-        [this](std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
-            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length);
+        [this, session = manager_ptr->outbound_session()](
+            std::uint32_t friend_num, const std::uint8_t* data, std::size_t length) {
+            return tox_adapter_->send_lossless_packet_typed(friend_num, data, length,
+                                                            session.get());
         },
         manager_ptr, friend_number);
     server_tunnel->set_on_send_to_tox(std::move(senders.span));
